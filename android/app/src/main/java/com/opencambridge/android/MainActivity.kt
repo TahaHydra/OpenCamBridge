@@ -62,6 +62,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        
+        // Initial rotation
+        updateServiceTargetRotation()
+        
         setContent {
             OpenCamBridgeTheme {
                 val isStreaming by viewModel.isStreaming.collectAsState()
@@ -168,6 +172,17 @@ class MainActivity : ComponentActivity() {
     private fun stopStreamService() {
         stopService(StreamService.startIntent(this))
     }
+
+    private fun updateServiceTargetRotation() {
+        val displayRotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            display?.rotation ?: android.view.Surface.ROTATION_0
+        } else {
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.rotation
+        }
+        com.opencambridge.android.state.StreamState.previewUseCase?.targetRotation = displayRotation
+        com.opencambridge.android.state.StreamState.imageAnalysisUseCase?.targetRotation = displayRotation
+    }
 }
 
 // ---- Composables ----
@@ -209,7 +224,7 @@ fun MainScreen(
     hasTorch: Boolean,
     linearZoom: Float,
     rotationDegrees: Int,
-    displayRotation: Int,
+    displayRotation: String,
     mirror: Boolean,
     accessMode: String,
     port: Int,
@@ -227,7 +242,7 @@ fun MainScreen(
     onTogglePreview: (Boolean) -> Unit,
     onToggleTorch: (Boolean) -> Unit,
     onZoomSelect: (Float) -> Unit,
-    onDisplayRotationSelect: (Int) -> Unit,
+    onDisplayRotationSelect: (String) -> Unit,
     onMirrorSelect: (Boolean) -> Unit,
     onStreamModeSelect: (String) -> Unit,
     onAccessModeSelect: (String) -> Unit,
@@ -456,11 +471,11 @@ fun MainControls(
     isStreaming: Boolean, wifiIp: String?, cameras: List<CameraInfoDto>, selectedCameraId: String,
     width: Int, height: Int, fps: Int, jpegQuality: Int, previewFitMode: String, aspectRatio: String,
     zoomSpeed: String, localPreviewEnabled: Boolean, rebindInProgress: Boolean, torchEnabled: Boolean,
-    hasTorch: Boolean, linearZoom: Float, rotationDegrees: Int, displayRotation: Int, mirror: Boolean, streamMode: String,
+    hasTorch: Boolean, linearZoom: Float, rotationDegrees: Int, displayRotation: String, mirror: Boolean, streamMode: String,
     onStartStop: () -> Unit, onCameraSelect: (String) -> Unit, onResolutionSelect: (Int, Int) -> Unit,
     onFpsSelect: (Int) -> Unit, onJpegQualitySelect: (Int) -> Unit, onPreviewFitModeSelect: (String) -> Unit,
     onAspectRatioSelect: (String) -> Unit, onZoomSpeedSelect: (String) -> Unit, onTogglePreview: (Boolean) -> Unit,
-    onToggleTorch: (Boolean) -> Unit, onZoomSelect: (Float) -> Unit, onDisplayRotationSelect: (Int) -> Unit,
+    onToggleTorch: (Boolean) -> Unit, onZoomSelect: (Float) -> Unit, onDisplayRotationSelect: (String) -> Unit,
     onMirrorSelect: (Boolean) -> Unit, onStreamModeSelect: (String) -> Unit
 ) {
     if (cameras.isNotEmpty()) {
@@ -473,8 +488,7 @@ fun MainControls(
                 Spacer(modifier = Modifier.height(16.dp))
                 ResolutionSelector(width, height, !rebindInProgress, onResolutionSelect)
                 Spacer(modifier = Modifier.height(16.dp))
-                AspectRatioSelector(aspectRatio, !rebindInProgress, onAspectRatioSelect)
-                Spacer(modifier = Modifier.height(16.dp))
+
                 FpsSelector(fps, !rebindInProgress, onFpsSelect)
             }
         }
@@ -515,12 +529,32 @@ fun MainControls(
                 Spacer(modifier = Modifier.height(16.dp))
                 FitModeSelector(previewFitMode, !rebindInProgress, onPreviewFitModeSelect)
                 Spacer(modifier = Modifier.height(16.dp))
-                DisplayRotationSelector(displayRotation, !rebindInProgress, onDisplayRotationSelect)
-                Spacer(modifier = Modifier.height(16.dp))
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("Mirror Image", color = if (!rebindInProgress) Color.Unspecified else Color.Gray)
-                    Switch(checked = mirror, enabled = !rebindInProgress, onCheckedChange = onMirrorSelect, colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary))
+                    Button(
+                        onClick = {
+                            val currentRot = displayRotation.toIntOrNull() ?: 0
+                            val newRot = (currentRot + 90) % 360
+                            onDisplayRotationSelect(newRot.toString())
+                        },
+                        enabled = !rebindInProgress,
+                        modifier = Modifier.fillMaxWidth(0.5f).padding(end = 8.dp)
+                    ) {
+                        Text("↻ Rotate 90°")
+                    }
+                    Button(
+                        onClick = { onMirrorSelect(!mirror) },
+                        enabled = !rebindInProgress,
+                        modifier = Modifier.fillMaxWidth().padding(start = 8.dp)
+                    ) {
+                        Text(if (mirror) "Mirror: ON" else "Mirror: OFF")
+                    }
                 }
+                Spacer(modifier = Modifier.height(16.dp))
+                OutputOrientationSelector(aspectRatio, displayRotation, !rebindInProgress) { ar, rot ->
+                    onAspectRatioSelect(ar)
+                    onDisplayRotationSelect(rot)
+                }
+                // OutputOrientationSelector removed the old Mirror switch
             }
         }
         Spacer(modifier = Modifier.height(32.dp))
@@ -741,15 +775,19 @@ fun FpsSelector(fps: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
 @Composable
 fun FitModeSelector(fitMode: String, enabled: Boolean, onSelect: (String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
-    val options = listOf("fit", "fill", "stretch", "original")
+    val options = listOf("fill", "fit")
 
     ExposedDropdownMenuBox(
         expanded = expanded,
         onExpandedChange = { if (enabled) expanded = it },
         modifier = Modifier.fillMaxWidth()
     ) {
+        val labels = mapOf(
+            "fill" to "Fill (Cover, no black bars)",
+            "fit" to "Fit (Contain, full frame)"
+        )
         OutlinedTextField(
-            value = fitMode.replaceFirstChar { it.uppercase() },
+            value = labels[fitMode] ?: fitMode.replaceFirstChar { it.uppercase() },
             onValueChange = {},
             readOnly = true,
             enabled = enabled,
@@ -767,7 +805,7 @@ fun FitModeSelector(fitMode: String, enabled: Boolean, onSelect: (String) -> Uni
         ) {
             options.forEach { opt ->
                 DropdownMenuItem(
-                    text = { Text(opt.replaceFirstChar { it.uppercase() }) },
+                    text = { Text(labels[opt] ?: opt) },
                     onClick = {
                         onSelect(opt)
                         expanded = false
@@ -780,9 +818,24 @@ fun FitModeSelector(fitMode: String, enabled: Boolean, onSelect: (String) -> Uni
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AspectRatioSelector(aspectRatio: String, enabled: Boolean, onSelect: (String) -> Unit) {
+fun OutputOrientationSelector(aspectRatio: String, displayRotation: String, enabled: Boolean, onSelect: (String, String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
-    val options = listOf("auto", "16:9", "4:3")
+    
+    val options = listOf(
+        Pair("16:9", "0"),
+        Pair("9:16", "90"),
+        Pair("9:16", "270"),
+        Pair("16:9", "180")
+    )
+    val labels = mapOf(
+        Pair("16:9", "0") to "Landscape (0°)",
+        Pair("9:16", "90") to "Portrait CW (90°)",
+        Pair("9:16", "270") to "Portrait CCW (270°)",
+        Pair("16:9", "180") to "Upside Down (180°)"
+    )
+    
+    val currentKey = Pair(aspectRatio, displayRotation)
+    val currentValue = labels[currentKey] ?: "Landscape (0°)"
 
     ExposedDropdownMenuBox(
         expanded = expanded,
@@ -790,11 +843,11 @@ fun AspectRatioSelector(aspectRatio: String, enabled: Boolean, onSelect: (String
         modifier = Modifier.fillMaxWidth()
     ) {
         OutlinedTextField(
-            value = aspectRatio.replaceFirstChar { it.uppercase() },
+            value = currentValue,
             onValueChange = {},
             readOnly = true,
             enabled = enabled,
-            label = { Text("Stream Aspect Ratio") },
+            label = { Text("Output Orientation") },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
             modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled).fillMaxWidth(),
             colors = OutlinedTextFieldDefaults.colors(
@@ -808,9 +861,9 @@ fun AspectRatioSelector(aspectRatio: String, enabled: Boolean, onSelect: (String
         ) {
             options.forEach { opt ->
                 DropdownMenuItem(
-                    text = { Text(opt.replaceFirstChar { it.uppercase() }) },
+                    text = { Text(labels[opt] ?: "") },
                     onClick = {
-                        onSelect(opt)
+                        onSelect(opt.first, opt.second)
                         expanded = false
                     }
                 )
@@ -897,46 +950,7 @@ fun ZoomSlider(zoom: Float, enabled: Boolean, onSelect: (Float) -> Unit) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun DisplayRotationSelector(rotation: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
-    var expanded by remember { mutableStateOf(false) }
-    val options = listOf(0, 90, 180, 270)
 
-    ExposedDropdownMenuBox(
-        expanded = expanded,
-        onExpandedChange = { if (enabled) expanded = it },
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        OutlinedTextField(
-            value = "$rotation°",
-            onValueChange = {},
-            readOnly = true,
-            enabled = enabled,
-            label = { Text("Display Rotation") },
-            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled).fillMaxWidth(),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = Color(0xFF4FC3F7),
-                unfocusedBorderColor = Color(0xFF37474F)
-            )
-        )
-        ExposedDropdownMenu(
-            expanded = expanded,
-            onDismissRequest = { expanded = false }
-        ) {
-            options.forEach { opt ->
-                DropdownMenuItem(
-                    text = { Text("$opt°") },
-                    onClick = {
-                        onSelect(opt)
-                        expanded = false
-                    }
-                )
-            }
-        }
-    }
-}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

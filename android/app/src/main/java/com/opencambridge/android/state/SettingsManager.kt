@@ -29,10 +29,21 @@ class SettingsManager(context: Context) {
         StreamState.height.set(prefs.getInt("height", 720))
         StreamState.fps.set(prefs.getInt("fps", 30))
         StreamState.jpegQuality.set(prefs.getInt("jpegQuality", 85))
-        StreamState.previewFitMode.set(prefs.getString("previewFitMode", "fit") ?: "fit")
-        StreamState.aspectRatio.set(prefs.getString("aspectRatio", "auto") ?: "auto")
+        StreamState.previewFitMode.set(prefs.getString("previewFitMode", "fill") ?: "fill")
+        val savedAspectRatio = prefs.getString("aspectRatio", "16:9") ?: "16:9"
+        StreamState.aspectRatio.set(if (savedAspectRatio == "auto") "16:9" else savedAspectRatio)
+        
         StreamState.zoomSpeed.set(prefs.getString("zoomSpeed", "normal") ?: "normal")
-        StreamState.displayRotation.set(prefs.getInt("displayRotation", 0))
+        
+        try {
+            val savedRot = prefs.getString("displayRotation", "0") ?: "0"
+            StreamState.displayRotation.set(if (savedRot == "auto") "0" else savedRot)
+        } catch (e: ClassCastException) {
+            // Safe migration from older Int values
+            val oldInt = prefs.getInt("displayRotation", 0)
+            StreamState.displayRotation.set(oldInt.toString())
+        }
+        
         StreamState.mirror.set(prefs.getBoolean("mirror", false))
         StreamState.localPreviewEnabled.set(prefs.getBoolean("localPreviewEnabled", false))
     }
@@ -53,7 +64,7 @@ class SettingsManager(context: Context) {
             putString("previewFitMode", StreamState.previewFitMode.get())
             putString("aspectRatio", StreamState.aspectRatio.get())
             putString("zoomSpeed", StreamState.zoomSpeed.get())
-            putInt("displayRotation", StreamState.displayRotation.get())
+            putString("displayRotation", StreamState.displayRotation.get())
             putBoolean("mirror", StreamState.mirror.get())
             putBoolean("localPreviewEnabled", StreamState.localPreviewEnabled.get())
             apply()

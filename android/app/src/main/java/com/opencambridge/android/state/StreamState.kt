@@ -38,10 +38,10 @@ object StreamState {
     val height = AtomicInteger(720)
     val jpegQuality = AtomicInteger(85)
     val fps = AtomicInteger(30)
-    val previewFitMode = AtomicReference("fit")
+    val previewFitMode = AtomicReference("fill")
     val aspectRatio = AtomicReference("auto") // auto, 16:9, 4:3
     val zoomSpeed = AtomicReference("normal") // slow, normal, fast
-    val displayRotation = AtomicInteger(0) // 0, 90, 180, 270
+    val displayRotation = AtomicReference("auto") // auto, 0, 90, 180, 270
     val mirror = AtomicBoolean(false)
     
     // UI/Preview
@@ -55,6 +55,9 @@ object StreamState {
     val linearZoom = AtomicReference(0.0f)
     val hasTorch = AtomicBoolean(false)
     val rotationDegrees = AtomicInteger(0)
+    val sensorOrientation = AtomicInteger(0)
+    val frameWidth = AtomicInteger(0)
+    val frameHeight = AtomicInteger(0)
 
     /** Latest JPEG frame bytes, updated by MjpegStreamer. Null before first frame. */
     val latestFrame = AtomicReference<ByteArray?>(null)
@@ -64,6 +67,9 @@ object StreamState {
     
     /** The active Preview UseCase (if any). Enables dynamic surface rebinding without tearing down CameraX. */
     var previewUseCase: androidx.camera.core.Preview? = null
+    
+    /** The active ImageAnalysis UseCase (if any). Enables dynamic targetRotation updates. */
+    var imageAnalysisUseCase: androidx.camera.core.ImageAnalysis? = null
     
     fun incrementRevision(source: String) {
         revision.incrementAndGet()
@@ -97,6 +103,11 @@ object StreamState {
         rebindInProgress = rebindInProgress.get(),
         hasTorch = hasTorch.get(),
         rotationDegrees = rotationDegrees.get(),
+        sensorOrientation = sensorOrientation.get(),
+        frameWidth = frameWidth.get(),
+        frameHeight = frameHeight.get(),
+        isFramePortrait = frameHeight.get() > frameWidth.get(),
+        isFrameLandscape = frameWidth.get() >= frameHeight.get(),
         displayRotation = displayRotation.get(),
         mirror = mirror.get()
     )
@@ -129,6 +140,11 @@ data class StreamStatusDto(
     val rebindInProgress: Boolean,
     val hasTorch: Boolean,
     val rotationDegrees: Int,
-    val displayRotation: Int,
+    val sensorOrientation: Int = 0,
+    val frameWidth: Int = 0,
+    val frameHeight: Int = 0,
+    val isFramePortrait: Boolean = false,
+    val isFrameLandscape: Boolean = false,
+    val displayRotation: String,
     val mirror: Boolean
 )

@@ -98,6 +98,7 @@ class H264Streamer(
                     .build()
 
                 imageAnalysis.setAnalyzer(analysisExecutor, ::processFrame)
+                StreamState.imageAnalysisUseCase = imageAnalysis
                 
                 val preview = Preview.Builder()
                     .setTargetResolution(android.util.Size(width, height))
@@ -256,8 +257,10 @@ class H264Streamer(
 
         try {
             StreamState.rotationDegrees.set(imageProxy.imageInfo.rotationDegrees)
-            
-            // 1. Feed H.264
+            StreamState.frameWidth.set(imageProxy.width)
+            StreamState.frameHeight.set(imageProxy.height)
+
+            // Feed frame to encodered H.264
             val inputBufferIndex = codec.dequeueInputBuffer(10000)
             if (inputBufferIndex >= 0) {
                 val inputBuffer = codec.getInputBuffer(inputBufferIndex)

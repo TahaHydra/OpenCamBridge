@@ -217,7 +217,6 @@ class StreamService : LifecycleService() {
         req.streamMode?.let { StreamState.streamMode.set(it); requiresRebind = true; requiresSettingsSave = true }
         req.h264Bitrate?.let { StreamState.h264Bitrate.set(it); requiresRebind = true; requiresSettingsSave = true }
         req.h264KeyframeInterval?.let { StreamState.h264KeyframeInterval.set(it); requiresRebind = true; requiresSettingsSave = true }
-        req.aspectRatio?.let { StreamState.aspectRatio.set(it); requiresRebind = true; requiresSettingsSave = true }
         req.fps?.let { StreamState.fps.set(it.coerceIn(1, 120)); requiresRebind = true; requiresSettingsSave = true }
 
         if (req.width != null || req.height != null) {
@@ -235,6 +234,7 @@ class StreamService : LifecycleService() {
         req.accessToken?.let { StreamState.accessToken.set(it); requiresSettingsSave = true }
         req.jpegQuality?.let { StreamState.jpegQuality.set(it.coerceIn(1, 100)); requiresSettingsSave = true }
         req.previewFitMode?.let { StreamState.previewFitMode.set(it); requiresSettingsSave = true }
+        req.aspectRatio?.let { StreamState.aspectRatio.set(it); requiresSettingsSave = true }
         req.zoomSpeed?.let { StreamState.zoomSpeed.set(it); requiresSettingsSave = true }
         req.displayRotation?.let { StreamState.displayRotation.set(it); requiresSettingsSave = true }
         req.mirror?.let { StreamState.mirror.set(it); requiresSettingsSave = true }

@@ -76,6 +76,7 @@ class MjpegStreamer(
                     .build()
 
                 imageAnalysis.setAnalyzer(analysisExecutor, ::processFrame)
+                StreamState.imageAnalysisUseCase = imageAnalysis
                 
                 val preview = Preview.Builder()
                     .setTargetResolution(android.util.Size(StreamState.width.get(), StreamState.height.get()))
@@ -191,6 +192,9 @@ class MjpegStreamer(
         
         try {
             StreamState.rotationDegrees.set(imageProxy.imageInfo.rotationDegrees)
+            StreamState.frameWidth.set(imageProxy.width)
+            StreamState.frameHeight.set(imageProxy.height)
+            
             val jpegBytes = yuvToJpeg(imageProxy, StreamState.jpegQuality.get())
             StreamState.latestFrame.set(jpegBytes)
         } catch (e: Exception) {

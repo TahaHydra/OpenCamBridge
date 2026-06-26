@@ -181,17 +181,42 @@ class ControlServer(
                   main { grid-template-columns: 1fr; }
                 }
 
-                .preview-container { 
-                    background: #000; 
-                    border-radius: 8px; 
-                    overflow: hidden; 
+                .preview-section {
                     width: 100%;
-                    aspect-ratio: 16/9; 
-                    display: flex; 
-                    align-items: center; 
-                    justify-content: center; 
-                    border: 1px solid #333;
+                    min-width: 0;
+                }
+                .preview-stage {
+                    width: 100%;
+                    height: calc(100vh - 140px);
+                    max-height: 80vh;
+                    min-height: 360px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    overflow: hidden;
+                    background: #1a1c23;
+                    border-radius: 8px;
+                    padding: 8px;
+                    box-sizing: border-box;
+                }
+                .preview-box {
                     position: relative;
+                    background: #000;
+                    border: 1px solid #333;
+                    border-radius: 8px;
+                    overflow: hidden;
+                }
+                .preview-box.layout-landscape {
+                    width: min(100%, calc(80vh * 16 / 9));
+                    aspect-ratio: 16 / 9;
+                }
+                .preview-box.layout-portrait {
+                    width: min(100%, calc(80vh * 9 / 16));
+                    aspect-ratio: 9 / 16;
+                }
+                .preview-box.layout-square {
+                    width: min(100%, 80vh);
+                    aspect-ratio: 1 / 1;
                 }
                 .offline-overlay {
                     position: absolute;
@@ -233,9 +258,25 @@ class ControlServer(
                     flex: unset;
                 }
                 .manual-refresh-btn:hover { background: rgba(0,0,0,0.8); border-color: rgba(255,255,255,0.4); }
-                .preview-container img { 
-                    /* Sizing is handled by JS to correctly emulate Android PreviewView rotation scaling */
-                    transition: transform 0.2s ease;
+                .stream-rotator {
+                    position: absolute;
+                    left: 50%;
+                    top: 50%;
+                    transform-origin: center center;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                }
+                .stream-img {
+                    width: 100%;
+                    height: 100%;
+                    display: block;
+                }
+                .stream-img.fit-contain {
+                    object-fit: contain;
+                }
+                .stream-img.fit-cover {
+                    object-fit: cover;
                 }
                 
                 .controls-grid { display: flex; flex-direction: column; gap: 16px; }
@@ -285,19 +326,24 @@ class ControlServer(
                       <h1>OpenCamBridge</h1>
                       <div class="subtitle">Live MJPEG Stream Control</div>
                   </div>
-                  <div id="rebind-warning" class="rebind-warning">Rebinding camera...</div>
+                  <div id="header-rebind-warning" class="rebind-warning">Rebinding camera...</div>
               </header>
               
               <main>
                   <!-- Left side: Preview -->
                   <div class="preview-section">
-                      <div class="preview-container">
-                        <img id="stream-img" src="/stream.mjpeg" class="fit-contain" alt="Live stream" onerror="this.alt='Stream stopped'">
-                        <div id="offline-overlay" class="offline-overlay">
-                            <p>Stream is offline</p>
-                            <button class="refresh-btn" onclick="reloadPreviewImage()">Refresh Image</button>
+                      <div class="preview-stage">
+                        <div id="preview-box" class="preview-box layout-landscape">
+                            <div id="offline-overlay" class="offline-overlay">
+                                <p>Camera is Offline</p>
+                                <button class="refresh-btn" onclick="fetchStatus()">Refresh Stream</button>
+                            </div>
+                            <span id="preview-rebind-warning" style="display:none; position:absolute; top:16px; left:16px; background:rgba(255,165,0,0.8); color:#000; padding:4px 8px; border-radius:4px; font-size:0.8rem; z-index:20; font-weight:bold;">REBINDING...</span>
+                            <button class="manual-refresh-btn" onclick="reloadPreviewImage()">Reload Image</button>
+                            <div id="stream-rotator" class="stream-rotator">
+                                <img id="stream-img" class="stream-img fit-contain" src="" alt="Live Stream">
+                            </div>
                         </div>
-                        <button class="manual-refresh-btn" onclick="reloadPreviewImage()" title="Refresh preview">↺ Refresh</button>
                       </div>
                   </div>
 
@@ -339,14 +385,7 @@ class ControlServer(
                            <option value="640x480">640 x 480</option>
                         </select>
                       </div>
-                      <div class="control-group">
-                        <label>Aspect Ratio</label>
-                        <select id="ar-select" onchange="patchSetting({aspectRatio: this.value})">
-                           <option value="auto">Auto</option>
-                           <option value="16:9">16:9</option>
-                           <option value="4:3">4:3</option>
-                        </select>
-                      </div>
+
                       <div class="control-group">
                         <label>FPS Limit</label>
                         <select id="fps-select" onchange="patchSetting({fps: parseInt(this.value)})">
@@ -401,20 +440,21 @@ class ControlServer(
                       <div class="control-group">
                         <label>Fit Mode</label>
                         <select id="fit-select" onchange="patchSetting({previewFitMode: this.value})">
-                           <option value="fit">Fit (Contain)</option>
-                           <option value="fill">Fill (Cover)</option>
-                           <option value="stretch">Stretch</option>
-                           <option value="original">Original (None)</option>
+                           <option value="fill">Fill (Cover, no black bars)</option>
+                           <option value="fit">Fit (Contain, full frame)</option>
                         </select>
                       </div>
                       <div class="control-group">
-                        <label>Rotation</label>
-                        <select id="rot-select" onchange="patchSetting({displayRotation: parseInt(this.value)})">
-                           <option value="0">0°</option>
-                           <option value="90">90°</option>
-                           <option value="180">180°</option>
-                           <option value="270">270°</option>
-                        </select>
+                        <label>Output Orientation</label>
+                        <div style="display:flex; gap:8px;">
+                          <select id="orient-select" style="flex:1;" onchange="updateOrientation(this.value)">
+                              <option value="landscape">Landscape (0°)</option>
+                              <option value="portrait_cw">Portrait CW (90°)</option>
+                              <option value="portrait_ccw">Portrait CCW (270°)</option>
+                              <option value="upside_down">Upside Down (180°)</option>
+                          </select>
+                          <button onclick="rotate90()" style="flex:none; padding:10px; background:#333; color:white; border:1px solid #444;" title="Rotate 90°">↻</button>
+                        </div>
                       </div>
                       <div class="control-row">
                         <label>Mirror</label>
@@ -456,8 +496,8 @@ class ControlServer(
               </main>
 
               <script>
-                const TOKEN = "${StreamState.accessToken.get()}";
-                const isTokenRequired = "${StreamState.accessMode.get()}" === "lanToken";
+                const TOKEN = "${'$'}{StreamState.accessToken.get()}";
+                const isTokenRequired = "${'$'}{StreamState.accessMode.get()}" === "lanToken";
                 
                 let lastStatus = null;
                 const fetchWithAuth = async (url, options = {}) => {
@@ -475,51 +515,64 @@ class ControlServer(
                     document.getElementById('tab-' + tabId).classList.add('active');
                     if (tabId === 'logs') fetchLogs();
                 }
-                function updateFitClass(mode, displayRot, mirror) {
+
+                let lastMode = 'fill', lastRot = 0, lastMirror = false, lastLayout = '16:9';
+
+                function applyDisplaySettings(mode, displayRot, mirror, layout) {
+                    if (mode !== undefined) lastMode = mode;
+                    if (displayRot !== undefined) lastRot = displayRot;
+                    if (mirror !== undefined) lastMirror = mirror;
+                    if (layout !== undefined) lastLayout = layout;
+
+                    const box = document.getElementById('preview-box');
+                    const rotator = document.getElementById('stream-rotator');
                     const img = document.getElementById('stream-img');
-                    const container = document.querySelector('.preview-container');
-                    const cw = container.clientWidth;
-                    const ch = container.clientHeight;
-                    if (cw === 0 || ch === 0) return;
-                    
-                    const nw = img.naturalWidth || 1280;
-                    const nh = img.naturalHeight || 720;
-                    
-                    let rw = nw;
-                    let rh = nh;
-                    if (displayRot === 90 || displayRot === 270) {
-                        rw = nh;
-                        rh = nw;
-                    }
-                    
-                    let finalW = rw;
-                    let finalH = rh;
-                    
-                    if (mode === 'fit') {
-                        const scale = Math.min(cw / rw, ch / rh);
-                        finalW = rw * scale;
-                        finalH = rh * scale;
-                    } else if (mode === 'fill') {
-                        const scale = Math.max(cw / rw, ch / rh);
-                        finalW = rw * scale;
-                        finalH = rh * scale;
-                    } else if (mode === 'stretch') {
-                        finalW = cw;
-                        finalH = ch;
-                    }
-                    
-                    if (displayRot === 90 || displayRot === 270) {
-                        img.style.width = finalH + 'px';
-                        img.style.height = finalW + 'px';
+
+                    box.classList.remove('layout-landscape', 'layout-portrait', 'layout-square');
+                    if (lastLayout === '9:16') box.classList.add('layout-portrait');
+                    else if (lastLayout === '1:1') box.classList.add('layout-square');
+                    else box.classList.add('layout-landscape');
+
+                    img.classList.remove('fit-contain', 'fit-cover');
+                    img.classList.add(lastMode === 'fill' ? 'fit-cover' : 'fit-contain');
+
+                    const rot = parseInt(lastRot || '0', 10) || 0;
+                    const boxW = box.clientWidth;
+                    const boxH = box.clientHeight;
+
+                    if (rot === 90 || rot === 270) {
+                        rotator.style.width = boxH + 'px';
+                        rotator.style.height = boxW + 'px';
                     } else {
-                        img.style.width = finalW + 'px';
-                        img.style.height = finalH + 'px';
+                        rotator.style.width = boxW + 'px';
+                        rotator.style.height = boxH + 'px';
                     }
-                    
-                    const scaleX = mirror ? -1 : 1;
-                    img.style.transform = 'rotate(' + displayRot + 'deg) scaleX(' + scaleX + ')';
+
+                    const scaleX = lastMirror ? -1 : 1;
+                    rotator.style.transform = `translate(-50%, -50%) rotate(${'$'}{rot}deg) scaleX(${'$'}{scaleX})`;
                 }
               
+                function updateOrientation(mode) {
+                    let aspect = '16:9';
+                    let rot = '0';
+                    if (mode === 'portrait_cw') { aspect = '9:16'; rot = '90'; }
+                    else if (mode === 'portrait_ccw') { aspect = '9:16'; rot = '270'; }
+                    else if (mode === 'upside_down') { aspect = '16:9'; rot = '180'; }
+                    patchSetting({ aspectRatio: aspect, displayRotation: rot });
+                }
+
+                function rotate90() {
+                    const sel = document.getElementById('orient-select');
+                    const map = {
+                        'landscape': 'portrait_cw',
+                        'portrait_cw': 'upside_down',
+                        'upside_down': 'portrait_ccw',
+                        'portrait_ccw': 'landscape'
+                    };
+                    sel.value = map[sel.value] || 'portrait_cw';
+                    updateOrientation(sel.value);
+                }
+
                 let currentRevision = 0;
                 let currentLifecycleState = '';
                 let isDraggingQuality = false;
@@ -557,10 +610,20 @@ class ControlServer(
                         document.getElementById('res-select').value = status.width + 'x' + status.height;
                         document.getElementById('fps-select').value = status.fps;
                         document.getElementById('fit-select').value = status.previewFitMode;
-                        document.getElementById('ar-select').value = status.aspectRatio || 'auto';
                         document.getElementById('zs-select').value = status.zoomSpeed || 'normal';
                         document.getElementById('sm-select').value = status.streamMode || 'mjpeg';
-                        document.getElementById('rot-select').value = status.displayRotation || 0;
+                        
+                        let rotStr = status.displayRotation;
+                        if (rotStr == null || rotStr === '') rotStr = 'auto';
+                        let layoutStr = status.aspectRatio || '16:9';
+                        
+                        let orientMode = 'landscape';
+                        if (layoutStr === '9:16' && rotStr === '90') orientMode = 'portrait_cw';
+                        else if (layoutStr === '9:16' && rotStr === '270') orientMode = 'portrait_ccw';
+                        else if (rotStr === '180') orientMode = 'upside_down';
+                        
+                        const orientSel = document.getElementById('orient-select');
+                        if (orientSel) orientSel.value = orientMode;
                         document.getElementById('mirror-check').checked = !!status.mirror;
                         document.getElementById('preview-check').checked = !!status.localPreviewEnabled;
                         
@@ -578,12 +641,21 @@ class ControlServer(
                             document.getElementById('quality-val').innerText = status.jpegQuality;
                         }
                         
-                        updateFitClass(status.previewFitMode, status.displayRotation || 0, !!status.mirror);
+                        let rot = status.displayRotation;
+                        if (rot === 'auto' || rot == null) rot = '0';
+                        rot = parseInt(rot);
+                        
+                        let layout = status.aspectRatio || '16:9';
+                        if (layout === 'auto') layout = '16:9';
+                        
+                        applyDisplaySettings(status.previewFitMode, rot, !!status.mirror, layout);
                         
                         if(status.rebindInProgress) {
-                            document.getElementById('rebind-warning').style.display = 'inline';
+                            document.getElementById('header-rebind-warning').style.display = 'inline';
+                            document.getElementById('preview-rebind-warning').style.display = 'inline';
                         } else {
-                            document.getElementById('rebind-warning').style.display = 'none';
+                            document.getElementById('header-rebind-warning').style.display = 'none';
+                            document.getElementById('preview-rebind-warning').style.display = 'none';
                         }
                         
                         if (currentLifecycleState !== 'STREAMING' && currentLifecycleState !== 'REBINDING') {
@@ -701,17 +773,8 @@ class ControlServer(
                             setTimeout(reloadPreviewImage, 1000);
                         }
                     };
-                    img.onload = () => {
-                        if (lastStatus) {
-                            updateFitClass(lastStatus.previewFitMode, lastStatus.displayRotation || 0, !!lastStatus.mirror);
-                        }
-                    };
-                    
-                    window.addEventListener('resize', () => {
-                        if (lastStatus) {
-                            updateFitClass(lastStatus.previewFitMode, lastStatus.displayRotation || 0, !!lastStatus.mirror);
-                        }
-                    });
+                    img.onload = () => applyDisplaySettings();
+                    window.addEventListener('resize', () => applyDisplaySettings());
                     
                     reloadPreviewImage();
 
@@ -726,7 +789,6 @@ class ControlServer(
             """.trimIndent()
         }
     }
-
     private suspend fun serveDeviceInfo(call: RoutingCall) {
         call.respond(DeviceInfoDto(app = "OpenCamBridge", version = "0.1.0", platform = "android", serverPort = StreamState.port.get()))
     }
@@ -994,7 +1056,7 @@ data class UpdateSettingsRequest(
     val previewFitMode: String? = null,
     val aspectRatio: String? = null,
     val zoomSpeed: String? = null,
-    val displayRotation: Int? = null,
+    val displayRotation: String? = null,
     val mirror: Boolean? = null,
     val localPreviewEnabled: Boolean? = null,
     val accessMode: String? = null,

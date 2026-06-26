@@ -45,23 +45,29 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private val _height = MutableStateFlow(720)
     val height: StateFlow<Int> = _height.asStateFlow()
 
+    private val _frameWidth = MutableStateFlow(0)
+    val frameWidth: StateFlow<Int> = _frameWidth.asStateFlow()
+
+    private val _frameHeight = MutableStateFlow(0)
+    val frameHeight: StateFlow<Int> = _frameHeight.asStateFlow()
+
     private val _fps = MutableStateFlow(30)
     val fps: StateFlow<Int> = _fps.asStateFlow()
 
     private val _jpegQuality = MutableStateFlow(85)
     val jpegQuality: StateFlow<Int> = _jpegQuality.asStateFlow()
 
-    private val _previewFitMode = MutableStateFlow("fit")
+    private val _previewFitMode = MutableStateFlow("fill")
     val previewFitMode: StateFlow<String> = _previewFitMode.asStateFlow()
     
-    private val _aspectRatio = MutableStateFlow("auto")
+    private val _aspectRatio = MutableStateFlow("16:9")
     val aspectRatio: StateFlow<String> = _aspectRatio.asStateFlow()
     
     private val _zoomSpeed = MutableStateFlow("normal")
     val zoomSpeed: StateFlow<String> = _zoomSpeed.asStateFlow()
     
-    private val _displayRotation = MutableStateFlow(0)
-    val displayRotation: StateFlow<Int> = _displayRotation.asStateFlow()
+    private val _displayRotation = MutableStateFlow("0")
+    val displayRotation: StateFlow<String> = _displayRotation.asStateFlow()
     
     private val _mirror = MutableStateFlow(false)
     val mirror: StateFlow<Boolean> = _mirror.asStateFlow()
@@ -115,6 +121,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 _selectedCameraId.value = StreamState.cameraId.get()
                 _width.value = StreamState.width.get()
                 _height.value = StreamState.height.get()
+                _frameWidth.value = StreamState.frameWidth.get()
+                _frameHeight.value = StreamState.frameHeight.get()
                 _fps.value = StreamState.fps.get()
                 _jpegQuality.value = StreamState.jpegQuality.get()
                 _previewFitMode.value = StreamState.previewFitMode.get()
@@ -184,8 +192,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"zoomSpeed": "$speed", "clientType": "phone"}""") }
     }
     
-    fun updateDisplayRotation(rotation: Int) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"displayRotation": $rotation, "clientType": "phone"}""") }
+    fun updateDisplayRotation(rotation: String) {
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"displayRotation": "$rotation", "clientType": "phone"}""") }
     }
     
     fun updateMirror(mirror: Boolean) {
