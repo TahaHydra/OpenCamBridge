@@ -29,6 +29,7 @@ compose-icons-extended = { group = "androidx.compose.material", name = "material
 camerax-core = { group = "androidx.camera", name = "camera-core", version.ref = "cameraX" }
 camerax-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "cameraX" }
 camerax-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "cameraX" }
+camerax-view = { group = "androidx.camera", name = "camera-view", version.ref = "cameraX" }
 
 # Ktor (embedded server, CIO engine) — Ktor 3.x is the current stable series
 ktor-server-core = { group = "io.ktor", name = "ktor-server-core", version.ref = "ktor" }

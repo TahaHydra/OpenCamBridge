@@ -15,16 +15,35 @@ object StreamState {
     val width = AtomicInteger(1280)
     val height = AtomicInteger(720)
     val jpegQuality = AtomicInteger(85)
+    val fps = AtomicInteger(30)
+    val previewFitMode = AtomicReference("fit")
+    
+    // UI/Preview
+    val localPreviewEnabled = AtomicBoolean(false)
+    val torchEnabled = AtomicBoolean(false)
+    val autofocusEnabled = AtomicBoolean(true) // Default true for continuous AF
+    
+    // Transient hardware state
+    val rebindInProgress = AtomicBoolean(false)
+    val zoomRatio = AtomicReference(1.0f)
+    val linearZoom = AtomicReference(0.0f)
 
     /** Latest JPEG frame bytes, updated by MjpegStreamer. Null before first frame. */
     val latestFrame = AtomicReference<ByteArray?>(null)
+    
+    /** SurfaceProvider for CameraX Preview use case */
+    var surfaceProvider: androidx.camera.core.Preview.SurfaceProvider? = null
 
     fun toStatusDto(): StreamStatusDto = StreamStatusDto(
         streaming = streaming.get(),
         cameraId = cameraId.get(),
         width = width.get(),
         height = height.get(),
-        jpegQuality = jpegQuality.get()
+        fps = fps.get(),
+        jpegQuality = jpegQuality.get(),
+        previewFitMode = previewFitMode.get(),
+        localPreviewEnabled = localPreviewEnabled.get(),
+        rebindInProgress = rebindInProgress.get()
     )
 }
 
@@ -34,5 +53,9 @@ data class StreamStatusDto(
     val cameraId: String,
     val width: Int,
     val height: Int,
-    val jpegQuality: Int
+    val fps: Int,
+    val jpegQuality: Int,
+    val previewFitMode: String,
+    val localPreviewEnabled: Boolean,
+    val rebindInProgress: Boolean
 )

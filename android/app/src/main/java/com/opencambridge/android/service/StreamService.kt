@@ -47,6 +47,9 @@ class StreamService : LifecycleService() {
         super.onCreate()
         createNotificationChannel()
 
+        val settingsManager = com.opencambridge.android.state.SettingsManager(applicationContext)
+        settingsManager.load()
+
         mjpegStreamer = MjpegStreamer(
             context = applicationContext,
             lifecycleOwner = this  // LifecycleService implements LifecycleOwner
@@ -54,6 +57,7 @@ class StreamService : LifecycleService() {
 
         controlServer = ControlServer(
             context = applicationContext,
+            settingsManager = settingsManager,
             onStreamStart = {
                 Log.d(TAG, "Stream start requested")
                 mjpegStreamer.start()
@@ -62,10 +66,13 @@ class StreamService : LifecycleService() {
                 Log.d(TAG, "Stream stop requested")
                 mjpegStreamer.stop()
             },
-            onCameraSwitch = { newId ->
-                Log.d(TAG, "Camera switch requested: $newId")
-                mjpegStreamer.switchCamera(newId)
-            }
+            onSettingsChanged = {
+                Log.d(TAG, "Settings changed, rebinding camera if streaming")
+                mjpegStreamer.rebindIfStreaming()
+            },
+            onSetZoomRatio = { ratio -> mjpegStreamer.setZoomRatio(ratio) },
+            onSetLinearZoom = { linear -> mjpegStreamer.setLinearZoom(linear) },
+            onSetTorch = { enabled -> mjpegStreamer.setTorch(enabled) }
         )
     }
 
