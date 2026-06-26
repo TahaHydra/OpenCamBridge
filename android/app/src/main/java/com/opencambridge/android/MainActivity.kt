@@ -65,11 +65,15 @@ class MainActivity : ComponentActivity() {
                 val fps by viewModel.fps.collectAsState()
                 val jpegQuality by viewModel.jpegQuality.collectAsState()
                 val previewFitMode by viewModel.previewFitMode.collectAsState()
+                val aspectRatio by viewModel.aspectRatio.collectAsState()
+                val zoomSpeed by viewModel.zoomSpeed.collectAsState()
                 
                 val localPreviewEnabled by viewModel.localPreviewEnabled.collectAsState()
                 val rebindInProgress by viewModel.rebindInProgress.collectAsState()
                 val torchEnabled by viewModel.torchEnabled.collectAsState()
+                val hasTorch by viewModel.hasTorch.collectAsState()
                 val linearZoom by viewModel.linearZoom.collectAsState()
+                val rotationDegrees by viewModel.rotationDegrees.collectAsState()
 
                 MainScreen(
                     isStreaming = isStreaming,
@@ -81,16 +85,22 @@ class MainActivity : ComponentActivity() {
                     fps = fps,
                     jpegQuality = jpegQuality,
                     previewFitMode = previewFitMode,
+                    aspectRatio = aspectRatio,
+                    zoomSpeed = zoomSpeed,
                     localPreviewEnabled = localPreviewEnabled,
                     rebindInProgress = rebindInProgress,
                     torchEnabled = torchEnabled,
+                    hasTorch = hasTorch,
                     linearZoom = linearZoom,
+                    rotationDegrees = rotationDegrees,
                     onStartStop = { if (isStreaming) stopStreamService() else requestPermissionsAndStart() },
                     onCameraSelect = { viewModel.selectCamera(it) },
                     onResolutionSelect = { w, h -> viewModel.updateResolution(w, h) },
                     onFpsSelect = { viewModel.updateFps(it) },
                     onJpegQualitySelect = { viewModel.updateJpegQuality(it) },
                     onPreviewFitModeSelect = { viewModel.updatePreviewFitMode(it) },
+                    onAspectRatioSelect = { viewModel.updateAspectRatio(it) },
+                    onZoomSpeedSelect = { viewModel.updateZoomSpeed(it) },
                     onTogglePreview = { viewModel.toggleLocalPreview(it) },
                     onToggleTorch = { viewModel.updateTorch(it) },
                     onZoomSelect = { viewModel.updateZoom(it) },
@@ -158,16 +168,22 @@ fun MainScreen(
     fps: Int,
     jpegQuality: Int,
     previewFitMode: String,
+    aspectRatio: String,
+    zoomSpeed: String,
     localPreviewEnabled: Boolean,
     rebindInProgress: Boolean,
     torchEnabled: Boolean,
+    hasTorch: Boolean,
     linearZoom: Float,
+    rotationDegrees: Int,
     onStartStop: () -> Unit,
     onCameraSelect: (String) -> Unit,
     onResolutionSelect: (Int, Int) -> Unit,
     onFpsSelect: (Int) -> Unit,
     onJpegQualitySelect: (Int) -> Unit,
     onPreviewFitModeSelect: (String) -> Unit,
+    onAspectRatioSelect: (String) -> Unit,
+    onZoomSpeedSelect: (String) -> Unit,
     onTogglePreview: (Boolean) -> Unit,
     onToggleTorch: (Boolean) -> Unit,
     onZoomSelect: (Float) -> Unit,
@@ -198,15 +214,18 @@ fun MainScreen(
             StatusCard(isStreaming, wifiIp)
             Spacer(modifier = Modifier.height(24.dp))
             
-            // Optional local preview
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text("Preview on phone")
+                Column {
+                    Text("Preview on phone", color = if (!rebindInProgress) Color.Unspecified else Color.Gray)
+                    Text(if (localPreviewEnabled) "Preview enabled" else "Preview disabled", color = Color.Gray, fontSize = 12.sp)
+                }
                 Switch(
                     checked = localPreviewEnabled,
+                    enabled = !rebindInProgress,
                     onCheckedChange = onTogglePreview,
                     colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary)
                 )
@@ -220,27 +239,38 @@ fun MainScreen(
             }
 
             if (cameras.isNotEmpty()) {
-                CameraSelector(cameras, selectedCameraId, onCameraSelect)
+                CameraSelector(cameras, selectedCameraId, !rebindInProgress, onCameraSelect)
                 Spacer(modifier = Modifier.height(16.dp))
                 
-                ResolutionSelector(width, height, onResolutionSelect)
+                ResolutionSelector(width, height, !rebindInProgress, onResolutionSelect)
                 Spacer(modifier = Modifier.height(16.dp))
 
-                FpsSelector(fps, onFpsSelect)
-                Spacer(modifier = Modifier.height(16.dp))
-                
-                FitModeSelector(previewFitMode, onPreviewFitModeSelect)
+                AspectRatioSelector(aspectRatio, !rebindInProgress, onAspectRatioSelect)
                 Spacer(modifier = Modifier.height(16.dp))
 
-                QualitySlider(jpegQuality, onJpegQualitySelect)
+                FpsSelector(fps, !rebindInProgress, onFpsSelect)
                 Spacer(modifier = Modifier.height(16.dp))
                 
-                ZoomSlider(linearZoom, onZoomSelect)
+                FitModeSelector(previewFitMode, !rebindInProgress, onPreviewFitModeSelect)
+                Spacer(modifier = Modifier.height(16.dp))
+
+                QualitySlider(jpegQuality, !rebindInProgress, onJpegQualitySelect)
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                ZoomSpeedSelector(zoomSpeed, !rebindInProgress, onZoomSpeedSelect)
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                ZoomSlider(linearZoom, !rebindInProgress, onZoomSelect)
                 Spacer(modifier = Modifier.height(16.dp))
                 
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("Torch / Lamp")
-                    Switch(checked = torchEnabled, onCheckedChange = onToggleTorch, colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary))
+                    Column {
+                        Text("Torch / Lamp", color = if (hasTorch && !rebindInProgress) Color.Unspecified else Color.Gray)
+                        if (!hasTorch) {
+                            Text("Unsupported on this camera", color = Color.Gray, fontSize = 12.sp)
+                        }
+                    }
+                    Switch(checked = torchEnabled, enabled = hasTorch && !rebindInProgress, onCheckedChange = onToggleTorch, colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary))
                 }
                 Spacer(modifier = Modifier.height(32.dp))
             } else {
@@ -354,6 +384,7 @@ fun StatusCard(isStreaming: Boolean, wifiIp: String?) {
 fun CameraSelector(
     cameras: List<CameraInfoDto>,
     selectedId: String,
+    enabled: Boolean,
     onSelect: (String) -> Unit
 ) {
     var expanded by remember { mutableStateOf(false) }
@@ -361,16 +392,17 @@ fun CameraSelector(
 
     ExposedDropdownMenuBox(
         expanded = expanded,
-        onExpandedChange = { expanded = it },
+        onExpandedChange = { if (enabled) expanded = it },
         modifier = Modifier.fillMaxWidth()
     ) {
         OutlinedTextField(
             value = "${selectedCamera.label} (${selectedCamera.id})",
             onValueChange = {},
             readOnly = true,
+            enabled = enabled,
             label = { Text("Camera") },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, true).fillMaxWidth(),
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled).fillMaxWidth(),
             colors = OutlinedTextFieldDefaults.colors(
                 focusedBorderColor = Color(0xFF4FC3F7),
                 unfocusedBorderColor = Color(0xFF37474F)
@@ -395,7 +427,7 @@ fun CameraSelector(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ResolutionSelector(width: Int, height: Int, onSelect: (Int, Int) -> Unit) {
+fun ResolutionSelector(width: Int, height: Int, enabled: Boolean, onSelect: (Int, Int) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     val options = listOf(
         Pair(1920, 1080),
@@ -405,16 +437,17 @@ fun ResolutionSelector(width: Int, height: Int, onSelect: (Int, Int) -> Unit) {
 
     ExposedDropdownMenuBox(
         expanded = expanded,
-        onExpandedChange = { expanded = it },
+        onExpandedChange = { if (enabled) expanded = it },
         modifier = Modifier.fillMaxWidth()
     ) {
         OutlinedTextField(
             value = "${width}x${height}",
             onValueChange = {},
             readOnly = true,
+            enabled = enabled,
             label = { Text("Resolution") },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, true).fillMaxWidth(),
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled).fillMaxWidth(),
             colors = OutlinedTextFieldDefaults.colors(
                 focusedBorderColor = Color(0xFF4FC3F7),
                 unfocusedBorderColor = Color(0xFF37474F)
@@ -439,22 +472,23 @@ fun ResolutionSelector(width: Int, height: Int, onSelect: (Int, Int) -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun FpsSelector(fps: Int, onSelect: (Int) -> Unit) {
+fun FpsSelector(fps: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     val options = listOf(15, 30, 60)
 
     ExposedDropdownMenuBox(
         expanded = expanded,
-        onExpandedChange = { expanded = it },
+        onExpandedChange = { if (enabled) expanded = it },
         modifier = Modifier.fillMaxWidth()
     ) {
         OutlinedTextField(
             value = "$fps fps",
             onValueChange = {},
             readOnly = true,
+            enabled = enabled,
             label = { Text("FPS Limit") },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, true).fillMaxWidth(),
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled).fillMaxWidth(),
             colors = OutlinedTextFieldDefaults.colors(
                 focusedBorderColor = Color(0xFF4FC3F7),
                 unfocusedBorderColor = Color(0xFF37474F)
@@ -479,22 +513,105 @@ fun FpsSelector(fps: Int, onSelect: (Int) -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun FitModeSelector(fitMode: String, onSelect: (String) -> Unit) {
+fun FitModeSelector(fitMode: String, enabled: Boolean, onSelect: (String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     val options = listOf("fit", "fill", "stretch", "original")
 
     ExposedDropdownMenuBox(
         expanded = expanded,
-        onExpandedChange = { expanded = it },
+        onExpandedChange = { if (enabled) expanded = it },
         modifier = Modifier.fillMaxWidth()
     ) {
         OutlinedTextField(
             value = fitMode.replaceFirstChar { it.uppercase() },
             onValueChange = {},
             readOnly = true,
+            enabled = enabled,
             label = { Text("Preview Fit Mode") },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, true).fillMaxWidth(),
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled).fillMaxWidth(),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Color(0xFF4FC3F7),
+                unfocusedBorderColor = Color(0xFF37474F)
+            )
+        )
+        ExposedDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            options.forEach { opt ->
+                DropdownMenuItem(
+                    text = { Text(opt.replaceFirstChar { it.uppercase() }) },
+                    onClick = {
+                        onSelect(opt)
+                        expanded = false
+                    }
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AspectRatioSelector(aspectRatio: String, enabled: Boolean, onSelect: (String) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    val options = listOf("auto", "16:9", "4:3")
+
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { if (enabled) expanded = it },
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        OutlinedTextField(
+            value = aspectRatio.replaceFirstChar { it.uppercase() },
+            onValueChange = {},
+            readOnly = true,
+            enabled = enabled,
+            label = { Text("Stream Aspect Ratio") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled).fillMaxWidth(),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Color(0xFF4FC3F7),
+                unfocusedBorderColor = Color(0xFF37474F)
+            )
+        )
+        ExposedDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            options.forEach { opt ->
+                DropdownMenuItem(
+                    text = { Text(opt.replaceFirstChar { it.uppercase() }) },
+                    onClick = {
+                        onSelect(opt)
+                        expanded = false
+                    }
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ZoomSpeedSelector(zoomSpeed: String, enabled: Boolean, onSelect: (String) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    val options = listOf("slow", "normal", "fast")
+
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { if (enabled) expanded = it },
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        OutlinedTextField(
+            value = zoomSpeed.replaceFirstChar { it.uppercase() },
+            onValueChange = {},
+            readOnly = true,
+            enabled = enabled,
+            label = { Text("Zoom Speed") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled).fillMaxWidth(),
             colors = OutlinedTextFieldDefaults.colors(
                 focusedBorderColor = Color(0xFF4FC3F7),
                 unfocusedBorderColor = Color(0xFF37474F)
@@ -518,14 +635,15 @@ fun FitModeSelector(fitMode: String, onSelect: (String) -> Unit) {
 }
 
 @Composable
-fun QualitySlider(quality: Int, onSelect: (Int) -> Unit) {
+fun QualitySlider(quality: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        Text(text = "JPEG Quality: $quality%", color = Color(0xFFE0E0E0), fontSize = 14.sp)
+        Text(text = "JPEG Quality: $quality%", color = if (enabled) Color(0xFFE0E0E0) else Color.Gray, fontSize = 14.sp)
         Slider(
             value = quality.toFloat(),
             onValueChange = { onSelect(it.roundToInt()) },
             valueRange = 10f..100f,
             steps = 90,
+            enabled = enabled,
             colors = SliderDefaults.colors(
                 thumbColor = Color(0xFF4FC3F7),
                 activeTrackColor = Color(0xFF4FC3F7),
@@ -536,13 +654,14 @@ fun QualitySlider(quality: Int, onSelect: (Int) -> Unit) {
 }
 
 @Composable
-fun ZoomSlider(zoom: Float, onSelect: (Float) -> Unit) {
+fun ZoomSlider(zoom: Float, enabled: Boolean, onSelect: (Float) -> Unit) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        Text(text = "Linear Zoom: ${String.format("%.2f", zoom)}", color = Color(0xFFE0E0E0), fontSize = 14.sp)
+        Text(text = "Linear Zoom: ${String.format("%.2f", zoom)}", color = if (enabled) Color(0xFFE0E0E0) else Color.Gray, fontSize = 14.sp)
         Slider(
             value = zoom,
             onValueChange = onSelect,
             valueRange = 0f..1f,
+            enabled = enabled,
             colors = SliderDefaults.colors(
                 thumbColor = Color(0xFF4FC3F7),
                 activeTrackColor = Color(0xFF4FC3F7),

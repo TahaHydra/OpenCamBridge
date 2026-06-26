@@ -47,6 +47,12 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _previewFitMode = MutableStateFlow("fit")
     val previewFitMode: StateFlow<String> = _previewFitMode.asStateFlow()
+    
+    private val _aspectRatio = MutableStateFlow("auto")
+    val aspectRatio: StateFlow<String> = _aspectRatio.asStateFlow()
+    
+    private val _zoomSpeed = MutableStateFlow("normal")
+    val zoomSpeed: StateFlow<String> = _zoomSpeed.asStateFlow()
 
     // Preview / Controls
     private val _localPreviewEnabled = MutableStateFlow(false)
@@ -58,8 +64,14 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private val _torchEnabled = MutableStateFlow(false)
     val torchEnabled: StateFlow<Boolean> = _torchEnabled.asStateFlow()
     
+    private val _hasTorch = MutableStateFlow(false)
+    val hasTorch: StateFlow<Boolean> = _hasTorch.asStateFlow()
+    
     private val _linearZoom = MutableStateFlow(0f)
     val linearZoom: StateFlow<Float> = _linearZoom.asStateFlow()
+    
+    private val _rotationDegrees = MutableStateFlow(0)
+    val rotationDegrees: StateFlow<Int> = _rotationDegrees.asStateFlow()
 
     init {
         viewModelScope.launch {
@@ -76,10 +88,14 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 _fps.value = StreamState.fps.get()
                 _jpegQuality.value = StreamState.jpegQuality.get()
                 _previewFitMode.value = StreamState.previewFitMode.get()
+                _aspectRatio.value = StreamState.aspectRatio.get()
+                _zoomSpeed.value = StreamState.zoomSpeed.get()
                 _localPreviewEnabled.value = StreamState.localPreviewEnabled.get()
                 _rebindInProgress.value = StreamState.rebindInProgress.get()
                 _torchEnabled.value = StreamState.torchEnabled.get()
+                _hasTorch.value = StreamState.hasTorch.get()
                 _linearZoom.value = StreamState.linearZoom.get()
+                _rotationDegrees.value = StreamState.rotationDegrees.get()
                 delay(500)
             }
         }
@@ -132,6 +148,18 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         postLocalApi("/api/settings", buildSettingsJson())
     }
     
+    fun updateAspectRatio(ratio: String) {
+        StreamState.aspectRatio.set(ratio)
+        settingsManager.save()
+        postLocalApi("/api/settings", buildSettingsJson())
+    }
+    
+    fun updateZoomSpeed(speed: String) {
+        StreamState.zoomSpeed.set(speed)
+        settingsManager.save()
+        postLocalApi("/api/settings", buildSettingsJson())
+    }
+    
     fun updateTorch(enabled: Boolean) {
         postLocalApi("/api/camera/torch", """{"enabled": $enabled}""")
     }
@@ -148,7 +176,9 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 "height": ${StreamState.height.get()},
                 "fps": ${StreamState.fps.get()},
                 "jpegQuality": ${StreamState.jpegQuality.get()},
-                "previewFitMode": "${StreamState.previewFitMode.get()}"
+                "previewFitMode": "${StreamState.previewFitMode.get()}",
+                "aspectRatio": "${StreamState.aspectRatio.get()}",
+                "zoomSpeed": "${StreamState.zoomSpeed.get()}"
             }
         """.trimIndent()
     }

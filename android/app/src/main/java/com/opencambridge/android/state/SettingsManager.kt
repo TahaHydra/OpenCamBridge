@@ -16,6 +16,8 @@ class SettingsManager(context: Context) {
         StreamState.fps.set(prefs.getInt("fps", 30))
         StreamState.jpegQuality.set(prefs.getInt("jpegQuality", 85))
         StreamState.previewFitMode.set(prefs.getString("previewFitMode", "fit") ?: "fit")
+        StreamState.aspectRatio.set(prefs.getString("aspectRatio", "auto") ?: "auto")
+        StreamState.zoomSpeed.set(prefs.getString("zoomSpeed", "normal") ?: "normal")
         StreamState.localPreviewEnabled.set(prefs.getBoolean("localPreviewEnabled", false))
     }
 
@@ -27,6 +29,8 @@ class SettingsManager(context: Context) {
             putInt("fps", StreamState.fps.get())
             putInt("jpegQuality", StreamState.jpegQuality.get())
             putString("previewFitMode", StreamState.previewFitMode.get())
+            putString("aspectRatio", StreamState.aspectRatio.get())
+            putString("zoomSpeed", StreamState.zoomSpeed.get())
             putBoolean("localPreviewEnabled", StreamState.localPreviewEnabled.get())
             apply()
         }

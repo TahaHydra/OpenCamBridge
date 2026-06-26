@@ -17,6 +17,8 @@ object StreamState {
     val jpegQuality = AtomicInteger(85)
     val fps = AtomicInteger(30)
     val previewFitMode = AtomicReference("fit")
+    val aspectRatio = AtomicReference("auto") // auto, 16:9, 4:3
+    val zoomSpeed = AtomicReference("normal") // slow, normal, fast
     
     // UI/Preview
     val localPreviewEnabled = AtomicBoolean(false)
@@ -27,6 +29,8 @@ object StreamState {
     val rebindInProgress = AtomicBoolean(false)
     val zoomRatio = AtomicReference(1.0f)
     val linearZoom = AtomicReference(0.0f)
+    val hasTorch = AtomicBoolean(false)
+    val rotationDegrees = AtomicInteger(0)
 
     /** Latest JPEG frame bytes, updated by MjpegStreamer. Null before first frame. */
     val latestFrame = AtomicReference<ByteArray?>(null)
@@ -42,8 +46,12 @@ object StreamState {
         fps = fps.get(),
         jpegQuality = jpegQuality.get(),
         previewFitMode = previewFitMode.get(),
+        aspectRatio = aspectRatio.get(),
+        zoomSpeed = zoomSpeed.get(),
         localPreviewEnabled = localPreviewEnabled.get(),
-        rebindInProgress = rebindInProgress.get()
+        rebindInProgress = rebindInProgress.get(),
+        hasTorch = hasTorch.get(),
+        rotationDegrees = rotationDegrees.get()
     )
 }
 
@@ -56,6 +64,10 @@ data class StreamStatusDto(
     val fps: Int,
     val jpegQuality: Int,
     val previewFitMode: String,
+    val aspectRatio: String,
+    val zoomSpeed: String,
     val localPreviewEnabled: Boolean,
-    val rebindInProgress: Boolean
+    val rebindInProgress: Boolean,
+    val hasTorch: Boolean,
+    val rotationDegrees: Int
 )

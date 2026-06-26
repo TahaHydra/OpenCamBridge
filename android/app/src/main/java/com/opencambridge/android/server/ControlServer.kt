@@ -72,6 +72,7 @@ class ControlServer(
                 post("/api/settings/fps")          { serveSetFps(call) }
                 post("/api/settings/jpeg-quality") { serveSetJpegQuality(call) }
                 post("/api/settings/preview-fit-mode") { serveSetPreviewFitMode(call) }
+                post("/api/settings/aspect-ratio") { serveSetAspectRatio(call) }
                 post("/api/settings")              { serveUpdateSettings(call) }
                 
                 // Controls
@@ -169,8 +170,24 @@ class ControlServer(
                       </select>
                     </div>
                     <div class="control-group">
+                      <label>Stream Aspect Ratio</label>
+                      <select id="ar-select" onchange="updateSettings()">
+                         <option value="auto">Auto</option>
+                         <option value="16:9">16:9</option>
+                         <option value="4:3">4:3</option>
+                      </select>
+                    </div>
+                    <div class="control-group">
                       <label>JPEG Quality: <span id="quality-val">85</span>%</label>
                       <input type="range" id="quality-slider" min="10" max="100" value="85" onchange="updateSettings()" oninput="document.getElementById('quality-val').innerText=this.value">
+                    </div>
+                    <div class="control-group">
+                      <label>Zoom Speed</label>
+                      <select id="zs-select" onchange="updateSettings()">
+                         <option value="slow">Slow</option>
+                         <option value="normal">Normal</option>
+                         <option value="fast">Fast</option>
+                      </select>
                     </div>
                   </div>
                   
@@ -200,11 +217,15 @@ class ControlServer(
               <script>
                 function updateFitClass(mode) {
                     const img = document.getElementById('stream-img');
+                    const container = document.querySelector('.preview-container');
                     img.className = '';
                     if (mode === 'fit') img.classList.add('fit-contain');
                     else if (mode === 'fill') img.classList.add('fit-cover');
                     else if (mode === 'stretch') img.classList.add('fit-fill');
                     else if (mode === 'original') img.classList.add('fit-none');
+                    
+                    // Removed automatic rotation/crop swaps for stability
+                    container.style.aspectRatio = '16/9';
                 }
               
                 async function fetchStatus() {
@@ -215,6 +236,8 @@ class ControlServer(
                         document.getElementById('res-select').value = status.width + 'x' + status.height;
                         document.getElementById('fps-select').value = status.fps;
                         document.getElementById('fit-select').value = status.previewFitMode;
+                        document.getElementById('ar-select').value = status.aspectRatio || 'auto';
+                        document.getElementById('zs-select').value = status.zoomSpeed || 'normal';
                         document.getElementById('quality-slider').value = status.jpegQuality;
                         document.getElementById('quality-val').innerText = status.jpegQuality;
                         
@@ -266,13 +289,15 @@ class ControlServer(
                     const height = parseInt(resStr[1]);
                     const fps = parseInt(document.getElementById('fps-select').value);
                     const previewFitMode = document.getElementById('fit-select').value;
+                    const aspectRatio = document.getElementById('ar-select').value;
+                    const zoomSpeed = document.getElementById('zs-select').value;
                     const jpegQuality = parseInt(document.getElementById('quality-slider').value);
                     
                     try {
                         await fetch('/api/settings', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ cameraId, width, height, fps, jpegQuality, previewFitMode })
+                            body: JSON.stringify({ cameraId, width, height, fps, jpegQuality, previewFitMode, aspectRatio, zoomSpeed })
                         });
                         setTimeout(fetchStatus, 500); // Give camera time to start rebinding
                     } catch (e) { console.error('Update err', e); }
@@ -292,6 +317,10 @@ class ControlServer(
                         method: 'POST', headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({ enabled })
                     });
+                    setTimeout(async () => {
+                        await fetchControls();
+                        await fetchStatus();
+                    }, 200);
                 }
                 
                 async function updateAf() {
@@ -345,7 +374,7 @@ class ControlServer(
     private suspend fun serveCameraControls(call: RoutingCall) {
         call.respond(
             CameraControlsDto(
-                hasTorch = true, // Simplified for MVP
+                hasTorch = StreamState.hasTorch.get(),
                 torchEnabled = StreamState.torchEnabled.get(),
                 autofocusSupported = false, // Simplified for MVP (CameraX defaults continuous)
                 autofocusEnabled = StreamState.autofocusEnabled.get(),
@@ -420,23 +449,56 @@ class ControlServer(
         call.respond(SimpleResult(success = true, message = "Preview fit mode set to ${req.previewFitMode}"))
     }
 
+    private suspend fun serveSetAspectRatio(call: RoutingCall) {
+        val req = try { call.receive<AspectRatioRequest>() } catch (e: Exception) {
+            call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
+            return
+        }
+        StreamState.aspectRatio.set(req.aspectRatio)
+        settingsManager.save()
+        call.respond(SimpleResult(success = true, message = "Aspect ratio set to ${req.aspectRatio}"))
+    }
+
     private suspend fun serveUpdateSettings(call: RoutingCall) {
         val req = try { call.receive<UpdateSettingsRequest>() } catch (e: Exception) {
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
         
+        var finalW = req.width
+        var finalH = req.height
+        
+        // Find nearest matching resolution based on aspect ratio constraint
+        val camInfo = cameraRepo.listCameras().find { it.id == req.cameraId }
+        if (camInfo != null) {
+            val validSizes = camInfo.supportedSizes.filter {
+                if (req.aspectRatio == "16:9") kotlin.math.abs((it.width.toFloat() / it.height.toFloat()) - 1.77f) < 0.1f
+                else if (req.aspectRatio == "4:3") kotlin.math.abs((it.width.toFloat() / it.height.toFloat()) - 1.33f) < 0.1f
+                else true
+            }
+            val exactMatch = validSizes.find { it.width == req.width && it.height == req.height }
+            if (exactMatch == null && validSizes.isNotEmpty()) {
+                val fallback = validSizes.minByOrNull { kotlin.math.abs(it.width * it.height - req.width * req.height) }
+                if (fallback != null) {
+                    finalW = fallback.width
+                    finalH = fallback.height
+                }
+            }
+        }
+        
         StreamState.cameraId.set(req.cameraId)
-        StreamState.width.set(req.width)
-        StreamState.height.set(req.height)
+        StreamState.width.set(finalW)
+        StreamState.height.set(finalH)
         StreamState.fps.set(req.fps.coerceIn(1, 120))
         StreamState.jpegQuality.set(req.jpegQuality.coerceIn(1, 100))
         StreamState.previewFitMode.set(req.previewFitMode)
+        StreamState.aspectRatio.set(req.aspectRatio)
+        StreamState.zoomSpeed.set(req.zoomSpeed)
         
         settingsManager.save()
         onSettingsChanged()
         
-        call.respond(SimpleResult(success = true, message = "Settings updated"))
+        call.respond(SimpleResult(success = true, message = "Settings updated. Fallback size used if necessary: ${finalW}x${finalH}"))
     }
     
     // ---- Controls ----
@@ -543,13 +605,18 @@ private data class JpegQualityRequest(val quality: Int)
 private data class PreviewFitModeRequest(val previewFitMode: String)
 
 @Serializable
+private data class AspectRatioRequest(val aspectRatio: String)
+
+@Serializable
 private data class UpdateSettingsRequest(
     val cameraId: String,
     val width: Int,
     val height: Int,
     val fps: Int,
     val jpegQuality: Int,
-    val previewFitMode: String
+    val previewFitMode: String,
+    val aspectRatio: String,
+    val zoomSpeed: String
 )
 
 @Serializable

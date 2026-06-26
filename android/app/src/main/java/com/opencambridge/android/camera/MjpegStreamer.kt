@@ -15,6 +15,8 @@ import android.content.Context
 import com.opencambridge.android.state.StreamState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -32,6 +34,7 @@ class MjpegStreamer(
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     private val scope = CoroutineScope(Dispatchers.Main)
     private val rebindMutex = Mutex()
+    private var zoomJob: Job? = null
     
     private var cameraProvider: ProcessCameraProvider? = null
     private var currentCamera: Camera? = null
@@ -49,6 +52,12 @@ class MjpegStreamer(
             StreamState.rebindInProgress.set(true)
             try {
                 val provider = cameraProvider ?: return@withLock
+                
+                // Force torch off and cancel zoom before unbinding to prevent driver state corruption
+                currentCamera?.cameraControl?.enableTorch(false)
+                StreamState.torchEnabled.set(false)
+                zoomJob?.cancel()
+
                 provider.unbindAll()
 
                 val selector = buildSelector(StreamState.cameraId.get())
@@ -66,7 +75,11 @@ class MjpegStreamer(
                 var preview: Preview? = null
                 val surfaceProvider = StreamState.surfaceProvider
                 if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
-                    preview = Preview.Builder().build()
+                    preview = Preview.Builder()
+                        .setTargetResolution(
+                            android.util.Size(StreamState.width.get(), StreamState.height.get())
+                        )
+                        .build()
                     preview.setSurfaceProvider(surfaceProvider)
                 }
 
@@ -115,6 +128,13 @@ class MjpegStreamer(
     private fun observeCameraControls() {
         val camInfo = currentCamera?.cameraInfo ?: return
         
+        val hasFlash = camInfo.hasFlashUnit()
+        StreamState.hasTorch.set(hasFlash)
+        if (!hasFlash && StreamState.torchEnabled.get()) {
+            StreamState.torchEnabled.set(false)
+            currentCamera?.cameraControl?.enableTorch(false)
+        }
+        
         // Synchronize state with current hardware capability
         camInfo.zoomState.observe(lifecycleOwner) { state ->
             StreamState.zoomRatio.set(state.zoomRatio)
@@ -131,7 +151,28 @@ class MjpegStreamer(
     }
     
     fun setLinearZoom(linear: Float) {
-        currentCamera?.cameraControl?.setLinearZoom(linear)
+        val speed = StreamState.zoomSpeed.get()
+        val step = when (speed) {
+            "slow" -> 0.01f
+            "fast" -> 0.1f
+            else -> 0.03f
+        }
+        val delayMs = when (speed) {
+            "slow" -> 50L
+            "fast" -> 20L
+            else -> 30L
+        }
+        
+        zoomJob?.cancel()
+        zoomJob = scope.launch {
+            var current = currentCamera?.cameraInfo?.zoomState?.value?.linearZoom ?: return@launch
+            while (kotlin.math.abs(current - linear) > step) {
+                if (current < linear) current += step else current -= step
+                currentCamera?.cameraControl?.setLinearZoom(current)
+                delay(delayMs)
+            }
+            currentCamera?.cameraControl?.setLinearZoom(linear)
+        }
     }
     
     fun setTorch(enabled: Boolean) {
@@ -148,6 +189,7 @@ class MjpegStreamer(
         }
         
         try {
+            StreamState.rotationDegrees.set(imageProxy.imageInfo.rotationDegrees)
             val jpegBytes = yuvToJpeg(imageProxy, StreamState.jpegQuality.get())
             StreamState.latestFrame.set(jpegBytes)
         } catch (e: Exception) {
