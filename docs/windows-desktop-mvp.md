@@ -49,6 +49,15 @@ npm install
 # Option A: Run purely in the browser (Web UI only, no native shell)
 npm run dev
 
-# Option B: Run the native Windows Desktop App (Requires Rust)
+# Option B: Run the native Windows Desktop App (Requires Rust and MSVC Build Tools)
 npm run tauri dev
 ```
+
+## Security & CSP (Tauri v2)
+To allow the native Tauri webview to access the Android server over HTTP and display the MJPEG feed, the following Content Security Policy (CSP) is enforced in `tauri.conf.json`:
+```json
+"csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' http://127.0.0.1:8080 http://localhost:8080 ws://localhost:1420; img-src 'self' data: blob: http://127.0.0.1:8080 http://localhost:8080; connect-src 'self' http://127.0.0.1:8080 http://localhost:8080 ws://localhost:1420;"
+```
+
+## Known Missing UI Features
+- The desktop app MVP UI (`ControlPanel.tsx`) currently lacks sliders for **Zoom** and dropdowns for **Camera Lens Selection** that were present in the Android original Web UI. These will be ported over in a future update.

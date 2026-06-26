@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { Play, Square, Settings2, Sliders, RefreshCw, RotateCw } from 'lucide-react';
+import { useState, useEffect, useCallback } from 'react';
+import { Play, Square, Settings2, Sliders, RefreshCw, RotateCw, ZoomIn, ZoomOut } from 'lucide-react';
 
 interface ControlPanelProps {
   baseUrl: string;
@@ -18,17 +18,12 @@ export default function ControlPanel({ baseUrl, fitMode, setFitMode }: ControlPa
     displayRotation: '0',
     aspectRatio: '16:9',
     mirror: false,
-    torchEnabled: false
+    torchEnabled: false,
+    linearZoom: 0.0
   });
   const [isSyncing, setIsSyncing] = useState(false);
 
-  useEffect(() => {
-    fetch(`${baseUrl}/api/camera/list`)
-      .then(res => res.json())
-      .then(data => setCameras(data.cameras || []))
-      .catch(console.error);
-    
-    // Also fetch initial settings to sync state
+  const fetchStatus = useCallback(() => {
     fetch(`${baseUrl}/api/camera/status`)
       .then(res => res.json())
       .then(data => {
@@ -43,12 +38,23 @@ export default function ControlPanel({ baseUrl, fitMode, setFitMode }: ControlPa
             displayRotation: status.displayRotation || prev.displayRotation,
             aspectRatio: status.aspectRatio || prev.aspectRatio,
             mirror: status.mirror || prev.mirror,
-            torchEnabled: status.torchEnabled || prev.torchEnabled
+            torchEnabled: status.torchEnabled || prev.torchEnabled,
+            linearZoom: status.linearZoom !== undefined ? status.linearZoom : prev.linearZoom
           }));
         }
       })
       .catch(console.error);
   }, [baseUrl]);
+
+  useEffect(() => {
+    fetch(`${baseUrl}/api/camera/list`)
+      .then(res => res.json())
+      .then(data => setCameras(Array.isArray(data) ? data : data.cameras || []))
+      .catch(console.error);
+    
+    // Fetch initial settings to sync state
+    fetchStatus();
+  }, [baseUrl, fetchStatus]);
 
   const updateSetting = async (key: string, value: any) => {
     const newSettings = { ...settings, [key]: value };
@@ -62,12 +68,21 @@ export default function ControlPanel({ baseUrl, fitMode, setFitMode }: ControlPa
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ enabled: value })
         });
+      } else if (key === 'linearZoom') {
+        await fetch(`${baseUrl}/api/camera/zoom`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ linearZoom: value })
+        });
       } else {
         await fetch(`${baseUrl}/api/settings`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ [key]: value })
         });
+        if (key === 'cameraId') {
+          setTimeout(fetchStatus, 600); // Reload bounds and orientation after camera switches
+        }
       }
     } catch (err) {
       console.error('Failed to update setting', err);
@@ -148,7 +163,7 @@ export default function ControlPanel({ baseUrl, fitMode, setFitMode }: ControlPa
           >
             {cameras.map(c => (
               <option key={c.id} value={c.id}>
-                {c.lensFacing.charAt(0).toUpperCase() + c.lensFacing.slice(1)} Camera ({c.id})
+                {c.label || `${c.facing?.charAt(0).toUpperCase() + c.facing?.slice(1)} Camera (${c.id})`}
               </option>
             ))}
             {cameras.length === 0 && <option value="0">Default Camera</option>}
@@ -190,6 +205,33 @@ export default function ControlPanel({ baseUrl, fitMode, setFitMode }: ControlPa
         <h3 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <Sliders size={16} /> Image Controls
         </h3>
+
+        <div className="control-item">
+          <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span>Zoom Level</span>
+            <span>{((settings.linearZoom || 0) * 100).toFixed(0)}%</span>
+          </label>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 4 }}>
+            <button className="btn btn-secondary" style={{ padding: '6px' }} onClick={() => updateSetting('linearZoom', Math.max(0, (settings.linearZoom || 0) - 0.1))}>
+              <ZoomOut size={16} />
+            </button>
+            <input 
+              type="range" 
+              min="0" max="100" step="1"
+              style={{ flex: 1 }}
+              value={((settings.linearZoom || 0) * 100)}
+              onChange={(e) => updateSetting('linearZoom', parseInt(e.target.value) / 100.0)}
+            />
+            <button className="btn btn-secondary" style={{ padding: '6px' }} onClick={() => updateSetting('linearZoom', Math.min(1.0, (settings.linearZoom || 0) + 0.1))}>
+              <ZoomIn size={16} />
+            </button>
+          </div>
+          {settings.linearZoom > 0 && (
+            <button className="btn btn-secondary" style={{ width: '100%', marginTop: 8 }} onClick={() => updateSetting('linearZoom', 0.0)}>
+              Reset Zoom
+            </button>
+          )}
+        </div>
 
         <div className="control-item">
           <label>Desktop Fit Mode</label>
