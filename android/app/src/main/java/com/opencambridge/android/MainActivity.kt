@@ -1092,7 +1092,7 @@ fun StreamModeSelector(mode: String, enabled: Boolean, onSelect: (String) -> Uni
     var expanded by remember { mutableStateOf(false) }
     val options = listOf(
         Pair("mjpeg", "MJPEG"),
-        Pair("h264", "H.264 (Low Latency)")
+        Pair("h264", "H.264 Experimental")
     )
     val displayMode = options.find { it.first == mode }?.second ?: mode
 

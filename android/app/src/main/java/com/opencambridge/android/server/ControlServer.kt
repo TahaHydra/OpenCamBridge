@@ -402,7 +402,7 @@ class ControlServer(
                         <label>Stream Mode</label>
                         <select id="sm-select" onchange="patchSetting({streamMode: this.value})">
                            <option value="mjpeg">MJPEG</option>
-                           <option value="h264">H.264 (Low Latency)</option>
+                           <option value="h264">H.264 Experimental</option>
                         </select>
                       </div>
                       <div id="h264-info" style="display:none; font-size: 0.85rem; color: #aaa; margin-top: 8px;">

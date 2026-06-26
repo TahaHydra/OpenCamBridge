@@ -22,6 +22,8 @@ import com.opencambridge.android.state.LifecycleState
 import com.opencambridge.android.state.SettingsManager
 import com.opencambridge.android.state.StreamState
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 private const val TAG = "StreamService"
 private const val NOTIFICATION_ID = 1
@@ -33,6 +35,8 @@ class StreamService : LifecycleService() {
     private lateinit var mjpegStreamer: MjpegStreamer
     private lateinit var h264Streamer: H264Streamer
     private lateinit var settingsManager: SettingsManager
+    
+    private val cameraMutex = Mutex()
 
     companion object {
         const val ACTION_STOP = "com.opencambridge.android.ACTION_STOP"
@@ -108,81 +112,87 @@ class StreamService : LifecycleService() {
     // --- State Machine & Controller Methods ---
 
     private fun startCamera() {
-        val currentState = StreamState.lifecycleState.get()
-        if (currentState == LifecycleState.STARTING || currentState == LifecycleState.STREAMING || currentState == LifecycleState.REBINDING) {
-            return
-        }
-
-        StreamState.lifecycleState.set(LifecycleState.STARTING)
-        StreamState.lastError.set("")
-        StreamState.streaming.set(true)
-        Log.d(TAG, "Camera STARTING")
-        AppLogger.i("Camera", "Camera starting")
-
         lifecycleScope.launch {
-            try {
-                if (StreamState.streamMode.get() == "h264") {
-                    h264Streamer.start()
-                } else {
-                    mjpegStreamer.start()
+            cameraMutex.withLock {
+                val currentState = StreamState.lifecycleState.get()
+                if (currentState == LifecycleState.STARTING || currentState == LifecycleState.STREAMING || currentState == LifecycleState.REBINDING) {
+                    return@withLock
                 }
-                StreamState.lifecycleState.set(LifecycleState.STREAMING)
-                Log.d(TAG, "Camera STREAMING")
-                AppLogger.i("Camera", "Camera streaming successfully")
-            } catch (e: Exception) {
-                handleCameraError("Failed to start camera", e)
+
+                StreamState.lifecycleState.set(LifecycleState.STARTING)
+                StreamState.lastError.set("")
+                StreamState.streaming.set(true)
+                Log.d(TAG, "Camera STARTING")
+                AppLogger.i("Camera", "Camera starting")
+
+                try {
+                    if (StreamState.streamMode.get() == "h264") {
+                        h264Streamer.start()
+                    } else {
+                        mjpegStreamer.start()
+                    }
+                    StreamState.lifecycleState.set(LifecycleState.STREAMING)
+                    Log.d(TAG, "Camera STREAMING")
+                    AppLogger.i("Camera", "Camera streaming successfully")
+                } catch (e: Exception) {
+                    handleCameraError("Failed to start camera", e)
+                }
             }
         }
     }
 
     private fun stopCamera() {
-        StreamState.lifecycleState.set(LifecycleState.STOPPING)
-        StreamState.streaming.set(false)
-        Log.d(TAG, "Camera STOPPING")
-        AppLogger.i("Camera", "Camera stopping")
-
         lifecycleScope.launch {
-            try {
-                mjpegStreamer.stop()
-                h264Streamer.stop()
-                StreamState.lifecycleState.set(LifecycleState.STOPPED)
-                Log.d(TAG, "Camera STOPPED")
-                AppLogger.i("Camera", "Camera stopped cleanly")
-            } catch (e: Exception) {
-                handleCameraError("Failed to stop camera cleanly", e)
+            cameraMutex.withLock {
+                StreamState.lifecycleState.set(LifecycleState.STOPPING)
+                StreamState.streaming.set(false)
+                Log.d(TAG, "Camera STOPPING")
+                AppLogger.i("Camera", "Camera stopping")
+
+                try {
+                    mjpegStreamer.stop()
+                    h264Streamer.stop()
+                    StreamState.lifecycleState.set(LifecycleState.STOPPED)
+                    Log.d(TAG, "Camera STOPPED")
+                    AppLogger.i("Camera", "Camera stopped cleanly")
+                } catch (e: Exception) {
+                    handleCameraError("Failed to stop camera cleanly", e)
+                }
             }
         }
     }
 
     private fun rebindCamera() {
-        val currentState = StreamState.lifecycleState.get()
-        if (currentState != LifecycleState.STREAMING && currentState != LifecycleState.ERROR) {
-            return
-        }
-        
-        Log.d(TAG, "Camera REBINDING")
-        AppLogger.i("Camera", "Camera rebinding due to setting change")
-        StreamState.lifecycleState.set(LifecycleState.REBINDING)
-        StreamState.streaming.set(false)
-        
         lifecycleScope.launch {
-            try {
-                mjpegStreamer.stop()
-                h264Streamer.stop()
-                // Wait briefly for camera hardware to release properly
-                kotlinx.coroutines.delay(200)
-                
-                if (StreamState.streamMode.get() == "h264") {
-                    h264Streamer.start()
-                } else {
-                    mjpegStreamer.start()
+            cameraMutex.withLock {
+                val currentState = StreamState.lifecycleState.get()
+                if (currentState != LifecycleState.STREAMING && currentState != LifecycleState.ERROR) {
+                    return@withLock
                 }
-                StreamState.lifecycleState.set(LifecycleState.STREAMING)
-                StreamState.streaming.set(true)
-                Log.d(TAG, "Camera REBOUND to STREAMING")
-                AppLogger.i("Camera", "Camera rebound successfully")
-            } catch (e: Exception) {
-                handleCameraError("Camera rebind failed", e)
+                
+                Log.d(TAG, "Camera REBINDING")
+                AppLogger.i("Camera", "Camera rebinding due to setting change")
+                StreamState.lifecycleState.set(LifecycleState.REBINDING)
+                StreamState.streaming.set(false)
+                
+                try {
+                    mjpegStreamer.stop()
+                    h264Streamer.stop()
+                    // Wait briefly for camera hardware to release properly
+                    kotlinx.coroutines.delay(200)
+                    
+                    if (StreamState.streamMode.get() == "h264") {
+                        h264Streamer.start()
+                    } else {
+                        mjpegStreamer.start()
+                    }
+                    StreamState.lifecycleState.set(LifecycleState.STREAMING)
+                    StreamState.streaming.set(true)
+                    Log.d(TAG, "Camera REBOUND to STREAMING")
+                    AppLogger.i("Camera", "Camera rebound successfully")
+                } catch (e: Exception) {
+                    handleCameraError("Camera rebind failed", e)
+                }
             }
         }
     }
@@ -190,10 +200,33 @@ class StreamService : LifecycleService() {
     private fun recoverCamera() {
         Log.d(TAG, "Camera RECOVERY requested")
         AppLogger.i("Camera", "Camera recovery requested")
-        stopCamera()
         lifecycleScope.launch {
-            kotlinx.coroutines.delay(500) // Ensure hardware teardown
-            startCamera()
+            cameraMutex.withLock {
+                StreamState.lifecycleState.set(LifecycleState.STOPPING)
+                StreamState.streaming.set(false)
+                try {
+                    mjpegStreamer.stop()
+                    h264Streamer.stop()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error stopping during recovery", e)
+                }
+                
+                kotlinx.coroutines.delay(500) // Ensure hardware teardown
+                
+                StreamState.lifecycleState.set(LifecycleState.STARTING)
+                StreamState.lastError.set("")
+                StreamState.streaming.set(true)
+                try {
+                    if (StreamState.streamMode.get() == "h264") {
+                        h264Streamer.start()
+                    } else {
+                        mjpegStreamer.start()
+                    }
+                    StreamState.lifecycleState.set(LifecycleState.STREAMING)
+                } catch (e: Exception) {
+                    handleCameraError("Failed to start camera during recovery", e)
+                }
+            }
         }
     }
 

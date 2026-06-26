@@ -41,6 +41,9 @@ class MjpegStreamer(
     private var cameraProvider: ProcessCameraProvider? = null
     private var currentCamera: Camera? = null
 
+    // Reusable buffer to avoid GC churn
+    private var nv21Buffer: ByteArray? = null
+
     suspend fun start() = suspendCoroutine<Unit> { cont ->
         val future = ProcessCameraProvider.getInstance(context)
         future.addListener({
@@ -195,56 +198,98 @@ class MjpegStreamer(
             StreamState.frameWidth.set(imageProxy.width)
             StreamState.frameHeight.set(imageProxy.height)
             
-            val jpegBytes = yuvToJpeg(imageProxy, StreamState.jpegQuality.get())
-            StreamState.latestFrame.set(jpegBytes)
+            val width = imageProxy.width
+            val height = imageProxy.height
+            val frameSize = width * height + (width / 2) * (height / 2) * 2
+
+            if (nv21Buffer?.size != frameSize) nv21Buffer = ByteArray(frameSize)
+            val nv21 = nv21Buffer!!
+            
+            yuvToNv21(imageProxy, nv21)
+            
+            val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+            val out = ByteArrayOutputStream()
+            yuvImage.compressToJpeg(Rect(0, 0, width, height), StreamState.jpegQuality.get(), out)
+            
+            StreamState.latestFrame.set(out.toByteArray())
         } catch (e: Exception) {
-            android.util.Log.e("MjpegStreamer", "yuvToJpeg failed", e)
+            android.util.Log.e("MjpegStreamer", "Frame processing failed", e)
         } finally {
             imageProxy.close()
         }
     }
 
-    private fun yuvToJpeg(image: ImageProxy, quality: Int): ByteArray {
-        val width  = image.width
+    private fun yuvToNv21(image: ImageProxy, outBuf: ByteArray) {
+        val width = image.width
         val height = image.height
 
         val yPlane = image.planes[0]
-        val uPlane = image.planes[1]
         val vPlane = image.planes[2]
+        val uPlane = image.planes[1]
 
-        val yRowStride    = yPlane.rowStride
-        val uvRowStride   = uPlane.rowStride
-        val uvPixelStride = uPlane.pixelStride
-
-        val chromaH = height / 2
-        val chromaW = width  / 2
-
-        val nv21 = ByteArray(width * height + chromaW * chromaH * 2)
+        val yRowStride = yPlane.rowStride
+        val uvRowStride = vPlane.rowStride
+        val uvPixelStride = vPlane.pixelStride
 
         val yBuf = yPlane.buffer
+        yBuf.rewind()
+        
         var dstOffset = 0
-        for (row in 0 until height) {
-            yBuf.position(row * yRowStride)
-            yBuf.get(nv21, dstOffset, width)
-            dstOffset += width
-        }
-
-        val vBuf = vPlane.buffer
-        val uBuf = uPlane.buffer
-        for (row in 0 until chromaH) {
-            for (col in 0 until chromaW) {
-                val srcIndex = row * uvRowStride + col * uvPixelStride
-                vBuf.position(srcIndex)
-                nv21[dstOffset++] = vBuf.get()
-                uBuf.position(srcIndex)
-                nv21[dstOffset++] = uBuf.get()
+        if (yRowStride == width) {
+            val toCopy = kotlin.math.min(width * height, yBuf.remaining())
+            yBuf.get(outBuf, 0, toCopy)
+            dstOffset = width * height
+        } else {
+            for (row in 0 until height) {
+                yBuf.position(row * yRowStride)
+                val toCopy = kotlin.math.min(width, yBuf.remaining())
+                yBuf.get(outBuf, dstOffset, toCopy)
+                dstOffset += width
             }
         }
 
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-        val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, width, height), quality, out)
-        return out.toByteArray()
+        val chromaH = height / 2
+        val chromaW = width / 2
+        val vBuf = vPlane.buffer
+        val uBuf = uPlane.buffer
+
+        // For NV21, we want V then U.
+        if (uvPixelStride == 2 && uvRowStride == width) {
+            vBuf.rewind()
+            val length = chromaH * chromaW * 2
+            val toCopy = kotlin.math.min(length, vBuf.remaining())
+            vBuf.get(outBuf, dstOffset, toCopy)
+        } else if (uvPixelStride == 2) {
+            for (row in 0 until chromaH) {
+                val pos = row * uvRowStride
+                if (pos < vBuf.limit()) {
+                    vBuf.position(pos)
+                    val toCopy = kotlin.math.min(width, vBuf.remaining())
+                    vBuf.get(outBuf, dstOffset, toCopy)
+                }
+                dstOffset += width
+            }
+        } else {
+            for (row in 0 until chromaH) {
+                var offset = 0
+                for (col in 0 until chromaW) {
+                    val srcIndex = row * uvRowStride + col * uvPixelStride
+                    if (srcIndex < vBuf.limit()) {
+                        vBuf.position(srcIndex)
+                        outBuf[dstOffset + offset++] = if (vBuf.remaining() > 0) vBuf.get() else 0
+                    } else {
+                        outBuf[dstOffset + offset++] = 0
+                    }
+                    if (srcIndex < uBuf.limit()) {
+                        uBuf.position(srcIndex)
+                        outBuf[dstOffset + offset++] = if (uBuf.remaining() > 0) uBuf.get() else 0
+                    } else {
+                        outBuf[dstOffset + offset++] = 0
+                    }
+                }
+                dstOffset += width
+            }
+        }
     }
 
     private fun buildSelector(cameraId: String): CameraSelector = when (cameraId) {
