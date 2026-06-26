@@ -1,2 +1,6 @@
 AGENTS.local.md
 .antigravity/
+local.properties
+android/local.properties
+*.zip
+C:/Temp/cmdline-tools.zip
