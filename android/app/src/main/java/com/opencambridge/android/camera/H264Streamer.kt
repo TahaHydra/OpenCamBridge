@@ -118,22 +118,22 @@ class H264Streamer(
                 StreamState.previewUseCase = preview
 
                 val surfaceProvider = StreamState.surfaceProvider
-                if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
-                    preview.setSurfaceProvider(surfaceProvider)
-                }
 
                 try {
                     val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis, preview)
                     
                     withContext(Dispatchers.Main) {
+                        if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
+                            preview.setSurfaceProvider(surfaceProvider)
+                        }
                         currentCamera = provider.bindToLifecycle(
                             lifecycleOwner, 
                             selector, 
                             *useCases.toTypedArray()
                         )
+                        observeCameraControls()
                     }
                     
-                    observeCameraControls()
                     StreamState.streaming.set(true)
                 } catch (e: Exception) {
                     Log.e("H264Streamer", "bindToLifecycle failed: ${e.message}")

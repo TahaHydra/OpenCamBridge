@@ -87,20 +87,22 @@ class MjpegStreamer(
                 StreamState.previewUseCase = preview
 
                 val surfaceProvider = StreamState.surfaceProvider
-                if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
-                    preview.setSurfaceProvider(surfaceProvider)
-                }
 
                 try {
                     val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis, preview)
                     
-                    currentCamera = provider.bindToLifecycle(
-                        lifecycleOwner, 
-                        selector, 
-                        *useCases.toTypedArray()
-                    )
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
+                            preview.setSurfaceProvider(surfaceProvider)
+                        }
+                        currentCamera = provider.bindToLifecycle(
+                            lifecycleOwner, 
+                            selector, 
+                            *useCases.toTypedArray()
+                        )
+                        observeCameraControls()
+                    }
                     
-                    observeCameraControls()
                     StreamState.streaming.set(true)
                 } catch (e: Exception) {
                     android.util.Log.e("MjpegStreamer", "bindToLifecycle failed: ${e.message}")

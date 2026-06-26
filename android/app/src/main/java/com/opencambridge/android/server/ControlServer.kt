@@ -15,6 +15,9 @@ import io.ktor.server.cio.CIOApplicationEngine
 import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.server.plugins.cors.routing.CORS
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.server.request.receive
 import io.ktor.server.request.path
 import io.ktor.server.request.accept
@@ -61,6 +64,17 @@ class ControlServer(
         val host = if (accessMode == "usbOnly") "127.0.0.1" else "0.0.0.0"
 
         engine = embeddedServer(CIO, port = port, host = host) {
+            install(CORS) {
+                allowMethod(HttpMethod.Get)
+                allowMethod(HttpMethod.Post)
+                allowMethod(HttpMethod.Options)
+                
+                allowHeader(HttpHeaders.ContentType)
+                allowHeader(HttpHeaders.Authorization)
+                allowHeader("X-OpenCamBridge-Token")
+                
+                anyHost() // OK for dev/MVP. We can restrict later.
+            }
             install(ContentNegotiation) {
                 json(Json { ignoreUnknownKeys = true })
             }
