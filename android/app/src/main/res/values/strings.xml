@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">OpenCamBridge</string>
+    <string name="notification_channel_name">Stream Service</string>
+    <string name="notification_title">OpenCamBridge</string>
+    <string name="notification_text">Server running on port 8080</string>
+    <string name="action_stop">Stop</string>
+</resources>

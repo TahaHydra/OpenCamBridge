@@ -1,0 +1,4 @@
+<resources>
+    <!-- Base application theme. Material3 with no action bar. -->
+    <style name="Theme.OpenCamBridge" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

@@ -3,4 +3,8 @@ AGENTS.local.md
 local.properties
 android/local.properties
 *.zip
-C:/Temp/cmdline-tools.zip
+
+android/.gradle/
+android/build/
+android/app/build/
+**/build/
