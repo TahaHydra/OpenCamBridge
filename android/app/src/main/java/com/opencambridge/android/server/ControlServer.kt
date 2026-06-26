@@ -2,8 +2,10 @@ package com.opencambridge.android.server
 
 import android.content.Context
 import com.opencambridge.android.camera.CameraRepository
+import com.opencambridge.android.camera.H264Streamer
 import com.opencambridge.android.state.SettingsManager
 import com.opencambridge.android.state.StreamState
+import com.opencambridge.android.state.AppLogger
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
@@ -14,6 +16,8 @@ import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.request.receive
+import io.ktor.server.request.path
+import io.ktor.server.request.accept
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytesWriter
 import io.ktor.server.response.respondText
@@ -21,6 +25,7 @@ import io.ktor.server.routing.RoutingCall
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
+import io.ktor.server.application.call
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.writeFully
 import kotlinx.coroutines.currentCoroutineContext
@@ -29,32 +34,57 @@ import kotlinx.coroutines.isActive
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
-private const val PORT = 8080
 private const val MJPEG_BOUNDARY = "FRAME"
 
 /**
- * Embedded Ktor (3.x) HTTP server on port 8080.
+ * Embedded Ktor (3.x) HTTP server.
  * Route handlers are plain suspend functions that receive the RoutingCall.
  */
 class ControlServer(
     private val context: Context,
     private val settingsManager: SettingsManager,
-    private val onStreamStart: () -> Unit,
-    private val onStreamStop: () -> Unit,
-    private val onSettingsChanged: () -> Unit,
+    private val h264Streamer: H264Streamer,
+    private val onStartCamera: () -> Unit,
+    private val onStopCamera: () -> Unit,
+    private val onApplySettingsPatch: (UpdateSettingsRequest, String?) -> Unit,
     private val onSetZoomRatio: (Float) -> Unit,
     private val onSetLinearZoom: (Float) -> Unit,
-    private val onSetTorch: (Boolean) -> Unit
+    private val onSetTorch: (Boolean) -> Unit,
+    private val onRecoverCamera: () -> Unit
 ) {
     private var engine: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
     private val cameraRepo = CameraRepository(context)
 
     fun start() {
-        engine = embeddedServer(CIO, port = PORT, host = "0.0.0.0") {
+        val port = StreamState.port.get()
+        val accessMode = StreamState.accessMode.get()
+        val host = if (accessMode == "usbOnly") "127.0.0.1" else "0.0.0.0"
+
+        engine = embeddedServer(CIO, port = port, host = host) {
             install(ContentNegotiation) {
                 json(Json { ignoreUnknownKeys = true })
             }
             routing {
+                intercept(io.ktor.server.application.ApplicationCallPipeline.Plugins) {
+                    val path = call.request.path()
+                    if (path == "/health") return@intercept
+                    
+                    val currentMode = StreamState.accessMode.get()
+                    if (currentMode == "lanToken") {
+                        val token = call.request.queryParameters["token"] ?: call.request.headers["X-OpenCamBridge-Token"]
+                        if (token != StreamState.accessToken.get()) {
+                            AppLogger.w("Security", "Rejected unauthorized request to $path")
+                            if (call.request.accept()?.contains("text/html") == true || path == "/") {
+                                call.respondText("Unauthorized. Missing or invalid token.", ContentType.Text.Html, HttpStatusCode.Unauthorized)
+                            } else {
+                                call.respondText("""{"error":"Unauthorized"}""", ContentType.Application.Json, HttpStatusCode.Unauthorized)
+                            }
+                            finish()
+                            return@intercept
+                        }
+                    }
+                }
+                
                 get("/")                           { serveIndex(call) }
                 get("/health")                     { call.respondText("OK") }
                 get("/api/device/info")            { serveDeviceInfo(call) }
@@ -62,9 +92,11 @@ class ControlServer(
                 get("/api/camera/status")          { serveCameraStatus(call) }
                 get("/api/camera/controls")        { serveCameraControls(call) }
                 get("/api/settings")               { serveGetSettings(call) }
+                get("/api/logs")                   { serveGetLogs(call) }
                 
                 post("/api/stream/start")          { serveStreamStart(call) }
                 post("/api/stream/stop")           { serveStreamStop(call) }
+                post("/api/stream/recover")        { serveStreamRecover(call) }
                 post("/api/camera/switch")         { serveCameraSwitch(call) }
                 
                 // Settings
@@ -80,7 +112,11 @@ class ControlServer(
                 post("/api/camera/torch")          { serveSetTorch(call) }
                 post("/api/camera/autofocus")      { serveSetAutofocus(call) }
                 
+                post("/api/logs/clear")            { serveClearLogs(call) }
+                
                 get("/stream.mjpeg")               { serveMjpeg(call) }
+                get("/stream.h264")                { serveH264(call) }
+                get("/api/stream/info")            { serveStreamInfo(call) }
             }
         }.start(wait = false)
     }
@@ -88,6 +124,20 @@ class ControlServer(
     fun stop() {
         engine?.stop(gracePeriodMillis = 500, timeoutMillis = 1000)
         engine = null
+    }
+
+    private suspend fun serveGetLogs(call: RoutingCall) {
+        val logs = AppLogger.getLogs()
+        call.respondText(
+            Json.encodeToString(kotlinx.serialization.builtins.ListSerializer(com.opencambridge.android.state.LogEntry.serializer()), logs),
+            ContentType.Application.Json
+        )
+    }
+
+    private suspend fun serveClearLogs(call: RoutingCall) {
+        AppLogger.clear()
+        AppLogger.i("Security", "Logs cleared by user")
+        call.respondText("""{"status":"ok"}""", ContentType.Application.Json)
     }
 
     private suspend fun serveIndex(call: RoutingCall) {
@@ -141,17 +191,52 @@ class ControlServer(
                     align-items: center; 
                     justify-content: center; 
                     border: 1px solid #333;
+                    position: relative;
                 }
+                .offline-overlay {
+                    position: absolute;
+                    inset: 0;
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    justify-content: center;
+                    background: rgba(0, 0, 0, 0.7);
+                    color: white;
+                    font-size: 1.2rem;
+                    z-index: 10;
+                    display: none;
+                }
+                .offline-overlay p { margin-bottom: 16px; font-weight: bold; }
+                .refresh-btn {
+                    padding: 8px 16px;
+                    background: #333;
+                    color: white;
+                    border: 1px solid #555;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    font-size: 0.9rem;
+                    flex: unset;
+                }
+                .refresh-btn:hover { background: #444; }
+                .manual-refresh-btn {
+                    position: absolute;
+                    top: 16px;
+                    right: 16px;
+                    background: rgba(0,0,0,0.5);
+                    border: 1px solid rgba(255,255,255,0.2);
+                    color: white;
+                    padding: 6px 12px;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    z-index: 15;
+                    font-size: 0.8rem;
+                    flex: unset;
+                }
+                .manual-refresh-btn:hover { background: rgba(0,0,0,0.8); border-color: rgba(255,255,255,0.4); }
                 .preview-container img { 
-                    width: 100%; 
-                    height: 100%; 
+                    /* Sizing is handled by JS to correctly emulate Android PreviewView rotation scaling */
                     transition: transform 0.2s ease;
                 }
-                /* Object fit classes applied via JS */
-                .fit-contain { object-fit: contain; }
-                .fit-cover { object-fit: cover; }
-                .fit-fill { object-fit: fill; }
-                .fit-none { object-fit: none; }
                 
                 .controls-grid { display: flex; flex-direction: column; gap: 16px; }
                 
@@ -181,9 +266,16 @@ class ControlServer(
                 .btn-start { background: var(--active); color: #000; }
                 .btn-stop { background: var(--error); color: #000; }
                 
+                .tabs { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 1px solid #2a2c33; padding-bottom: 0px; overflow-x: auto; }
+                .tab { padding: 10px 16px; cursor: pointer; color: #aaa; border-radius: 6px 6px 0 0; transition: background 0.2s, color 0.2s; white-space: nowrap; margin-bottom: -1px; border: 1px solid transparent; }
+                .tab:hover { color: #fff; }
+                .tab.active { background: var(--surface); color: var(--primary); font-weight: 600; border: 1px solid #2a2c33; border-bottom: 1px solid var(--surface); }
+                .tab-content { display: none; }
+                .tab-content.active { display: block; }
+                
                 details { background: var(--surface); padding: 16px; border-radius: 8px; border: 1px solid #2a2c33; }
                 summary { cursor: pointer; font-weight: 600; color: var(--primary); outline: none; }
-                .status { margin-top: 12px; padding: 12px; border-radius: 6px; background: #121317; font-family: monospace; font-size: 0.8rem; max-height: 300px; overflow-y: auto; border: 1px solid #2a2c33; color: #00e5ff; }
+                .status { margin-top: 12px; padding: 12px; border-radius: 6px; background: #121317; font-family: monospace; font-size: 0.8rem; max-height: 400px; overflow-y: auto; border: 1px solid #2a2c33; color: #00e5ff; white-space: pre-wrap; }
                 .rebind-warning { color: #fbc02d; font-weight: 600; display: none; font-size: 0.9rem; }
             </style>
             </head>
@@ -201,12 +293,27 @@ class ControlServer(
                   <div class="preview-section">
                       <div class="preview-container">
                         <img id="stream-img" src="/stream.mjpeg" class="fit-contain" alt="Live stream" onerror="this.alt='Stream stopped'">
+                        <div id="offline-overlay" class="offline-overlay">
+                            <p>Stream is offline</p>
+                            <button class="refresh-btn" onclick="reloadPreviewImage()">Refresh Image</button>
+                        </div>
+                        <button class="manual-refresh-btn" onclick="reloadPreviewImage()" title="Refresh preview">↺ Refresh</button>
                       </div>
                   </div>
 
-                  <!-- Right side: Controls -->
-                  <div class="controls-grid">
-                    <div class="controls">
+                  <!-- Right side: Content -->
+                  <div class="right-panel">
+                    <div class="tabs">
+                      <div class="tab active" onclick="switchTab('controls')">Controls</div>
+                      <div class="tab" onclick="switchTab('security')">Security</div>
+                      <div class="tab" onclick="switchTab('logs')">Logs</div>
+                      <div class="tab" onclick="switchTab('debug')">Debug</div>
+                    </div>
+                    
+                    <!-- Controls Tab -->
+                    <div id="tab-controls" class="tab-content active">
+                      <div class="controls-grid">
+                        <div class="controls">
                       <h3>Connection</h3>
                       <div class="btn-group">
                         <button class="btn-start" onclick="startStream()">Start Stream</button>
@@ -252,6 +359,17 @@ class ControlServer(
                     
                     <div class="controls">
                       <h3>Image Controls</h3>
+                      <div class="control-group">
+                        <label>Stream Mode</label>
+                        <select id="sm-select" onchange="patchSetting({streamMode: this.value})">
+                           <option value="mjpeg">MJPEG</option>
+                           <option value="h264">H.264 (Low Latency)</option>
+                        </select>
+                      </div>
+                      <div id="h264-info" style="display:none; font-size: 0.85rem; color: #aaa; margin-top: 8px;">
+                          H.264 stream active at: <a href="#" id="h264-link" style="color:var(--primary)" target="_blank">/stream.h264</a><br>
+                          Test with: <code style="background:#000;padding:2px 4px;border-radius:4px;color:#fff;">ffplay http://[IP]/stream.h264</code>
+                      </div>
                       <div class="control-group">
                         <label>JPEG Quality: <span id="quality-val">85</span>%</label>
                         <input type="range" id="quality-slider" min="10" max="100" value="85" onmousedown="isDraggingQuality=true" onmouseup="isDraggingQuality=false; patchSetting({jpegQuality: parseInt(this.value)})" oninput="document.getElementById('quality-val').innerText=this.value">
@@ -303,66 +421,157 @@ class ControlServer(
                         <input type="checkbox" id="mirror-check" onchange="patchSetting({mirror: this.checked})">
                       </div>
                     </div>
+                      </div>
+                    </div>
                     
-                    <details>
-                        <summary>Advanced / Debug</summary>
+                    <!-- Security Tab -->
+                    <div id="tab-security" class="tab-content">
+                      <div class="controls">
+                        <h3>Security Info</h3>
+                        <p style="font-size: 0.9rem; color: #aaa;">Access Mode: <span id="sec-mode" style="color: var(--primary); font-weight: bold;"></span></p>
+                        <p style="font-size: 0.9rem; color: #aaa;">Port: <span id="sec-port" style="color: var(--primary); font-weight: bold;"></span></p>
+                        <p style="font-size: 0.8rem; color: #888;">To change security settings, please use the Android app UI. Changes to port will require an app restart.</p>
+                      </div>
+                    </div>
+                    
+                    <!-- Logs Tab -->
+                    <div id="tab-logs" class="tab-content">
+                      <div class="controls">
+                        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #2a2c33; padding-bottom: 8px; margin-bottom: 16px;">
+                          <h3 style="margin: 0; border: none; padding: 0;">Application Logs</h3>
+                          <button onclick="clearLogs()" style="padding: 6px 12px; flex: none; background: #2a2c33; color: white;">Clear</button>
+                        </div>
+                        <div id="logs-panel" class="status">Loading logs...</div>
+                      </div>
+                    </div>
+                    
+                    <!-- Debug Tab -->
+                    <div id="tab-debug" class="tab-content">
+                      <div class="controls">
+                        <h3>Raw State</h3>
                         <div id="status-panel" class="status">Loading status...</div>
-                    </details>
+                      </div>
+                    </div>
                   </div>
               </main>
 
               <script>
+                const TOKEN = "${StreamState.accessToken.get()}";
+                const isTokenRequired = "${StreamState.accessMode.get()}" === "lanToken";
+                
+                let lastStatus = null;
+                const fetchWithAuth = async (url, options = {}) => {
+                    const urlObj = new URL(url, window.location.origin);
+                    if (isTokenRequired && TOKEN) {
+                        urlObj.searchParams.set('token', TOKEN);
+                    }
+                    return fetch(urlObj, options);
+                };
+
+                function switchTab(tabId) {
+                    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                    event.target.classList.add('active');
+                    document.getElementById('tab-' + tabId).classList.add('active');
+                    if (tabId === 'logs') fetchLogs();
+                }
                 function updateFitClass(mode, displayRot, mirror) {
                     const img = document.getElementById('stream-img');
+                    const container = document.querySelector('.preview-container');
+                    const cw = container.clientWidth;
+                    const ch = container.clientHeight;
+                    if (cw === 0 || ch === 0) return;
                     
-                    // Reset sizing to let CSS compute naturally before transform
-                    img.style.width = '100%';
-                    img.style.height = '100%';
+                    const nw = img.naturalWidth || 1280;
+                    const nh = img.naturalHeight || 720;
                     
-                    img.className = '';
-                    if (mode === 'fit') img.classList.add('fit-contain');
-                    else if (mode === 'fill') img.classList.add('fit-cover');
-                    else if (mode === 'stretch') img.classList.add('fit-fill');
-                    else if (mode === 'original') img.classList.add('fit-none');
+                    let rw = nw;
+                    let rh = nh;
+                    if (displayRot === 90 || displayRot === 270) {
+                        rw = nh;
+                        rh = nw;
+                    }
                     
-                    // Calculate transform
+                    let finalW = rw;
+                    let finalH = rh;
+                    
+                    if (mode === 'fit') {
+                        const scale = Math.min(cw / rw, ch / rh);
+                        finalW = rw * scale;
+                        finalH = rh * scale;
+                    } else if (mode === 'fill') {
+                        const scale = Math.max(cw / rw, ch / rh);
+                        finalW = rw * scale;
+                        finalH = rh * scale;
+                    } else if (mode === 'stretch') {
+                        finalW = cw;
+                        finalH = ch;
+                    }
+                    
+                    if (displayRot === 90 || displayRot === 270) {
+                        img.style.width = finalH + 'px';
+                        img.style.height = finalW + 'px';
+                    } else {
+                        img.style.width = finalW + 'px';
+                        img.style.height = finalH + 'px';
+                    }
+                    
                     const scaleX = mirror ? -1 : 1;
                     img.style.transform = 'rotate(' + displayRot + 'deg) scaleX(' + scaleX + ')';
-                    
-                    // If rotated 90 or 270 degrees, the width and height bounds are flipped
-                    // To prevent it from overflowing vertically and breaking the layout,
-                    // we swap the dimension boundaries within the parent container's box.
-                    if (displayRot === 90 || displayRot === 270) {
-                        // The max dimension is the parent's height. To stretch correctly inside,
-                        // its width needs to be bounded by the parent height, and vice versa.
-                        // Simple robust fix: swap CSS height and width assignments.
-                        const parent = document.querySelector('.preview-container');
-                        const cw = parent.clientWidth;
-                        const ch = parent.clientHeight;
-                        // We set explicit pixel bounds so rotation bounds don't blow up
-                        img.style.width = ch + 'px';
-                        img.style.height = cw + 'px';
-                    }
                 }
               
                 let currentRevision = 0;
+                let currentLifecycleState = '';
                 let isDraggingQuality = false;
                 let isDraggingZoom = false;
 
+                function reloadPreviewImage() {
+                    const img = document.getElementById('stream-img');
+                    const imgUrl = new URL('/stream.mjpeg', window.location.origin);
+                    if (isTokenRequired && TOKEN) imgUrl.searchParams.set('token', TOKEN);
+                    imgUrl.searchParams.set('ts', new Date().getTime());
+                    img.src = imgUrl.toString();
+                }
+
                 async function fetchStatus() {
                     try {
-                        const res = await fetch('/api/camera/status');
+                        const res = await fetchWithAuth('/api/camera/status');
                         const status = await res.json();
+                        lastStatus = status;
+                        
+                        const previousLifecycle = currentLifecycleState;
+                        currentLifecycleState = status.lifecycleState;
                         currentRevision = status.revision;
+                        
+                        // Auto-reconnect preview if rebind finished successfully
+                        if (previousLifecycle !== 'STREAMING' && currentLifecycleState === 'STREAMING') {
+                            if (status.streamMode === 'mjpeg') {
+                                reloadPreviewImage();
+                            }
+                        }
+
                         document.getElementById('status-panel').innerText = JSON.stringify(status, null, 2);
+                        document.getElementById('sec-mode').innerText = status.accessMode;
+                        document.getElementById('sec-port').innerText = status.port;
+                        
                         document.getElementById('res-select').value = status.width + 'x' + status.height;
                         document.getElementById('fps-select').value = status.fps;
                         document.getElementById('fit-select').value = status.previewFitMode;
                         document.getElementById('ar-select').value = status.aspectRatio || 'auto';
                         document.getElementById('zs-select').value = status.zoomSpeed || 'normal';
+                        document.getElementById('sm-select').value = status.streamMode || 'mjpeg';
                         document.getElementById('rot-select').value = status.displayRotation || 0;
                         document.getElementById('mirror-check').checked = !!status.mirror;
                         document.getElementById('preview-check').checked = !!status.localPreviewEnabled;
+                        
+                        if (status.streamMode === 'h264') {
+                            document.getElementById('h264-info').style.display = 'block';
+                            let h264Url = new URL('/stream.h264', window.location.origin);
+                            if (isTokenRequired && TOKEN) h264Url.searchParams.set('token', TOKEN);
+                            document.getElementById('h264-link').href = h264Url.toString();
+                        } else {
+                            document.getElementById('h264-info').style.display = 'none';
+                        }
                         
                         if (!isDraggingQuality) {
                             document.getElementById('quality-slider').value = status.jpegQuality;
@@ -377,6 +586,14 @@ class ControlServer(
                             document.getElementById('rebind-warning').style.display = 'none';
                         }
                         
+                        if (currentLifecycleState !== 'STREAMING' && currentLifecycleState !== 'REBINDING') {
+                            document.getElementById('offline-overlay').style.display = 'flex';
+                            document.getElementById('stream-img').style.opacity = '0.3';
+                        } else {
+                            document.getElementById('offline-overlay').style.display = 'none';
+                            document.getElementById('stream-img').style.opacity = '1';
+                        }
+                        
                         const camSelect = document.getElementById('camera-select');
                         if(camSelect.options.length > 0) camSelect.value = status.cameraId;
                     } catch (e) {
@@ -386,7 +603,7 @@ class ControlServer(
 
                 async function fetchCameras() {
                     try {
-                        const res = await fetch('/api/camera/list');
+                        const res = await fetchWithAuth('/api/camera/list');
                         const cameras = await res.json();
                         const select = document.getElementById('camera-select');
                         select.innerHTML = '';
@@ -401,7 +618,7 @@ class ControlServer(
 
                 async function fetchControls() {
                     try {
-                        const res = await fetch('/api/camera/controls');
+                        const res = await fetchWithAuth('/api/camera/controls');
                         const controls = await res.json();
                         document.getElementById('torch-check').checked = controls.torchEnabled;
                         document.getElementById('af-check').checked = controls.autofocusEnabled;
@@ -416,7 +633,7 @@ class ControlServer(
                     payload.clientRevision = currentRevision;
                     payload.clientType = 'web';
                     try {
-                        await fetch('/api/settings', {
+                        await fetchWithAuth('/api/settings', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify(payload)
@@ -427,7 +644,7 @@ class ControlServer(
                 
                 async function updateZoom() {
                     const val = parseInt(document.getElementById('zoom-slider').value) / 100.0;
-                    await fetch('/api/camera/zoom', {
+                    await fetchWithAuth('/api/camera/zoom', {
                         method: 'POST', headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({ linearZoom: val })
                     });
@@ -436,7 +653,7 @@ class ControlServer(
                 
                 async function updateTorch() {
                     const enabled = document.getElementById('torch-check').checked;
-                    await fetch('/api/camera/torch', {
+                    await fetchWithAuth('/api/camera/torch', {
                         method: 'POST', headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({ enabled })
                     });
@@ -445,24 +662,59 @@ class ControlServer(
                 
                 async function updateAf() {
                     const enabled = document.getElementById('af-check').checked;
-                    await fetch('/api/camera/autofocus', {
+                    await fetchWithAuth('/api/camera/autofocus', {
                         method: 'POST', headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({ enabled })
                     });
                 }
 
                 async function startStream() {
-                    await fetch('/api/stream/start', { method: 'POST' });
-                    document.getElementById('stream-img').src = '/stream.mjpeg?' + new Date().getTime();
+                    await fetchWithAuth('/api/stream/start', { method: 'POST' });
+                    reloadPreviewImage();
                     fetchStatus();
                 }
 
                 async function stopStream() {
-                    await fetch('/api/stream/stop', { method: 'POST' });
+                    await fetchWithAuth('/api/stream/stop', { method: 'POST' });
                     fetchStatus();
                 }
 
+                async function fetchLogs() {
+                    try {
+                        const res = await fetchWithAuth('/api/logs');
+                        const logs = await res.json();
+                        const p = document.getElementById('logs-panel');
+                        p.innerText = logs.map(l => `[${'$'}{new Date(l.timestamp).toLocaleTimeString()}] ${'$'}{l.level} [${'$'}{l.source}]: ${'$'}{l.message}`).join('\n');
+                    } catch (e) { console.error('Failed to load logs', e); }
+                }
+                
+                async function clearLogs() {
+                    await fetchWithAuth('/api/logs/clear', { method: 'POST' });
+                    fetchLogs();
+                }
+
                 window.onload = async () => {
+                    const img = document.getElementById('stream-img');
+                    img.onerror = () => {
+                        // If stream is supposed to be running but image broke, retry after 1s
+                        if (currentLifecycleState === 'STREAMING') {
+                            setTimeout(reloadPreviewImage, 1000);
+                        }
+                    };
+                    img.onload = () => {
+                        if (lastStatus) {
+                            updateFitClass(lastStatus.previewFitMode, lastStatus.displayRotation || 0, !!lastStatus.mirror);
+                        }
+                    };
+                    
+                    window.addEventListener('resize', () => {
+                        if (lastStatus) {
+                            updateFitClass(lastStatus.previewFitMode, lastStatus.displayRotation || 0, !!lastStatus.mirror);
+                        }
+                    });
+                    
+                    reloadPreviewImage();
+
                     await fetchCameras();
                     await fetchStatus();
                     await fetchControls();
@@ -476,7 +728,7 @@ class ControlServer(
     }
 
     private suspend fun serveDeviceInfo(call: RoutingCall) {
-        call.respond(DeviceInfoDto(app = "OpenCamBridge", version = "0.1.0", platform = "android", serverPort = PORT))
+        call.respond(DeviceInfoDto(app = "OpenCamBridge", version = "0.1.0", platform = "android", serverPort = StreamState.port.get()))
     }
 
     private suspend fun serveCameraList(call: RoutingCall) {
@@ -505,13 +757,18 @@ class ControlServer(
     }
 
     private suspend fun serveStreamStart(call: RoutingCall) {
-        onStreamStart()
-        call.respond(SimpleResult(success = true, message = "Stream started"))
+        onStartCamera()
+        call.respond(SimpleResult(true, "Stream start requested"))
     }
 
     private suspend fun serveStreamStop(call: RoutingCall) {
-        onStreamStop()
-        call.respond(SimpleResult(success = true, message = "Stream stopped"))
+        onStopCamera()
+        call.respond(SimpleResult(true, "Stream stop requested"))
+    }
+    
+    private suspend fun serveStreamRecover(call: RoutingCall) {
+        onRecoverCamera()
+        call.respond(SimpleResult(true, "Stream recovery requested"))
     }
 
     private suspend fun serveCameraSwitch(call: RoutingCall) {
@@ -519,10 +776,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON: ${e.message}"))
             return
         }
-        StreamState.cameraId.set(req.cameraId)
-        settingsManager.save()
-        StreamState.incrementRevision("api")
-        onSettingsChanged()
+        onApplySettingsPatch(UpdateSettingsRequest(cameraId = req.cameraId), "api")
         call.respond(SimpleResult(success = true, message = "Switched to camera ${req.cameraId}"))
     }
 
@@ -531,11 +785,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        StreamState.width.set(req.width)
-        StreamState.height.set(req.height)
-        settingsManager.save()
-        StreamState.incrementRevision("api")
-        onSettingsChanged()
+        onApplySettingsPatch(UpdateSettingsRequest(width = req.width, height = req.height), "api")
         call.respond(SimpleResult(success = true, message = "Resolution set to ${req.width}x${req.height}"))
     }
 
@@ -544,10 +794,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        StreamState.fps.set(req.fps.coerceIn(1, 120))
-        settingsManager.save()
-        StreamState.incrementRevision("api")
-        onSettingsChanged()
+        onApplySettingsPatch(UpdateSettingsRequest(fps = req.fps), "api")
         call.respond(SimpleResult(success = true, message = "FPS set to ${req.fps}"))
     }
 
@@ -557,9 +804,7 @@ class ControlServer(
             return
         }
         val quality = req.quality.coerceIn(1, 100)
-        StreamState.jpegQuality.set(quality)
-        settingsManager.save()
-        StreamState.incrementRevision("api")
+        onApplySettingsPatch(UpdateSettingsRequest(jpegQuality = quality), "api")
         call.respond(SimpleResult(success = true, message = "JPEG quality set to $quality"))
     }
 
@@ -568,9 +813,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        StreamState.previewFitMode.set(req.previewFitMode)
-        settingsManager.save()
-        StreamState.incrementRevision("api")
+        onApplySettingsPatch(UpdateSettingsRequest(previewFitMode = req.previewFitMode), "api")
         call.respond(SimpleResult(success = true, message = "Preview fit mode set to ${req.previewFitMode}"))
     }
 
@@ -579,9 +822,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        StreamState.aspectRatio.set(req.aspectRatio)
-        settingsManager.save()
-        StreamState.incrementRevision("api")
+        onApplySettingsPatch(UpdateSettingsRequest(aspectRatio = req.aspectRatio), "api")
         call.respond(SimpleResult(success = true, message = "Aspect ratio set to ${req.aspectRatio}"))
     }
 
@@ -596,52 +837,8 @@ class ControlServer(
             return
         }
         
-        var requiresRebind = false
-        var requiresSettingsSave = false
-        
-        req.cameraId?.let { StreamState.cameraId.set(it); requiresRebind = true; requiresSettingsSave = true }
-        
-        if (req.width != null || req.height != null || req.aspectRatio != null || req.cameraId != null) {
-            var finalW = req.width ?: StreamState.width.get()
-            var finalH = req.height ?: StreamState.height.get()
-            val finalAR = req.aspectRatio ?: StreamState.aspectRatio.get()
-            val finalCam = req.cameraId ?: StreamState.cameraId.get()
-            
-            // Find nearest matching resolution based on aspect ratio constraint
-            val camInfo = cameraRepo.listCameras().find { it.id == finalCam }
-            if (camInfo != null) {
-                val validSizes = camInfo.supportedSizes.filter {
-                    if (finalAR == "16:9") kotlin.math.abs((it.width.toFloat() / it.height.toFloat()) - 1.77f) < 0.1f
-                    else if (finalAR == "4:3") kotlin.math.abs((it.width.toFloat() / it.height.toFloat()) - 1.33f) < 0.1f
-                    else true
-                }
-                val exactMatch = validSizes.find { it.width == finalW && it.height == finalH }
-                if (exactMatch == null && validSizes.isNotEmpty()) {
-                    val fallback = validSizes.minByOrNull { kotlin.math.abs(it.width * it.height - finalW * finalH) }
-                    if (fallback != null) {
-                        finalW = fallback.width
-                        finalH = fallback.height
-                    }
-                }
-            }
-            StreamState.width.set(finalW)
-            StreamState.height.set(finalH)
-            requiresRebind = true
-            requiresSettingsSave = true
-        }
-        
-        req.fps?.let { StreamState.fps.set(it.coerceIn(1, 120)); requiresRebind = true; requiresSettingsSave = true }
-        req.jpegQuality?.let { StreamState.jpegQuality.set(it.coerceIn(1, 100)); requiresSettingsSave = true }
-        req.previewFitMode?.let { StreamState.previewFitMode.set(it); requiresSettingsSave = true }
-        req.aspectRatio?.let { StreamState.aspectRatio.set(it); requiresRebind = true; requiresSettingsSave = true }
-        req.zoomSpeed?.let { StreamState.zoomSpeed.set(it); requiresSettingsSave = true }
-        req.displayRotation?.let { StreamState.displayRotation.set(it); requiresSettingsSave = true }
-        req.mirror?.let { StreamState.mirror.set(it); requiresSettingsSave = true }
-        req.localPreviewEnabled?.let { StreamState.localPreviewEnabled.set(it); requiresRebind = true; requiresSettingsSave = true }
-        
-        if (requiresSettingsSave) settingsManager.save()
-        StreamState.incrementRevision(req.clientType ?: "api")
-        if (requiresRebind) onSettingsChanged()
+        // Delegate patch application to the central stream controller
+        onApplySettingsPatch(req, req.clientType ?: "api")
         
         call.respond(SimpleResult(success = true, message = "Settings updated."))
     }
@@ -700,6 +897,8 @@ class ControlServer(
                 val targetFps = StreamState.fps.get().coerceIn(1, 120)
                 val delayMs = 1000L / targetFps
                 
+                if (StreamState.lifecycleState.get() != com.opencambridge.android.state.LifecycleState.STREAMING) break
+                
                 val frame = StreamState.latestFrame.get()
                 if (frame != null && !StreamState.rebindInProgress.get()) {
                     val header = "--$MJPEG_BOUNDARY\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.size}\r\n\r\n"
@@ -713,6 +912,37 @@ class ControlServer(
         } catch (_: Exception) {
             // Client disconnected
         }
+    }
+
+    private suspend fun serveH264(call: RoutingCall) {
+        call.response.headers.append("Cache-Control", "no-cache")
+        call.response.headers.append("Connection", "close")
+        call.respondBytesWriter(
+            contentType = ContentType.parse("video/h264")
+        ) {
+            val channel = h264Streamer.subscribe()
+            try {
+                for (frame in channel) {
+                    if (!currentCoroutineContext().isActive || StreamState.lifecycleState.get() != com.opencambridge.android.state.LifecycleState.STREAMING) break
+                    writeFully(frame)
+                    flush()
+                }
+            } catch (e: Exception) {
+            } finally {
+                h264Streamer.unsubscribe(channel)
+            }
+        }
+    }
+
+    private suspend fun serveStreamInfo(call: RoutingCall) {
+        call.respond(
+            StreamInfoDto(
+                mode = StreamState.streamMode.get(),
+                resolution = "${StreamState.width.get()}x${StreamState.height.get()}",
+                fps = StreamState.fps.get(),
+                h264Bitrate = StreamState.h264Bitrate.get()
+            )
+        )
     }
 }
 
@@ -753,7 +983,7 @@ private data class PreviewFitModeRequest(val previewFitMode: String)
 private data class AspectRatioRequest(val aspectRatio: String)
 
 @Serializable
-private data class UpdateSettingsRequest(
+data class UpdateSettingsRequest(
     val clientRevision: Long? = null,
     val clientType: String? = null,
     val cameraId: String? = null,
@@ -766,8 +996,17 @@ private data class UpdateSettingsRequest(
     val zoomSpeed: String? = null,
     val displayRotation: Int? = null,
     val mirror: Boolean? = null,
-    val localPreviewEnabled: Boolean? = null
+    val localPreviewEnabled: Boolean? = null,
+    val accessMode: String? = null,
+    val port: Int? = null,
+    val accessToken: String? = null,
+    val streamMode: String? = null,
+    val h264Bitrate: Int? = null,
+    val h264KeyframeInterval: Int? = null
 )
+
+@Serializable
+private data class StreamInfoDto(val mode: String, val resolution: String, val fps: Int, val h264Bitrate: Int)
 
 @Serializable
 private data class ZoomRequest(val zoomRatio: Float? = null, val linearZoom: Float? = null)

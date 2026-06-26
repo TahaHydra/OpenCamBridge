@@ -22,6 +22,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 /**
  * Opens the camera via CameraX ImageAnalysis and optional Preview.
@@ -39,11 +41,14 @@ class MjpegStreamer(
     private var cameraProvider: ProcessCameraProvider? = null
     private var currentCamera: Camera? = null
 
-    fun start() {
+    suspend fun start() = suspendCoroutine<Unit> { cont ->
         val future = ProcessCameraProvider.getInstance(context)
         future.addListener({
             cameraProvider = future.get()
-            scope.launch { bindCameraSafe() }
+            scope.launch { 
+                bindCameraSafe() 
+                cont.resume(Unit)
+            }
         }, ContextCompat.getMainExecutor(context))
     }
 
@@ -72,20 +77,18 @@ class MjpegStreamer(
 
                 imageAnalysis.setAnalyzer(analysisExecutor, ::processFrame)
                 
-                var preview: Preview? = null
+                val preview = Preview.Builder()
+                    .setTargetResolution(android.util.Size(StreamState.width.get(), StreamState.height.get()))
+                    .build()
+                StreamState.previewUseCase = preview
+
                 val surfaceProvider = StreamState.surfaceProvider
                 if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
-                    preview = Preview.Builder()
-                        .setTargetResolution(
-                            android.util.Size(StreamState.width.get(), StreamState.height.get())
-                        )
-                        .build()
                     preview.setSurfaceProvider(surfaceProvider)
                 }
 
                 try {
-                    val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis)
-                    if (preview != null) useCases.add(preview)
+                    val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis, preview)
                     
                     currentCamera = provider.bindToLifecycle(
                         lifecycleOwner, 
@@ -104,14 +107,12 @@ class MjpegStreamer(
         }
     }
 
-    fun stop() {
-        scope.launch {
-            rebindMutex.withLock {
-                cameraProvider?.unbindAll()
-                currentCamera = null
-                StreamState.streaming.set(false)
-                StreamState.latestFrame.set(null)
-            }
+    suspend fun stop() {
+        rebindMutex.withLock {
+            cameraProvider?.unbindAll()
+            currentCamera = null
+            StreamState.streaming.set(false)
+            StreamState.latestFrame.set(null)
         }
     }
 

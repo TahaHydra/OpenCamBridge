@@ -10,6 +10,20 @@ class SettingsManager(context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("OpenCamBridgeSettings", Context.MODE_PRIVATE)
 
     fun load() {
+        StreamState.accessMode.set(prefs.getString("accessMode", "usbOnly") ?: "usbOnly")
+        StreamState.port.set(prefs.getInt("port", 8080))
+        
+        var token = prefs.getString("accessToken", "") ?: ""
+        if (token.isEmpty()) {
+            token = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
+            prefs.edit().putString("accessToken", token).apply()
+        }
+        StreamState.accessToken.set(token)
+
+        StreamState.streamMode.set(prefs.getString("streamMode", "mjpeg") ?: "mjpeg")
+        StreamState.h264Bitrate.set(prefs.getInt("h264Bitrate", 4000000))
+        StreamState.h264KeyframeInterval.set(prefs.getInt("h264KeyframeInterval", 2))
+
         StreamState.cameraId.set(prefs.getString("cameraId", "0") ?: "0")
         StreamState.width.set(prefs.getInt("width", 1280))
         StreamState.height.set(prefs.getInt("height", 720))
@@ -25,6 +39,12 @@ class SettingsManager(context: Context) {
 
     fun save() {
         prefs.edit().apply {
+            putString("accessMode", StreamState.accessMode.get())
+            putInt("port", StreamState.port.get())
+            putString("accessToken", StreamState.accessToken.get())
+            putString("streamMode", StreamState.streamMode.get())
+            putInt("h264Bitrate", StreamState.h264Bitrate.get())
+            putInt("h264KeyframeInterval", StreamState.h264KeyframeInterval.get())
             putString("cameraId", StreamState.cameraId.get())
             putInt("width", StreamState.width.get())
             putInt("height", StreamState.height.get())

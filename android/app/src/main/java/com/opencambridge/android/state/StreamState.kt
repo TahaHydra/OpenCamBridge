@@ -10,12 +10,29 @@ import java.util.concurrent.atomic.AtomicReference
  * Shared mutable state for the stream. Accessed from both the UI thread and
  * Ktor server coroutines — uses atomic types for thread safety.
  */
+enum class LifecycleState {
+    STOPPED, STARTING, STREAMING, REBINDING, STOPPING, ERROR
+}
+
 object StreamState {
     val revision = AtomicLong(0L)
     val updatedAtMillis = AtomicLong(System.currentTimeMillis())
     val lastUpdatedBy = AtomicReference("system")
 
-    val streaming = AtomicBoolean(false)
+    val streaming = AtomicBoolean(false) // Deprecated, use lifecycleState
+    val lifecycleState = AtomicReference(LifecycleState.STOPPED)
+    val lastError = AtomicReference("")
+
+    
+    // Security & Network
+    val accessMode = AtomicReference("usbOnly") // usbOnly, lanOpen, lanToken
+    val port = AtomicInteger(8080)
+    val accessToken = AtomicReference("")
+
+    val streamMode = AtomicReference("mjpeg") // mjpeg, h264
+    val h264Bitrate = AtomicInteger(4000000)
+    val h264KeyframeInterval = AtomicInteger(2)
+
     val cameraId = AtomicReference("0")
     val width = AtomicInteger(1280)
     val height = AtomicInteger(720)
@@ -45,6 +62,9 @@ object StreamState {
     /** SurfaceProvider for CameraX Preview use case */
     var surfaceProvider: androidx.camera.core.Preview.SurfaceProvider? = null
     
+    /** The active Preview UseCase (if any). Enables dynamic surface rebinding without tearing down CameraX. */
+    var previewUseCase: androidx.camera.core.Preview? = null
+    
     fun incrementRevision(source: String) {
         revision.incrementAndGet()
         updatedAtMillis.set(System.currentTimeMillis())
@@ -56,6 +76,15 @@ object StreamState {
         updatedAtMillis = updatedAtMillis.get(),
         lastUpdatedBy = lastUpdatedBy.get(),
         streaming = streaming.get(),
+        lifecycleState = lifecycleState.get().name,
+        lastError = lastError.get(),
+        accessMode = accessMode.get(),
+        port = port.get(),
+        tokenRequired = accessMode.get() == "lanToken",
+        allowLan = accessMode.get() != "usbOnly",
+        streamMode = streamMode.get(),
+        h264Bitrate = h264Bitrate.get(),
+        h264KeyframeInterval = h264KeyframeInterval.get(),
         cameraId = cameraId.get(),
         width = width.get(),
         height = height.get(),
@@ -79,6 +108,15 @@ data class StreamStatusDto(
     val updatedAtMillis: Long,
     val lastUpdatedBy: String,
     val streaming: Boolean,
+    val lifecycleState: String,
+    val lastError: String,
+    val accessMode: String,
+    val port: Int,
+    val tokenRequired: Boolean,
+    val allowLan: Boolean,
+    val streamMode: String,
+    val h264Bitrate: Int,
+    val h264KeyframeInterval: Int,
     val cameraId: String,
     val width: Int,
     val height: Int,

@@ -26,6 +26,12 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private val _isStreaming = MutableStateFlow(false)
     val isStreaming: StateFlow<Boolean> = _isStreaming.asStateFlow()
 
+    private val _lifecycleState = MutableStateFlow("STOPPED")
+    val lifecycleState: StateFlow<String> = _lifecycleState.asStateFlow()
+
+    private val _lastError = MutableStateFlow("")
+    val lastError: StateFlow<String> = _lastError.asStateFlow()
+
     private val _wifiIp = MutableStateFlow<String?>(null)
     val wifiIp: StateFlow<String?> = _wifiIp.asStateFlow()
 
@@ -59,6 +65,22 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     
     private val _mirror = MutableStateFlow(false)
     val mirror: StateFlow<Boolean> = _mirror.asStateFlow()
+    
+    private val _streamMode = MutableStateFlow("mjpeg")
+    val streamMode: StateFlow<String> = _streamMode.asStateFlow()
+    
+    // Security
+    private val _accessMode = MutableStateFlow("usbOnly")
+    val accessMode: StateFlow<String> = _accessMode.asStateFlow()
+
+    private val _port = MutableStateFlow(8080)
+    val port: StateFlow<Int> = _port.asStateFlow()
+
+    private val _accessToken = MutableStateFlow("")
+    val accessToken: StateFlow<String> = _accessToken.asStateFlow()
+    
+    private val _logs = MutableStateFlow<List<com.opencambridge.android.state.LogEntry>>(emptyList())
+    val logs: StateFlow<List<com.opencambridge.android.state.LogEntry>> = _logs.asStateFlow()
 
     // Preview / Controls
     private val _localPreviewEnabled = MutableStateFlow(false)
@@ -87,6 +109,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             while (true) {
                 _isStreaming.value = StreamState.streaming.get()
+                _lifecycleState.value = StreamState.lifecycleState.get().name
+                _lastError.value = StreamState.lastError.get()
                 _wifiIp.value = NetworkUtils.getWifiIpAddress(getApplication())
                 _selectedCameraId.value = StreamState.cameraId.get()
                 _width.value = StreamState.width.get()
@@ -98,12 +122,17 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 _zoomSpeed.value = StreamState.zoomSpeed.get()
                 _displayRotation.value = StreamState.displayRotation.get()
                 _mirror.value = StreamState.mirror.get()
+                _streamMode.value = StreamState.streamMode.get()
                 _localPreviewEnabled.value = StreamState.localPreviewEnabled.get()
                 _rebindInProgress.value = StreamState.rebindInProgress.get()
                 _torchEnabled.value = StreamState.torchEnabled.get()
                 _hasTorch.value = StreamState.hasTorch.get()
                 _linearZoom.value = StreamState.linearZoom.get()
                 _rotationDegrees.value = StreamState.rotationDegrees.get()
+                _accessMode.value = StreamState.accessMode.get()
+                _port.value = StreamState.port.get()
+                _accessToken.value = StreamState.accessToken.get()
+                _logs.value = com.opencambridge.android.state.AppLogger.getLogs()
                 delay(500)
             }
         }
@@ -111,21 +140,17 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setSurfaceProvider(provider: Preview.SurfaceProvider?) {
         StreamState.surfaceProvider = provider
-        // Only trigger rebind if streaming AND local preview is enabled
-        // This avoids double-rebinds when the user toggles preview ON.
-        if (StreamState.streaming.get() && StreamState.localPreviewEnabled.get()) {
-            viewModelScope.launch {
-                postLocalApiSuspend("/api/settings", """{"clientType": "phone"}""")
-            }
-        }
+        // Dynamically attach or detach the surface to the active Preview UseCase
+        // This avoids tearing down the entire CameraX session when switching tabs.
+        StreamState.previewUseCase?.setSurfaceProvider(provider)
     }
 
     fun toggleLocalPreview(enabled: Boolean) {
-        // Just send the request to update state.
-        // If we are turning OFF, the API will trigger a rebind immediately to tear down Preview.
-        // If turning ON, it triggers a rebind (which creates camera without preview surface) 
-        // AND then Compose sets surface provider, triggering a second rebind.
-        // This is safe but optimal fix requires deeper refactor.
+        // We still save the preference, but if it's disabled, we detach the surface explicitly.
+        // It's handled by ControlServer now, but we can also detach instantly here.
+        if (!enabled) {
+            StreamState.previewUseCase?.setSurfaceProvider(null)
+        }
         viewModelScope.launch {
             postLocalApiSuspend("/api/settings", """{"localPreviewEnabled": $enabled, "clientType": "phone"}""")
         }
@@ -167,6 +192,27 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"mirror": $mirror, "clientType": "phone"}""") }
     }
     
+    fun updateStreamMode(mode: String) {
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"streamMode": "$mode", "clientType": "phone"}""") }
+    }
+    
+    fun updateAccessMode(mode: String) {
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"accessMode": "$mode", "clientType": "phone"}""") }
+    }
+    
+    fun updatePort(p: Int) {
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"port": $p, "clientType": "phone"}""") }
+    }
+    
+    fun regenerateToken() {
+        val newToken = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"accessToken": "$newToken", "clientType": "phone"}""") }
+    }
+    
+    fun clearLogs() {
+        viewModelScope.launch { postLocalApiSuspend("/api/logs/clear", "{}") }
+    }
+    
     fun updateTorch(enabled: Boolean) {
         viewModelScope.launch {
             postLocalApiSuspend("/api/camera/torch", """{"enabled": $enabled}""")
@@ -177,17 +223,31 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch { postLocalApiSuspend("/api/camera/zoom", """{"linearZoom": $linearZoom}""") }
     }
 
+    fun stopStream() {
+        viewModelScope.launch { postLocalApiSuspend("/api/stream/stop", "{}") }
+    }
+
+    fun startStream() {
+        // We still need to ensure the service is running, but if it is, this API call tells it to start the camera pipeline.
+        viewModelScope.launch { postLocalApiSuspend("/api/stream/start", "{}") }
+    }
+
     // buildSettingsJson is no longer needed since we patch individually
 
     private suspend fun postLocalApiSuspend(path: String, jsonPayload: String) {
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             try {
+                val port = StreamState.port.get()
+                val token = StreamState.accessToken.get()
                 java.net.HttpURLConnection.setFollowRedirects(false)
-                val url = java.net.URL("http://127.0.0.1:8080$path")
+                val url = java.net.URL("http://127.0.0.1:$port$path")
                 val conn = url.openConnection() as java.net.HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.doOutput = true
                 conn.setRequestProperty("Content-Type", "application/json")
+                if (token.isNotEmpty()) {
+                    conn.setRequestProperty("X-OpenCamBridge-Token", token)
+                }
                 conn.connectTimeout = 1000
                 conn.readTimeout = 1000
                 conn.outputStream.write(jsonPayload.toByteArray())
