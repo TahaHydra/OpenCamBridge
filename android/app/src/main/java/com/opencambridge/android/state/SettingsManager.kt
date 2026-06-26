@@ -18,6 +18,8 @@ class SettingsManager(context: Context) {
         StreamState.previewFitMode.set(prefs.getString("previewFitMode", "fit") ?: "fit")
         StreamState.aspectRatio.set(prefs.getString("aspectRatio", "auto") ?: "auto")
         StreamState.zoomSpeed.set(prefs.getString("zoomSpeed", "normal") ?: "normal")
+        StreamState.displayRotation.set(prefs.getInt("displayRotation", 0))
+        StreamState.mirror.set(prefs.getBoolean("mirror", false))
         StreamState.localPreviewEnabled.set(prefs.getBoolean("localPreviewEnabled", false))
     }
 
@@ -31,6 +33,8 @@ class SettingsManager(context: Context) {
             putString("previewFitMode", StreamState.previewFitMode.get())
             putString("aspectRatio", StreamState.aspectRatio.get())
             putString("zoomSpeed", StreamState.zoomSpeed.get())
+            putInt("displayRotation", StreamState.displayRotation.get())
+            putBoolean("mirror", StreamState.mirror.get())
             putBoolean("localPreviewEnabled", StreamState.localPreviewEnabled.get())
             apply()
         }

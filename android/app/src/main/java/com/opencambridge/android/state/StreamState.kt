@@ -3,6 +3,7 @@ package com.opencambridge.android.state
 import kotlinx.serialization.Serializable
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -10,6 +11,10 @@ import java.util.concurrent.atomic.AtomicReference
  * Ktor server coroutines — uses atomic types for thread safety.
  */
 object StreamState {
+    val revision = AtomicLong(0L)
+    val updatedAtMillis = AtomicLong(System.currentTimeMillis())
+    val lastUpdatedBy = AtomicReference("system")
+
     val streaming = AtomicBoolean(false)
     val cameraId = AtomicReference("0")
     val width = AtomicInteger(1280)
@@ -19,6 +24,8 @@ object StreamState {
     val previewFitMode = AtomicReference("fit")
     val aspectRatio = AtomicReference("auto") // auto, 16:9, 4:3
     val zoomSpeed = AtomicReference("normal") // slow, normal, fast
+    val displayRotation = AtomicInteger(0) // 0, 90, 180, 270
+    val mirror = AtomicBoolean(false)
     
     // UI/Preview
     val localPreviewEnabled = AtomicBoolean(false)
@@ -37,8 +44,17 @@ object StreamState {
     
     /** SurfaceProvider for CameraX Preview use case */
     var surfaceProvider: androidx.camera.core.Preview.SurfaceProvider? = null
+    
+    fun incrementRevision(source: String) {
+        revision.incrementAndGet()
+        updatedAtMillis.set(System.currentTimeMillis())
+        lastUpdatedBy.set(source)
+    }
 
     fun toStatusDto(): StreamStatusDto = StreamStatusDto(
+        revision = revision.get(),
+        updatedAtMillis = updatedAtMillis.get(),
+        lastUpdatedBy = lastUpdatedBy.get(),
         streaming = streaming.get(),
         cameraId = cameraId.get(),
         width = width.get(),
@@ -51,12 +67,17 @@ object StreamState {
         localPreviewEnabled = localPreviewEnabled.get(),
         rebindInProgress = rebindInProgress.get(),
         hasTorch = hasTorch.get(),
-        rotationDegrees = rotationDegrees.get()
+        rotationDegrees = rotationDegrees.get(),
+        displayRotation = displayRotation.get(),
+        mirror = mirror.get()
     )
 }
 
 @Serializable
 data class StreamStatusDto(
+    val revision: Long,
+    val updatedAtMillis: Long,
+    val lastUpdatedBy: String,
     val streaming: Boolean,
     val cameraId: String,
     val width: Int,
@@ -69,5 +90,7 @@ data class StreamStatusDto(
     val localPreviewEnabled: Boolean,
     val rebindInProgress: Boolean,
     val hasTorch: Boolean,
-    val rotationDegrees: Int
+    val rotationDegrees: Int,
+    val displayRotation: Int,
+    val mirror: Boolean
 )

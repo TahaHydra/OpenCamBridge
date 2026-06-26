@@ -53,6 +53,12 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     
     private val _zoomSpeed = MutableStateFlow("normal")
     val zoomSpeed: StateFlow<String> = _zoomSpeed.asStateFlow()
+    
+    private val _displayRotation = MutableStateFlow(0)
+    val displayRotation: StateFlow<Int> = _displayRotation.asStateFlow()
+    
+    private val _mirror = MutableStateFlow(false)
+    val mirror: StateFlow<Boolean> = _mirror.asStateFlow()
 
     // Preview / Controls
     private val _localPreviewEnabled = MutableStateFlow(false)
@@ -90,6 +96,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 _previewFitMode.value = StreamState.previewFitMode.get()
                 _aspectRatio.value = StreamState.aspectRatio.get()
                 _zoomSpeed.value = StreamState.zoomSpeed.get()
+                _displayRotation.value = StreamState.displayRotation.get()
+                _mirror.value = StreamState.mirror.get()
                 _localPreviewEnabled.value = StreamState.localPreviewEnabled.get()
                 _rebindInProgress.value = StreamState.rebindInProgress.get()
                 _torchEnabled.value = StreamState.torchEnabled.get()
@@ -103,88 +111,76 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setSurfaceProvider(provider: Preview.SurfaceProvider?) {
         StreamState.surfaceProvider = provider
-        // If streaming is already active, toggling preview requires a rebind
-        if (StreamState.streaming.get()) {
-            postLocalApi("/api/settings", buildSettingsJson())
+        // Only trigger rebind if streaming AND local preview is enabled
+        // This avoids double-rebinds when the user toggles preview ON.
+        if (StreamState.streaming.get() && StreamState.localPreviewEnabled.get()) {
+            viewModelScope.launch {
+                postLocalApiSuspend("/api/settings", """{"clientType": "phone"}""")
+            }
         }
     }
 
     fun toggleLocalPreview(enabled: Boolean) {
-        StreamState.localPreviewEnabled.set(enabled)
-        settingsManager.save()
-        if (StreamState.streaming.get()) {
-            postLocalApi("/api/settings", buildSettingsJson())
+        // Just send the request to update state.
+        // If we are turning OFF, the API will trigger a rebind immediately to tear down Preview.
+        // If turning ON, it triggers a rebind (which creates camera without preview surface) 
+        // AND then Compose sets surface provider, triggering a second rebind.
+        // This is safe but optimal fix requires deeper refactor.
+        viewModelScope.launch {
+            postLocalApiSuspend("/api/settings", """{"localPreviewEnabled": $enabled, "clientType": "phone"}""")
         }
     }
 
     fun selectCamera(cameraId: String) {
-        StreamState.cameraId.set(cameraId)
-        settingsManager.save()
-        postLocalApi("/api/settings", buildSettingsJson())
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"cameraId": "$cameraId", "clientType": "phone"}""") }
     }
 
     fun updateResolution(w: Int, h: Int) {
-        StreamState.width.set(w)
-        StreamState.height.set(h)
-        settingsManager.save()
-        postLocalApi("/api/settings", buildSettingsJson())
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"width": $w, "height": $h, "clientType": "phone"}""") }
     }
 
     fun updateFps(f: Int) {
-        StreamState.fps.set(f)
-        settingsManager.save()
-        postLocalApi("/api/settings", buildSettingsJson())
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"fps": $f, "clientType": "phone"}""") }
     }
 
     fun updateJpegQuality(q: Int) {
-        StreamState.jpegQuality.set(q)
-        settingsManager.save()
-        postLocalApi("/api/settings", buildSettingsJson())
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"jpegQuality": $q, "clientType": "phone"}""") }
     }
 
     fun updatePreviewFitMode(mode: String) {
-        StreamState.previewFitMode.set(mode)
-        settingsManager.save()
-        postLocalApi("/api/settings", buildSettingsJson())
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"previewFitMode": "$mode", "clientType": "phone"}""") }
     }
     
     fun updateAspectRatio(ratio: String) {
-        StreamState.aspectRatio.set(ratio)
-        settingsManager.save()
-        postLocalApi("/api/settings", buildSettingsJson())
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"aspectRatio": "$ratio", "clientType": "phone"}""") }
     }
     
     fun updateZoomSpeed(speed: String) {
-        StreamState.zoomSpeed.set(speed)
-        settingsManager.save()
-        postLocalApi("/api/settings", buildSettingsJson())
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"zoomSpeed": "$speed", "clientType": "phone"}""") }
+    }
+    
+    fun updateDisplayRotation(rotation: Int) {
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"displayRotation": $rotation, "clientType": "phone"}""") }
+    }
+    
+    fun updateMirror(mirror: Boolean) {
+        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"mirror": $mirror, "clientType": "phone"}""") }
     }
     
     fun updateTorch(enabled: Boolean) {
-        postLocalApi("/api/camera/torch", """{"enabled": $enabled}""")
+        viewModelScope.launch {
+            postLocalApiSuspend("/api/camera/torch", """{"enabled": $enabled}""")
+        }
     }
     
     fun updateZoom(linearZoom: Float) {
-        postLocalApi("/api/camera/zoom", """{"linearZoom": $linearZoom}""")
+        viewModelScope.launch { postLocalApiSuspend("/api/camera/zoom", """{"linearZoom": $linearZoom}""") }
     }
 
-    private fun buildSettingsJson(): String {
-        return """
-            {
-                "cameraId": "${StreamState.cameraId.get()}",
-                "width": ${StreamState.width.get()},
-                "height": ${StreamState.height.get()},
-                "fps": ${StreamState.fps.get()},
-                "jpegQuality": ${StreamState.jpegQuality.get()},
-                "previewFitMode": "${StreamState.previewFitMode.get()}",
-                "aspectRatio": "${StreamState.aspectRatio.get()}",
-                "zoomSpeed": "${StreamState.zoomSpeed.get()}"
-            }
-        """.trimIndent()
-    }
+    // buildSettingsJson is no longer needed since we patch individually
 
-    private fun postLocalApi(path: String, jsonPayload: String) {
-        viewModelScope.launch {
+    private suspend fun postLocalApiSuspend(path: String, jsonPayload: String) {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             try {
                 java.net.HttpURLConnection.setFollowRedirects(false)
                 val url = java.net.URL("http://127.0.0.1:8080$path")
