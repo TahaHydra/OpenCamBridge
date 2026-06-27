@@ -1,13 +1,15 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Play, Square, Settings2, Sliders, RefreshCw, RotateCw, ZoomIn, ZoomOut } from 'lucide-react';
+import { Play, Square, Settings2, Sliders, RefreshCw, RotateCw, ZoomIn, ZoomOut, Monitor, Video } from 'lucide-react';
+import { connectAndSetupObs, ObsStatus } from '../services/obs';
 
 interface ControlPanelProps {
   baseUrl: string;
   fitMode: string;
   setFitMode: (mode: string) => void;
+  onEnterObsMode?: () => void;
 }
 
-export default function ControlPanel({ baseUrl, fitMode, setFitMode }: ControlPanelProps) {
+export default function ControlPanel({ baseUrl, fitMode, setFitMode, onEnterObsMode }: ControlPanelProps) {
   const [cameras, setCameras] = useState<any[]>([]);
   const [settings, setSettings] = useState({
     cameraId: '0',
@@ -22,6 +24,20 @@ export default function ControlPanel({ baseUrl, fitMode, setFitMode }: ControlPa
     linearZoom: 0.0
   });
   const [isSyncing, setIsSyncing] = useState(false);
+
+  const [obsPassword, setObsPassword] = useState('');
+  const [obsStatus, setObsStatus] = useState<ObsStatus | null>(null);
+  const [isObsConnecting, setIsObsConnecting] = useState(false);
+
+  const handleStartObs = async () => {
+    setIsObsConnecting(true);
+    setObsStatus(null);
+    const success = await connectAndSetupObs(obsPassword, (status) => setObsStatus(status));
+    setIsObsConnecting(false);
+    if (success && onEnterObsMode) {
+      onEnterObsMode();
+    }
+  };
 
   const fetchStatus = useCallback(() => {
     fetch(`${baseUrl}/api/camera/status`)
@@ -290,6 +306,43 @@ export default function ControlPanel({ baseUrl, fitMode, setFitMode }: ControlPa
             <RefreshCw size={12} className="animate-spin" style={{ animation: 'pulse 1s infinite' }} /> Syncing settings...
           </div>
         )}
+
+        <div style={{ marginTop: 24, borderTop: '1px solid var(--surface-border)', paddingTop: 16 }}>
+          <h3 style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+            <Video size={16} /> OBS Virtual Camera
+          </h3>
+          
+          <div className="control-item">
+            <input 
+              type="password" 
+              className="input-control" 
+              placeholder="OBS WebSocket Password (optional)"
+              value={obsPassword}
+              onChange={(e) => setObsPassword(e.target.value)}
+              style={{ marginBottom: 8 }}
+            />
+            <button className="btn btn-primary" style={{ width: '100%', display: 'flex', justifyContent: 'center', gap: 8, background: 'var(--primary)' }} onClick={handleStartObs} disabled={isObsConnecting}>
+              {isObsConnecting ? <RefreshCw size={16} className="animate-spin" /> : <Monitor size={16} />}
+              {isObsConnecting ? 'Connecting...' : 'Start OBS Virtual Camera'}
+            </button>
+          </div>
+
+          {obsStatus && (
+            <div style={{ marginTop: 12, padding: 12, background: obsStatus.error ? 'rgba(255,50,50,0.1)' : 'rgba(50,255,50,0.1)', borderRadius: 6, border: `1px solid ${obsStatus.error ? 'rgba(255,50,50,0.3)' : 'rgba(50,255,50,0.3)'}` }}>
+              <strong style={{ display: 'block', fontSize: '0.85rem', color: obsStatus.error ? '#ff6b6b' : '#51cf66' }}>{obsStatus.message}</strong>
+              {obsStatus.error && <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.4 }}>{obsStatus.error}</p>}
+            </div>
+          )}
+
+          <div style={{ marginTop: 16, borderTop: '1px solid var(--surface-border)', paddingTop: 16 }}>
+            <button className="btn" style={{ width: '100%', background: 'var(--surface-light)', color: 'var(--text-primary)', display: 'flex', justifyContent: 'center', gap: 8 }} onClick={onEnterObsMode}>
+              Enter Clean Feed (Manual Mode)
+            </button>
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', textAlign: 'center', marginTop: 8, lineHeight: 1.4 }}>
+              Requires OBS Studio with WebSocket enabled (port 4455).
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   );

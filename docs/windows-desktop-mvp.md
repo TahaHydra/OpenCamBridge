@@ -10,11 +10,11 @@ The OpenCamBridge Desktop MVP provides a lightweight Windows client to preview t
 
 ## Known Limitations
 * **MJPEG Only:** H.264 is strictly marked experimental in the server and is not decoded by the desktop app yet.
-* **No Virtual Camera:** The desktop app previews the stream but does not yet expose it as a standard Windows webcam device.
+* **OBS Requirement:** Virtual camera support currently relies on OBS Studio. There is no standalone kernel driver virtual camera.
 * **ADB Requirement:** Requires a USB connection and manual ADB port forwarding. No automatic LAN discovery yet.
 
 ## Future Phases
-1. **Virtual Camera:** Integrate DirectShow/Media Foundation to broadcast the feed as a native Windows webcam (e.g. for OBS/Zoom).
+1. **Standalone Virtual Camera:** Eventually integrate a standalone Frame Server or DirectShow driver.
 2. **H.264 Native Decoder:** Feed the `/stream.h264` byte-stream directly into `FFmpeg` or a Windows hardware decoder for zero-latency preview.
 3. **USB Auto-Discovery & Wi-Fi Pairing:** Eliminate the need to manually run `adb forward`.
 
@@ -59,5 +59,10 @@ To allow the native Tauri webview to access the Android server over HTTP and dis
 "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' http://127.0.0.1:8080 http://localhost:8080 ws://localhost:1420; img-src 'self' data: blob: http://127.0.0.1:8080 http://localhost:8080; connect-src 'self' http://127.0.0.1:8080 http://localhost:8080 ws://localhost:1420;"
 ```
 
-## Known Missing UI Features
-- The desktop app MVP UI (`ControlPanel.tsx`) currently lacks sliders for **Zoom** and dropdowns for **Camera Lens Selection** that were present in the Android original Web UI. These will be ported over in a future update.
+## OBS-Assisted Virtual Camera Mode
+OpenCamBridge Desktop now includes built-in OBS automation.
+1. Install **OBS Studio** and enable the **WebSocket Server** (Tools > WebSocket Server Settings). Ensure it is running on the default port `4455`.
+2. Open the OpenCamBridge Desktop app.
+3. In the control panel, locate the **OBS Virtual Camera** section.
+4. Enter your OBS WebSocket password (if configured) and click **Start OBS Virtual Camera**.
+5. The app will automatically connect to OBS, configure a Clean Feed capture, and start the virtual camera. You can now select `OBS Virtual Camera` in Teams, Discord, or Zoom.

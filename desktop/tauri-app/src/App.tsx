@@ -73,6 +73,15 @@ export default function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [serverStatus, setServerStatus] = useState<any>(null);
   const [fitMode, setFitMode] = useState('fill');
+  const [obsMode, setObsMode] = useState(false);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setObsMode(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   // Polling loop for status
   useEffect(() => {
@@ -104,6 +113,21 @@ export default function App() {
   const stateClass = serverStatus?.lifecycleState?.toLowerCase() || 'stopped';
   const isError = serverStatus?.lifecycleState === 'ERROR' || serverStatus?.lifecycleState === 'OFFLINE';
 
+  if (obsMode) {
+    return (
+      <div style={{ width: '100vw', height: '100vh', margin: 0, padding: 0, overflow: 'hidden', background: '#000', position: 'relative' }}>
+        <style>{`.preview-stage { border-radius: 0 !important; background: transparent !important; }`}</style>
+        <Preview baseUrl={baseUrl} fitMode={fitMode} serverStatus={serverStatus} />
+        <button 
+          onClick={() => setObsMode(false)}
+          style={{ position: 'absolute', top: 16, right: 16, zIndex: 9999, background: 'rgba(0,0,0,0.7)', color: 'white', border: '1px solid #444', padding: '8px 16px', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', gap: 8 }}
+        >
+          <Unplug size={16} /> Exit OBS Mode (Esc)
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="app-container animate-fade">
       <header className="header">
@@ -132,7 +156,7 @@ export default function App() {
           <Preview baseUrl={baseUrl} fitMode={fitMode} serverStatus={serverStatus} />
         </div>
         
-        <ControlPanel baseUrl={baseUrl} fitMode={fitMode} setFitMode={setFitMode} />
+        <ControlPanel baseUrl={baseUrl} fitMode={fitMode} setFitMode={setFitMode} onEnterObsMode={() => setObsMode(true)} />
       </main>
     </div>
   );
