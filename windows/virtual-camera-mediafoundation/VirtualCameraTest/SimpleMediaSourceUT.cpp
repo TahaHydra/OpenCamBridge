@@ -186,7 +186,7 @@ namespace VirtualCameraTest::impl
         winrt::hstring physicalCamSymLink;
         RETURN_IF_FAILED(VCamUtils::RegisterVirtualCamera(
             VIRTUALCAMERAMEDIASOURCE_CLSID,
-            L"SWVCamMediaSource",
+            L"OpenCamBridge Camera",
             physicalCamSymLink,
             vcamLifetime,
             vcamAccess,

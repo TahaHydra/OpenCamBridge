@@ -8,12 +8,12 @@
 
 #include <initguid.h>
 
-// {7B89B92E-FE71-42D0-8A41-E137D06EA184}
+// {8CF75B14-3F68-46BC-80DF-5FB86AED931E}
 DEFINE_GUID(CLSID_VirtualCameraMediaSource ,
-    0x7b89b92e, 0xfe71, 0x42d0, 0x8a, 0x41, 0xe1, 0x37, 0xd0, 0x6e, 0xa1, 0x84);
+    0x8cf75b14, 0x3f68, 0x46bc, 0x80, 0xdf, 0x5f, 0xb8, 0x6a, 0xed, 0x93, 0x1e);
 
-static LPCWSTR VIRTUALCAMERAMEDIASOURCE_CLSID = L"{7B89B92E-FE71-42D0-8A41-E137D06EA184}";
-static LPCWSTR VIRTUALCAMERAMEDIASOURCE_FRIENDLYNAME = L"VirtualCameraMediaSource";
+static LPCWSTR VIRTUALCAMERAMEDIASOURCE_CLSID = L"{8CF75B14-3F68-46BC-80DF-5FB86AED931E}";
+static LPCWSTR VIRTUALCAMERAMEDIASOURCE_FRIENDLYNAME = L"OpenCamBridge Camera";
 
 // The below 2 GUIDs are defined in Windows build 22621 and above only, 
 // if targetting SDK for Windows 22621 or higher this would need to be commented out.

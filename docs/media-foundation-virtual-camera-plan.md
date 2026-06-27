@@ -69,3 +69,9 @@ Files changed:
 3. Keep HKLM COM registration documented, as the Frame Server (`LOCAL SERVICE`) requires this to instantiate the virtual camera DLL.
 4. Verify the rebranded camera still appears in browser/OBS.
 5. Verify synthetic frames still display after rebrand.
+
+## Phase 2 Report
+- Registration of new CLSID {8CF75B14-3F68-46BC-80DF-5FB86AED931E} successful.
+- Old Microsoft sample CLSID successfully unregistered.
+- Rebranded camera successfully discovered in OBS as OpenCamBridge Camera with synthetic frames intact.
+- **Note**: VirtualCameraTest.exe prints an XML/data-drive warning (C4244 conversion warning during compile or runtime warning), but this is non-blocking and does not prevent OBS/Browser from using the Virtual Camera. It should only be addressed if it blocks future automated tests.

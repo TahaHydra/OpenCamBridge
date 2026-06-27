@@ -19,7 +19,7 @@
     clsid: clsid of media source in this format  {7B89B92E-FE71-42D0-8A41-E137D06EA184} 
     -->
     <Row >
-      <Parameter Name="clsid">{7B89B92E-FE71-42D0-8A41-E137D06EA184}</Parameter>
+      <Parameter Name="clsid">{8CF75B14-3F68-46BC-80DF-5FB86AED931E}</Parameter>
       <Parameter Name="StreamCount">2</Parameter>"
     </Row>
   </Table>
@@ -30,7 +30,7 @@
     friendname: friendname of the vcam, optional.
     -->
     <Row >
-      <Parameter Name="clsid">{7B89B92E-FE71-42D0-8A41-E137D06EA184}</Parameter>
+      <Parameter Name="clsid">{8CF75B14-3F68-46BC-80DF-5FB86AED931E}</Parameter>
       <Parameter Name="friendlyname">testMediaSourceVCam</Parameter>
     </Row>
   </Table>
