@@ -8,3 +8,46 @@ android/.gradle/
 android/build/
 android/app/build/
 **/build/
+
+# Antigravity / agent scratch
+implementation_plan.md
+task.md
+walkthrough.md
+scratch/
+
+# Rust
+target/
+**/target/
+
+# Visual Studio / MSBuild
+.vs/
+x64/
+x86/
+Debug/
+Release/
+**/x64/
+**/x86/
+**/Debug/
+**/Release/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.tlog
+*.lastbuildstate
+*.recipe
+*.log
+*.cache
+*.ipch
+*.aps
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+
+# NuGet packages restored locally
+**/packages/
+nuget.exe

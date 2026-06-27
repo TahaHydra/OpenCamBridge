@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>OpenCamBridge - Stream Dashboard</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&amp;family=JetBrains+Mono:wght@500;600&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "on-error-container": "#ffdad6",
+                        "on-tertiary": "#003912",
+                        "outline-variant": "#3b494c",
+                        "on-tertiary-container": "#006727",
+                        "tertiary-fixed": "#69ff87",
+                        "inverse-on-surface": "#2f3034",
+                        "secondary": "#c8c6c5",
+                        "surface": "#121317",
+                        "primary-fixed": "#9cf0ff",
+                        "surface-variant": "#343539",
+                        "surface-container-highest": "#343539",
+                        "surface-tint": "#00daf3",
+                        "outline": "#849396",
+                        "secondary-container": "#4a4949",
+                        "on-tertiary-fixed-variant": "#00531e",
+                        "on-primary-fixed": "#001f24",
+                        "surface-dim": "#121317",
+                        "inverse-primary": "#006875",
+                        "surface-container-high": "#292a2e",
+                        "primary-fixed-dim": "#00daf3",
+                        "surface-container-lowest": "#0d0e12",
+                        "on-secondary-container": "#bab8b7",
+                        "on-surface": "#e3e2e7",
+                        "on-secondary": "#313030",
+                        "on-error": "#690005",
+                        "secondary-fixed-dim": "#c8c6c5",
+                        "tertiary-fixed-dim": "#3ce36a",
+                        "surface-container-low": "#1a1b1f",
+                        "on-surface-variant": "#bac9cc",
+                        "error": "#ffb4ab",
+                        "tertiary": "#b1ffb5",
+                        "inverse-surface": "#e3e2e7",
+                        "on-tertiary-fixed": "#002108",
+                        "background": "#121317",
+                        "on-secondary-fixed": "#1c1b1b",
+                        "surface-container": "#1e1f23",
+                        "tertiary-container": "#49ed72",
+                        "on-secondary-fixed-variant": "#474646",
+                        "on-primary-container": "#00626e",
+                        "on-primary": "#00363d",
+                        "primary-container": "#00e5ff",
+                        "surface-bright": "#38393d",
+                        "secondary-fixed": "#e5e2e1",
+                        "primary": "#c3f5ff",
+                        "on-primary-fixed-variant": "#004f58",
+                        "on-background": "#e3e2e7",
+                        "error-container": "#93000a"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.25rem",
+                        "lg": "0.5rem",
+                        "xl": "0.75rem",
+                        "full": "9999px"
+                    },
+                    "spacing": {
+                        "gutter": "12px",
+                        "base": "4px",
+                        "lg": "24px",
+                        "xs": "4px",
+                        "md": "16px",
+                        "sm": "8px",
+                        "xl": "32px",
+                        "margin": "20px"
+                    },
+                    "fontFamily": {
+                        "headline-md": ["Inter"],
+                        "headline-sm": ["Inter"],
+                        "label-sm": ["JetBrains Mono"],
+                        "body-md": ["Inter"],
+                        "body-lg": ["Inter"],
+                        "headline-lg": ["Inter"],
+                        "code-md": ["JetBrains Mono"]
+                    },
+                    "fontSize": {
+                        "headline-md": ["24px", {"lineHeight": "32px", "letterSpacing": "-0.01em", "fontWeight": "600"}],
+                        "headline-sm": ["20px", {"lineHeight": "28px", "fontWeight": "600"}],
+                        "label-sm": ["11px", {"lineHeight": "16px", "letterSpacing": "0.05em", "fontWeight": "600"}],
+                        "body-md": ["14px", {"lineHeight": "20px", "fontWeight": "400"}],
+                        "body-lg": ["16px", {"lineHeight": "24px", "fontWeight": "400"}],
+                        "headline-lg": ["32px", {"lineHeight": "40px", "letterSpacing": "-0.02em", "fontWeight": "700"}],
+                        "code-md": ["13px", {"lineHeight": "18px", "fontWeight": "500"}]
+                    }
+                }
+            }
+        }
+    </script>
+<style>
+        /* Custom scrollbar for technical aesthetic */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #121317;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #343539;
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #00daf3;
+        }
+        
+        .pulse-dot {
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(0.8); }
+            100% { opacity: 1; transform: scale(1); }
+        }
+
+        /* Range Slider Styling */
+        input[type=range] {
+            -webkit-appearance: none;
+            width: 100%;
+            background: transparent;
+        }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 16px;
+            width: 16px;
+            border-radius: 50%;
+            background: #c3f5ff;
+            cursor: pointer;
+            margin-top: -6px;
+        }
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 4px;
+            cursor: pointer;
+            background: #3b494c;
+            border-radius: 2px;
+        }
+        input[type=range]:focus::-webkit-slider-runnable-track {
+            background: #00daf3;
+        }
+    </style>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="bg-background text-on-background h-screen overflow-hidden flex flex-col font-body-md">
+<!-- TopAppBar -->
+<header class="bg-surface dark:bg-surface border-b border-outline-variant dark:border-outline-variant flex justify-between items-center w-full px-md h-16 shrink-0 z-50">
+<div class="flex items-center gap-sm hover:opacity-80 transition-opacity cursor-pointer">
+<span class="material-symbols-outlined text-primary dark:text-primary text-[24px]">videocam</span>
+<span class="font-headline-sm text-headline-sm font-bold text-primary dark:text-primary tracking-tight">OpenCamBridge</span>
+</div>
+<div class="hidden md:flex gap-lg">
+<a class="text-primary dark:text-primary font-label-sm text-label-sm flex items-center gap-xs hover:text-primary transition-colors duration-200" href="#">
+<span class="material-symbols-outlined text-[18px]">sensors</span> Stream
+            </a>
+<a class="text-on-surface-variant dark:text-on-surface-variant font-label-sm text-label-sm flex items-center gap-xs hover:text-primary transition-colors duration-200" href="#">
+<span class="material-symbols-outlined text-[18px]">settings_input_component</span> Settings
+            </a>
+<a class="text-on-surface-variant dark:text-on-surface-variant font-label-sm text-label-sm flex items-center gap-xs hover:text-primary transition-colors duration-200" href="#">
+<span class="material-symbols-outlined text-[18px]">camera_roll</span> Lenses
+            </a>
+<a class="text-on-surface-variant dark:text-on-surface-variant font-label-sm text-label-sm flex items-center gap-xs hover:text-primary transition-colors duration-200" href="#">
+<span class="material-symbols-outlined text-[18px]">terminal</span> Logs
+            </a>
+</div>
+<div class="flex items-center gap-sm">
+<button class="p-xs text-on-surface-variant hover:text-primary transition-colors rounded">
+<span class="material-symbols-outlined">notifications</span>
+</button>
+<div class="w-8 h-8 rounded-full bg-surface-container-high border border-outline-variant overflow-hidden">
+<img alt="Profile" class="w-full h-full object-cover" data-alt="A macro photography shot of a sleek, dark-themed camera lens with subtle cyan reflections, serving as an abstract tech profile picture. OLED black background with sharp technological details." src="https://lh3.googleusercontent.com/aida-public/AB6AXuDH0oLcV8wgS0qVMRu6WAGrHnmbY4c4pAh_YVTR9kiWSitk2cPw5cWC2G1_wlDT1DL4Sr5QrzFNXdDwjRrVfFvkefshBq-dVe6Iv4egQXmkHFkQcKSUwQAbhJYH4xV7NlJQtV7C4_SfrlHjnRqUqSvJzXHNwUSYYxEr-HmF7uXr7lP5Ezo4bMKDKOcoCwrm4aswz5csS-XCqHiZft4Y_BhEzl6AZnarrbJIo8-Fe8DEQn6DDWHC9CjCt4_9anietEUzqWT2M8qqRldh"/>
+</div>
+</div>
+</header>
+<!-- Main Content Layout -->
+<main class="flex-1 flex flex-col md:flex-row overflow-hidden">
+<!-- Left Column: Camera Preview (60%) -->
+<section class="flex-1 lg:w-[60%] flex flex-col bg-black relative border-r border-outline-variant">
+<!-- Preview Canvas -->
+<div class="flex-1 relative w-full h-full flex items-center justify-center bg-surface-container-lowest">
+<div class="absolute inset-0 bg-cover bg-center w-full h-full opacity-80" data-alt="A simulated live camera feed showing a high-tech modern office space illuminated by soft neon lights, primarily deep blues and cyan. A desk with multiple monitors is visible. The image is crisp, simulating a 1080p stream." style="background-image: url('https://lh3.googleusercontent.com/aida-public/AB6AXuDxETfMsPvemSZdQpvCvlOefsPldefNYPqrcIgF2mEty4pDUz_kf2hqW5BDgV3utGAeze9gaUZH36-ELhGuzuuYmjrZGbcsdPeBe2Le9y-NivappsEW376lA4AHkHJ_tYrH114WruwjYisfyVuVMi8idBgVC0-D7g8J3yG5-ttbbX_MEFWD061HMCOiVD-pgcCFsF3os50GwssUIoDPVgpbf4UlHvISJkdmHCiIS4Nn1T5YqehliL5WMngNFlyh5IAfzj72pOcKXvUi')"></div>
+<!-- Center Reticle (Aesthetic) -->
+<div class="absolute w-32 h-32 border border-outline-variant opacity-30 flex items-center justify-center pointer-events-none">
+<div class="w-1 h-1 bg-primary rounded-full"></div>
+<div class="absolute top-0 left-1/2 -translate-x-1/2 w-[1px] h-2 bg-outline-variant"></div>
+<div class="absolute bottom-0 left-1/2 -translate-x-1/2 w-[1px] h-2 bg-outline-variant"></div>
+<div class="absolute left-0 top-1/2 -translate-y-1/2 w-2 h-[1px] bg-outline-variant"></div>
+<div class="absolute right-0 top-1/2 -translate-y-1/2 w-2 h-[1px] bg-outline-variant"></div>
+</div>
+<!-- Overlay Info -->
+<div class="absolute top-sm left-sm flex gap-xs">
+<div class="bg-surface/80 backdrop-blur border border-outline-variant px-sm py-xs rounded flex items-center gap-xs">
+<div class="w-2 h-2 rounded-full bg-tertiary-fixed-dim pulse-dot"></div>
+<span class="font-code-md text-code-md text-on-surface">LIVE</span>
+</div>
+<div class="bg-surface/80 backdrop-blur border border-outline-variant px-sm py-xs rounded">
+<span class="font-code-md text-code-md text-secondary">REC 00:45:12</span>
+</div>
+</div>
+<div class="absolute bottom-sm right-sm bg-surface/80 backdrop-blur border border-outline-variant px-sm py-xs rounded flex gap-md">
+<span class="font-code-md text-code-md text-primary">1080p60</span>
+<span class="font-code-md text-code-md text-on-surface-variant">5.2 Mbps</span>
+<span class="font-code-md text-code-md text-tertiary-fixed-dim">0 Drops</span>
+</div>
+</div>
+</section>
+<!-- Right Column: Sidebar Controls (40%) -->
+<aside class="w-full md:w-[40%] lg:w-80 bg-surface flex flex-col shrink-0 border-l border-outline-variant z-10">
+<div class="flex-1 overflow-y-auto p-md space-y-md">
+<!-- Status & Action Card -->
+<div class="bg-surface-container rounded-lg border border-outline-variant p-sm flex flex-col gap-sm">
+<div class="flex justify-between items-center">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Stream URL</span>
+<button class="text-primary hover:text-primary-fixed transition-colors">
+<span class="material-symbols-outlined text-[16px]">content_copy</span>
+</button>
+</div>
+<div class="bg-black border border-outline-variant rounded p-xs overflow-hidden">
+<span class="font-code-md text-code-md text-secondary truncate block">rtsp://192.168.1.105:8554/cam1</span>
+</div>
+<button class="w-full bg-primary text-on-primary font-headline-sm text-headline-sm py-sm rounded hover:bg-primary-fixed transition-colors flex justify-center items-center gap-xs">
+<span class="material-symbols-outlined">stop_circle</span> Stop Stream
+                    </button>
+</div>
+<!-- Camera Settings -->
+<div class="bg-surface-container rounded-lg border border-outline-variant p-sm">
+<h3 class="font-label-sm text-label-sm text-on-surface-variant uppercase mb-sm flex items-center gap-xs">
+<span class="material-symbols-outlined text-[16px]">photo_camera</span> Camera Control
+                    </h3>
+<div class="space-y-sm">
+<!-- Exposure -->
+<div>
+<div class="flex justify-between mb-xs">
+<label class="font-code-md text-code-md text-on-surface">Exposure</label>
+<span class="font-code-md text-code-md text-secondary">Auto</span>
+</div>
+<input max="100" min="1" type="range" value="50"/>
+</div>
+<!-- ISO -->
+<div>
+<div class="flex justify-between mb-xs">
+<label class="font-code-md text-code-md text-on-surface">ISO</label>
+<span class="font-code-md text-code-md text-secondary">800</span>
+</div>
+<input max="6400" min="100" type="range" value="800"/>
+</div>
+<!-- Focus Toggle -->
+<div class="flex justify-between items-center pt-xs border-t border-outline-variant">
+<span class="font-code-md text-code-md text-on-surface">Auto Focus</span>
+<button class="w-8 h-4 bg-primary rounded-full relative">
+<div class="absolute right-0.5 top-0.5 w-3 h-3 bg-on-primary rounded-full"></div>
+</button>
+</div>
+</div>
+</div>
+<!-- Image Settings -->
+<div class="bg-surface-container rounded-lg border border-outline-variant p-sm">
+<h3 class="font-label-sm text-label-sm text-on-surface-variant uppercase mb-sm flex items-center gap-xs">
+<span class="material-symbols-outlined text-[16px]">tune</span> Image Adjustments
+                    </h3>
+<div class="space-y-sm">
+<!-- Contrast -->
+<div>
+<div class="flex justify-between mb-xs">
+<label class="font-code-md text-code-md text-on-surface">Contrast</label>
+<span class="font-code-md text-code-md text-secondary">1.2</span>
+</div>
+<input max="200" min="0" type="range" value="120"/>
+</div>
+<!-- Saturation -->
+<div>
+<div class="flex justify-between mb-xs">
+<label class="font-code-md text-code-md text-on-surface">Saturation</label>
+<span class="font-code-md text-code-md text-secondary">1.0</span>
+</div>
+<input max="200" min="0" type="range" value="100"/>
+</div>
+</div>
+</div>
+<!-- Encoding Data -->
+<div class="bg-surface-container rounded-lg border border-outline-variant p-sm">
+<h3 class="font-label-sm text-label-sm text-on-surface-variant uppercase mb-sm flex items-center gap-xs">
+<span class="material-symbols-outlined text-[16px]">memory</span> Encoding
+                    </h3>
+<div class="grid grid-cols-2 gap-sm">
+<div class="bg-black p-xs rounded border border-outline-variant">
+<span class="font-label-sm text-label-sm text-secondary block">Codec</span>
+<span class="font-code-md text-code-md text-primary block mt-xs">H.265 (HEVC)</span>
+</div>
+<div class="bg-black p-xs rounded border border-outline-variant">
+<span class="font-label-sm text-label-sm text-secondary block">Keyframe</span>
+<span class="font-code-md text-code-md text-primary block mt-xs">2s</span>
+</div>
+</div>
+</div>
+</div>
+</aside>
+</main>
+<!-- BottomNavBar (Mobile Only) -->
+<nav class="md:hidden fixed bottom-0 left-0 w-full z-50 flex justify-around items-center h-20 px-sm pb-safe bg-surface dark:bg-surface border-t border-outline-variant dark:border-outline-variant">
+<a class="flex flex-col items-center justify-center bg-secondary-container dark:bg-secondary-container text-primary dark:text-primary rounded-xl px-4 py-1 hover:text-primary dark:hover:text-primary scale-95 transition-transform duration-150" href="#">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">sensors</span>
+<span class="font-label-sm text-label-sm">Stream</span>
+</a>
+<a class="flex flex-col items-center justify-center text-on-surface-variant dark:text-on-surface-variant px-4 py-1 hover:text-primary dark:hover:text-primary" href="#">
+<span class="material-symbols-outlined">settings_input_component</span>
+<span class="font-label-sm text-label-sm">Settings</span>
+</a>
+<a class="flex flex-col items-center justify-center text-on-surface-variant dark:text-on-surface-variant px-4 py-1 hover:text-primary dark:hover:text-primary" href="#">
+<span class="material-symbols-outlined">camera_roll</span>
+<span class="font-label-sm text-label-sm">Lenses</span>
+</a>
+<a class="flex flex-col items-center justify-center text-on-surface-variant dark:text-on-surface-variant px-4 py-1 hover:text-primary dark:hover:text-primary" href="#">
+<span class="material-symbols-outlined">terminal</span>
+<span class="font-label-sm text-label-sm">Logs</span>
+</a>
+</nav>
+</body></html>

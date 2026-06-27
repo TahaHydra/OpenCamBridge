@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>OpenCamBridge - Web Control Dashboard</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com" rel="preconnect"/>
+<link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&amp;family=JetBrains+Mono:wght@500;600&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+          darkMode: "class",
+          theme: {
+            extend: {
+              "colors": {
+                      "on-secondary-fixed-variant": "#474646",
+                      "on-tertiary-container": "#006727",
+                      "on-surface": "#e3e2e7",
+                      "secondary-fixed-dim": "#c8c6c5",
+                      "error": "#ffb4ab",
+                      "inverse-primary": "#006875",
+                      "on-secondary-container": "#bab8b7",
+                      "background": "#121317",
+                      "surface-bright": "#38393d",
+                      "secondary-container": "#4a4949",
+                      "primary": "#c3f5ff",
+                      "inverse-on-surface": "#2f3034",
+                      "surface-container-highest": "#343539",
+                      "on-primary-container": "#00626e",
+                      "tertiary-fixed-dim": "#3ce36a",
+                      "on-tertiary-fixed": "#002108",
+                      "on-primary": "#00363d",
+                      "on-error-container": "#ffdad6",
+                      "tertiary-fixed": "#69ff87",
+                      "surface-container": "#1e1f23",
+                      "surface-variant": "#343539",
+                      "surface-container-lowest": "#0d0e12",
+                      "surface": "#121317",
+                      "on-secondary": "#313030",
+                      "tertiary": "#b1ffb5",
+                      "outline-variant": "#3b494c",
+                      "surface-container-high": "#292a2e",
+                      "secondary": "#c8c6c5",
+                      "error-container": "#93000a",
+                      "primary-fixed-dim": "#00daf3",
+                      "primary-container": "#00e5ff",
+                      "on-surface-variant": "#bac9cc",
+                      "on-background": "#e3e2e7",
+                      "on-secondary-fixed": "#1c1b1b",
+                      "on-primary-fixed-variant": "#004f58",
+                      "inverse-surface": "#e3e2e7",
+                      "on-tertiary-fixed-variant": "#00531e",
+                      "on-tertiary": "#003912",
+                      "on-primary-fixed": "#001f24",
+                      "tertiary-container": "#49ed72",
+                      "surface-container-low": "#1a1b1f",
+                      "on-error": "#690005",
+                      "outline": "#849396",
+                      "primary-fixed": "#9cf0ff",
+                      "surface-tint": "#00daf3",
+                      "surface-dim": "#121317",
+                      "secondary-fixed": "#e5e2e1"
+              },
+              "borderRadius": {
+                      "DEFAULT": "0.25rem",
+                      "lg": "0.5rem",
+                      "xl": "0.75rem",
+                      "full": "9999px"
+              },
+              "spacing": {
+                      "xs": "4px",
+                      "gutter": "12px",
+                      "base": "4px",
+                      "sm": "8px",
+                      "md": "16px",
+                      "margin": "20px",
+                      "lg": "24px",
+                      "xl": "32px"
+              },
+              "fontFamily": {
+                      "body-md": ["Inter"],
+                      "headline-md": ["Inter"],
+                      "headline-sm": ["Inter"],
+                      "code-md": ["JetBrains Mono"],
+                      "label-sm": ["JetBrains Mono"],
+                      "headline-lg": ["Inter"],
+                      "body-lg": ["Inter"]
+              },
+              "fontSize": {
+                      "body-md": ["14px", {"lineHeight": "20px", "fontWeight": "400"}],
+                      "headline-md": ["24px", {"lineHeight": "32px", "letterSpacing": "-0.01em", "fontWeight": "600"}],
+                      "headline-sm": ["20px", {"lineHeight": "28px", "fontWeight": "600"}],
+                      "code-md": ["13px", {"lineHeight": "18px", "fontWeight": "500"}],
+                      "label-sm": ["11px", {"lineHeight": "16px", "letterSpacing": "0.05em", "fontWeight": "600"}],
+                      "headline-lg": ["32px", {"lineHeight": "40px", "letterSpacing": "-0.02em", "fontWeight": "700"}],
+                      "body-lg": ["16px", {"lineHeight": "24px", "fontWeight": "400"}]
+              }
+            }
+          }
+        }
+    </script>
+<style>
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+        .material-symbols-outlined.filled {
+            font-variation-settings: 'FILL' 1;
+        }
+        
+        /* Custom scrollbar for dark theme */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #121317; 
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #343539; 
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #4a4949; 
+        }
+
+        /* Pulsing dot animation */
+        @keyframes pulse-dot {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(105, 255, 135, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(105, 255, 135, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(105, 255, 135, 0); }
+        }
+        .pulse-live {
+            animation: pulse-dot 2s infinite;
+        }
+    </style>
+</head>
+<body class="bg-background text-on-surface font-body-md h-screen overflow-hidden flex flex-col antialiased">
+<!-- TopAppBar Component -->
+<header class="w-full h-16 fixed top-0 z-50 border-b border-outline-variant bg-background flex items-center justify-between px-lg w-full">
+<div class="flex items-center gap-md">
+<span class="font-headline-sm text-headline-sm font-black text-primary">OpenCamBridge</span>
+<nav class="hidden md:flex gap-lg ml-xl h-full items-center">
+<a class="text-primary border-b-2 border-primary pb-2 h-16 flex items-center pt-2 font-label-sm text-label-sm" href="#">Dashboard</a>
+<a class="text-on-surface-variant hover:text-primary transition-colors cursor-pointer active:opacity-80 font-label-sm text-label-sm" href="#">Studio</a>
+<a class="text-on-surface-variant hover:text-primary transition-colors cursor-pointer active:opacity-80 font-label-sm text-label-sm" href="#">Logs</a>
+<a class="text-on-surface-variant hover:text-primary transition-colors cursor-pointer active:opacity-80 font-label-sm text-label-sm" href="#">Advanced</a>
+</nav>
+</div>
+<div class="flex items-center gap-md">
+<button class="bg-error text-on-error px-4 py-2 rounded font-label-sm text-label-sm uppercase tracking-wider hover:bg-error-container hover:text-on-error-container transition-colors shadow-[0_0_10px_rgba(255,180,171,0.2)]">Go Live</button>
+<div class="flex gap-sm">
+<button class="text-on-surface-variant hover:text-primary transition-colors p-2">
+<span class="material-symbols-outlined">notifications</span>
+</button>
+<button class="text-on-surface-variant hover:text-primary transition-colors p-2">
+<span class="material-symbols-outlined">help_outline</span>
+</button>
+</div>
+</div>
+</header>
+<!-- SideNavBar & Main Content Wrapper -->
+<div class="flex flex-1 pt-16 h-full">
+<!-- SideNavBar Component (Fixed Left) -->
+<aside class="w-[280px] h-full border-r border-outline-variant bg-background flex flex-col py-md px-sm z-40">
+<nav class="flex flex-col gap-xs flex-1">
+<a class="flex items-center gap-3 p-3 rounded text-on-surface-variant font-medium hover:bg-surface-container-highest transition-colors duration-150 active:scale-[0.98] transition-transform" href="#">
+<span class="material-symbols-outlined">phonelink_setup</span>
+<span class="font-label-sm text-label-sm">Devices</span>
+</a>
+<a class="flex items-center gap-3 p-3 rounded text-on-surface-variant font-medium hover:bg-surface-container-highest transition-colors duration-150 active:scale-[0.98] transition-transform" href="#">
+<span class="material-symbols-outlined">tune</span>
+<span class="font-label-sm text-label-sm">Presets</span>
+</a>
+<a class="flex items-center gap-3 p-3 rounded text-primary font-bold border-r-2 border-primary bg-surface-container-highest hover:bg-surface-container-highest transition-colors duration-150 active:scale-[0.98] transition-transform" href="#">
+<span class="material-symbols-outlined">video_library</span>
+<span class="font-label-sm text-label-sm">Recordings</span>
+</a>
+<a class="flex items-center gap-3 p-3 rounded text-on-surface-variant font-medium hover:bg-surface-container-highest transition-colors duration-150 active:scale-[0.98] transition-transform" href="#">
+<span class="material-symbols-outlined">settings_ethernet</span>
+<span class="font-label-sm text-label-sm">Networks</span>
+</a>
+<a class="flex items-center gap-3 p-3 rounded text-on-surface-variant font-medium hover:bg-surface-container-highest transition-colors duration-150 active:scale-[0.98] transition-transform" href="#">
+<span class="material-symbols-outlined">settings</span>
+<span class="font-label-sm text-label-sm">Settings</span>
+</a>
+</nav>
+<div class="mt-auto pt-md border-t border-outline-variant">
+<button class="w-full bg-primary-container text-on-primary-container py-3 rounded font-label-sm text-label-sm hover:opacity-90 transition-opacity uppercase tracking-wider">Start Stream</button>
+</div>
+</aside>
+<!-- Main Studio Area (Split Pane) -->
+<main class="flex-1 flex overflow-hidden">
+<!-- Left Pane: Live Preview (70%) -->
+<div class="w-[70%] bg-surface flex flex-col p-gutter">
+<!-- Video Container -->
+<div class="flex-1 relative bg-black border border-outline-variant rounded flex items-center justify-center overflow-hidden">
+<!-- Simulated Video Feed -->
+<div class="absolute inset-0 bg-cover bg-center opacity-80" data-alt="A highly detailed view of a professional server room rack bathed in cool cyan and deep blue LED lighting. The perspective is slightly angled, showing dense cabling, glowing status indicators on network switches, and metallic hardware textures. The aesthetic is clean, technical, high-contrast, and cinematic, conveying a sense of vast data processing power." style="background-image: url('https://lh3.googleusercontent.com/aida-public/AB6AXuDcMujzT0jnK8NYmOpTF612N6W3kPiHifaX8FL2UTGaNtEXvovKo_75NuU-ZSNx9JnU9leXYRGTuaoJnpWxhRhvqXh7aNGwx8ldI0V8Dgux1i3TD10y3nO3NuYyTMCMPV2I6ktcX3E1dqgR2Y9Gb0egEnwXpAKQCNG7k11y85OwJmb0RF2IUiaiujxeaF91dOSN2x07Be99hYJ4TXmxXac8wGaebr_TWq5NItNNtlh4SgYbON-MkIxaCVCk72lFS6v8Lg8RqO4uMat4')"></div>
+<!-- Overlay: Top Left (Status) -->
+<div class="absolute top-sm left-sm flex gap-sm">
+<div class="bg-surface/80 backdrop-blur-sm border border-outline-variant px-2 py-1 rounded flex items-center gap-2">
+<div class="w-2 h-2 rounded-full bg-tertiary-fixed pulse-live"></div>
+<span class="font-code-md text-code-md text-tertiary-fixed uppercase">Live</span>
+</div>
+<div class="bg-surface/80 backdrop-blur-sm border border-outline-variant px-2 py-1 rounded">
+<span class="font-code-md text-code-md text-on-surface-variant">REC</span>
+</div>
+</div>
+<!-- Overlay: Top Right (Network) -->
+<div class="absolute top-sm right-sm flex flex-col items-end gap-xs">
+<div class="bg-surface/80 backdrop-blur-sm border border-outline-variant px-2 py-1 rounded">
+<span class="font-code-md text-code-md text-primary">60 FPS</span>
+</div>
+<div class="bg-surface/80 backdrop-blur-sm border border-outline-variant px-2 py-1 rounded">
+<span class="font-code-md text-code-md text-on-surface-variant">6.5 Mbps</span>
+</div>
+</div>
+<!-- Overlay: Bottom Left (Res/Latency) -->
+<div class="absolute bottom-sm left-sm flex gap-sm">
+<div class="bg-surface/80 backdrop-blur-sm border border-outline-variant px-2 py-1 rounded">
+<span class="font-code-md text-code-md text-on-surface-variant">1920x1080</span>
+</div>
+<div class="bg-surface/80 backdrop-blur-sm border border-outline-variant px-2 py-1 rounded">
+<span class="font-code-md text-code-md text-on-surface-variant">12ms Latency</span>
+</div>
+</div>
+</div>
+<!-- View Controls below video -->
+<div class="mt-sm flex justify-between items-center bg-surface-container-lowest border border-outline-variant rounded p-2">
+<div class="flex gap-2">
+<button class="bg-surface-container-highest border border-outline-variant text-primary px-3 py-1.5 rounded font-label-sm text-label-sm hover:border-primary transition-colors flex items-center gap-2">
+<span class="material-symbols-outlined text-[18px]">aspect_ratio</span>
+                            Fit
+                        </button>
+<button class="bg-transparent border border-transparent text-on-surface-variant px-3 py-1.5 rounded font-label-sm text-label-sm hover:bg-surface-container-highest transition-colors">Fill</button>
+<button class="bg-transparent border border-transparent text-on-surface-variant px-3 py-1.5 rounded font-label-sm text-label-sm hover:bg-surface-container-highest transition-colors">Stretch</button>
+</div>
+<div class="flex gap-4 items-center px-2">
+<label class="flex items-center gap-2 cursor-pointer">
+<div class="relative">
+<input class="sr-only peer" type="checkbox"/>
+<div class="w-8 h-4 bg-surface-container-highest rounded-full peer peer-checked:after:translate-x-full peer-checked:bg-primary-container after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-on-surface after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all"></div>
+</div>
+<span class="font-label-sm text-label-sm text-on-surface-variant">Mirror</span>
+</label>
+<div class="w-[1px] h-4 bg-outline-variant"></div>
+<button class="text-on-surface-variant hover:text-primary transition-colors flex items-center">
+<span class="material-symbols-outlined text-[20px]">fullscreen</span>
+</button>
+</div>
+</div>
+</div>
+<!-- Right Pane: Controls Sidebar (30%) -->
+<div class="w-[30%] bg-surface-container border-l border-outline-variant overflow-y-auto flex flex-col">
+<!-- Status & Primary Action -->
+<div class="p-md border-b border-outline-variant bg-surface-container-low flex items-center justify-between sticky top-0 z-10">
+<div class="flex items-center gap-2">
+<div class="w-3 h-3 rounded-full bg-tertiary-fixed pulse-live"></div>
+<span class="font-headline-sm text-headline-sm text-on-surface">Streaming</span>
+</div>
+<button class="bg-error/10 text-error border border-error/50 px-4 py-2 rounded font-label-sm text-label-sm uppercase hover:bg-error hover:text-on-error transition-colors">Stop Stream</button>
+</div>
+<!-- Settings Group -->
+<div class="p-md border-b border-outline-variant">
+<h3 class="font-label-sm text-label-sm text-on-surface-variant mb-sm uppercase tracking-widest">Settings</h3>
+<div class="space-y-4">
+<!-- Select -->
+<div>
+<label class="block font-label-sm text-label-sm text-on-surface-variant mb-1">Camera Selector</label>
+<select class="w-full bg-black border border-outline-variant rounded px-2 py-1.5 font-code-md text-code-md text-on-surface focus:border-primary focus:ring-1 focus:ring-primary outline-none">
+<option>Cam_01_Main</option>
+<option>Cam_02_Overhead</option>
+<option>Cam_03_Macro</option>
+</select>
+</div>
+<!-- 2 Col Grid -->
+<div class="grid grid-cols-2 gap-3">
+<div>
+<label class="block font-label-sm text-label-sm text-on-surface-variant mb-1">Resolution</label>
+<select class="w-full bg-black border border-outline-variant rounded px-2 py-1.5 font-code-md text-code-md text-on-surface focus:border-primary focus:ring-1 focus:ring-primary outline-none">
+<option>1080p</option>
+<option>720p</option>
+<option>4K</option>
+</select>
+</div>
+<div>
+<label class="block font-label-sm text-label-sm text-on-surface-variant mb-1">FPS</label>
+<select class="w-full bg-black border border-outline-variant rounded px-2 py-1.5 font-code-md text-code-md text-on-surface focus:border-primary focus:ring-1 focus:ring-primary outline-none">
+<option>60</option>
+<option>30</option>
+<option>24</option>
+</select>
+</div>
+</div>
+<!-- Slider -->
+<div>
+<div class="flex justify-between items-end mb-1">
+<label class="block font-label-sm text-label-sm text-on-surface-variant">JPEG Quality</label>
+<span class="font-code-md text-code-md text-primary">85%</span>
+</div>
+<input class="w-full h-1 bg-surface-bright rounded-lg appearance-none cursor-pointer accent-primary" max="100" min="1" type="range" value="85"/>
+</div>
+</div>
+</div>
+<!-- Hardware Group -->
+<div class="p-md border-b border-outline-variant">
+<h3 class="font-label-sm text-label-sm text-on-surface-variant mb-sm uppercase tracking-widest">Hardware</h3>
+<div class="space-y-4">
+<!-- Toggles -->
+<div class="flex items-center justify-between">
+<span class="font-label-sm text-label-sm text-on-surface">Torch</span>
+<label class="relative inline-flex items-center cursor-pointer">
+<input class="sr-only peer" type="checkbox"/>
+<div class="w-9 h-5 bg-surface-bright peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+</label>
+</div>
+<div class="flex items-center justify-between">
+<span class="font-label-sm text-label-sm text-on-surface">Autofocus</span>
+<label class="relative inline-flex items-center cursor-pointer">
+<input checked="" class="sr-only peer" type="checkbox"/>
+<div class="w-9 h-5 bg-surface-bright peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-background after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary-container"></div>
+</label>
+</div>
+<!-- Complex Slider with Speed -->
+<div class="pt-2 border-t border-outline-variant">
+<div class="flex justify-between items-end mb-2">
+<label class="block font-label-sm text-label-sm text-on-surface-variant">Zoom</label>
+<div class="flex gap-1 bg-black border border-outline-variant rounded p-0.5">
+<button class="px-2 py-0.5 text-[10px] font-code-md text-on-surface bg-surface-bright rounded-sm">1x</button>
+<button class="px-2 py-0.5 text-[10px] font-code-md text-on-surface-variant hover:text-on-surface rounded-sm">2x</button>
+<button class="px-2 py-0.5 text-[10px] font-code-md text-on-surface-variant hover:text-on-surface rounded-sm">4x</button>
+</div>
+</div>
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-[16px] text-on-surface-variant">zoom_out</span>
+<input class="w-full h-1 bg-surface-bright rounded-lg appearance-none cursor-pointer accent-primary" max="100" min="1" type="range" value="10"/>
+<span class="material-symbols-outlined text-[16px] text-on-surface-variant">zoom_in</span>
+</div>
+</div>
+</div>
+</div>
+<!-- System Group (Collapsible) -->
+<div class="p-md">
+<button class="w-full flex items-center justify-between font-label-sm text-label-sm text-on-surface-variant mb-2 uppercase tracking-widest hover:text-on-surface transition-colors">
+                        System Debug Data
+                        <span class="material-symbols-outlined text-[18px]">expand_more</span>
+</button>
+<div class="bg-black border border-outline-variant rounded p-2 overflow-x-auto">
+<pre class="font-code-md text-[11px] text-on-surface-variant leading-tight">{
+  "cam_id": "usb-046d_C922",
+  "v4l2_caps": "0x84200001",
+  "current_fmt": "MJPG",
+  "hw_decode": true,
+  "temp_c": 42.5,
+  "dropped_frames": 0,
+  "buffer_health": "ok"
+}
+</pre>
+</div>
+</div>
+</div>
+</main>
+</div>
+<!-- Footer Component -->
+<footer class="fixed bottom-0 left-0 w-full h-8 z-50 border-t border-outline-variant bg-surface-container-lowest flex items-center justify-between px-md w-full">
+<span class="font-label-sm text-label-sm text-on-surface-variant">© 2024 OpenCamBridge. Engine: v2.4.0-stable</span>
+<div class="flex gap-4">
+<a class="font-label-sm text-label-sm text-on-surface-variant hover:text-on-surface cursor-default" href="#">System Logs</a>
+<a class="font-label-sm text-label-sm text-on-surface-variant hover:text-on-surface cursor-default" href="#">Network Monitor</a>
+<a class="font-label-sm text-label-sm text-on-surface-variant hover:text-on-surface cursor-default" href="#">API Docs</a>
+<a class="font-label-sm text-label-sm text-on-surface-variant hover:text-on-surface cursor-default" href="#">Help</a>
+</div>
+</footer>
+</body></html>

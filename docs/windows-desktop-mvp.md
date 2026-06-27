@@ -61,6 +61,19 @@ To allow the native Tauri webview to access the Android server over HTTP and dis
 
 ## OBS-Assisted Virtual Camera Mode
 OpenCamBridge Desktop now includes built-in OBS automation.
+1. Tauri backend (Rust)
+2. React frontend (Vite)
+3. ADB forward tunneling (TCP port 8080)
+4. Desktop MJPEG fetching/decoding logic (Native Rust Feeder binary or OBS Clean Feed)
+
+## Required MVP Features
+
+* **Device Connection:** Ensure the Android Ktor API is reachable.
+* **Camera Config:** Select front/back lens, resolution, and target FPS.
+* **Stream View:** Clean rendering of the MJPEG feed.
+* **Virtual Camera Export (Native):** Provide a `rust-feeder.exe` wrapper in the UI to spawn the standalone `OpenCamBridge Camera` device without requiring OBS.
+* **Virtual Camera Export (Fallback):** Provide the OBS WebSockets "Browser Source" workflow for restrictive apps (like Discord Desktop) that block unsigned DirectShow DLLs.
+
 1. Install **OBS Studio** and enable the **WebSocket Server** (Tools > WebSocket Server Settings). Ensure it is running on the default port `4455`.
 2. Open the OpenCamBridge Desktop app.
 3. In the control panel, locate the **OBS Virtual Camera** section.

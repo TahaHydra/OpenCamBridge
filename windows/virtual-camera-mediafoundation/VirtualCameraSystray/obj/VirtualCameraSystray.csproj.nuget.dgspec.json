@@ -1,0 +1,61 @@
+{
+  "format": 1,
+  "restore": {
+    "C:\\Dev\\OpenCamBridge\\windows\\virtual-camera-mediafoundation\\VirtualCameraSystray\\VirtualCameraSystray.csproj": {}
+  },
+  "projects": {
+    "C:\\Dev\\OpenCamBridge\\windows\\virtual-camera-mediafoundation\\VirtualCameraSystray\\VirtualCameraSystray.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "C:\\Dev\\OpenCamBridge\\windows\\virtual-camera-mediafoundation\\VirtualCameraSystray\\VirtualCameraSystray.csproj",
+        "projectName": "VirtualCameraSystray",
+        "projectPath": "C:\\Dev\\OpenCamBridge\\windows\\virtual-camera-mediafoundation\\VirtualCameraSystray\\VirtualCameraSystray.csproj",
+        "packagesPath": "C:\\Users\\Hydra\\.nuget\\packages\\",
+        "outputPath": "C:\\Dev\\OpenCamBridge\\windows\\virtual-camera-mediafoundation\\VirtualCameraSystray\\obj\\",
+        "projectStyle": "PackageReference",
+        "skipContentFileWrite": true,
+        "UsingMicrosoftNETSdk": false,
+        "configFilePaths": [
+          "C:\\Users\\Hydra\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net48"
+        ],
+        "frameworks": {
+          "net48": {
+            "projectReferences": {}
+          }
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        }
+      },
+      "frameworks": {
+        "net48": {
+          "dependencies": {
+            "Microsoft.Windows.SDK.Contracts": {
+              "target": "Package",
+              "version": "[10.0.26100.8249, )"
+            }
+          }
+        }
+      },
+      "runtimes": {
+        "win": {
+          "#import": []
+        },
+        "win-arm64": {
+          "#import": []
+        },
+        "win-x64": {
+          "#import": []
+        },
+        "win-x86": {
+          "#import": []
+        }
+      }
+    }
+  }
+}

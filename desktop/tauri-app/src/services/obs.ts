@@ -8,7 +8,7 @@ export interface ObsStatus {
   error?: string;
 }
 
-export async function connectAndSetupObs(password: string, onStatus: (status: ObsStatus) => void): Promise<boolean> {
+export async function connectAndSetupObs(password: string, browserUrl: string, obsMode: 'browser' | 'window', onStatus: (status: ObsStatus) => void): Promise<boolean> {
   try {
     onStatus({ connected: false, message: 'Connecting to OBS...' });
     
@@ -37,7 +37,51 @@ export async function connectAndSetupObs(password: string, onStatus: (status: Ob
     await obs.call('SetCurrentProgramScene', { sceneName });
 
     // 2. Source Management
-    const sourceName = 'OpenCamBridge Clean Feed';
+    let windowCaptureKind = 'window_capture';
+    try {
+      const res = await obs.call('GetInputKindList');
+      const inputKinds = res.inputKinds as string[];
+      console.log('Available OBS Input Kinds:', inputKinds);
+      
+      if (inputKinds.includes('window_capture_wgc')) {
+        windowCaptureKind = 'window_capture_wgc';
+      } else if (inputKinds.includes('window_capture')) {
+        windowCaptureKind = 'window_capture';
+      } else {
+        const possible = inputKinds.find(k => k.includes('window_capture'));
+        if (possible) windowCaptureKind = possible;
+      }
+      console.log('Selected Window Capture Kind:', windowCaptureKind);
+    } catch (e) {
+      console.warn('Failed to query input kinds', e);
+    }
+
+    let sourceName = '';
+    let inputKind = '';
+    let inputSettings: any = {};
+
+    if (obsMode === 'browser') {
+      sourceName = 'OpenCamBridge Browser Feed';
+      inputKind = 'browser_source';
+      inputSettings = {
+        url: browserUrl,
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        shutdown: false,
+        reroute_audio: false,
+        restart_when_active: true
+      };
+    } else {
+      sourceName = 'OpenCamBridge Window Capture';
+      inputKind = windowCaptureKind;
+      inputSettings = {
+        window: 'OpenCamBridge:*:tauri-app.exe',
+        window_match_priority: 2,
+        client_area: false,
+        method: 2 // WGC (Windows Graphics Capture) usually handles WebView2 best
+      };
+    }
     
     // Check if source already exists
     let sourceExists = false;
@@ -48,34 +92,26 @@ export async function connectAndSetupObs(password: string, onStatus: (status: Ob
       // Ignore
     }
 
-    const windowSettings = {
-      window: 'OpenCamBridge:*:tauri-app.exe',
-      window_match_priority: 2, // 2 = Match title, otherwise find window of same executable
-      client_area: true
-    };
-
     if (!sourceExists) {
       try {
         await obs.call('CreateInput', {
           sceneName,
           inputName: sourceName,
-          inputKind: 'window_capture',
-          inputSettings: windowSettings
+          inputKind: inputKind,
+          inputSettings: inputSettings
         });
       } catch (err: any) {
         console.warn('Could not create source (it might exist globally). Trying to reuse it.');
-        // If it exists globally but not in scene, we would add a scene item.
-        // For simplicity, we just try to update settings.
         await obs.call('SetInputSettings', {
           inputName: sourceName,
-          inputSettings: windowSettings
+          inputSettings: inputSettings
         });
       }
     } else {
       // Source exists, update settings just in case
       await obs.call('SetInputSettings', {
         inputName: sourceName,
-        inputSettings: windowSettings
+        inputSettings: inputSettings
       });
     }
 

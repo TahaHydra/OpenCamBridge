@@ -131,6 +131,7 @@ class ControlServer(
                 get("/stream.mjpeg")               { serveMjpeg(call) }
                 get("/stream.h264")                { serveH264(call) }
                 get("/api/stream/info")            { serveStreamInfo(call) }
+                get("/obs")                        { serveObs(call) }
             }
         }.start(wait = false)
     }
@@ -138,6 +139,67 @@ class ControlServer(
     fun stop() {
         engine?.stop(gracePeriodMillis = 500, timeoutMillis = 1000)
         engine = null
+    }
+
+    private suspend fun serveObs(call: RoutingCall) {
+        val fit = call.request.queryParameters["fit"] ?: "cover"
+        val mirror = call.request.queryParameters["mirror"] == "true"
+        val rotate = call.request.queryParameters["rotate"]?.toIntOrNull() ?: 0
+
+        val scaleX = if (mirror) -1 else 1
+        val accessMode = StreamState.accessMode.get()
+        val token = StreamState.accessToken.get()
+        
+        call.respondText(ContentType.Text.Html) {
+            """
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>OBS Clean Feed</title>
+              <style>
+                body, html {
+                    margin: 0;
+                    padding: 0;
+                    width: 100%;
+                    height: 100%;
+                    background: #000;
+                    overflow: hidden;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                }
+                #stream {
+                    width: 100%;
+                    height: 100%;
+                    object-fit: $fit;
+                    transform: rotate(${rotate}deg) scaleX($scaleX);
+                }
+              </style>
+            </head>
+            <body>
+              <img id="stream" src="/stream.mjpeg?obs=1">
+              <script>
+                const isTokenRequired = "$accessMode" === "lanToken";
+                const token = "$token";
+                const img = document.getElementById('stream');
+                let url = '/stream.mjpeg?obs=1';
+                if (isTokenRequired && token) {
+                    url += '&token=' + token;
+                }
+                img.src = url;
+                
+                img.onerror = () => {
+                    setTimeout(() => {
+                        img.src = url + '&ts=' + new Date().getTime();
+                    }, 1000);
+                };
+              </script>
+            </body>
+            </html>
+            """.trimIndent()
+        }
     }
 
     private suspend fun serveGetLogs(call: RoutingCall) {

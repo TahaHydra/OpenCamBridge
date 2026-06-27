@@ -1,6 +1,23 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Play, Square, Settings2, Sliders, RefreshCw, RotateCw, ZoomIn, ZoomOut, Monitor, Video } from 'lucide-react';
+import { Play, Square, Settings2, Sliders, RefreshCw, RotateCw, ZoomIn, ZoomOut, Monitor, Video, ShieldAlert } from 'lucide-react';
 import { connectAndSetupObs, ObsStatus } from '../services/obs';
+import { invoke } from '@tauri-apps/api/core';
+
+interface VirtualCamMetrics {
+  input_fps: number;
+  output_fps: number;
+  decode_ms_avg: number;
+  bytes_per_sec: number;
+  dropped_frames: number;
+  frame_age_ms: number;
+  status: string;
+}
+
+interface VirtualCamState {
+  running: boolean;
+  registered: boolean;
+  metrics: VirtualCamMetrics | null;
+}
 
 interface ControlPanelProps {
   baseUrl: string;
@@ -26,15 +43,38 @@ export default function ControlPanel({ baseUrl, fitMode, setFitMode, onEnterObsM
   const [isSyncing, setIsSyncing] = useState(false);
 
   const [obsPassword, setObsPassword] = useState('');
+  const [obsMode, setObsMode] = useState<'browser' | 'window'>('browser');
   const [obsStatus, setObsStatus] = useState<ObsStatus | null>(null);
   const [isObsConnecting, setIsObsConnecting] = useState(false);
 
+  const [vcamState, setVcamState] = useState<VirtualCamState | null>(null);
+  const [isVcamRegistering, setIsVcamRegistering] = useState(false);
+  const [vcamMessage, setVcamMessage] = useState('');
+
   const handleStartObs = async () => {
-    setIsObsConnecting(true);
-    setObsStatus(null);
-    const success = await connectAndSetupObs(obsPassword, (status) => setObsStatus(status));
+    if (obsMode === 'window' && onEnterObsMode) {
+      onEnterObsMode();
+      setIsObsConnecting(true);
+      setObsStatus({ connected: false, message: 'Waiting for Clean Feed transition...' });
+      await new Promise(resolve => setTimeout(resolve, 500));
+    } else {
+      setIsObsConnecting(true);
+      setObsStatus(null);
+    }
+
+    const queryParams = new URLSearchParams();
+    queryParams.set('fit', fitMode === 'fill' ? 'cover' : 'contain');
+    queryParams.set('mirror', settings.mirror ? 'true' : 'false');
+    let rot = settings.displayRotation;
+    if (rot === 'auto' || !rot) rot = '0';
+    queryParams.set('rotate', rot);
+
+    const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+    const obsUrl = `${base}/obs?${queryParams.toString()}`;
+
+    const success = await connectAndSetupObs(obsPassword, obsUrl, obsMode, (status) => setObsStatus(status));
     setIsObsConnecting(false);
-    if (success && onEnterObsMode) {
+    if (obsMode === 'browser' && success && onEnterObsMode) {
       onEnterObsMode();
     }
   };
@@ -70,7 +110,56 @@ export default function ControlPanel({ baseUrl, fitMode, setFitMode, onEnterObsM
     
     // Fetch initial settings to sync state
     fetchStatus();
+
+    const interval = setInterval(() => {
+      invoke<VirtualCamState>('get_virtual_camera_status')
+        .then(setVcamState)
+        .catch(console.error);
+    }, 1000);
+
+    return () => clearInterval(interval);
   }, [baseUrl, fetchStatus]);
+
+  const handleRegisterVcam = async () => {
+    setIsVcamRegistering(true);
+    setVcamMessage('Registering COM object... You may see a PowerShell window flash.');
+    try {
+      const msg = await invoke<string>('register_virtual_camera_backend');
+      setVcamMessage(msg);
+      invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
+    } catch (e: any) {
+      setVcamMessage(e.toString());
+    }
+    setIsVcamRegistering(false);
+  };
+
+  const handleStartVcam = async () => {
+    setVcamMessage('Starting native stream...');
+    try {
+      await startStream(); // Ensure Android is streaming
+      const targetUrl = `${baseUrl}/stream.mjpeg`;
+      await invoke('start_virtual_camera_feeder', { 
+        url: targetUrl,
+        width: settings.width,
+        height: settings.height,
+        fps: settings.fps
+      });
+      setVcamMessage('');
+      invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
+    } catch (e: any) {
+      setVcamMessage(e.toString());
+    }
+  };
+
+  const handleStopVcam = async () => {
+    try {
+      await invoke('stop_virtual_camera_feeder');
+      setVcamMessage('Stopped native stream.');
+      invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
+    } catch (e: any) {
+      setVcamMessage(e.toString());
+    }
+  };
 
   const updateSetting = async (key: string, value: any) => {
     const newSettings = { ...settings, [key]: value };
@@ -307,12 +396,102 @@ export default function ControlPanel({ baseUrl, fitMode, setFitMode, onEnterObsM
           </div>
         )}
 
+        {/* NATIVE VIRTUAL CAMERA */}
         <div style={{ marginTop: 24, borderTop: '1px solid var(--surface-border)', paddingTop: 16 }}>
-          <h3 style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-            <Video size={16} /> OBS Virtual Camera
+          <h3 style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, color: 'var(--primary)' }}>
+            <Monitor size={16} /> Native Virtual Camera (Beta)
+          </h3>
+          
+          <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: 12, lineHeight: 1.4 }}>
+            Exposes <b>OpenCamBridge Camera</b> directly to Windows.
+          </p>
+
+          <div className="control-item">
+            {vcamState && !vcamState.registered ? (
+              <div style={{ marginBottom: 12, background: 'rgba(255, 179, 0, 0.1)', padding: 12, borderRadius: 6, border: '1px solid rgba(255, 179, 0, 0.3)' }}>
+                <p style={{ fontSize: '0.85rem', color: '#ffb300', marginBottom: 12 }}>
+                  <ShieldAlert size={14} style={{ display: 'inline', verticalAlign: 'text-bottom', marginRight: 4 }} />
+                  Backend is not registered. Run setup first.
+                </p>
+                <button 
+                  className="btn btn-primary" 
+                  style={{ width: '100%', display: 'flex', justifyContent: 'center', gap: 8 }} 
+                  onClick={handleRegisterVcam} 
+                  disabled={isVcamRegistering}
+                >
+                  {isVcamRegistering ? 'Registering...' : 'Register Camera Backend'}
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+                {!vcamState?.running ? (
+                  <button className="btn btn-primary" style={{ flex: 1, display: 'flex', justifyContent: 'center', gap: 8, background: 'var(--active)', color: '#000' }} onClick={handleStartVcam}>
+                    <Play size={16} /> Start Camera
+                  </button>
+                ) : (
+                  <button className="btn btn-danger" style={{ flex: 1, display: 'flex', justifyContent: 'center', gap: 8 }} onClick={handleStopVcam}>
+                    <Square size={16} /> Stop Camera
+                  </button>
+                )}
+              </div>
+            )}
+            
+            {vcamMessage && (
+              <p style={{ fontSize: '0.8rem', color: '#aaa', marginBottom: 12 }}>{vcamMessage}</p>
+            )}
+
+            {vcamState?.running && vcamState.metrics && (
+              <div style={{ background: '#000', padding: 12, borderRadius: 6, border: '1px solid #333', fontFamily: 'monospace', fontSize: '0.8rem', color: '#51cf66' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <span>FPS:</span>
+                  <span>{vcamState.metrics.output_fps} / {settings.fps}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <span>Latency:</span>
+                  <span>{vcamState.metrics.frame_age_ms} ms</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <span>Decode Time:</span>
+                  <span>{vcamState.metrics.decode_ms_avg.toFixed(1)} ms</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <span>Bandwidth:</span>
+                  <span>{(vcamState.metrics.bytes_per_sec / 1024 / 1024).toFixed(2)} MB/s</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span>Dropped:</span>
+                  <span style={{ color: vcamState.metrics.dropped_frames > 0 ? '#ff6b6b' : 'inherit' }}>{vcamState.metrics.dropped_frames}</span>
+                </div>
+              </div>
+            )}
+
+            <p style={{ fontSize: '0.75rem', color: 'rgba(255, 255, 255, 0.4)', marginTop: 12, lineHeight: 1.4 }}>
+              * Unsigned DirectShow drivers may be blocked by strict apps like native Discord. Use OBS Fallback below if the camera is black.
+            </p>
+          </div>
+        </div>
+
+        {/* OBS FALLBACK SECTION */}
+        <div style={{ marginTop: 24, borderTop: '1px solid var(--surface-border)', paddingTop: 16 }}>
+          <h3 style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, color: '#aaa' }}>
+            <Video size={16} /> OBS Fallback Mode
           </h3>
           
           <div className="control-item">
+            <select 
+              className="input-control" 
+              value={obsMode} 
+              onChange={(e) => setObsMode(e.target.value as 'browser' | 'window')}
+              style={{ marginBottom: 8, width: '100%', cursor: 'pointer' }}
+            >
+              <option value="browser">Mode: Browser Source (Recommended)</option>
+              <option value="window">Mode: Window Capture</option>
+            </select>
+            {obsMode === 'window' && (
+              <p style={{ fontSize: '0.75rem', color: '#ffb300', marginBottom: 8, lineHeight: 1.4, background: 'rgba(255, 179, 0, 0.1)', padding: 8, borderRadius: 4 }}>
+                Window Capture can be black with WebView2/GPU windows. Try Browser Source mode or change OBS Capture Method manually.
+              </p>
+            )}
             <input 
               type="password" 
               className="input-control" 

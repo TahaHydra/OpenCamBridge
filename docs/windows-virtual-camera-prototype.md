@@ -24,3 +24,20 @@ The prototype proves OBS automation is the only safe short-term option to get a 
 
 **Exact Next Code Step:**
 Integrate the logic from `obs-auto-start.js` directly into the Tauri Rust backend. When the user clicks the "Enter OBS Clean Feed" button we added in the previous milestone, Tauri should automatically fire off the WebSocket commands to OBS, making the entire "Window capture -> Start Virtual Camera" process completely invisible and seamless to the end user.
+
+## Phase 1: OBS Integration (Complete)
+We proved the integration using OBS WebSocket to orchestrate OBS Studio from the Tauri frontend. Both Window Capture and Browser Source modes were implemented successfully.
+
+## Phase 2: Standalone Prototype (Complete)
+We evaluated DirectShow and Media Foundation APIs. To build a rapid, standalone prototype without requiring OBS, we chose to leverage the open-source MIT-licensed `UnityCapture` DirectShow filter.
+
+**Steps Taken:**
+1. Downloaded the 32/64-bit UnityCapture `.ax` filter DLLs.
+2. Registered the DLL directly into `HKEY_CURRENT_USER\Software\Classes\CLSID` (bypassing UAC Administrator requirements).
+3. Rebranded the `FriendlyName` to **OpenCamBridge Camera** natively in the registry.
+4. Created a Rust feeder binary using the `virtualcam` crate.
+5. Successfully pushed a 1280x720 30FPS gradient video stream via Shared Memory directly into the Windows camera stack.
+
+**Next Steps:**
+- Establish an IPC mechanism (e.g., Local Sockets or Shared Memory) between the Tauri app and a Rust daemon.
+- Route decoded Android MJPEG frames out to the `virtualcam` backend.

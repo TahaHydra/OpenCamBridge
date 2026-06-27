@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>OpenCamBridge - State Screens</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&amp;family=JetBrains+Mono:wght@500;600&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "on-error-container": "#ffdad6",
+                        "on-tertiary": "#003912",
+                        "outline-variant": "#3b494c",
+                        "on-tertiary-container": "#006727",
+                        "tertiary-fixed": "#69ff87",
+                        "inverse-on-surface": "#2f3034",
+                        "secondary": "#c8c6c5",
+                        "surface": "#121317",
+                        "primary-fixed": "#9cf0ff",
+                        "surface-variant": "#343539",
+                        "surface-container-highest": "#343539",
+                        "surface-tint": "#00daf3",
+                        "outline": "#849396",
+                        "secondary-container": "#4a4949",
+                        "on-tertiary-fixed-variant": "#00531e",
+                        "on-primary-fixed": "#001f24",
+                        "surface-dim": "#121317",
+                        "inverse-primary": "#006875",
+                        "surface-container-high": "#292a2e",
+                        "primary-fixed-dim": "#00daf3",
+                        "surface-container-lowest": "#0d0e12",
+                        "on-secondary-container": "#bab8b7",
+                        "on-surface": "#e3e2e7",
+                        "on-secondary": "#313030",
+                        "on-error": "#690005",
+                        "secondary-fixed-dim": "#c8c6c5",
+                        "tertiary-fixed-dim": "#3ce36a",
+                        "surface-container-low": "#1a1b1f",
+                        "on-surface-variant": "#bac9cc",
+                        "error": "#ffb4ab",
+                        "tertiary": "#b1ffb5",
+                        "inverse-surface": "#e3e2e7",
+                        "on-tertiary-fixed": "#002108",
+                        "background": "#121317",
+                        "on-secondary-fixed": "#1c1b1b",
+                        "surface-container": "#1e1f23",
+                        "tertiary-container": "#49ed72",
+                        "on-secondary-fixed-variant": "#474646",
+                        "on-primary-container": "#00626e",
+                        "on-primary": "#00363d",
+                        "primary-container": "#00e5ff",
+                        "surface-bright": "#38393d",
+                        "secondary-fixed": "#e5e2e1",
+                        "primary": "#c3f5ff",
+                        "on-primary-fixed-variant": "#004f58",
+                        "on-background": "#e3e2e7",
+                        "error-container": "#93000a"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.25rem",
+                        "lg": "0.5rem",
+                        "xl": "0.75rem",
+                        "full": "9999px"
+                    },
+                    "spacing": {
+                        "gutter": "12px",
+                        "base": "4px",
+                        "lg": "24px",
+                        "xs": "4px",
+                        "md": "16px",
+                        "sm": "8px",
+                        "xl": "32px",
+                        "margin": "20px"
+                    },
+                    "fontFamily": {
+                        "headline-md": ["Inter"],
+                        "headline-sm": ["Inter"],
+                        "label-sm": ["JetBrains Mono"],
+                        "body-md": ["Inter"],
+                        "body-lg": ["Inter"],
+                        "headline-lg": ["Inter"],
+                        "code-md": ["JetBrains Mono"]
+                    },
+                    "fontSize": {
+                        "headline-md": ["24px", { "lineHeight": "32px", "letterSpacing": "-0.01em", "fontWeight": "600" }],
+                        "headline-sm": ["20px", { "lineHeight": "28px", "fontWeight": "600" }],
+                        "label-sm": ["11px", { "lineHeight": "16px", "letterSpacing": "0.05em", "fontWeight": "600" }],
+                        "body-md": ["14px", { "lineHeight": "20px", "fontWeight": "400" }],
+                        "body-lg": ["16px", { "lineHeight": "24px", "fontWeight": "400" }],
+                        "headline-lg": ["32px", { "lineHeight": "40px", "letterSpacing": "-0.02em", "fontWeight": "700" }],
+                        "code-md": ["13px", { "lineHeight": "18px", "fontWeight": "500" }]
+                    }
+                }
+            }
+        }
+    </script>
+<style>
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+        .material-symbols-outlined[data-weight="fill"] {
+            font-variation-settings: 'FILL' 1;
+        }
+        
+        .loader {
+            border: 3px solid rgba(0, 229, 255, 0.1);
+            border-left-color: #00e5ff;
+            border-radius: 50%;
+            width: 48px;
+            height: 48px;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Custom Range Slider */
+        input[type=range] {
+            -webkit-appearance: none;
+            width: 100%;
+            background: transparent;
+        }
+
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 16px;
+            width: 16px;
+            border-radius: 50%;
+            background: #00e5ff;
+            cursor: pointer;
+            margin-top: -6px;
+            border: 2px solid #121317;
+        }
+
+        input[type=range]:disabled::-webkit-slider-thumb {
+            background: #343539;
+            cursor: not-allowed;
+            border-color: #1a1b1f;
+        }
+
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 4px;
+            cursor: pointer;
+            background: #343539;
+            border-radius: 2px;
+        }
+
+        input[type=range]:disabled::-webkit-slider-runnable-track {
+            background: #1a1b1f;
+            cursor: not-allowed;
+        }
+    </style>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="bg-background text-on-background font-body-md min-h-screen flex flex-col md:flex-row overflow-hidden">
+<!-- Top App Bar (Web / Mobile) -->
+<header class="bg-surface dark:bg-surface border-b border-outline-variant dark:border-outline-variant flex justify-between items-center w-full px-md h-16 md:hidden z-40 fixed top-0 w-full">
+<div class="flex items-center gap-sm">
+<span class="material-symbols-outlined text-primary dark:text-primary">videocam</span>
+<h1 class="font-headline-sm text-headline-sm font-bold text-primary dark:text-primary tracking-tight">OpenCamBridge</h1>
+</div>
+<div class="flex items-center gap-sm">
+<span class="material-symbols-outlined text-on-surface-variant hover:text-primary transition-colors cursor-pointer">more_vert</span>
+</div>
+</header>
+<!-- Side Nav (Web) -->
+<nav class="hidden md:flex flex-col w-[280px] bg-surface border-r border-outline-variant h-screen fixed left-0 top-0 z-40 px-md py-lg">
+<div class="flex items-center gap-sm mb-xl px-sm">
+<span class="material-symbols-outlined text-primary text-headline-md">videocam</span>
+<h1 class="font-headline-sm text-headline-sm font-bold text-primary tracking-tight">OpenCamBridge</h1>
+</div>
+<div class="flex flex-col gap-xs flex-1">
+<a class="flex items-center gap-md px-sm py-sm rounded-lg hover:bg-surface-container-high transition-colors text-on-surface-variant hover:text-on-surface" href="#">
+<span class="material-symbols-outlined">sensors</span>
+<span class="font-body-md text-body-md">Stream</span>
+</a>
+<a class="flex items-center gap-md px-sm py-sm rounded-lg hover:bg-surface-container-high transition-colors text-on-surface-variant hover:text-on-surface" href="#">
+<span class="material-symbols-outlined">settings_input_component</span>
+<span class="font-body-md text-body-md">Settings</span>
+</a>
+<a class="flex items-center gap-md px-sm py-sm rounded-lg bg-secondary-container text-primary transition-colors" href="#">
+<span class="material-symbols-outlined" data-weight="fill">camera_roll</span>
+<span class="font-body-md text-body-md font-semibold">Lenses</span>
+</a>
+<a class="flex items-center gap-md px-sm py-sm rounded-lg hover:bg-surface-container-high transition-colors text-on-surface-variant hover:text-on-surface" href="#">
+<span class="material-symbols-outlined">terminal</span>
+<span class="font-body-md text-body-md">Logs</span>
+</a>
+</div>
+</nav>
+<!-- Main Content Area -->
+<main class="flex-1 w-full md:pl-[280px] pt-16 md:pt-0 pb-24 md:pb-0 overflow-y-auto relative h-screen bg-surface-container-lowest">
+<div class="p-md md:p-xl grid grid-cols-1 lg:grid-cols-2 gap-md md:gap-lg max-w-[1600px] mx-auto">
+<!-- Panel 1: Unsupported State Example -->
+<section class="flex flex-col gap-md">
+<div class="flex items-center justify-between mb-sm">
+<h2 class="font-headline-sm text-headline-sm text-on-surface">Camera Lenses</h2>
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider">Device ID: FRONT_CAM_01</span>
+</div>
+<div class="bg-surface border border-outline-variant rounded-lg overflow-hidden flex flex-col">
+<!-- Preview Area -->
+<div class="h-64 bg-surface-container-low relative border-b border-outline-variant flex items-center justify-center overflow-hidden">
+<div class="absolute inset-0 bg-cover bg-center opacity-40" data-alt="A highly detailed, technical view of a camera sensor array glowing slightly in the dark. The environment is a sleek, black OLED-style interface with subtle geometric grid lines overlaid. The mood is precise, professional, and slightly futuristic, emphasizing high-end optics and developer tools. Minimalist lighting highlights the metallic textures of the lens components." style="background-image: url('https://lh3.googleusercontent.com/aida-public/AB6AXuDeqIVRW59SQJRt6SPQHXnzWHJFU2MjK4_c2juEAZHY0-137xb4dZqgWmsax6mBHck7IxBM_017zuNgnMRAI25XMOqtheHfd_U4HDifFviSi0jsvgU9bn39aJVAjupQidWHhbBzl2TN76KC6ujvOQekeYw9PlShkKmqcdC59oQcu0q-G3bb7MAvUCL9drfkmGqMkNtZRXXWknHVZpm7rQQ1KhiL94FxATvg4QlPubhBGwAcmYrT1E4nUfbi72Sv9w6V5EMA1lcf6Ykq')"></div>
+<div class="z-10 bg-surface-container-highest border border-outline-variant rounded-md px-sm py-xs flex items-center gap-xs">
+<span class="material-symbols-outlined text-[16px] text-primary">visibility</span>
+<span class="font-label-sm text-label-sm text-on-surface uppercase">Live Preview</span>
+</div>
+</div>
+<!-- Controls Area -->
+<div class="p-md flex flex-col gap-md">
+<!-- Zoom Control (Disabled) -->
+<div class="flex flex-col gap-xs">
+<div class="flex items-center justify-between">
+<label class="font-label-sm text-label-sm text-on-surface-variant">Optical Zoom</label>
+<span class="font-label-sm text-label-sm text-error bg-error-container/20 px-2 py-0.5 rounded border border-error/30">Hardware Unsupported</span>
+</div>
+<div class="flex items-center gap-sm opacity-50 cursor-not-allowed">
+<span class="material-symbols-outlined text-on-surface-variant text-[20px]">zoom_out</span>
+<input class="flex-1" disabled="" max="10" min="1" type="range" value="1"/>
+<span class="material-symbols-outlined text-on-surface-variant text-[20px]">zoom_in</span>
+</div>
+<div class="flex justify-between font-code-md text-code-md text-on-surface-variant opacity-50">
+<span>1.0x</span>
+<span>Fixed</span>
+</div>
+</div>
+<hr class="border-outline-variant border-t"/>
+<!-- Torch Toggle (Disabled) -->
+<div class="flex items-center justify-between opacity-50 cursor-not-allowed">
+<div class="flex items-center gap-sm">
+<div class="w-10 h-10 rounded bg-surface-container-high flex items-center justify-center border border-outline-variant">
+<span class="material-symbols-outlined text-on-surface-variant">flashlight_on</span>
+</div>
+<div class="flex flex-col">
+<span class="font-body-md text-body-md text-on-surface">Torch / Flash</span>
+<span class="font-label-sm text-label-sm text-on-surface-variant">Not available on front camera</span>
+</div>
+</div>
+<!-- Disabled Toggle Switch -->
+<div class="w-11 h-6 bg-surface-container-high rounded-full border border-outline-variant relative flex items-center px-1">
+<div class="w-4 h-4 bg-outline-variant rounded-full"></div>
+</div>
+</div>
+<hr class="border-outline-variant border-t"/>
+<!-- Exposure Control (Active) -->
+<div class="flex flex-col gap-xs">
+<div class="flex items-center justify-between">
+<label class="font-label-sm text-label-sm text-on-surface-variant">Exposure Compensation</label>
+<span class="font-code-md text-code-md text-primary">+0.0 EV</span>
+</div>
+<div class="flex items-center gap-sm">
+<span class="material-symbols-outlined text-on-surface-variant text-[20px]">exposure_neg_1</span>
+<input class="flex-1" max="2" min="-2" step="0.1" type="range" value="0"/>
+<span class="material-symbols-outlined text-on-surface-variant text-[20px]">exposure_plus_1</span>
+</div>
+</div>
+</div>
+</div>
+</section>
+</div>
+<!-- Overlay for Screen A: 'Applying Changes...' State -->
+<div class="absolute inset-0 z-50 flex items-center justify-center bg-surface-container-lowest/80 backdrop-blur-sm">
+<div class="bg-surface border border-outline-variant rounded-xl p-xl flex flex-col items-center justify-center min-w-[300px] shadow-2xl">
+<div class="loader mb-lg"></div>
+<h3 class="font-headline-sm text-headline-sm text-on-surface mb-xs">Rebinding camera...</h3>
+<p class="font-body-md text-body-md text-on-surface-variant text-center max-w-[250px]">
+                    Applying resolution settings and initializing hardware pipelines.
+                </p>
+<div class="mt-md w-full bg-surface-container-high h-1 rounded-full overflow-hidden">
+<div class="h-full bg-primary w-1/3 animate-pulse rounded-full"></div>
+</div>
+</div>
+</div>
+</main>
+<!-- Bottom Nav Bar (Mobile) -->
+<nav class="fixed bottom-0 left-0 w-full z-50 flex justify-around items-center h-20 px-sm pb-safe bg-surface dark:bg-surface border-t border-outline-variant dark:border-outline-variant md:hidden">
+<a class="flex flex-col items-center justify-center text-on-surface-variant dark:text-on-surface-variant px-4 py-1 hover:text-primary dark:hover:text-primary" href="#">
+<span class="material-symbols-outlined">sensors</span>
+<span class="font-label-sm text-label-sm mt-1">Stream</span>
+</a>
+<a class="flex flex-col items-center justify-center text-on-surface-variant dark:text-on-surface-variant px-4 py-1 hover:text-primary dark:hover:text-primary" href="#">
+<span class="material-symbols-outlined">settings_input_component</span>
+<span class="font-label-sm text-label-sm mt-1">Settings</span>
+</a>
+<a class="flex flex-col items-center justify-center bg-secondary-container dark:bg-secondary-container text-primary dark:text-primary rounded-xl px-4 py-1 scale-95 transition-transform duration-150" href="#">
+<span class="material-symbols-outlined" data-weight="fill">camera_roll</span>
+<span class="font-label-sm text-label-sm mt-1">Lenses</span>
+</a>
+<a class="flex flex-col items-center justify-center text-on-surface-variant dark:text-on-surface-variant px-4 py-1 hover:text-primary dark:hover:text-primary" href="#">
+<span class="material-symbols-outlined">terminal</span>
+<span class="font-label-sm text-label-sm mt-1">Logs</span>
+</a>
+</nav>
+</body></html>
