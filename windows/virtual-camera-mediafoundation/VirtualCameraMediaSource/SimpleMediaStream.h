@@ -7,6 +7,8 @@
 
 #include "SimpleMediaSource.h"
 #include "VirtualCameraMediaSource.h"
+#include "SimpleFrameGenerator.h"
+#include "SharedMemoryClient.h"
 
 namespace winrt::WindowsSample::implementation
 {
@@ -69,6 +71,7 @@ namespace winrt::WindowsSample::implementation
 
         DWORD m_dwStreamId = 0;
         MFSampleAllocatorUsage m_allocatorUsage;
+        SharedMemoryClient m_shmClient;
     };
 }
 

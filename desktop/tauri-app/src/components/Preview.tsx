@@ -48,6 +48,12 @@ export default function Preview({ baseUrl, fitMode, serverStatus }: PreviewProps
     }
   }, [isError]);
 
+  useEffect(() => {
+    const handleReload = () => reloadPreview();
+    window.addEventListener('reload-preview', handleReload);
+    return () => window.removeEventListener('reload-preview', handleReload);
+  }, []);
+
   const rot = parseInt(serverStatus?.displayRotation || '0') || 0;
   const layout = serverStatus?.aspectRatio || '16:9';
   const mirror = serverStatus?.mirror || false;

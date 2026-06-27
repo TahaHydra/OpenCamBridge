@@ -282,9 +282,14 @@ HRESULT VCamApp()
         {
             case 1: // Interactive install of virtual camera
             {
-                wil::com_ptr_nothrow<IMFVirtualCamera> spVirtualCamera;
-                RETURN_IF_FAILED_MSG(SelectRegisterVirtualCamera(&spVirtualCamera), "Register Virtual Camera failed");
-                RETURN_IF_FAILED(spVirtualCamera->Shutdown());
+                static wil::com_ptr_nothrow<IMFVirtualCamera> s_spVirtualCamera;
+                
+                RETURN_IF_FAILED_MSG(
+                    SelectRegisterVirtualCamera(&s_spVirtualCamera),
+                    "Register Virtual Camera failed"
+                );
+
+                LOG_COMMENT(L"OpenCamBridge Camera is running. Keep this installer process open while testing.");
                 break;
             }
 
@@ -370,6 +375,34 @@ int wmain(int argc, wchar_t* argv[])
 
     LOG_COMMENT(L"Virtual Camera simple application !");
     RETURN_IF_FAILED(MFStartup(MF_VERSION));
+
+    bool isHostMode = false;
+    for (int i = 1; i < argc; i++) {
+        if (_wcsicmp(argv[i], L"--mode") == 0 && i + 1 < argc && _wcsicmp(argv[i+1], L"host") == 0) {
+            isHostMode = true;
+        }
+    }
+
+    if (isHostMode)
+    {
+        LOG_COMMENT(L"Running in HOST mode for Tauri...");
+        static wil::com_ptr_nothrow<IMFVirtualCamera> s_spVirtualCamera;
+        
+        SimpleMediaSourceUT test;
+        HRESULT hr = test.CreateVirtualCamera(MFVirtualCameraLifetime_Session, MFVirtualCameraAccess_CurrentUser, &s_spVirtualCamera);
+        if (FAILED(hr)) {
+            LOG_ERROR(L"Failed to register Virtual Camera in host mode: 0x%08X", hr);
+            return hr;
+        }
+
+        LOG_COMMENT(L"OpenCamBridge Camera host is running. Press Ctrl+C to exit.");
+        
+        // Wait indefinitely until killed by Tauri
+        while (true) {
+            Sleep(1000);
+        }
+        return 0;
+    }
 
     if (argc == 2)
     {

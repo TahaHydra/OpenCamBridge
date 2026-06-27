@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <Import Project="..\packages\Microsoft.Windows.CppWinRT.3.0.260520.1\build\native\Microsoft.Windows.CppWinRT.props" Condition="Exists('..\packages\Microsoft.Windows.CppWinRT.3.0.260520.1\build\native\Microsoft.Windows.CppWinRT.props')" />
   <Import Project="$(SolutionDir)packages\Microsoft.Windows.CppWinRT.2.0.220608.4\build\native\Microsoft.Windows.CppWinRT.props" Condition="Exists('$(SolutionDir)packages\Microsoft.Windows.CppWinRT.2.0.220608.4\build\native\Microsoft.Windows.CppWinRT.props')" />
@@ -50,6 +50,7 @@
     <ClCompile Include="HWMediaStream.cpp" />
     <ClCompile Include="pch.cpp" />
     <ClCompile Include="SimpleFrameGenerator.cpp" />
+    <ClCompile Include="SharedMemoryClient.cpp" />
     <ClCompile Include="SimpleMediaSource.cpp" />
     <ClCompile Include="VirtualCameraMediaSourceActivate.cpp" />
     <ClCompile Include="SimpleMediaStream.cpp" />
@@ -63,6 +64,7 @@
     <ClInclude Include="HWMediaStream.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="SimpleFrameGenerator.h" />
+    <ClInclude Include="SharedMemoryClient.h" />
     <ClInclude Include="SimpleMediaSource.h" />
     <ClInclude Include="VirtualCameraMediaSourceActivate.h" />
     <ClInclude Include="SimpleMediaStream.h" />

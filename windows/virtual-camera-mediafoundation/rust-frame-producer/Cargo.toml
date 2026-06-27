@@ -1,0 +1,18 @@
+[package]
+name = "rust-frame-producer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+image = "0.24"
+reqwest = { version = "0.11", features = ["blocking"] }
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO"
+] }
