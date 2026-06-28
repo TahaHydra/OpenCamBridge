@@ -1,3 +1,7 @@
+# ABANDONED EXPERIMENT — NOT CURRENT ARCHITECTURE
+
+Current production architecture is: Android MJPEG -> rust-frame-producer -> ProgramData IPC framebuffer -> Media Foundation VirtualCameraMediaSource -> OpenCamBridge Camera -> OBS/Teams/etc.
+
 # Windows Virtual Camera Implementation Plan
 
 This document outlines the technical plan for exposing the OpenCamBridge MJPEG stream as a native Windows webcam, allowing it to be used in applications like Microsoft Teams, Zoom, and Discord.
@@ -87,3 +91,4 @@ Avoid attempting to write a custom DirectShow `.ax` filter right now. While it s
 ### Troubleshooting
 - **Password Error:** If you get an authentication error, ensure the password exactly matches what is set in OBS WebSocket settings. If you forget it, click "Show Connect Info" inside OBS.
 - **Source Not Capturing:** If the OBS feed is a black screen, open OBS manually, find the `OpenCamBridge Clean Feed` source, double click it, and ensure the Window dropdown is targeting `tauri-app.exe`.
+

@@ -1,3 +1,7 @@
+# ABANDONED EXPERIMENT — NOT CURRENT ARCHITECTURE
+
+Current production architecture is: Android MJPEG -> rust-frame-producer -> ProgramData IPC framebuffer -> Media Foundation VirtualCameraMediaSource -> OpenCamBridge Camera -> OBS/Teams/etc.
+
 # Windows Virtual Camera Prototype
 
 ## Objective
@@ -41,3 +45,4 @@ We evaluated DirectShow and Media Foundation APIs. To build a rapid, standalone 
 **Next Steps:**
 - Establish an IPC mechanism (e.g., Local Sockets or Shared Memory) between the Tauri app and a Rust daemon.
 - Route decoded Android MJPEG frames out to the `virtualcam` backend.
+

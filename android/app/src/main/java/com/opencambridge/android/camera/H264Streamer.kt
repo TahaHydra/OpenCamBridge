@@ -101,10 +101,20 @@ class H264Streamer(
                 val height = StreamState.height.get()
                 val fps = StreamState.fps.get()
 
+                // TODO: H264Streamer starts MediaCodec before knowing actual CameraX selected resolution.
+                // Before real H264, configure codec after selected ImageAnalysis resolution is confirmed, or enforce exact match.
                 startCodec(width, height, fps)
 
+                val resSelector = ResolutionPolicy.buildSelector(
+                    profile = StreamState.profile.get(),
+                    requestedWidth = width,
+                    requestedHeight = height,
+                    allowNative = StreamState.profile.get() == "native",
+                    allowAspectFallback = false
+                )
+
                 val imageAnalysis = ImageAnalysis.Builder()
-                    .setTargetResolution(android.util.Size(width, height))
+                    .setResolutionSelector(resSelector)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                     .build()
@@ -113,18 +123,19 @@ class H264Streamer(
                 StreamState.imageAnalysisUseCase = imageAnalysis
                 
                 val preview = Preview.Builder()
-                    .setTargetResolution(android.util.Size(width, height))
+                    .setResolutionSelector(resSelector)
                     .build()
                 StreamState.previewUseCase = preview
 
                 val surfaceProvider = StreamState.surfaceProvider
 
                 try {
-                    val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis, preview)
+                    val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis)
                     
                     withContext(Dispatchers.Main) {
                         if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
                             preview.setSurfaceProvider(surfaceProvider)
+                            useCases.add(preview)
                         }
                         currentCamera = provider.bindToLifecycle(
                             lifecycleOwner, 
@@ -132,6 +143,22 @@ class H264Streamer(
                             *useCases.toTypedArray()
                         )
                         observeCameraControls()
+                        
+                        val resolution = imageAnalysis.resolutionInfo?.resolution
+                        if (resolution != null) {
+                            val sensorRot = imageAnalysis.resolutionInfo?.rotationDegrees ?: 0
+                            val isRotated = sensorRot % 180 != 0
+                            val effW = if (isRotated) resolution.height else resolution.width
+                            val effH = if (isRotated) resolution.width else resolution.height
+                            
+                            StreamState.selectedRawWidth.set(resolution.width)
+                            StreamState.selectedRawHeight.set(resolution.height)
+                            StreamState.selectedEffectiveWidth.set(effW)
+                            StreamState.selectedEffectiveHeight.set(effH)
+                            StreamState.normalizedForPolicy.set(true)
+                            
+                            Log.i("H264Streamer", "Selected Resolution: ${resolution.width}x${resolution.height} (Effective: ${effW}x${effH})")
+                        }
                     }
                     
                     StreamState.streaming.set(true)
@@ -288,6 +315,29 @@ class H264Streamer(
 
             val width = imageProxy.width
             val height = imageProxy.height
+            
+            val actualRatio = width.toFloat() / height
+            val aspect16_9 = 16f / 9f
+            val aspect4_3 = 4f / 3f
+            
+            if (kotlin.math.abs(actualRatio - aspect16_9) < 0.1 || kotlin.math.abs(1f/actualRatio - aspect16_9) < 0.1) {
+                StreamState.selectedAspectRatio.set("16:9")
+            } else if (kotlin.math.abs(actualRatio - aspect4_3) < 0.1 || kotlin.math.abs(1f/actualRatio - aspect4_3) < 0.1) {
+                StreamState.selectedAspectRatio.set("4:3")
+            } else {
+                StreamState.selectedAspectRatio.set(String.format(java.util.Locale.US, "%.2f", actualRatio))
+            }
+            
+            val reqAspect = StreamState.requestedAspectRatio.get()
+            StreamState.aspectRatioMatch.set(reqAspect.startsWith(StreamState.selectedAspectRatio.get()))
+            
+            val targetW = StreamState.width.get()
+            val targetH = StreamState.height.get()
+            val rotatedW = if (StreamState.rotationDegrees.get() % 180 != 0) height else width
+            val rotatedH = if (StreamState.rotationDegrees.get() % 180 != 0) width else height
+            
+            StreamState.resizeNeeded.set(rotatedW != targetW || rotatedH != targetH)
+            
             val frameSize = width * height + (width / 2) * (height / 2) * 2
 
             if (nv12Buffer?.size != frameSize) nv12Buffer = ByteArray(frameSize)

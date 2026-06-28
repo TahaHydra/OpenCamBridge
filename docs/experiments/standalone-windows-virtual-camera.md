@@ -1,3 +1,7 @@
+# ABANDONED EXPERIMENT — NOT CURRENT ARCHITECTURE
+
+Current production architecture is: Android MJPEG -> rust-frame-producer -> ProgramData IPC framebuffer -> Media Foundation VirtualCameraMediaSource -> OpenCamBridge Camera -> OBS/Teams/etc.
+
 # Standalone Windows Virtual Camera Architecture
 
 ## Overview
@@ -80,3 +84,4 @@ We leverage the MIT-licensed `UnityCapture` DirectShow filter to act as our `Ope
 * **Cleanup:** Run `unregister.ps1` to scrub the CLSID keys from `HKCU`.
 
 > **Important:** Why does OBS fallback still exist? Unsigned DirectShow `.ax` DLLs may be rejected by strict Desktop applications (e.g., native Discord desktop or Teams) if Windows Signature Mitigation is active. Browsers and the Windows Camera app accept them without issues. OBS Virtual Camera bypasses this because OBS digitally signs their drivers.
+

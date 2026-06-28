@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Camera, Unplug, Zap } from 'lucide-react';
+import { Camera, Unplug, Zap, Monitor } from 'lucide-react';
 import Preview from './components/Preview';
 import ControlPanel from './components/ControlPanel';
 import './App.css';
@@ -74,6 +74,7 @@ export default function App() {
   const [serverStatus, setServerStatus] = useState<any>(null);
   const [fitMode, setFitMode] = useState('fill');
   const [obsMode, setObsMode] = useState(false);
+  const [previewOff, setPreviewOff] = useState(false);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -153,10 +154,20 @@ export default function App() {
               <strong>Camera Error:</strong> {serverStatus.lastError}
             </div>
           )}
-          <Preview baseUrl={baseUrl} fitMode={fitMode} serverStatus={serverStatus} />
+          {!previewOff ? (
+            <Preview baseUrl={baseUrl} fitMode={fitMode} serverStatus={serverStatus} />
+          ) : (
+            <div className="preview-stage glass-panel" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+              <div style={{ textAlign: 'center', color: '#888' }}>
+                <Monitor size={48} style={{ opacity: 0.5, marginBottom: 16 }} />
+                <p>Preview Disabled for Performance Diagnostics</p>
+                <p style={{ fontSize: '0.8rem', marginTop: 8 }}>Frames are still being captured and sent to the Virtual Camera.</p>
+              </div>
+            </div>
+          )}
         </div>
         
-        <ControlPanel baseUrl={baseUrl} fitMode={fitMode} setFitMode={setFitMode} onEnterObsMode={() => setObsMode(true)} />
+        <ControlPanel baseUrl={baseUrl} fitMode={fitMode} setFitMode={setFitMode} onEnterObsMode={() => setObsMode(true)} previewOff={previewOff} setPreviewOff={setPreviewOff} />
       </main>
     </div>
   );

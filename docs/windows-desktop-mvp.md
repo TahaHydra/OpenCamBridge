@@ -14,7 +14,7 @@ The OpenCamBridge Desktop MVP provides a lightweight Windows client to preview t
 * **ADB Requirement:** Requires a USB connection and manual ADB port forwarding. No automatic LAN discovery yet.
 
 ## Future Phases
-1. **Standalone Virtual Camera:** Eventually integrate a standalone Frame Server or DirectShow driver.
+1. **Standalone Virtual Camera:** Eventually integrate a standalone Frame Server or Media Foundation driver.
 2. **H.264 Native Decoder:** Feed the `/stream.h264` byte-stream directly into `FFmpeg` or a Windows hardware decoder for zero-latency preview.
 3. **USB Auto-Discovery & Wi-Fi Pairing:** Eliminate the need to manually run `adb forward`.
 
@@ -71,8 +71,8 @@ OpenCamBridge Desktop now includes built-in OBS automation.
 * **Device Connection:** Ensure the Android Ktor API is reachable.
 * **Camera Config:** Select front/back lens, resolution, and target FPS.
 * **Stream View:** Clean rendering of the MJPEG feed.
-* **Virtual Camera Export (Native):** Provide a `rust-feeder.exe` wrapper in the UI to spawn the standalone `OpenCamBridge Camera` device without requiring OBS.
-* **Virtual Camera Export (Fallback):** Provide the OBS WebSockets "Browser Source" workflow for restrictive apps (like Discord Desktop) that block unsigned DirectShow DLLs.
+* **Virtual Camera Export (Native):** Provide a `rust-frame-producer.exe` wrapper in the UI to spawn the standalone `OpenCamBridge Camera` device without requiring OBS.
+* **Virtual Camera Export (Fallback):** Provide the OBS WebSockets "Browser Source" workflow for restrictive apps (like Discord Desktop) that block unsigned Media Foundation DLLs.
 
 1. Install **OBS Studio** and enable the **WebSocket Server** (Tools > WebSocket Server Settings). Ensure it is running on the default port `4455`.
 2. Open the OpenCamBridge Desktop app.

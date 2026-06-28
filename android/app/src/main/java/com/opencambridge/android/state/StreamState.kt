@@ -34,8 +34,12 @@ object StreamState {
     val h264KeyframeInterval = AtomicInteger(2)
 
     val cameraId = AtomicReference("0")
-    val width = AtomicInteger(1280)
-    val height = AtomicInteger(720)
+    val width = AtomicInteger(1280) // requested capture width
+    val height = AtomicInteger(720) // requested capture height
+    val outputWidth = AtomicInteger(1280) // requested output width
+    val outputHeight = AtomicInteger(720) // requested output height
+    val profile = AtomicReference("balanced")
+    
     val jpegQuality = AtomicInteger(85)
     val fps = AtomicInteger(30)
     val previewFitMode = AtomicReference("fill")
@@ -58,9 +62,32 @@ object StreamState {
     val sensorOrientation = AtomicInteger(0)
     val frameWidth = AtomicInteger(0)
     val frameHeight = AtomicInteger(0)
+    val encodedWidth = AtomicInteger(0)
+    val encodedHeight = AtomicInteger(0)
+    val rotationApplied = AtomicBoolean(false)
+    
+    // Resolution Selection Metrics
+    val selectedRawWidth = AtomicInteger(0)
+    val selectedRawHeight = AtomicInteger(0)
+    val selectedEffectiveWidth = AtomicInteger(0)
+    val selectedEffectiveHeight = AtomicInteger(0)
+    val normalizedForPolicy = AtomicBoolean(false)
+    val resolutionPolicy = AtomicReference("unknown")
+    val fallbackUsed = AtomicBoolean(false)
+    
+    val requestedAspectRatio = AtomicReference("unknown")
+    val selectedAspectRatio = AtomicReference("unknown")
+    val aspectRatioMatch = AtomicBoolean(false)
+    val resizeNeeded = AtomicBoolean(false)
+
+    // Bandwidth metrics
+    val targetBandwidthMbps = AtomicInteger(0)
+    val bytesSentThisSecond = AtomicLong(0L)
+    val estimatedMbps = AtomicReference("0.0")
 
     /** Latest JPEG frame bytes, updated by MjpegStreamer. Null before first frame. */
     val latestFrame = AtomicReference<ByteArray?>(null)
+    val latestFrameRevision = AtomicLong(0L)
     
     /** SurfaceProvider for CameraX Preview use case */
     var surfaceProvider: androidx.camera.core.Preview.SurfaceProvider? = null
@@ -94,6 +121,9 @@ object StreamState {
         cameraId = cameraId.get(),
         width = width.get(),
         height = height.get(),
+        outputWidth = outputWidth.get(),
+        outputHeight = outputHeight.get(),
+        profile = profile.get(),
         fps = fps.get(),
         jpegQuality = jpegQuality.get(),
         previewFitMode = previewFitMode.get(),
@@ -106,10 +136,26 @@ object StreamState {
         sensorOrientation = sensorOrientation.get(),
         frameWidth = frameWidth.get(),
         frameHeight = frameHeight.get(),
+        encodedWidth = encodedWidth.get(),
+        encodedHeight = encodedHeight.get(),
+        rotationApplied = rotationApplied.get(),
+        targetBandwidthMbps = targetBandwidthMbps.get(),
+        estimatedMbps = estimatedMbps.get(),
         isFramePortrait = frameHeight.get() > frameWidth.get(),
         isFrameLandscape = frameWidth.get() >= frameHeight.get(),
         displayRotation = displayRotation.get(),
-        mirror = mirror.get()
+        mirror = mirror.get(),
+        requestedAspectRatio = requestedAspectRatio.get(),
+        selectedAspectRatio = selectedAspectRatio.get(),
+        aspectRatioMatch = aspectRatioMatch.get(),
+        resizeNeeded = resizeNeeded.get(),
+        selectedRawWidth = selectedRawWidth.get(),
+        selectedRawHeight = selectedRawHeight.get(),
+        selectedEffectiveWidth = selectedEffectiveWidth.get(),
+        selectedEffectiveHeight = selectedEffectiveHeight.get(),
+        normalizedForPolicy = normalizedForPolicy.get(),
+        resolutionPolicy = resolutionPolicy.get(),
+        fallbackUsed = fallbackUsed.get()
     )
 }
 
@@ -131,6 +177,9 @@ data class StreamStatusDto(
     val cameraId: String,
     val width: Int,
     val height: Int,
+    val outputWidth: Int,
+    val outputHeight: Int,
+    val profile: String,
     val fps: Int,
     val jpegQuality: Int,
     val previewFitMode: String,
@@ -143,8 +192,24 @@ data class StreamStatusDto(
     val sensorOrientation: Int = 0,
     val frameWidth: Int = 0,
     val frameHeight: Int = 0,
+    val encodedWidth: Int = 0,
+    val encodedHeight: Int = 0,
+    val rotationApplied: Boolean = false,
+    val targetBandwidthMbps: Int = 0,
+    val estimatedMbps: String = "0.0",
     val isFramePortrait: Boolean = false,
     val isFrameLandscape: Boolean = false,
     val displayRotation: String,
-    val mirror: Boolean
+    val mirror: Boolean,
+    val requestedAspectRatio: String = "unknown",
+    val selectedAspectRatio: String = "unknown",
+    val aspectRatioMatch: Boolean = false,
+    val resizeNeeded: Boolean = false,
+    val selectedRawWidth: Int = 0,
+    val selectedRawHeight: Int = 0,
+    val selectedEffectiveWidth: Int = 0,
+    val selectedEffectiveHeight: Int = 0,
+    val normalizedForPolicy: Boolean = false,
+    val resolutionPolicy: String = "unknown",
+    val fallbackUsed: Boolean = false
 )

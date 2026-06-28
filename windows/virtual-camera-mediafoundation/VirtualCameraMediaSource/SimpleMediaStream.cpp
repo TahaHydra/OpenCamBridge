@@ -4,12 +4,6 @@
 
 #include "pch.h"
 
-#define NUM_IMAGE_ROWS 720
-#define NUM_IMAGE_COLS 1280
-#define BYTES_PER_PIXEL 4
-#define IMAGE_BUFFER_SIZE_BYTES (NUM_IMAGE_ROWS * NUM_IMAGE_COLS * BYTES_PER_PIXEL)
-#define IMAGE_ROW_SIZE_BYTES (NUM_IMAGE_COLS * BYTES_PER_PIXEL)
-
 namespace winrt::WindowsSample::implementation
 {
     HRESULT SimpleMediaStream::Initialize(
@@ -29,23 +23,30 @@ namespace winrt::WindowsSample::implementation
         m_dwStreamId = dwStreamId;
         m_allocatorUsage = allocatorUsage;
 
-        const uint32_t NUM_MEDIATYPES = 1;
+        const uint32_t NUM_MEDIATYPES = 3;
         wil::unique_cotaskmem_array_ptr<wil::com_ptr_nothrow<IMFMediaType>> mediaTypeList = wilEx::make_unique_cotaskmem_array<wil::com_ptr_nothrow<IMFMediaType>>(NUM_MEDIATYPES);
 
-        // Initialize media type and set the video output media type.
-        wil::com_ptr_nothrow<IMFMediaType> spMediaType;
-        RETURN_IF_FAILED(MFCreateMediaType(&spMediaType));
-        spMediaType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        spMediaType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-        spMediaType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        spMediaType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
-        MFSetAttributeSize(spMediaType.get(), MF_MT_FRAME_SIZE, NUM_IMAGE_COLS, NUM_IMAGE_ROWS);
-        MFSetAttributeRatio(spMediaType.get(), MF_MT_FRAME_RATE, 30, 1);
-        // frame size * pixle bit size * framerate
-        uint32_t bitrate = (uint32_t)(NUM_IMAGE_COLS * NUM_IMAGE_ROWS * 4 * 8* 30);
-        spMediaType->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
-        MFSetAttributeRatio(spMediaType.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-        mediaTypeList[0] = spMediaType.detach();
+        auto createMediaType = [](uint32_t width, uint32_t height, wil::com_ptr_nothrow<IMFMediaType>& spMediaType) -> HRESULT {
+            RETURN_IF_FAILED(MFCreateMediaType(&spMediaType));
+            spMediaType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+            spMediaType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+            spMediaType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+            spMediaType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
+            MFSetAttributeSize(spMediaType.get(), MF_MT_FRAME_SIZE, width, height);
+            MFSetAttributeRatio(spMediaType.get(), MF_MT_FRAME_RATE, 30, 1);
+            uint32_t bitrate = (uint32_t)(width * height * 4 * 8 * 30);
+            spMediaType->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
+            MFSetAttributeRatio(spMediaType.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+            return S_OK;
+        };
+
+        wil::com_ptr_nothrow<IMFMediaType> spMediaType0, spMediaType1, spMediaType2;
+        RETURN_IF_FAILED(createMediaType(1920, 1080, spMediaType0));
+        mediaTypeList[0] = spMediaType0.detach();
+        RETURN_IF_FAILED(createMediaType(1280, 720, spMediaType1));
+        mediaTypeList[1] = spMediaType1.detach();
+        RETURN_IF_FAILED(createMediaType(960, 540, spMediaType2));
+        mediaTypeList[2] = spMediaType2.detach();
 
         RETURN_IF_FAILED(MFCreateAttributes(&m_spAttributes, 10));
         RETURN_IF_FAILED(_SetStreamAttributes(m_spAttributes.get()));
@@ -197,12 +198,17 @@ namespace winrt::WindowsSample::implementation
             &bufferLength));
         
 
-        HRESULT hrFrame = m_shmClient.ReadFrame(pbuf, bufferLength, pitch, NUM_IMAGE_COLS, NUM_IMAGE_ROWS);
+        UINT32 width = 1280, height = 720;
+        if (m_spMediaType) {
+            MFGetAttributeSize(m_spMediaType.get(), MF_MT_FRAME_SIZE, &width, &height);
+        }
+
+        HRESULT hrFrame = m_shmClient.ReadFrame(pbuf, bufferLength, pitch, width, height);
         if (FAILED(hrFrame)) {
             // Log fallback if desired
             RETURN_IF_FAILED(m_spFrameGenerator->CreateFrame(pbuf, bufferLength, pitch, m_rgbMask));
         }
-        //RETURN_IF_FAILED(WriteSampleData(pbuf, bufferLength, pitch, NUM_IMAGE_COLS, NUM_IMAGE_ROWS));
+        //RETURN_IF_FAILED(WriteSampleData(pbuf, bufferLength, pitch, width, height));
         RETURN_IF_FAILED(buffer2D->Unlock2D());
 
         RETURN_IF_FAILED(sample->SetSampleTime(MFGetSystemTime()));

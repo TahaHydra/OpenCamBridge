@@ -1,6 +1,8 @@
 package com.opencambridge.android.server
 
 import android.content.Context
+import android.hardware.camera2.CameraCharacteristics
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import com.opencambridge.android.camera.CameraRepository
 import com.opencambridge.android.camera.H264Streamer
 import com.opencambridge.android.state.SettingsManager
@@ -107,10 +109,12 @@ class ControlServer(
                 get("/api/camera/controls")        { serveCameraControls(call) }
                 get("/api/settings")               { serveGetSettings(call) }
                 get("/api/logs")                   { serveGetLogs(call) }
+                get("/api/camera/capabilities")    { serveCameraCapabilities(call) }
                 
                 post("/api/stream/start")          { serveStreamStart(call) }
                 post("/api/stream/stop")           { serveStreamStop(call) }
                 post("/api/stream/recover")        { serveStreamRecover(call) }
+                get("/api/stream/metrics")         { serveStreamMetrics(call) }
                 post("/api/camera/switch")         { serveCameraSwitch(call) }
                 
                 // Settings
@@ -881,6 +885,64 @@ class ControlServer(
         call.respond(StreamState.toStatusDto())
     }
     
+    private suspend fun serveCameraCapabilities(call: RoutingCall) {
+        try {
+            val providerFuture = androidx.camera.lifecycle.ProcessCameraProvider.getInstance(context)
+            val provider = providerFuture.get()
+            if (provider == null) {
+                call.respond(HttpStatusCode.ServiceUnavailable, SimpleResult(false, "Camera provider not ready"))
+                return
+            }
+
+            val capabilities = mutableListOf<Map<String, Any>>()
+            val cameraInfos = provider.availableCameraInfos
+
+            for (camInfo in cameraInfos) {
+                val facing = if (camInfo.lensFacing == androidx.camera.core.CameraSelector.LENS_FACING_BACK) "back"
+                             else if (camInfo.lensFacing == androidx.camera.core.CameraSelector.LENS_FACING_FRONT) "front"
+                             else "external"
+
+                val zoomState = camInfo.zoomState.value
+                val minZoom = zoomState?.minZoomRatio ?: 1.0f
+                val maxZoom = zoomState?.maxZoomRatio ?: 1.0f
+
+                var label = "$facing camera"
+                var sensorRotation = camInfo.sensorRotationDegrees
+                
+                try {
+                    val c2info = Camera2CameraInfo.from(camInfo)
+                    val id = c2info.cameraId
+                    
+                    label = "${facing} camera $id"
+                    
+                    val focalLengths = c2info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    if (focalLengths != null && focalLengths.isNotEmpty()) {
+                        val minFocal = focalLengths.minOrNull() ?: 50f
+                        if (minFocal < 3.0f) label = "${facing} ultrawide"
+                        else if (minFocal > 5.0f) label = "${facing} telephoto"
+                        else label = "${facing} wide/main"
+                    }
+                    
+                    val map = mutableMapOf<String, Any>(
+                        "id" to id,
+                        "facing" to facing,
+                        "label" to label,
+                        "minZoom" to minZoom,
+                        "maxZoom" to maxZoom,
+                        "sensorRotation" to sensorRotation
+                    )
+                    capabilities.add(map)
+                } catch (e: Exception) {
+                    // fallback if Camera2Interop fails
+                }
+            }
+
+            call.respond(capabilities)
+        } catch (e: Exception) {
+            call.respond(HttpStatusCode.InternalServerError, SimpleResult(false, "Error: ${e.message}"))
+        }
+    }
+
     private suspend fun serveCameraControls(call: RoutingCall) {
         call.respond(
             CameraControlsDto(
@@ -1029,6 +1091,7 @@ class ControlServer(
     }
 
     private suspend fun ByteWriteChannel.streamMjpegFrames() {
+        var lastRevision = -1L
         try {
             while (currentCoroutineContext().isActive) {
                 // Throttle based on requested FPS
@@ -1037,15 +1100,26 @@ class ControlServer(
                 
                 if (StreamState.lifecycleState.get() != com.opencambridge.android.state.LifecycleState.STREAMING) break
                 
+                val currentRev = StreamState.latestFrameRevision.get()
+                if (currentRev == lastRevision) {
+                    delay(5)
+                    continue
+                }
+                
                 val frame = StreamState.latestFrame.get()
                 if (frame != null && !StreamState.rebindInProgress.get()) {
-                    val header = "--$MJPEG_BOUNDARY\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.size}\r\n\r\n"
-                    writeFully(header.toByteArray(Charsets.US_ASCII))
+                    lastRevision = currentRev
+                    val headerStr = "--$MJPEG_BOUNDARY\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.size}\r\n\r\n"
+                    val headerBytes = headerStr.toByteArray(Charsets.US_ASCII)
+                    writeFully(headerBytes)
                     writeFully(frame)
                     writeFully("\r\n".toByteArray(Charsets.US_ASCII))
                     flush()
+                    
+                    StreamState.bytesSentThisSecond.addAndGet((headerBytes.size + frame.size + 2).toLong())
+                } else {
+                    delay(delayMs)
                 }
-                delay(delayMs)
             }
         } catch (_: Exception) {
             // Client disconnected
@@ -1079,6 +1153,32 @@ class ControlServer(
                 resolution = "${StreamState.width.get()}x${StreamState.height.get()}",
                 fps = StreamState.fps.get(),
                 h264Bitrate = StreamState.h264Bitrate.get()
+            )
+        )
+    }
+
+    private suspend fun serveStreamMetrics(call: RoutingCall) {
+        call.respond(
+            StreamMetricsDto(
+                fps = StreamState.fps.get(),
+                droppedFrames = 0,
+                latestFrameRevision = StreamState.latestFrameRevision.get(),
+                estimatedMbps = StreamState.estimatedMbps.get(),
+                targetBandwidthMbps = StreamState.targetBandwidthMbps.get(),
+                encodedWidth = StreamState.encodedWidth.get(),
+                encodedHeight = StreamState.encodedHeight.get(),
+                rotationApplied = StreamState.rotationApplied.get(),
+                requestedAspectRatio = StreamState.requestedAspectRatio.get(),
+                selectedAspectRatio = StreamState.selectedAspectRatio.get(),
+                aspectRatioMatch = StreamState.aspectRatioMatch.get(),
+                resizeNeeded = StreamState.resizeNeeded.get(),
+                selectedRawWidth = StreamState.selectedRawWidth.get(),
+                selectedRawHeight = StreamState.selectedRawHeight.get(),
+                selectedEffectiveWidth = StreamState.selectedEffectiveWidth.get(),
+                selectedEffectiveHeight = StreamState.selectedEffectiveHeight.get(),
+                normalizedForPolicy = StreamState.normalizedForPolicy.get(),
+                resolutionPolicy = StreamState.resolutionPolicy.get(),
+                fallbackUsed = StreamState.fallbackUsed.get()
             )
         )
     }
@@ -1127,6 +1227,9 @@ data class UpdateSettingsRequest(
     val cameraId: String? = null,
     val width: Int? = null,
     val height: Int? = null,
+    val outputWidth: Int? = null,
+    val outputHeight: Int? = null,
+    val profile: String? = null,
     val fps: Int? = null,
     val jpegQuality: Int? = null,
     val previewFitMode: String? = null,
@@ -1140,7 +1243,8 @@ data class UpdateSettingsRequest(
     val accessToken: String? = null,
     val streamMode: String? = null,
     val h264Bitrate: Int? = null,
-    val h264KeyframeInterval: Int? = null
+    val h264KeyframeInterval: Int? = null,
+    val targetBandwidthMbps: Int? = null
 )
 
 @Serializable
@@ -1154,3 +1258,26 @@ private data class TorchRequest(val enabled: Boolean)
 
 @Serializable
 private data class AutofocusRequest(val enabled: Boolean)
+
+@Serializable
+private data class StreamMetricsDto(
+    val fps: Int, 
+    val droppedFrames: Int, 
+    val latestFrameRevision: Long,
+    val estimatedMbps: String = "0.0",
+    val targetBandwidthMbps: Int = 0,
+    val encodedWidth: Int = 0,
+    val encodedHeight: Int = 0,
+    val rotationApplied: Boolean = false,
+    val requestedAspectRatio: String = "unknown",
+    val selectedAspectRatio: String = "unknown",
+    val aspectRatioMatch: Boolean = false,
+    val resizeNeeded: Boolean = false,
+    val selectedRawWidth: Int = 0,
+    val selectedRawHeight: Int = 0,
+    val selectedEffectiveWidth: Int = 0,
+    val selectedEffectiveHeight: Int = 0,
+    val normalizedForPolicy: Boolean = false,
+    val resolutionPolicy: String = "unknown",
+    val fallbackUsed: Boolean = false
+)

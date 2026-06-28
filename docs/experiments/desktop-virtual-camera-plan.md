@@ -1,3 +1,7 @@
+# ABANDONED EXPERIMENT — NOT CURRENT ARCHITECTURE
+
+Current production architecture is: Android MJPEG -> rust-frame-producer -> ProgramData IPC framebuffer -> Media Foundation VirtualCameraMediaSource -> OpenCamBridge Camera -> OBS/Teams/etc.
+
 # Virtual Camera Implementation Plan
 
 The current Desktop Companion App is an "MVP 1" build that only provides stream preview, settings control, and connection management. It does **not** expose the phone stream as a native webcam to the Windows operating system (e.g., for use in Zoom, Teams, or Discord).
@@ -37,3 +41,4 @@ Instead of building our own driver, we can leverage the open-source OBS Virtual 
 
 1. **Evaluate Latency**: Once H.264 is fully vetted, measure if the Rust -> DirectShow bridge adds unacceptable latency.
 2. **Develop Windows PoC**: Start by writing a simple Media Foundation Virtual Camera filter in C++ that receives an RGB frame via shared memory and displays it in Windows Camera.
+

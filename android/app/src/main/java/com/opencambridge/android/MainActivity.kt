@@ -162,10 +162,14 @@ class MainActivity : ComponentActivity() {
 
     private fun startStreamService() {
         val intent = StreamService.startIntent(this)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start StreamService", e)
         }
     }
 

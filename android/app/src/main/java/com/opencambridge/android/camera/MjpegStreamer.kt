@@ -70,10 +70,16 @@ class MjpegStreamer(
 
                 val selector = buildSelector(StreamState.cameraId.get())
 
+                val resSelector = ResolutionPolicy.buildSelector(
+                    profile = StreamState.profile.get(),
+                    requestedWidth = StreamState.width.get(),
+                    requestedHeight = StreamState.height.get(),
+                    allowNative = StreamState.profile.get() == "native",
+                    allowAspectFallback = false
+                )
+
                 val imageAnalysis = ImageAnalysis.Builder()
-                    .setTargetResolution(
-                        android.util.Size(StreamState.width.get(), StreamState.height.get())
-                    )
+                    .setResolutionSelector(resSelector)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                     .build()
@@ -82,18 +88,19 @@ class MjpegStreamer(
                 StreamState.imageAnalysisUseCase = imageAnalysis
                 
                 val preview = Preview.Builder()
-                    .setTargetResolution(android.util.Size(StreamState.width.get(), StreamState.height.get()))
+                    .setResolutionSelector(resSelector)
                     .build()
                 StreamState.previewUseCase = preview
 
                 val surfaceProvider = StreamState.surfaceProvider
 
                 try {
-                    val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis, preview)
+                    val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis)
                     
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                         if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
                             preview.setSurfaceProvider(surfaceProvider)
+                            useCases.add(preview)
                         }
                         currentCamera = provider.bindToLifecycle(
                             lifecycleOwner, 
@@ -101,6 +108,23 @@ class MjpegStreamer(
                             *useCases.toTypedArray()
                         )
                         observeCameraControls()
+                        
+                        // Extract actual resolution selected by CameraX
+                        val resolution = imageAnalysis.resolutionInfo?.resolution
+                        if (resolution != null) {
+                            val sensorRot = imageAnalysis.resolutionInfo?.rotationDegrees ?: 0
+                            val isRotated = sensorRot % 180 != 0
+                            val effW = if (isRotated) resolution.height else resolution.width
+                            val effH = if (isRotated) resolution.width else resolution.height
+                            
+                            StreamState.selectedRawWidth.set(resolution.width)
+                            StreamState.selectedRawHeight.set(resolution.height)
+                            StreamState.selectedEffectiveWidth.set(effW)
+                            StreamState.selectedEffectiveHeight.set(effH)
+                            StreamState.normalizedForPolicy.set(true)
+                            
+                            android.util.Log.i("MjpegStreamer", "Selected Resolution: ${resolution.width}x${resolution.height} (Effective: ${effW}x${effH})")
+                        }
                     }
                     
                     StreamState.streaming.set(true)
@@ -200,8 +224,35 @@ class MjpegStreamer(
             StreamState.frameWidth.set(imageProxy.width)
             StreamState.frameHeight.set(imageProxy.height)
             
+            // For metrics only - what was actually sent
+            StreamState.encodedWidth.set(imageProxy.width)
+            StreamState.encodedHeight.set(imageProxy.height)
+            
             val width = imageProxy.width
             val height = imageProxy.height
+            
+            val actualRatio = width.toFloat() / height
+            val aspect16_9 = 16f / 9f
+            val aspect4_3 = 4f / 3f
+            
+            if (kotlin.math.abs(actualRatio - aspect16_9) < 0.1 || kotlin.math.abs(1f/actualRatio - aspect16_9) < 0.1) {
+                StreamState.selectedAspectRatio.set("16:9")
+            } else if (kotlin.math.abs(actualRatio - aspect4_3) < 0.1 || kotlin.math.abs(1f/actualRatio - aspect4_3) < 0.1) {
+                StreamState.selectedAspectRatio.set("4:3")
+            } else {
+                StreamState.selectedAspectRatio.set(String.format(java.util.Locale.US, "%.2f", actualRatio))
+            }
+            
+            val reqAspect = StreamState.requestedAspectRatio.get()
+            StreamState.aspectRatioMatch.set(reqAspect.startsWith(StreamState.selectedAspectRatio.get()))
+            
+            val targetW = StreamState.width.get()
+            val targetH = StreamState.height.get()
+            val rotatedW = if (StreamState.rotationDegrees.get() % 180 != 0) height else width
+            val rotatedH = if (StreamState.rotationDegrees.get() % 180 != 0) width else height
+            
+            StreamState.resizeNeeded.set(rotatedW != targetW || rotatedH != targetH)
+            
             val frameSize = width * height + (width / 2) * (height / 2) * 2
 
             if (nv21Buffer?.size != frameSize) nv21Buffer = ByteArray(frameSize)
@@ -214,6 +265,7 @@ class MjpegStreamer(
             yuvImage.compressToJpeg(Rect(0, 0, width, height), StreamState.jpegQuality.get(), out)
             
             StreamState.latestFrame.set(out.toByteArray())
+            StreamState.latestFrameRevision.incrementAndGet()
         } catch (e: Exception) {
             android.util.Log.e("MjpegStreamer", "Frame processing failed", e)
         } finally {

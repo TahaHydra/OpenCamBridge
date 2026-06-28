@@ -22,6 +22,7 @@ import com.opencambridge.android.state.LifecycleState
 import com.opencambridge.android.state.SettingsManager
 import com.opencambridge.android.state.StreamState
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -87,7 +88,11 @@ class StreamService : LifecycleService() {
         }
 
         val ip = NetworkUtils.getWifiIpAddress(applicationContext) ?: "device-ip"
-        startForeground(NOTIFICATION_ID, buildNotification(ip))
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, buildNotification(ip), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification(ip))
+        }
 
         controlServer.start()
         val port = StreamState.port.get()
@@ -96,6 +101,31 @@ class StreamService : LifecycleService() {
         
         // Auto-start stream
         startCamera()
+        
+        // Start bandwidth monitoring
+        lifecycleScope.launch {
+            while (isActive) {
+                kotlinx.coroutines.delay(2000)
+                
+                val sent = StreamState.bytesSentThisSecond.getAndSet(0L)
+                val bps = sent / 2.0 // average over 2 seconds
+                val mbps = (bps * 8.0) / 1_000_000.0
+                StreamState.estimatedMbps.set(String.format(java.util.Locale.US, "%.2f", mbps))
+                
+                val targetBandwidth = StreamState.targetBandwidthMbps.get()
+                if (targetBandwidth > 0 && StreamState.streamMode.get() == "mjpeg" && StreamState.lifecycleState.get() == LifecycleState.STREAMING) {
+                    val currentQ = StreamState.jpegQuality.get()
+                    if (mbps > targetBandwidth * 1.15 && currentQ > 40) {
+                        StreamState.jpegQuality.set((currentQ - 3).coerceAtLeast(40))
+                        StreamState.incrementRevision("auto-bandwidth")
+                    } else if (mbps < targetBandwidth * 0.75 && currentQ < 95) {
+                        StreamState.jpegQuality.set((currentQ + 2).coerceAtMost(95))
+                        StreamState.incrementRevision("auto-bandwidth")
+                    }
+                }
+            }
+        }
+        
         return START_STICKY
     }
 
@@ -261,6 +291,17 @@ class StreamService : LifecycleService() {
             requiresSettingsSave = true
         }
         
+        if (req.outputWidth != null || req.outputHeight != null) {
+            val finalOW = req.outputWidth ?: StreamState.outputWidth.get()
+            val finalOH = req.outputHeight ?: StreamState.outputHeight.get()
+            StreamState.outputWidth.set(finalOW)
+            StreamState.outputHeight.set(finalOH)
+            requiresRebind = true
+            requiresSettingsSave = true
+        }
+        
+        req.profile?.let { StreamState.profile.set(it); requiresRebind = true; requiresSettingsSave = true }
+        
         // --- Display-Only & Control Settings (No Rebind) ---
         req.accessMode?.let { StreamState.accessMode.set(it); requiresSettingsSave = true }
         req.port?.let { StreamState.port.set(it); requiresSettingsSave = true }
@@ -272,6 +313,7 @@ class StreamService : LifecycleService() {
         req.displayRotation?.let { StreamState.displayRotation.set(it); requiresSettingsSave = true }
         req.mirror?.let { StreamState.mirror.set(it); requiresSettingsSave = true }
         req.localPreviewEnabled?.let { StreamState.localPreviewEnabled.set(it); requiresSettingsSave = true }
+        req.targetBandwidthMbps?.let { StreamState.targetBandwidthMbps.set(it); requiresSettingsSave = true }
 
         // Dynamic preview surface detach
         if (req.localPreviewEnabled == false) {

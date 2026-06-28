@@ -17,10 +17,12 @@ interface VirtualCamMetrics {
   dropped_jpegs: number;
   jpeg_queue_len: number;
   decode_ms_avg: number;
+  rotate_ms_avg: number;
   resize_ms_avg: number;
   write_ms_avg: number;
   total_pipeline_ms: number;
   bytes_per_sec: number;
+  estimated_mbps: string;
   pixel_format: string;
   last_error: string | null;
 }
@@ -42,22 +44,30 @@ interface ControlPanelProps {
   fitMode: string;
   setFitMode: (mode: string) => void;
   onEnterObsMode?: () => void;
+  previewOff: boolean;
+  setPreviewOff: (val: boolean) => void;
 }
 
-export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode }: ControlPanelProps) {
+export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, previewOff, setPreviewOff }: ControlPanelProps) {
   const [cameras, setCameras] = useState<any[]>([]);
   const [settings, setSettings] = useState({
     cameraId: '0',
     profile: 'balanced',
     width: 1280,
     height: 720,
+    outputWidth: 1280,
+    outputHeight: 720,
     fps: 30,
     jpegQuality: 85,
     displayRotation: '0',
     aspectRatio: '16:9',
     mirror: false,
     torchEnabled: false,
-    linearZoom: 0.0
+    linearZoom: 0.0,
+    streamMode: 'mjpeg',
+    targetBandwidthMbps: 0,
+    h264Bitrate: 4000000,
+    h264KeyframeInterval: 2
   });
   const [isSyncing, setIsSyncing] = useState(false);
 
@@ -70,6 +80,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode }: Contr
   const [isVcamRegistering, setIsVcamRegistering] = useState(false);
   const [vcamMessage, setVcamMessage] = useState('');
   const [androidStreamStatus, setAndroidStreamStatus] = useState('unknown');
+  const [androidMetrics, setAndroidMetrics] = useState<any>(null);
   const [now, setNow] = useState(Date.now() / 1000);
 
   const handleStartObs = async () => {
@@ -113,7 +124,11 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode }: Contr
             aspectRatio: status.aspectRatio || prev.aspectRatio,
             mirror: status.mirror || prev.mirror,
             torchEnabled: status.torchEnabled || prev.torchEnabled,
-            linearZoom: status.linearZoom !== undefined ? status.linearZoom : prev.linearZoom
+            linearZoom: status.linearZoom !== undefined ? status.linearZoom : prev.linearZoom,
+            streamMode: status.streamMode || prev.streamMode,
+            targetBandwidthMbps: status.targetBandwidthMbps || prev.targetBandwidthMbps,
+            h264Bitrate: status.h264Bitrate || prev.h264Bitrate,
+            h264KeyframeInterval: status.h264KeyframeInterval || prev.h264KeyframeInterval
           }));
         }
       })
@@ -144,6 +159,11 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode }: Contr
         })
         .catch(() => setAndroidStreamStatus('error'));
 
+      fetch(`${baseUrl}/api/stream/metrics`)
+        .then(res => res.json())
+        .then(data => setAndroidMetrics(data))
+        .catch(() => setAndroidMetrics(null));
+
     }, 1000);
 
     return () => clearInterval(interval);
@@ -168,15 +188,16 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode }: Contr
   const handleStartProducer = async (s: any) => {
     const targetUrl = `${baseUrl}/stream.mjpeg`;
     console.log('[Tauri UI] Calling start_virtual_camera_feeder with', {
-      url: targetUrl, width: s.width, height: s.height, fps: s.fps, quality: s.jpegQuality
+      url: targetUrl, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, quality: s.jpegQuality
     });
     try {
       await invoke('start_virtual_camera_feeder', { 
         url: targetUrl,
-        width: s.width,
-        height: s.height,
+        width: s.outputWidth || s.width,
+        height: s.outputHeight || s.height,
         fps: s.fps,
-        quality: s.jpegQuality
+        quality: s.jpegQuality,
+        profile: s.profile
       });
       console.log('[Tauri UI] start_virtual_camera_feeder completed');
     } catch (e: any) {
@@ -219,10 +240,32 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode }: Contr
     setVcamMessage('Starting feed...');
     try {
       await startStream();
+      
+      let ready = false;
+      for (let i = 0; i < 15; i++) {
+        try {
+          const mRes = await fetch(`${baseUrl}/api/stream/metrics`);
+          if (mRes.ok) {
+            const mData = await mRes.json();
+            if (mData.latestFrameRevision > 0 || (mData.encodedWidth > 0)) {
+              ready = true;
+              break;
+            }
+          }
+        } catch (e) {}
+        await new Promise(r => setTimeout(r, 500));
+      }
+      
+      if (!ready) {
+        throw new Error("Android stream did not produce frames within timeout.");
+      }
+
       await handleStartProducer(settings);
       setVcamMessage('');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
-      setTimeout(() => window.dispatchEvent(new CustomEvent('reload-preview')), 1000);
+      if (!previewOff) {
+        setTimeout(() => window.dispatchEvent(new CustomEvent('reload-preview')), 1000);
+      }
     } catch (e: any) {
       setVcamMessage(`Error: ${e.toString()}`);
     }
@@ -272,12 +315,15 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode }: Contr
   };
 
   const updateProfile = async (profile: string) => {
-    let width = 1280; let height = 720; let fps = 30; let jpegQuality = 85;
-    if (profile === 'low-latency') { width = 640; height = 480; fps = 30; jpegQuality = 70; }
-    else if (profile === 'quality') { width = 1920; height = 1080; fps = 30; jpegQuality = 90; }
-    else if (profile === 'experimental-1080p60') { width = 1920; height = 1080; fps = 60; jpegQuality = 85; }
+    let captureWidth = 1280; let captureHeight = 720; 
+    let outputWidth = 1280; let outputHeight = 720; 
+    let fps = 30; let jpegQuality = 85;
+    
+    if (profile === 'low-latency') { captureWidth = 960; captureHeight = 540; outputWidth = 960; outputHeight = 540; fps = 30; jpegQuality = 70; }
+    else if (profile === 'quality') { captureWidth = 1920; captureHeight = 1080; outputWidth = 1920; outputHeight = 1080; fps = 30; jpegQuality = 90; }
+    else if (profile === 'balanced') { captureWidth = 1280; captureHeight = 720; outputWidth = 1280; outputHeight = 720; fps = 30; jpegQuality = 85; }
 
-    const newSettings = { ...settings, profile, width, height, fps, jpegQuality };
+    const newSettings = { ...settings, profile, width: captureWidth, height: captureHeight, outputWidth, outputHeight, fps, jpegQuality };
     setSettings(newSettings);
     setIsSyncing(true);
 
@@ -285,7 +331,18 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode }: Contr
       await fetch(`${baseUrl}/api/settings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ width, height, fps, jpegQuality })
+        body: JSON.stringify({
+          profile,
+          width: captureWidth,
+          height: captureHeight,
+          outputWidth,
+          outputHeight,
+          fps,
+          jpegQuality,
+          aspectRatio: "16:9",
+          streamMode: settings.streamMode,
+          targetBandwidthMbps: settings.targetBandwidthMbps
+        })
       });
       if (vcamState?.running) {
         await invoke('stop_virtual_camera_feeder');
@@ -441,6 +498,61 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode }: Contr
               </div>
             </div>
 
+            {androidMetrics && (
+              <div style={{ marginBottom: 8, paddingBottom: 8, borderBottom: '1px solid #222' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                  <span>Requested Aspect:</span>
+                  <span>{androidMetrics.requestedAspectRatio}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                  <span>Selected Aspect:</span>
+                  <span style={{ color: androidMetrics.aspectRatioMatch ? '#51cf66' : '#ffb300' }}>{androidMetrics.selectedAspectRatio}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                  <span>Native Encode Dim:</span>
+                  <span>{androidMetrics.encodedWidth}x{androidMetrics.encodedHeight}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                  <span>Rotation Resizing:</span>
+                  <span style={{ color: androidMetrics.resizeNeeded ? '#ffb300' : '#51cf66' }}>{androidMetrics.resizeNeeded ? 'Required' : 'Native Match'}</span>
+                </div>
+                
+                {/* Degradation Warnings */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8 }}>
+                  {androidMetrics.fallbackUsed && (
+                    <div style={{ padding: '4px 8px', background: 'rgba(255, 179, 0, 0.1)', color: '#ffb300', border: '1px solid rgba(255, 179, 0, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
+                      ⚠️ Fallback resolution used: {androidMetrics.resolutionPolicy}
+                    </div>
+                  )}
+                  {settings.profile === 'native' && (
+                    <div style={{ padding: '4px 8px', background: 'rgba(255, 107, 107, 0.1)', color: '#ff6b6b', border: '1px solid rgba(255, 107, 107, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
+                      ⚠️ Native mode active: High CPU & latency expected
+                    </div>
+                  )}
+                  {androidMetrics.selectedEffectiveWidth > settings.width * 1.5 && (
+                    <div style={{ padding: '4px 8px', background: 'rgba(255, 107, 107, 0.1)', color: '#ff6b6b', border: '1px solid rgba(255, 107, 107, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
+                      ⚠️ Source too large: Profile degraded, selected {androidMetrics.selectedRawWidth}x{androidMetrics.selectedRawHeight} instead of {settings.width}x{settings.height}
+                    </div>
+                  )}
+                  {vcamState?.metrics && vcamState.metrics.decoded_fps < settings.fps - 5 && (
+                    <div style={{ padding: '4px 8px', background: 'rgba(255, 179, 0, 0.1)', color: '#ffb300', border: '1px solid rgba(255, 179, 0, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
+                      ⚠️ FPS below target: {vcamState.metrics.decoded_fps} / {settings.fps}
+                    </div>
+                  )}
+                  {vcamState?.metrics && vcamState.metrics.source_width !== vcamState.metrics.output_width && (
+                    <div style={{ padding: '4px 8px', background: 'rgba(255, 179, 0, 0.1)', color: '#ffb300', border: '1px solid rgba(255, 179, 0, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
+                      ⚠️ Heavy resize: {vcamState.metrics.source_width}x{vcamState.metrics.source_height} &rarr; {vcamState.metrics.output_width}x{vcamState.metrics.output_height}
+                    </div>
+                  )}
+                  {settings.profile === 'experimental-1080p60' && settings.outputWidth === 1280 && (
+                    <div style={{ padding: '4px 8px', background: 'rgba(255, 179, 0, 0.1)', color: '#ffb300', border: '1px solid rgba(255, 179, 0, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
+                      ⚠️ Virtual output mismatch: Capture requested 1080p60, virtual output currently 720p.
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {vcamState.metrics ? (
               <>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
@@ -453,8 +565,16 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode }: Contr
                     <span>{vcamState.metrics.total_pipeline_ms} ms</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#888' }}>Est. Bandwidth:</span>
+                    <span style={{ color: '#4dabf7' }}>{vcamState.metrics.estimated_mbps} Mbps</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                     <span style={{ color: '#888' }}>Decode Time:</span>
                     <span>{vcamState.metrics.decode_ms_avg} ms</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#888' }}>Rotate Time:</span>
+                    <span>{vcamState.metrics.rotate_ms_avg} ms</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                     <span style={{ color: '#888' }}>Resize Time:</span>
@@ -500,10 +620,10 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode }: Contr
             value={settings.profile}
             onChange={(e) => updateProfile(e.target.value)}
           >
-            <option value="low-latency">Low Latency (640x480 @ 30fps, Q70)</option>
+            <option value="low-latency">Low Latency (960x540 @ 30fps, Q70)</option>
             <option value="balanced">Balanced (1280x720 @ 30fps, Q85)</option>
             <option value="quality">Quality (1920x1080 @ 30fps, Q90)</option>
-            <option value="experimental-1080p60">Experimental (1080p @ 60fps, Q85)</option>
+            <option value="experimental-1080p60" disabled>Experimental (1080p @ 60fps) - Not Stable</option>
           </select>
         </div>
       </div>
@@ -554,6 +674,75 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode }: Contr
               Reset Zoom
             </button>
           )}
+        </div>
+
+        <div className="control-item">
+          <label>Stream Codec</label>
+          <select 
+            className="input-control" 
+            value={settings.streamMode} 
+            onChange={(e) => updateSetting('streamMode', e.target.value)}
+          >
+            <option value="mjpeg">MJPEG</option>
+            <option value="h264" disabled>H.264 (Experimental - Disabled in this batch)</option>
+          </select>
+        </div>
+
+        {settings.streamMode === 'mjpeg' ? (
+          <>
+            <div className="control-item" style={{ marginTop: 12 }}>
+              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>JPEG Quality</span>
+                <span>{settings.jpegQuality}%</span>
+              </label>
+              <input 
+                type="range" 
+                min="40" max="95" step="1"
+                style={{ width: '100%', marginTop: 8 }}
+                value={settings.jpegQuality}
+                onChange={(e) => updateSetting('jpegQuality', parseInt(e.target.value))}
+              />
+            </div>
+            
+            <div className="control-item" style={{ marginTop: 12 }}>
+              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Target Bandwidth (Auto Quality)</span>
+                <span>{settings.targetBandwidthMbps === 0 ? 'Off' : `${settings.targetBandwidthMbps} Mbps`}</span>
+              </label>
+              <input 
+                type="range" 
+                min="0" max="50" step="1"
+                style={{ width: '100%', marginTop: 8 }}
+                value={settings.targetBandwidthMbps}
+                onChange={(e) => updateSetting('targetBandwidthMbps', parseInt(e.target.value))}
+              />
+              <p style={{ fontSize: '0.75rem', color: '#888', marginTop: 4 }}>Set to 0 to disable automatic quality adjustment.</p>
+            </div>
+          </>
+        ) : (
+          <div style={{ marginTop: 12, padding: 12, background: 'rgba(255, 179, 0, 0.1)', borderRadius: 6, border: '1px solid rgba(255, 179, 0, 0.3)' }}>
+            <p style={{ fontSize: '0.8rem', color: '#ffb300', marginBottom: 12 }}>H.264 is currently experimental. UI controls are disabled in this batch.</p>
+            <div className="control-item">
+              <label>Bitrate (Mbps)</label>
+              <input type="range" min="1" max="50" value={4} disabled style={{ width: '100%', opacity: 0.5 }} />
+            </div>
+            <div className="control-row" style={{ marginTop: 8 }}>
+              <label>Low Latency Profile</label>
+              <input type="checkbox" checked disabled />
+            </div>
+          </div>
+        )}
+
+        <div className="control-row" style={{ marginTop: 20 }}>
+          <label style={{ fontSize: '0.9rem' }}>Disable Preview (Diagnostic)</label>
+          <label className="switch">
+            <input 
+              type="checkbox" 
+              checked={previewOff} 
+              onChange={(e) => setPreviewOff(e.target.checked)}
+            />
+            <span className="slider"></span>
+          </label>
         </div>
 
         <div className="control-item" style={{ marginTop: 20 }}>

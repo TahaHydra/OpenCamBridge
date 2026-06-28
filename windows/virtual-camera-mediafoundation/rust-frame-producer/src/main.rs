@@ -41,14 +41,14 @@ struct Args {
     #[arg(short, long)]
     url: Option<String>,
 
-    #[arg(long, default_value_t = 1280)]
-    width: u32,
+    #[arg(long)]
+    width: Option<u32>,
 
-    #[arg(long, default_value_t = 720)]
-    height: u32,
+    #[arg(long)]
+    height: Option<u32>,
 
-    #[arg(long, default_value_t = 30)]
-    fps: u32,
+    #[arg(long)]
+    fps: Option<u32>,
 
     #[arg(long)]
     quality: Option<u32>,
@@ -56,7 +56,7 @@ struct Args {
     #[arg(long)]
     latest_only: bool,
 
-    #[arg(long, default_value = "balanced")]
+    #[arg(long, default_value = "custom")]
     profile: String,
 }
 
@@ -230,7 +230,7 @@ fn generate_test_pattern(frame_counter: u64, width: u32, height: u32) -> Vec<u8>
     buf
 }
 
-fn start_mjpeg_reader(url: String, latest_jpeg: Arc<Mutex<Option<Vec<u8>>>>, http_jpeg_counter: Arc<Mutex<u32>>, dropped_jpeg_counter: Arc<Mutex<u32>>) {
+fn start_mjpeg_reader(url: String, latest_jpeg: Arc<Mutex<Option<Vec<u8>>>>, http_jpeg_counter: Arc<Mutex<u32>>, dropped_jpeg_counter: Arc<Mutex<u32>>, mjpeg_bytes_counter: Arc<Mutex<u64>>) {
     spawn(move || {
         loop {
             let client = reqwest::blocking::Client::builder()
@@ -263,6 +263,8 @@ fn start_mjpeg_reader(url: String, latest_jpeg: Arc<Mutex<Option<Vec<u8>>>>, htt
                                             *lock = Some(jpeg_data.to_vec());
                                             let mut http_count = http_jpeg_counter.lock().unwrap();
                                             *http_count += 1;
+                                            let mut bytes_lock = mjpeg_bytes_counter.lock().unwrap();
+                                            *bytes_lock += jpeg_data.len() as u64;
                                         }
 
                                         frame_buffer.drain(..end);
@@ -289,34 +291,40 @@ fn start_mjpeg_reader(url: String, latest_jpeg: Arc<Mutex<Option<Vec<u8>>>>, htt
 }
 
 fn main() {
-    let mut args = Args::parse();
+    let args = Args::parse();
     
-    // Process test profiles mapping
-    match args.profile.as_str() {
-        "low-latency" => { args.width = 640; args.height = 480; args.fps = 30; if args.quality.is_none() { args.quality = Some(70); } },
-        "balanced" => { args.width = 1280; args.height = 720; args.fps = 30; if args.quality.is_none() { args.quality = Some(85); } },
-        "quality" => { args.width = 1920; args.height = 1080; args.fps = 30; if args.quality.is_none() { args.quality = Some(90); } },
-        "experimental-1080p60" => { args.width = 1920; args.height = 1080; args.fps = 60; if args.quality.is_none() { args.quality = Some(85); } },
-        _ => {}
-    }
+    let defaults = match args.profile.as_str() {
+        "low-latency" => (960, 540, 30, 70),
+        "balanced" => (1280, 720, 30, 85),
+        "quality" => (1920, 1080, 30, 90),
+        "experimental-1080p60" => (1920, 1080, 60, 85),
+        _ => (1280, 720, 30, 85),
+    };
+
+    let width = args.width.unwrap_or(defaults.0);
+    let height = args.height.unwrap_or(defaults.1);
+    let fps = args.fps.unwrap_or(defaults.2);
+    let _quality = args.quality.unwrap_or(defaults.3); // Kept for completeness
 
     let ipc = SharedMemoryIpc::new().expect("Failed to initialize IPC");
 
     let mut frame_counter = 0u64;
-    let target_duration = Duration::from_millis(1000 / args.fps as u64);
+    let target_duration = Duration::from_millis(1000 / fps as u64);
     let mut last_print = Instant::now();
     let mut output_fps_counter = 0;
 
     let latest_jpeg = Arc::new(Mutex::new(None));
     let http_jpeg_counter = Arc::new(Mutex::new(0));
     let dropped_jpeg_counter = Arc::new(Mutex::new(0));
+    let mjpeg_bytes_counter = Arc::new(Mutex::new(0u64));
 
     if args.source == "mjpeg" {
         let url = args.url.clone().expect("URL is required for mjpeg source");
-        start_mjpeg_reader(url, latest_jpeg.clone(), http_jpeg_counter.clone(), dropped_jpeg_counter.clone());
+        start_mjpeg_reader(url, latest_jpeg.clone(), http_jpeg_counter.clone(), dropped_jpeg_counter.clone(), mjpeg_bytes_counter.clone());
     }
 
     let mut sum_decode_ms = 0;
+    let mut sum_rotate_ms = 0;
     let mut sum_resize_ms = 0;
     let mut sum_write_ms = 0;
     let mut sum_total_ms = 0;
@@ -329,9 +337,9 @@ fn main() {
         let mut loop_total_ms = 0;
 
         if args.source == "test-pattern" {
-            let frame = generate_test_pattern(frame_counter, args.width, args.height);
+            let frame = generate_test_pattern(frame_counter, width, height);
             let write_start = Instant::now();
-            ipc.write_frame(frame_counter, &frame, args.width, args.height);
+            ipc.write_frame(frame_counter, &frame, width, height);
             sum_write_ms += write_start.elapsed().as_millis() as u32;
             frame_counter += 1;
             output_fps_counter += 1;
@@ -356,17 +364,29 @@ fn main() {
                     }
                     sum_decode_ms += decode_start.elapsed().as_millis() as u32;
 
+                    let rotate_start = Instant::now();
+                    let needs_rotate = source_w < source_h && width >= height;
+                    let rotated_opt = if needs_rotate {
+                        Some(image::imageops::rotate90(&rgba))
+                    } else {
+                        None
+                    };
+                    let current_w = if needs_rotate { source_h } else { source_w };
+                    let current_h = if needs_rotate { source_w } else { source_h };
+                    let current_ref = if let Some(ref r) = rotated_opt { r } else { &rgba };
+                    sum_rotate_ms += rotate_start.elapsed().as_millis() as u32;
+
                     let resize_start = Instant::now();
-                    let final_frame = if source_w != args.width || source_h != args.height {
-                        let resized = image::imageops::resize(&rgba, args.width, args.height, image::imageops::FilterType::Triangle);
+                    let final_frame = if current_w != width || current_h != height {
+                        let resized = image::imageops::resize(current_ref, width, height, image::imageops::FilterType::Triangle);
                         resized.into_raw()
                     } else {
-                        rgba.into_raw()
+                        if let Some(r) = rotated_opt { r.into_raw() } else { rgba.into_raw() }
                     };
                     sum_resize_ms += resize_start.elapsed().as_millis() as u32;
 
                     let write_start = Instant::now();
-                    ipc.write_frame(frame_counter, &final_frame, args.width, args.height);
+                    ipc.write_frame(frame_counter, &final_frame, width, height);
                     sum_write_ms += write_start.elapsed().as_millis() as u32;
                     
                     frame_counter += 1;
@@ -382,6 +402,7 @@ fn main() {
             let mut http_fps = output_fps_counter;
             let mut dropped_jpegs = 0;
             let mut queue_len = 0;
+            let mut mjpeg_bytes = 0;
 
             if args.source == "mjpeg" {
                 let mut lock = http_jpeg_counter.lock().unwrap();
@@ -394,25 +415,33 @@ fn main() {
 
                 let jpeg_lock = latest_jpeg.lock().unwrap();
                 if jpeg_lock.is_some() { queue_len = 1; }
+                
+                let mut bytes_lock = mjpeg_bytes_counter.lock().unwrap();
+                mjpeg_bytes = *bytes_lock;
+                *bytes_lock = 0;
             }
 
             let denom = if output_fps_counter > 0 { output_fps_counter } else { 1 };
             let avg_decode = sum_decode_ms / denom;
+            let avg_rotate = sum_rotate_ms / denom;
             let avg_resize = sum_resize_ms / denom;
             let avg_write = sum_write_ms / denom;
             let avg_total = sum_total_ms / denom;
+            
+            let mbps = (mjpeg_bytes as f64 * 8.0) / 1_000_000.0;
 
-            println!(r#"{{"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"dropped_jpegs":{},"jpeg_queue_len":{},"decode_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"bytes_per_sec":{},"pixel_format":"BGRA32","last_error":null}}"#, 
-                args.source, args.profile, source_w, source_h, args.width, args.height, args.fps,
+            println!(r#"{{"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"dropped_jpegs":{},"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"BGRA32","last_error":null}}"#, 
+                args.source, args.profile, source_w, source_h, width, height, fps,
                 http_fps, decoded_fps_counter, output_fps_counter, dropped_jpegs, queue_len,
-                avg_decode, avg_resize, avg_write, avg_total,
-                output_fps_counter * (args.width * args.height * 4)
+                avg_decode, avg_rotate, avg_resize, avg_write, avg_total,
+                mjpeg_bytes, mbps
             );
 
             last_print = Instant::now();
             output_fps_counter = 0;
             decoded_fps_counter = 0;
             sum_decode_ms = 0;
+            sum_rotate_ms = 0;
             sum_resize_ms = 0;
             sum_write_ms = 0;
             sum_total_ms = 0;
