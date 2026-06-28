@@ -1160,7 +1160,10 @@ class ControlServer(
     private suspend fun serveStreamMetrics(call: RoutingCall) {
         call.respond(
             StreamMetricsDto(
-                fps = StreamState.fps.get(),
+                fps = StreamState.actualFps.get(),
+                requestedFps = StreamState.fps.get(),
+                actualFps = StreamState.actualFps.get(),
+                androidEncodeMsAvg = StreamState.androidEncodeMsAvg.get(),
                 droppedFrames = 0,
                 latestFrameRevision = StreamState.latestFrameRevision.get(),
                 estimatedMbps = StreamState.estimatedMbps.get(),
@@ -1261,7 +1264,10 @@ private data class AutofocusRequest(val enabled: Boolean)
 
 @Serializable
 private data class StreamMetricsDto(
-    val fps: Int, 
+    val fps: Int,
+    val requestedFps: Int = 0,
+    val actualFps: Int = 0,
+    val androidEncodeMsAvg: Double = 0.0,
     val droppedFrames: Int, 
     val latestFrameRevision: Long,
     val estimatedMbps: String = "0.0",

@@ -45,8 +45,12 @@ object ResolutionPolicy {
                         }
                     }
                 }
-                "balanced" -> {
-                    resolutionPolicyName = "strict_balanced"
+                "balanced", "balanced-720p60" -> {
+                    resolutionPolicyName = if (profile == "balanced-720p60") {
+                        "strict_balanced_720p60"
+                    } else {
+                        "strict_balanced"
+                    }
                     validSizes.addAll(supportedSizes.filter { isNearAspect(it, 16, 9) && landscapeW(it) <= 1920 })
                     validSizes.sortBy { size ->
                         val lw = landscapeW(size)

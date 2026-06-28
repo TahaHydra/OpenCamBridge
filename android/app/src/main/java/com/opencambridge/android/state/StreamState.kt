@@ -42,6 +42,10 @@ object StreamState {
     
     val jpegQuality = AtomicInteger(85)
     val fps = AtomicInteger(30)
+    val actualFps = AtomicInteger(0)
+    val framesThisSecond = AtomicInteger(0)
+    val fpsWindowStartMs = AtomicLong(System.currentTimeMillis())
+    val androidEncodeMsAvg = AtomicReference(0.0)
     val previewFitMode = AtomicReference("fill")
     val aspectRatio = AtomicReference("auto") // auto, 16:9, 4:3
     val zoomSpeed = AtomicReference("normal") // slow, normal, fast

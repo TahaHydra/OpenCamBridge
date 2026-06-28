@@ -121,12 +121,17 @@ pub fn start_virtual_camera_feeder(
     height: u32,
     fps: f64,
     quality: Option<u32>,
+    profile: Option<String>,
 ) -> Result<(), String> {
     println!(">>> [Tauri] start_virtual_camera_feeder called with width={}, height={}, fps={}", width, height, fps);
     let mut child_guard = state.child.lock().unwrap();
-    if child_guard.is_some() {
-        println!(">>> [Tauri] Feeder already running, skipping.");
-        return Ok(()); // Already running
+    if let Some(mut child) = child_guard.take() {
+        println!(">>> [Tauri] Found existing producer (PID {}). Stopping it.", child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        *state.last_error.lock().unwrap() = Some(format!("Killed previous producer for restart"));
+        *state.metrics.lock().unwrap() = None;
+        *state.last_metrics_time.lock().unwrap() = None;
     }
 
     let mut repo_root = std::env::current_dir().unwrap();
@@ -162,6 +167,10 @@ pub fn start_virtual_camera_feeder(
        
     if let Some(q) = quality {
         cmd.arg("--quality").arg(q.to_string());
+    }
+
+    if let Some(p) = profile {
+        cmd.arg("--profile").arg(p);
     }
 
     println!(">>> [Tauri] Executing exactly: {:?}", cmd);
@@ -263,6 +272,8 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
                 if !current_err.contains(&status.to_string()) {
                     *err_guard = Some(format!("Exited with {}. {}", status, current_err));
                 }
+                *state.metrics.lock().unwrap() = None;
+                *state.last_metrics_time.lock().unwrap() = None;
             }
             Ok(None) => {
                 // Still running
@@ -278,11 +289,19 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
     }
     
     let host_running = state.host_child.lock().unwrap().is_some();
-    let metrics = state.metrics.lock().unwrap().clone();
+    let mut metrics = state.metrics.lock().unwrap().clone();
     let registered = check_virtual_camera_backend();
     let producer_path = state.producer_path.lock().unwrap().clone();
     let last_error = state.last_error.lock().unwrap().clone();
     let last_metrics_time = state.last_metrics_time.lock().unwrap().clone();
+
+    if let Some(last_time) = last_metrics_time {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        if now > last_time + 3 {
+            metrics = None;
+            *state.metrics.lock().unwrap() = None;
+        }
+    }
 
     let mut repo_root = std::env::current_dir().unwrap();
     while !repo_root.join("windows").exists() && repo_root.parent().is_some() {

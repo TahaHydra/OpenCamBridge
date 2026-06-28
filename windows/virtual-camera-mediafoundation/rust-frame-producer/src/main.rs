@@ -296,6 +296,7 @@ fn main() {
     let defaults = match args.profile.as_str() {
         "low-latency" => (960, 540, 30, 70),
         "balanced" => (1280, 720, 30, 85),
+        "balanced-720p60" => (1280, 720, 60, 80),
         "quality" => (1920, 1080, 30, 90),
         "experimental-1080p60" => (1920, 1080, 60, 85),
         _ => (1280, 720, 30, 85),
@@ -309,7 +310,8 @@ fn main() {
     let ipc = SharedMemoryIpc::new().expect("Failed to initialize IPC");
 
     let mut frame_counter = 0u64;
-    let target_duration = Duration::from_millis(1000 / fps as u64);
+    let target_duration = Duration::from_secs_f64(1.0 / fps as f64);
+    let mut next_frame_deadline = Instant::now();
     let mut last_print = Instant::now();
     let mut output_fps_counter = 0;
 
@@ -399,14 +401,15 @@ fn main() {
         sum_total_ms += loop_total_ms;
 
         if last_print.elapsed().as_secs() >= 1 {
-            let mut http_fps = output_fps_counter;
+            let interval_secs = last_print.elapsed().as_secs_f64().max(0.001);
+            let mut http_fps = ((output_fps_counter as f64) / interval_secs).round() as u32;
             let mut dropped_jpegs = 0;
             let mut queue_len = 0;
             let mut mjpeg_bytes = 0;
 
             if args.source == "mjpeg" {
                 let mut lock = http_jpeg_counter.lock().unwrap();
-                http_fps = *lock;
+                http_fps = ((*lock as f64) / interval_secs).round() as u32;
                 *lock = 0;
 
                 let mut drop_lock = dropped_jpeg_counter.lock().unwrap();
@@ -429,10 +432,12 @@ fn main() {
             let avg_total = sum_total_ms / denom;
             
             let mbps = (mjpeg_bytes as f64 * 8.0) / 1_000_000.0;
+            let decoded_fps_normalized = ((decoded_fps_counter as f64) / interval_secs).round() as u32;
+            let written_fps_normalized = ((output_fps_counter as f64) / interval_secs).round() as u32;
 
             println!(r#"{{"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"dropped_jpegs":{},"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"BGRA32","last_error":null}}"#, 
                 args.source, args.profile, source_w, source_h, width, height, fps,
-                http_fps, decoded_fps_counter, output_fps_counter, dropped_jpegs, queue_len,
+                http_fps, decoded_fps_normalized, written_fps_normalized, dropped_jpegs, queue_len,
                 avg_decode, avg_rotate, avg_resize, avg_write, avg_total,
                 mjpeg_bytes, mbps
             );
@@ -447,9 +452,24 @@ fn main() {
             sum_total_ms = 0;
         }
 
-        let elapsed = start_time.elapsed();
-        if elapsed < target_duration {
-            sleep(target_duration - elapsed);
+        next_frame_deadline += target_duration;
+
+        let now = Instant::now();
+        if next_frame_deadline > now {
+            let remaining = next_frame_deadline - now;
+
+            if remaining > Duration::from_millis(2) {
+                sleep(remaining - Duration::from_millis(1));
+            }
+
+            while Instant::now() < next_frame_deadline {
+                std::thread::yield_now();
+            }
+        } else {
+            // If we are too far behind, reset the clock instead of accumulating lag.
+            if now.duration_since(next_frame_deadline) > target_duration {
+                next_frame_deadline = now;
+            }
         }
     }
 }

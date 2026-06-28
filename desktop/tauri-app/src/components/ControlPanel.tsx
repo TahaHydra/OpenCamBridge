@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Play, Square, Settings2, Sliders, RefreshCw, RotateCw, ZoomIn, ZoomOut, Monitor, Video, ShieldAlert } from 'lucide-react';
 import { connectAndSetupObs, ObsStatus } from '../services/obs';
 import { invoke } from '@tauri-apps/api/core';
@@ -69,6 +69,66 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
     h264Bitrate: 4000000,
     h264KeyframeInterval: 2
   });
+
+  const PROFILE_PRESETS: Record<string, any> = {
+    'low-latency': {
+      profile: 'low-latency',
+      width: 960,
+      height: 540,
+      outputWidth: 960,
+      outputHeight: 540,
+      fps: 30,
+      jpegQuality: 70,
+      aspectRatio: '16:9'
+    },
+    balanced: {
+      profile: 'balanced',
+      width: 1280,
+      height: 720,
+      outputWidth: 1280,
+      outputHeight: 720,
+      fps: 30,
+      jpegQuality: 85,
+      aspectRatio: '16:9'
+    },
+    'balanced-720p60': {
+      profile: 'balanced-720p60',
+      width: 1280,
+      height: 720,
+      outputWidth: 1280,
+      outputHeight: 720,
+      fps: 60,
+      jpegQuality: 80,
+      aspectRatio: '16:9'
+    },
+    quality: {
+      profile: 'quality',
+      width: 1920,
+      height: 1080,
+      outputWidth: 1920,
+      outputHeight: 1080,
+      fps: 30,
+      jpegQuality: 90,
+      aspectRatio: '16:9'
+    },
+    'experimental-1080p60': {
+      profile: 'experimental-1080p60',
+      width: 1920,
+      height: 1080,
+      outputWidth: 1920,
+      outputHeight: 1080,
+      fps: 60,
+      jpegQuality: 85,
+      aspectRatio: '16:9'
+    }
+  };
+
+  const settingsRef = useRef(settings);
+
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
   const [isSyncing, setIsSyncing] = useState(false);
 
   const [obsPassword, setObsPassword] = useState('');
@@ -188,7 +248,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
   const handleStartProducer = async (s: any) => {
     const targetUrl = `${baseUrl}/stream.mjpeg`;
     console.log('[Tauri UI] Calling start_virtual_camera_feeder with', {
-      url: targetUrl, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, quality: s.jpegQuality
+      url: targetUrl, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, quality: s.jpegQuality, profile: s.profile
     });
     try {
       await invoke('start_virtual_camera_feeder', { 
@@ -207,19 +267,20 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
   };
 
   const handleStartNativeCamera = async () => {
+    const s = settingsRef.current;
+  
     setVcamMessage('Starting pipeline...');
     try {
       if (!vcamState?.host_running) {
         await invoke('start_virtual_camera_host');
       }
-      if (!vcamState?.running) {
-        await startStream();
-        await handleStartProducer(settings);
-      }
+  
+      await restartFullPipelineWithSettings(s);
+  
       setVcamMessage('');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
-      setTimeout(() => window.dispatchEvent(new CustomEvent('reload-preview')), 1000);
     } catch (e: any) {
+      console.error('[Tauri UI] handleStartNativeCamera failed:', e);
       setVcamMessage(`Error: ${e.toString()}`);
     }
   };
@@ -237,36 +298,21 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
   };
 
   const handleStartFeedOnly = async () => {
+    const s = settingsRef.current;
+  
     setVcamMessage('Starting feed...');
     try {
-      await startStream();
-      
-      let ready = false;
-      for (let i = 0; i < 15; i++) {
-        try {
-          const mRes = await fetch(`${baseUrl}/api/stream/metrics`);
-          if (mRes.ok) {
-            const mData = await mRes.json();
-            if (mData.latestFrameRevision > 0 || (mData.encodedWidth > 0)) {
-              ready = true;
-              break;
-            }
-          }
-        } catch (e) {}
-        await new Promise(r => setTimeout(r, 500));
-      }
-      
-      if (!ready) {
-        throw new Error("Android stream did not produce frames within timeout.");
-      }
-
-      await handleStartProducer(settings);
+      await restartAndroidStreamWithSettings(s);
+      await handleStartProducer(s);
+  
       setVcamMessage('');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
+  
       if (!previewOff) {
         setTimeout(() => window.dispatchEvent(new CustomEvent('reload-preview')), 1000);
       }
     } catch (e: any) {
+      console.error('[Tauri UI] handleStartFeedOnly failed:', e);
       setVcamMessage(`Error: ${e.toString()}`);
     }
   };
@@ -282,77 +328,148 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
     }
   };
 
-  const updateSetting = async (key: string, value: any) => {
-    const newSettings = { ...settings, [key]: value };
-    setSettings(newSettings);
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+  const postSettingsToAndroid = async (s: any) => {
+    await fetch(`${baseUrl}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        profile: s.profile,
+        width: s.width,
+        height: s.height,
+        outputWidth: s.outputWidth,
+        outputHeight: s.outputHeight,
+        fps: s.fps,
+        jpegQuality: s.jpegQuality,
+        cameraId: s.cameraId,
+        aspectRatio: s.aspectRatio || '16:9',
+        streamMode: s.streamMode,
+        targetBandwidthMbps: s.targetBandwidthMbps,
+        h264Bitrate: s.h264Bitrate,
+        h264KeyframeInterval: s.h264KeyframeInterval,
+        localPreviewEnabled: !previewOff
+      })
+    });
+  };
+
+  const applySettingsAndRefreshPreview = async (nextSettings: any, keysChanged: string[]) => {
+    setSettings(nextSettings);
+    settingsRef.current = nextSettings;
     setIsSyncing(true);
 
     try {
-      if (key === 'torchEnabled') {
-        await fetch(`${baseUrl}/api/camera/torch`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ enabled: value })
-        });
-      } else if (key === 'linearZoom') {
-        await fetch(`${baseUrl}/api/camera/zoom`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ linearZoom: value })
-        });
+      const streamImpacting = ['profile', 'width', 'height', 'fps', 'jpegQuality', 'cameraId', 'streamMode'].some(k => keysChanged.includes(k));
+      const streamWasRunning = vcamState?.running || androidMetrics?.encodedWidth > 0;
+
+      if (streamImpacting && streamWasRunning) {
+        await restartFullPipelineWithSettings(nextSettings);
       } else {
-        await fetch(`${baseUrl}/api/settings`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ [key]: value })
-        });
+        await postSettingsToAndroid(nextSettings);
+        if (!previewOff) {
+          window.dispatchEvent(new CustomEvent('reload-preview'));
+        }
       }
-    } catch (err) {
-      console.error('Failed to update setting', err);
+    } catch (err: any) {
+      console.error('[Tauri UI] applySettingsAndRefreshPreview failed:', err);
+      setVcamMessage(`Settings apply failed: ${err.toString()}`);
     } finally {
       setIsSyncing(false);
     }
   };
 
-  const updateProfile = async (profile: string) => {
-    let captureWidth = 1280; let captureHeight = 720; 
-    let outputWidth = 1280; let outputHeight = 720; 
-    let fps = 30; let jpegQuality = 85;
+  const updateSetting = async (key: string, value: any) => {
+    const newSettings = { ...settingsRef.current, [key]: value };
     
-    if (profile === 'low-latency') { captureWidth = 960; captureHeight = 540; outputWidth = 960; outputHeight = 540; fps = 30; jpegQuality = 70; }
-    else if (profile === 'quality') { captureWidth = 1920; captureHeight = 1080; outputWidth = 1920; outputHeight = 1080; fps = 30; jpegQuality = 90; }
-    else if (profile === 'balanced') { captureWidth = 1280; captureHeight = 720; outputWidth = 1280; outputHeight = 720; fps = 30; jpegQuality = 85; }
-
-    const newSettings = { ...settings, profile, width: captureWidth, height: captureHeight, outputWidth, outputHeight, fps, jpegQuality };
-    setSettings(newSettings);
-    setIsSyncing(true);
-
-    try {
-      await fetch(`${baseUrl}/api/settings`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          profile,
-          width: captureWidth,
-          height: captureHeight,
-          outputWidth,
-          outputHeight,
-          fps,
-          jpegQuality,
-          aspectRatio: "16:9",
-          streamMode: settings.streamMode,
-          targetBandwidthMbps: settings.targetBandwidthMbps
-        })
-      });
-      if (vcamState?.running) {
-        await invoke('stop_virtual_camera_feeder');
-        await handleStartProducer(newSettings);
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setIsSyncing(false);
+    if (key === 'torchEnabled') {
+      setSettings(newSettings);
+      settingsRef.current = newSettings;
+      await fetch(`${baseUrl}/api/camera/torch`, { method: 'POST', body: JSON.stringify({ enabled: value }), headers: { 'Content-Type': 'application/json' }});
+      return;
+    } else if (key === 'linearZoom') {
+      setSettings(newSettings);
+      settingsRef.current = newSettings;
+      await fetch(`${baseUrl}/api/camera/zoom`, { method: 'POST', body: JSON.stringify({ linearZoom: value }), headers: { 'Content-Type': 'application/json' }});
+      return;
     }
+    
+    await applySettingsAndRefreshPreview(newSettings, [key]);
+  };
+
+  const waitForAndroidResolution = async (s: any, timeoutMs = 8000) => {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(`${baseUrl}/api/stream/metrics`);
+        if (res.ok) {
+          const m = await res.json();
+
+          const encodedOk =
+            Number(m.encodedWidth) === Number(s.width) &&
+            Number(m.encodedHeight) === Number(s.height);
+
+          const hasFrame =
+            Number(m.latestFrameRevision || 0) > 0 ||
+            Number(m.fps || 0) > 0 ||
+            Number(m.encodedWidth || 0) > 0;
+
+          if (encodedOk && hasFrame) {
+            return m;
+          }
+        }
+      } catch {}
+
+      await sleep(300);
+    }
+
+    throw new Error(
+      `Android did not rebind to ${s.width}x${s.height}. ` +
+      `Stop/start CameraX is broken or resolution policy rejected it.`
+    );
+  };
+
+  const restartAndroidStreamWithSettings = async (s: any) => {
+    console.log('[Tauri UI] Restarting Android stream with settings:', s);
+
+    await stopStream();
+    await sleep(500);
+
+    await postSettingsToAndroid(s);
+    await sleep(200);
+
+    await startStream();
+
+    const metrics = await waitForAndroidResolution(s);
+    console.log('[Tauri UI] Android stream rebound OK:', metrics);
+
+    return metrics;
+  };
+
+  const restartFullPipelineWithSettings = async (s: any) => {
+    console.log('[Tauri UI] Restarting full pipeline:', s);
+
+    await invoke('stop_virtual_camera_feeder');
+    await restartAndroidStreamWithSettings(s);
+    await handleStartProducer(s);
+
+    const state = await invoke<VirtualCamState>('get_virtual_camera_status');
+    setVcamState(state);
+
+    if (!previewOff) {
+      setTimeout(() => window.dispatchEvent(new CustomEvent('reload-preview')), 1000);
+    }
+  };
+
+  const updateProfile = async (profile: string) => {
+    const preset = PROFILE_PRESETS[profile];
+    if (!preset) {
+      console.error('Unknown profile:', profile);
+      return;
+    }
+  
+    const newSettings = { ...settingsRef.current, ...preset };
+    await applySettingsAndRefreshPreview(newSettings, ['profile', 'width', 'height', 'fps', 'jpegQuality']);
   };
 
   const handleRotate = async () => {
@@ -516,6 +633,16 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
                   <span>Rotation Resizing:</span>
                   <span style={{ color: androidMetrics.resizeNeeded ? '#ffb300' : '#51cf66' }}>{androidMetrics.resizeNeeded ? 'Required' : 'Native Match'}</span>
                 </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                  <span>Android FPS:</span>
+                  <span style={{ color: (androidMetrics.actualFps || androidMetrics.fps) >= settings.fps - 5 ? '#51cf66' : '#ffb300' }}>
+                    {androidMetrics.actualFps ?? androidMetrics.fps} / {settings.fps}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                  <span>Android JPEG Encode:</span>
+                  <span>{Number(androidMetrics.androidEncodeMsAvg || 0).toFixed(1)} ms</span>
+                </div>
                 
                 {/* Degradation Warnings */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8 }}>
@@ -547,6 +674,27 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
                   {settings.profile === 'experimental-1080p60' && settings.outputWidth === 1280 && (
                     <div style={{ padding: '4px 8px', background: 'rgba(255, 179, 0, 0.1)', color: '#ffb300', border: '1px solid rgba(255, 179, 0, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
                       ⚠️ Virtual output mismatch: Capture requested 1080p60, virtual output currently 720p.
+                    </div>
+                  )}
+                  {settings.profile === 'experimental-1080p60' && vcamState?.metrics && (
+                    <div style={{ padding: '8px', background: 'rgba(77, 171, 247, 0.1)', color: '#4dabf7', border: '1px solid rgba(77, 171, 247, 0.3)', borderRadius: 4, fontSize: '0.75rem', marginTop: 4 }}>
+                      <div style={{ fontWeight: 'bold', marginBottom: 4 }}>1080p60 Truth Metrics:</div>
+                      <div>Target: 60 FPS | Actual: {vcamState.metrics.written_fps} FPS</div>
+                      <div>
+                        Status: {
+                          vcamState.metrics.written_fps >= 55 ? <span style={{ color: '#51cf66' }}>OK</span> :
+                          vcamState.metrics.written_fps >= 45 ? <span style={{ color: '#ffb300' }}>Degraded</span> :
+                          <span style={{ color: '#ff6b6b' }}>Not Viable</span>
+                        }
+                      </div>
+                      <div style={{ marginTop: 4, fontStyle: 'italic', color: '#888' }}>
+                        Bottleneck Analysis:
+                        <ul style={{ margin: '2px 0 0 16px', padding: 0 }}>
+                          <li>Android Encode: {androidMetrics.encodedFps || 0} FPS ({androidMetrics.encodeMsAvg || 0}ms)</li>
+                          <li>Rust Decode: {vcamState.metrics.decode_ms_avg} ms</li>
+                          <li>IPC Write: {vcamState.metrics.write_ms_avg} ms</li>
+                        </ul>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -622,8 +770,9 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
           >
             <option value="low-latency">Low Latency (960x540 @ 30fps, Q70)</option>
             <option value="balanced">Balanced (1280x720 @ 30fps, Q85)</option>
+            <option value="balanced-720p60">Balanced 60 (1280x720 @ 60fps, Q80)</option>
             <option value="quality">Quality (1920x1080 @ 30fps, Q90)</option>
-            <option value="experimental-1080p60" disabled>Experimental (1080p @ 60fps) - Not Stable</option>
+            <option value="experimental-1080p60">Experimental (1080p @ 60fps)</option>
           </select>
         </div>
       </div>

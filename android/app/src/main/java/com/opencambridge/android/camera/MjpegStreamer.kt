@@ -78,18 +78,52 @@ class MjpegStreamer(
                     allowAspectFallback = false
                 )
 
-                val imageAnalysis = ImageAnalysis.Builder()
+                val targetFps = StreamState.fps.get()
+
+                val fpsRange = if (targetFps >= 60) {
+                    android.util.Range(60, 60)
+                } else {
+                    android.util.Range(30, 30)
+                }
+
+                val imageAnalysisBuilder = ImageAnalysis.Builder()
                     .setResolutionSelector(resSelector)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                    .build()
+
+                try {
+                    androidx.camera.camera2.interop.Camera2Interop.Extender(imageAnalysisBuilder)
+                        .setCaptureRequestOption(
+                            android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                            fpsRange
+                        )
+                    android.util.Log.i(
+                        "OpenCamBridge",
+                        "Binding MJPEG CameraX profile=${StreamState.profile.get()} requested=${StreamState.width.get()}x${StreamState.height.get()} fps=$targetFps fpsRange=$fpsRange preview=${StreamState.localPreviewEnabled.get()}"
+                    )
+                } catch (e: Exception) {
+                    android.util.Log.w("OpenCamBridge", "Could not set FPS range $fpsRange", e)
+                }
+
+                val imageAnalysis = imageAnalysisBuilder.build()
 
                 imageAnalysis.setAnalyzer(analysisExecutor, ::processFrame)
                 StreamState.imageAnalysisUseCase = imageAnalysis
                 
-                val preview = Preview.Builder()
+                val previewBuilder = Preview.Builder()
                     .setResolutionSelector(resSelector)
-                    .build()
+                    
+                try {
+                    androidx.camera.camera2.interop.Camera2Interop.Extender(previewBuilder)
+                        .setCaptureRequestOption(
+                            android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                            fpsRange
+                        )
+                } catch (e: Exception) {
+                    android.util.Log.w("OpenCamBridge", "Could not set FPS range on preview", e)
+                }
+
+                val preview = previewBuilder.build()
                 StreamState.previewUseCase = preview
 
                 val surfaceProvider = StreamState.surfaceProvider
@@ -260,12 +294,30 @@ class MjpegStreamer(
             
             yuvToNv21(imageProxy, nv21)
             
+            val encodeStartNs = System.nanoTime()
+
             val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
             val out = ByteArrayOutputStream()
             yuvImage.compressToJpeg(Rect(0, 0, width, height), StreamState.jpegQuality.get(), out)
+
+            val encodeMs = (System.nanoTime() - encodeStartNs) / 1_000_000.0
+            val prevAvg = StreamState.androidEncodeMsAvg.get()
+            val nextAvg = if (prevAvg <= 0.0) encodeMs else (prevAvg * 0.85 + encodeMs * 0.15)
+            StreamState.androidEncodeMsAvg.set(nextAvg)
             
             StreamState.latestFrame.set(out.toByteArray())
             StreamState.latestFrameRevision.incrementAndGet()
+
+            val now = System.currentTimeMillis()
+            StreamState.framesThisSecond.incrementAndGet()
+            val windowStart = StreamState.fpsWindowStartMs.get()
+
+            if (now - windowStart >= 1000L) {
+                if (StreamState.fpsWindowStartMs.compareAndSet(windowStart, now)) {
+                    val count = StreamState.framesThisSecond.getAndSet(0)
+                    StreamState.actualFps.set(count)
+                }
+            }
         } catch (e: Exception) {
             android.util.Log.e("MjpegStreamer", "Frame processing failed", e)
         } finally {

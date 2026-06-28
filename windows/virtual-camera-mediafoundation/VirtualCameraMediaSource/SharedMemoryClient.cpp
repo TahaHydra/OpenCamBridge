@@ -155,23 +155,39 @@ HRESULT SharedMemoryClient::ReadFrame(BYTE* pBuf, DWORD len, LONG pitch, DWORD w
         OpenCamBridgeFrameHeader* header = static_cast<OpenCamBridgeFrameHeader*>(m_pMappedView);
         HRESULT hr = E_FAIL;
         
-        if (header->magic == OCBF_MAGIC && header->version == 1 &&
-            header->width == width && header->height == height && 
-            header->format == 1) // 1 = BGRA32
+        if (header->magic == OCBF_MAGIC && header->version == 1 && header->format == 1) // 1 = BGRA32
         {
             BYTE* srcData = static_cast<BYTE*>(m_pMappedView) + sizeof(OpenCamBridgeFrameHeader);
             
-            if (len >= header->dataSize) {
-                if (pitch == static_cast<LONG>(header->stride)) {
-                    memcpy(pBuf, srcData, header->dataSize);
+            if (header->width == width && header->height == height) {
+                if (len >= header->dataSize) {
+                    if (pitch == static_cast<LONG>(header->stride)) {
+                        memcpy(pBuf, srcData, header->dataSize);
+                    } else {
+                        for (DWORD y = 0; y < height; ++y) {
+                            memcpy(pBuf + y * pitch, srcData + y * header->stride, min(static_cast<DWORD>(pitch), header->stride));
+                        }
+                    }
+                    hr = S_OK;
                 } else {
-                    for (DWORD y = 0; y < height; ++y) {
-                        memcpy(pBuf + y * pitch, srcData + y * header->stride, min(static_cast<DWORD>(pitch), header->stride));
+                    hr = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+                }
+            } else {
+                char msg[256];
+                sprintf_s(msg, sizeof(msg), "OpenCamBridge: mismatch framebuffer=%lux%lu requested=%lux%lu\n", header->width, header->height, width, height);
+                OutputDebugStringA(msg);
+                
+                for (DWORD y = 0; y < height; ++y) {
+                    DWORD srcY = (y * header->height) / height;
+                    DWORD* dstRow = reinterpret_cast<DWORD*>(pBuf + y * pitch);
+                    DWORD* srcRow = reinterpret_cast<DWORD*>(srcData + srcY * header->stride);
+                    
+                    for (DWORD x = 0; x < width; ++x) {
+                        DWORD srcX = (x * header->width) / width;
+                        dstRow[x] = srcRow[srcX];
                     }
                 }
                 hr = S_OK;
-            } else {
-                hr = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
             }
         } else {
             hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
