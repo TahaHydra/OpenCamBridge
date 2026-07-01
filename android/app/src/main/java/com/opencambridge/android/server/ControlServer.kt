@@ -65,6 +65,10 @@ class ControlServer(
         val accessMode = StreamState.accessMode.get()
         val host = if (accessMode == "usbOnly") "127.0.0.1" else "0.0.0.0"
 
+        if (accessMode != "usbOnly") {
+            AppLogger.w("Security", "LAN access mode ($accessMode) is active. Requiring token for all endpoints except /health.")
+        }
+
         engine = embeddedServer(CIO, port = port, host = host) {
             install(CORS) {
                 allowMethod(HttpMethod.Get)
@@ -86,7 +90,7 @@ class ControlServer(
                     if (path == "/health") return@intercept
                     
                     val currentMode = StreamState.accessMode.get()
-                    if (currentMode == "lanToken") {
+                    if (currentMode != "usbOnly") {
                         val token = call.request.queryParameters["token"] ?: call.request.headers["X-OpenCamBridge-Token"]
                         if (token != StreamState.accessToken.get()) {
                             AppLogger.w("Security", "Rejected unauthorized request to $path")

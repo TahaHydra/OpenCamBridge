@@ -976,10 +976,9 @@ fun SecurityTabContent(
         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp)) {
                 var expanded by remember { mutableStateOf(false) }
-                val modeOptions = listOf("usbOnly", "lanOpen", "lanToken")
+                val modeOptions = listOf("usbOnly", "lanToken")
                 val modeLabels = mapOf(
                     "usbOnly" to "USB Only (Localhost)",
-                    "lanOpen" to "LAN Open (Unsafe)",
                     "lanToken" to "LAN Token (Secure)"
                 )
                 
@@ -1010,9 +1009,7 @@ fun SecurityTabContent(
                 }
                 
                 Spacer(modifier = Modifier.height(8.dp))
-                if (accessMode == "lanOpen") {
-                    Text("Warning: LAN Open allows anyone on your network to view the stream and control the camera.", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
-                } else if (accessMode == "lanToken") {
+                if (accessMode == "lanToken") {
                     Text("Token required for LAN access. You must append ?token=... to the URL.", color = Color(0xFF4CAF50), fontSize = 12.sp)
                 } else {
                     Text("Server bound to 127.0.0.1. Accessible via adb forward.", color = Color.Gray, fontSize = 12.sp)

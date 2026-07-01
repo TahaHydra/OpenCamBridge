@@ -68,3 +68,8 @@ Invoke-RestMethod http://127.0.0.1:8080/api/stream/metrics
 - WebRTC
 - macOS virtual camera driver
 - HEVC
+## Security Note
+
+- **USB mode (default)** is recommended and binds securely to 127.0.0.1.
+- **LAN mode** requires a token for authentication.
+- Open unauthenticated LAN camera access is intentionally not supported.
