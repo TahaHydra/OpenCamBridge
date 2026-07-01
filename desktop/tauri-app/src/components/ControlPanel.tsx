@@ -179,16 +179,16 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
         if (status) {
           setSettings(prev => ({
             ...prev,
-            cameraId: status.cameraId || prev.cameraId,
-            displayRotation: status.displayRotation || prev.displayRotation,
-            aspectRatio: status.aspectRatio || prev.aspectRatio,
-            mirror: status.mirror || prev.mirror,
-            torchEnabled: status.torchEnabled || prev.torchEnabled,
-            linearZoom: status.linearZoom !== undefined ? status.linearZoom : prev.linearZoom,
-            streamMode: status.streamMode || prev.streamMode,
-            targetBandwidthMbps: status.targetBandwidthMbps || prev.targetBandwidthMbps,
-            h264Bitrate: status.h264Bitrate || prev.h264Bitrate,
-            h264KeyframeInterval: status.h264KeyframeInterval || prev.h264KeyframeInterval
+            cameraId: status.cameraId ?? prev.cameraId,
+            displayRotation: status.displayRotation ?? prev.displayRotation,
+            aspectRatio: status.aspectRatio ?? prev.aspectRatio,
+            mirror: status.mirror ?? prev.mirror,
+            torchEnabled: status.torchEnabled ?? prev.torchEnabled,
+            linearZoom: status.linearZoom ?? prev.linearZoom,
+            streamMode: status.streamMode ?? prev.streamMode,
+            targetBandwidthMbps: status.targetBandwidthMbps ?? prev.targetBandwidthMbps,
+            h264Bitrate: status.h264Bitrate ?? prev.h264Bitrate,
+            h264KeyframeInterval: status.h264KeyframeInterval ?? prev.h264KeyframeInterval
           }));
         }
       })
@@ -455,6 +455,8 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
 
     const state = await invoke<VirtualCamState>('get_virtual_camera_status');
     setVcamState(state);
+    
+    fetchStatus();
 
     if (!previewOff) {
       setTimeout(() => window.dispatchEvent(new CustomEvent('reload-preview')), 1000);
