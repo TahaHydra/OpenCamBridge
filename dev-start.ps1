@@ -2,7 +2,7 @@ Write-Host "=== OpenCamBridge DEV START ===" -ForegroundColor Cyan
 
 $ErrorActionPreference = "Continue"
 
-$root = "C:\Dev\OpenCamBridge"
+$root = $PSScriptRoot
 $tauri = "$root\desktop\tauri-app"
 $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 
@@ -19,7 +19,7 @@ Write-Host "Checking ADB devices..."
 Write-Host "Starting Android app..."
 & $adb shell am force-stop com.opencambridge.android
 Start-Sleep -Milliseconds 500
-& $adb shell monkey -p com.opencambridge.android 1
+& $adb shell am start -n com.opencambridge.android/.MainActivity
 
 Write-Host "Setting ADB forward 8080..."
 & $adb forward --remove-all

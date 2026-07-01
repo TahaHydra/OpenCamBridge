@@ -1,7 +1,7 @@
 Write-Host "=== OpenCamBridge HARD DEV RESET ===" -ForegroundColor Cyan
 $ErrorActionPreference = "SilentlyContinue"
 
-$root = "C:\Dev\OpenCamBridge"
+$root = $PSScriptRoot
 $framebuffer = "C:\ProgramData\OpenCamBridge\framebuffer.bin"
 $producerLog = "C:\ProgramData\OpenCamBridge\producer.log"
 $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"

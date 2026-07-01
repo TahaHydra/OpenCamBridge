@@ -1,8 +1,12 @@
+param(
+    [switch]$ForceKillApps
+)
+
 Write-Host "=== Build OpenCamBridge Media Foundation DLL ===" -ForegroundColor Cyan
 
 $ErrorActionPreference = "Stop"
 
-$root = "C:\Dev\OpenCamBridge"
+$root = $PSScriptRoot
 $mfRoot = "$root\windows\virtual-camera-mediafoundation"
 $vcxproj = "$mfRoot\VirtualCameraMediaSource\VirtualCameraMediaSource.vcxproj"
 $builtDll = "$mfRoot\VirtualCameraMediaSource\x64\Release\VirtualCameraMediaSource.dll"
@@ -21,13 +25,17 @@ Stop-Process -Name tauri-app -Force -ErrorAction SilentlyContinue
 Stop-Process -Name node -Force -ErrorAction SilentlyContinue
 Stop-Process -Name rust-frame-producer -Force -ErrorAction SilentlyContinue
 Stop-Process -Name VirtualCamera_Installer -Force -ErrorAction SilentlyContinue
-Stop-Process -Name WindowsCamera -Force -ErrorAction SilentlyContinue
-Stop-Process -Name Teams -Force -ErrorAction SilentlyContinue
-Stop-Process -Name ms-teams -Force -ErrorAction SilentlyContinue
-Stop-Process -Name Zoom -Force -ErrorAction SilentlyContinue
-Stop-Process -Name Discord -Force -ErrorAction SilentlyContinue
 Stop-Service FrameServer -Force -ErrorAction SilentlyContinue
 Stop-Service FrameServerMonitor -Force -ErrorAction SilentlyContinue
+
+if ($ForceKillApps) {
+    Write-Host "Force-killing additional apps..." -ForegroundColor Yellow
+    Stop-Process -Name WindowsCamera -Force -ErrorAction SilentlyContinue
+    Stop-Process -Name Teams -Force -ErrorAction SilentlyContinue
+    Stop-Process -Name ms-teams -Force -ErrorAction SilentlyContinue
+    Stop-Process -Name Zoom -Force -ErrorAction SilentlyContinue
+    Stop-Process -Name Discord -Force -ErrorAction SilentlyContinue
+}
 Start-Sleep -Seconds 2
 
 Write-Host "Finding cppwinrt.exe..." -ForegroundColor Yellow
@@ -57,7 +65,7 @@ Write-Host "Copying DLL to installer folder..." -ForegroundColor Yellow
 try {
     Copy-Item $builtDll $targetDll -Force -ErrorAction Stop
 } catch {
-    Write-Host "DLL is locked by Windows FrameServer/svchost. Stop FrameServer or reboot, then rerun dev-build-vcam.ps1." -ForegroundColor Red
+    Write-Host "DLL is locked by Windows FrameServer/svchost or another camera app. Close camera apps or rerun with -ForceKillApps, or reboot." -ForegroundColor Red
     exit 1
 }
 
