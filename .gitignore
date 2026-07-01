@@ -64,4 +64,4 @@ obj/
 
 # Rust extra
 *.rlib
-*.rmeta
+*.rmeta*.winmd
