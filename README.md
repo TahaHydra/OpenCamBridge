@@ -2,6 +2,11 @@
 
 OpenCamBridge is a free open-source phone-as-webcam project.
 
+## Architecture Pipeline
+
+- **Stable V1 (MJPEG)**: Android CameraX -> `/stream.mjpeg` -> Rust producer -> shared memory framebuffer -> Media Foundation virtual camera -> OBS.
+- **Experimental (H.264)**: An H.264 encoder endpoint (`/stream.h264`) exists on Android, but the Rust producer does not yet decode H.264 to the framebuffer. Thus, H.264 is strictly experimental and not currently OBS-ready.
+
 ## Current stable workflow
 
 ```powershell
@@ -68,6 +73,25 @@ Invoke-RestMethod http://127.0.0.1:8080/api/stream/metrics
 - WebRTC
 - macOS virtual camera driver
 - HEVC
+
+## Known Limitations
+
+- No audio support.
+- No iOS app.
+- No macOS virtual camera driver yet.
+- H.264 stream cannot yet be consumed by the OBS virtual camera pipeline.
+
+## Release Checklist
+
+Before tagging a release, ensure:
+- [ ] Android build completes (`.\gradlew.bat assembleDebug` / `assembleRelease`)
+- [ ] Rust producer builds (`cargo build`)
+- [ ] Tauri app builds (`npm run tauri build`)
+- [ ] Pipeline runs correctly via `dev-reset.ps1` and `dev-start.ps1`
+- [ ] OBS Custom Resolution is tested:
+  - [ ] 720p30 (Balanced) works flawlessly
+  - [ ] 1080p60 (Experimental) produces reasonable framerates
+- [ ] Torch and profile changes update UI state reliably
 ## Security Note
 
 - **USB mode (default)** is recommended and binds securely to 127.0.0.1.
