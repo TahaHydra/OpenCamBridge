@@ -1,20 +1,22 @@
 import { useState, useEffect, useRef } from 'react';
 import { CameraOff, RefreshCw } from 'lucide-react';
+import { buildUrl } from '../services/api';
 
 interface PreviewProps {
   baseUrl: string;
+  token?: string;
   fitMode: string;
   serverStatus: any;
 }
 
-export default function Preview({ baseUrl, fitMode, serverStatus }: PreviewProps) {
+export default function Preview({ baseUrl, token, fitMode, serverStatus }: PreviewProps) {
   const [timestamp, setTimestamp] = useState(Date.now());
   const [isError, setIsError] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
   const [boxSize, setBoxSize] = useState({ w: 0, h: 0 });
 
-  const mjpegUrl = `${baseUrl}/stream.mjpeg?ts=${timestamp}`;
+  const mjpegUrl = buildUrl(baseUrl, '/stream.mjpeg', token, { ts: String(timestamp) });
 
   useEffect(() => {
     if (!boxRef.current) return;
@@ -87,7 +89,7 @@ export default function Preview({ baseUrl, fitMode, serverStatus }: PreviewProps
             style={{ opacity: isError ? 0 : 1 }}
           />
         </div>
-        
+
         {isError && (
           <div className="preview-overlay">
             <CameraOff size={48} opacity={0.5} />
@@ -99,8 +101,8 @@ export default function Preview({ baseUrl, fitMode, serverStatus }: PreviewProps
         )}
 
         {!isError && (
-          <button 
-            className="btn btn-secondary" 
+          <button
+            className="btn btn-secondary"
             style={{ position: 'absolute', top: 16, right: 16, padding: '6px 12px', fontSize: '0.8rem', background: 'rgba(0,0,0,0.5)' }}
             onClick={reloadPreview}
           >

@@ -1,38 +1,108 @@
 import { useState, useEffect } from 'react';
-import { Camera, Unplug, Zap, Monitor } from 'lucide-react';
+import { Camera, Unplug, Zap, Monitor, Usb, Wifi, ShieldCheck } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import Preview from './components/Preview';
 import ControlPanel from './components/ControlPanel';
+import { apiFetch } from './services/api';
 import './App.css';
 
 interface ConnectionScreenProps {
-  onConnect: (url: string) => void;
+  onConnect: (url: string, token: string) => void;
 }
 
+type ConnectMode = 'usb' | 'lan';
+
 function ConnectionScreen({ onConnect }: ConnectionScreenProps) {
-  const [url, setUrl] = useState('http://127.0.0.1:8080');
+  const [mode, setMode] = useState<ConnectMode>('usb');
+  const [port, setPort] = useState('8080');
+  const [lanUrl, setLanUrl] = useState('http://192.168.1.10:8080');
+  const [lanToken, setLanToken] = useState('');
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
 
-  const handleConnect = async (e: React.FormEvent) => {
+  const verifyAndConnect = async (url: string, token: string) => {
+    const formattedUrl = url.endsWith('/') ? url.slice(0, -1) : url;
+
+    // 1. Reachability (no token needed for /health by design)
+    const healthRes = await fetch(`${formattedUrl}/health`);
+    if (!healthRes.ok) throw new Error('Health check failed');
+    const text = await healthRes.text();
+    if (!(text === 'OK' || text.toLowerCase().includes('ok'))) {
+      throw new Error('Invalid health response');
+    }
+
+    // 2. Authorization (LAN mode requires the token for everything else)
+    const statusRes = await apiFetch(formattedUrl, '/api/camera/status', token);
+    if (statusRes.status === 401) {
+      throw new Error('UNAUTHORIZED');
+    }
+    if (!statusRes.ok) throw new Error('Status check failed');
+
+    onConnect(formattedUrl, token);
+  };
+
+  const handleUsbConnect = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsConnecting(true);
     setError('');
+    setInfo('');
+    const p = parseInt(port, 10) || 8080;
     try {
-      const formattedUrl = url.endsWith('/') ? url.slice(0, -1) : url;
-      const res = await fetch(`${formattedUrl}/health`);
-      if (!res.ok) throw new Error('Server returned error');
-      const text = await res.text();
-      if (text === 'OK' || text.includes('ok') || text.includes('OK')) {
-        onConnect(formattedUrl);
-      } else {
-        throw new Error('Invalid health response');
+      // Best-effort adb forward. If adb is missing we still try to connect:
+      // the user may have set the forward up manually.
+      try {
+        setInfo('Setting up adb port forwarding...');
+        await invoke<string>('forward_port', { port: p });
+        setInfo('adb forward active. Connecting...');
+      } catch (adbErr: any) {
+        setInfo(`adb not available (${String(adbErr).slice(0, 120)}). Trying direct connection...`);
       }
-    } catch (err) {
-      setError('Connection failed. Ensure Android server is running and ADB is forwarded.');
+      await verifyAndConnect(`http://127.0.0.1:${p}`, '');
+    } catch (err: any) {
+      if (String(err?.message) === 'UNAUTHORIZED') {
+        setError('The phone rejected the request (401). Is the phone set to LAN mode? For USB, set Access Mode to "USB Only" on the phone.');
+      } else {
+        setError('Connection failed. Check: phone connected via USB, USB debugging enabled, OpenCamBridge app running on the phone.');
+      }
     } finally {
       setIsConnecting(false);
     }
   };
+
+  const handleLanConnect = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsConnecting(true);
+    setError('');
+    setInfo('');
+    try {
+      await verifyAndConnect(lanUrl, lanToken.trim());
+    } catch (err: any) {
+      if (String(err?.message) === 'UNAUTHORIZED') {
+        setError('Invalid or missing token. Copy the access token from the phone: OpenCamBridge app > Security tab.');
+      } else {
+        setError('Connection failed. Ensure the phone is on the same network, LAN mode is enabled, and the URL matches the one shown on the phone.');
+      }
+    } finally {
+      setIsConnecting(false);
+    }
+  };
+
+  const tabStyle = (active: boolean): React.CSSProperties => ({
+    flex: 1,
+    padding: '10px 12px',
+    borderRadius: 8,
+    border: active ? '1px solid var(--accent, #4dabf7)' : '1px solid rgba(255,255,255,0.1)',
+    background: active ? 'rgba(77, 171, 247, 0.15)' : 'transparent',
+    color: active ? '#4dabf7' : 'var(--text-secondary, #aaa)',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    fontWeight: 600,
+    fontSize: '0.9rem',
+  });
 
   return (
     <div className="connection-screen">
@@ -40,29 +110,86 @@ function ConnectionScreen({ onConnect }: ConnectionScreenProps) {
         <div className="brand-hero">
           <Camera size={64} />
           <h1>OpenCamBridge</h1>
-          <p>Connect to Android Camera Server</p>
+          <p>Use your Android phone as a webcam</p>
         </div>
-        
-        <form onSubmit={handleConnect} style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {error && <div className="error-banner">{error}</div>}
-          
-          <div style={{ textAlign: 'left' }}>
-            <label style={{ display: 'block', marginBottom: 8, fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Server URL</label>
-            <input 
-              type="text" 
-              className="input-control" 
-              value={url} 
-              onChange={(e) => setUrl(e.target.value)} 
-              placeholder="http://127.0.0.1:8080"
-              required
-            />
-          </div>
-          
-          <button type="submit" className="btn btn-primary" style={{ width: '100%', padding: '14px', marginTop: 8 }} disabled={isConnecting}>
-            {isConnecting ? <Zap className="animate-spin" style={{ animation: 'pulse 1s infinite' }} /> : <Unplug size={18} />}
-            {isConnecting ? 'Connecting...' : 'Connect to Camera'}
+
+        <div style={{ display: 'flex', gap: 8, width: '100%', marginBottom: 16 }}>
+          <button type="button" style={tabStyle(mode === 'usb')} onClick={() => { setMode('usb'); setError(''); setInfo(''); }}>
+            <Usb size={16} /> USB (Recommended)
           </button>
-        </form>
+          <button type="button" style={tabStyle(mode === 'lan')} onClick={() => { setMode('lan'); setError(''); setInfo(''); }}>
+            <Wifi size={16} /> Wi-Fi (LAN)
+          </button>
+        </div>
+
+        {mode === 'usb' ? (
+          <form onSubmit={handleUsbConnect} style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {error && <div className="error-banner">{error}</div>}
+            {info && !error && <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{info}</div>}
+
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textAlign: 'left', margin: 0, lineHeight: 1.5 }}>
+              Private and stable: video never leaves the USB cable. Connect the phone via USB,
+              enable USB debugging, and keep the phone in <strong>USB Only</strong> access mode (the default).
+            </p>
+
+            <div style={{ textAlign: 'left' }}>
+              <label style={{ display: 'block', marginBottom: 8, fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Port</label>
+              <input
+                type="text"
+                className="input-control"
+                value={port}
+                onChange={(e) => setPort(e.target.value)}
+                placeholder="8080"
+                required
+              />
+            </div>
+
+            <button type="submit" className="btn btn-primary" style={{ width: '100%', padding: '14px', marginTop: 8 }} disabled={isConnecting}>
+              {isConnecting ? <Zap size={18} /> : <Usb size={18} />}
+              {isConnecting ? 'Connecting...' : 'Set up USB & Connect'}
+            </button>
+          </form>
+        ) : (
+          <form onSubmit={handleLanConnect} style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {error && <div className="error-banner">{error}</div>}
+
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textAlign: 'left', margin: 0, lineHeight: 1.5 }}>
+              On the phone: open OpenCamBridge &gt; Security, switch to <strong>LAN Token</strong> mode,
+              then copy the URL and access token shown there.
+            </p>
+
+            <div style={{ textAlign: 'left' }}>
+              <label style={{ display: 'block', marginBottom: 8, fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Phone URL</label>
+              <input
+                type="text"
+                className="input-control"
+                value={lanUrl}
+                onChange={(e) => setLanUrl(e.target.value)}
+                placeholder="http://192.168.1.10:8080"
+                required
+              />
+            </div>
+
+            <div style={{ textAlign: 'left' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                <ShieldCheck size={14} /> Access Token (required for LAN)
+              </label>
+              <input
+                type="password"
+                className="input-control"
+                value={lanToken}
+                onChange={(e) => setLanToken(e.target.value)}
+                placeholder="Token from the phone's Security tab"
+                required
+              />
+            </div>
+
+            <button type="submit" className="btn btn-primary" style={{ width: '100%', padding: '14px', marginTop: 8 }} disabled={isConnecting}>
+              {isConnecting ? <Zap size={18} /> : <Unplug size={18} />}
+              {isConnecting ? 'Connecting...' : 'Connect over Wi-Fi'}
+            </button>
+          </form>
+        )}
       </div>
     </div>
   );
@@ -70,6 +197,7 @@ function ConnectionScreen({ onConnect }: ConnectionScreenProps) {
 
 export default function App() {
   const [baseUrl, setBaseUrl] = useState('');
+  const [token, setToken] = useState('');
   const [isConnected, setIsConnected] = useState(false);
   const [serverStatus, setServerStatus] = useState<any>(null);
   const [fitMode, setFitMode] = useState('fill');
@@ -87,11 +215,11 @@ export default function App() {
   // Polling loop for status
   useEffect(() => {
     if (!isConnected || !baseUrl) return;
-    
+
     let active = true;
     const poll = async () => {
       try {
-        const res = await fetch(`${baseUrl}/api/camera/status`);
+        const res = await apiFetch(baseUrl, '/api/camera/status', token);
         if (!res.ok) throw new Error('Offline');
         const data = await res.json();
         const status = data.status || data;
@@ -105,21 +233,22 @@ export default function App() {
     };
     poll();
     return () => { active = false; };
-  }, [isConnected, baseUrl]);
+  }, [isConnected, baseUrl, token]);
 
   if (!isConnected) {
-    return <ConnectionScreen onConnect={(url) => { setBaseUrl(url); setIsConnected(true); }} />;
+    return <ConnectionScreen onConnect={(url, tok) => { setBaseUrl(url); setToken(tok); setIsConnected(true); }} />;
   }
 
   const stateClass = serverStatus?.lifecycleState?.toLowerCase() || 'stopped';
   const isError = serverStatus?.lifecycleState === 'ERROR' || serverStatus?.lifecycleState === 'OFFLINE';
+  const transportLabel = token ? 'LAN' : 'USB';
 
   if (obsMode) {
     return (
       <div style={{ width: '100vw', height: '100vh', margin: 0, padding: 0, overflow: 'hidden', background: '#000', position: 'relative' }}>
         <style>{`.preview-stage { border-radius: 0 !important; background: transparent !important; }`}</style>
-        <Preview baseUrl={baseUrl} fitMode={fitMode} serverStatus={serverStatus} />
-        <button 
+        <Preview baseUrl={baseUrl} token={token} fitMode={fitMode} serverStatus={serverStatus} />
+        <button
           onClick={() => setObsMode(false)}
           style={{ position: 'absolute', top: 16, right: 16, zIndex: 9999, background: 'rgba(0,0,0,0.7)', color: 'white', border: '1px solid #444', padding: '8px 16px', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', gap: 8 }}
         >
@@ -135,13 +264,17 @@ export default function App() {
         <div className="header-brand">
           <Camera size={24} /> OpenCamBridge
         </div>
-        
+
         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <div className="status-badge" title={token ? 'Connected over Wi-Fi with token auth' : 'Connected over USB (adb forward)'}>
+            {token ? <Wifi size={14} /> : <Usb size={14} />}
+            <span style={{ textTransform: 'uppercase', letterSpacing: 1 }}>{transportLabel}</span>
+          </div>
           <div className="status-badge">
             <div className={`status-dot ${stateClass}`}></div>
             <span style={{ textTransform: 'uppercase', letterSpacing: 1 }}>{serverStatus?.lifecycleState || 'UNKNOWN'}</span>
           </div>
-          <button className="btn btn-secondary" onClick={() => setIsConnected(false)} style={{ padding: '6px 12px', fontSize: '0.8rem' }}>
+          <button className="btn btn-secondary" onClick={() => { setIsConnected(false); setToken(''); }} style={{ padding: '6px 12px', fontSize: '0.8rem' }}>
             <Unplug size={14} /> Disconnect
           </button>
         </div>
@@ -155,7 +288,7 @@ export default function App() {
             </div>
           )}
           {!previewOff ? (
-            <Preview baseUrl={baseUrl} fitMode={fitMode} serverStatus={serverStatus} />
+            <Preview baseUrl={baseUrl} token={token} fitMode={fitMode} serverStatus={serverStatus} />
           ) : (
             <div className="preview-stage glass-panel" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
               <div style={{ textAlign: 'center', color: '#888' }}>
@@ -166,8 +299,8 @@ export default function App() {
             </div>
           )}
         </div>
-        
-        <ControlPanel baseUrl={baseUrl} fitMode={fitMode} setFitMode={setFitMode} onEnterObsMode={() => setObsMode(true)} previewOff={previewOff} setPreviewOff={setPreviewOff} />
+
+        <ControlPanel baseUrl={baseUrl} token={token} fitMode={fitMode} setFitMode={setFitMode} onEnterObsMode={() => setObsMode(true)} previewOff={previewOff} setPreviewOff={setPreviewOff} />
       </main>
     </div>
   );

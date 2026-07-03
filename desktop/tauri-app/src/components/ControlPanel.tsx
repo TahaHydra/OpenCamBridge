@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Play, Square, Settings2, Sliders, RefreshCw, RotateCw, ZoomIn, ZoomOut, Monitor, Video, ShieldAlert } from 'lucide-react';
 import { connectAndSetupObs, ObsStatus } from '../services/obs';
+import { apiFetch, buildUrl } from '../services/api';
 import { invoke } from '@tauri-apps/api/core';
 
 interface VirtualCamMetrics {
@@ -41,6 +42,7 @@ interface VirtualCamState {
 
 interface ControlPanelProps {
   baseUrl: string;
+  token?: string;
   fitMode: string;
   setFitMode: (mode: string) => void;
   onEnterObsMode?: () => void;
@@ -48,7 +50,7 @@ interface ControlPanelProps {
   setPreviewOff: (val: boolean) => void;
 }
 
-export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, previewOff, setPreviewOff }: ControlPanelProps) {
+export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, previewOff, setPreviewOff }: ControlPanelProps) {
   const [cameras, setCameras] = useState<any[]>([]);
   const [settings, setSettings] = useState({
     cameraId: '0',
@@ -154,15 +156,13 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
       setObsStatus(null);
     }
 
-    const queryParams = new URLSearchParams();
-    queryParams.set('fit', fitMode === 'fill' ? 'cover' : 'contain');
-    queryParams.set('mirror', settings.mirror ? 'true' : 'false');
     let rot = settings.displayRotation;
     if (rot === 'auto' || !rot) rot = '0';
-    queryParams.set('rotate', rot);
-
-    const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
-    const obsUrl = `${base}/obs?${queryParams.toString()}`;
+    const obsUrl = buildUrl(baseUrl, '/obs', token, {
+      fit: fitMode === 'fill' ? 'cover' : 'contain',
+      mirror: settings.mirror ? 'true' : 'false',
+      rotate: rot,
+    });
 
     const success = await connectAndSetupObs(obsPassword, obsUrl, obsMode, (status) => setObsStatus(status));
     setIsObsConnecting(false);
@@ -172,7 +172,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
   };
 
   const fetchStatus = useCallback(() => {
-    fetch(`${baseUrl}/api/camera/status`)
+    apiFetch(baseUrl, '/api/camera/status', token)
       .then(res => res.json())
       .then(data => {
         const status = data.status || data;
@@ -193,14 +193,14 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
         }
       })
       .catch(console.error);
-  }, [baseUrl]);
+  }, [baseUrl, token]);
 
   useEffect(() => {
-    fetch(`${baseUrl}/api/camera/list`)
+    apiFetch(baseUrl, '/api/camera/list', token)
       .then(res => res.json())
       .then(data => setCameras(Array.isArray(data) ? data : data.cameras || []))
       .catch(console.error);
-    
+
     fetchStatus();
 
     const interval = setInterval(() => {
@@ -208,8 +208,8 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
       invoke<VirtualCamState>('get_virtual_camera_status')
         .then(setVcamState)
         .catch(console.error);
-      
-      fetch(`${baseUrl}/health`)
+
+      apiFetch(baseUrl, '/health', token)
         .then(res => {
           if (res.ok) {
             setAndroidStreamStatus('running');
@@ -219,7 +219,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
         })
         .catch(() => setAndroidStreamStatus('error'));
 
-      fetch(`${baseUrl}/api/stream/metrics`)
+      apiFetch(baseUrl, '/api/stream/metrics', token)
         .then(res => res.json())
         .then(data => setAndroidMetrics(data))
         .catch(() => setAndroidMetrics(null));
@@ -227,7 +227,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [baseUrl, fetchStatus]);
+  }, [baseUrl, token, fetchStatus]);
 
   const handleRegisterVcam = async () => {
     setIsVcamRegistering(true);
@@ -242,22 +242,30 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
     setIsVcamRegistering(false);
   };
 
-  const startStream = () => fetch(`${baseUrl}/api/stream/start`, { method: 'POST' });
-  const stopStream = () => fetch(`${baseUrl}/api/stream/stop`, { method: 'POST' });
+  const startStream = () => apiFetch(baseUrl, '/api/stream/start', token, { method: 'POST' });
+  const stopStream = () => apiFetch(baseUrl, '/api/stream/stop', token, { method: 'POST' });
 
   const handleStartProducer = async (s: any) => {
-    const targetUrl = `${baseUrl}/stream.mjpeg`;
+    const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+    const targetUrl = `${base}/stream.mjpeg`;
+    // Pass display rotation/mirror to the producer so the virtual camera output
+    // matches the preview; the raw MJPEG frames from Android are unrotated.
+    let rotate: number | undefined = parseInt(s.displayRotation, 10);
+    if (isNaN(rotate) || rotate % 90 !== 0) rotate = undefined;
     console.log('[Tauri UI] Calling start_virtual_camera_feeder with', {
-      url: targetUrl, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, quality: s.jpegQuality, profile: s.profile
+      url: targetUrl, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, quality: s.jpegQuality, profile: s.profile, rotate, mirror: s.mirror
     });
     try {
-      await invoke('start_virtual_camera_feeder', { 
+      await invoke('start_virtual_camera_feeder', {
         url: targetUrl,
         width: s.outputWidth || s.width,
         height: s.outputHeight || s.height,
         fps: s.fps,
         quality: s.jpegQuality,
-        profile: s.profile
+        profile: s.profile,
+        rotate,
+        mirror: !!s.mirror,
+        token: token || undefined
       });
       console.log('[Tauri UI] start_virtual_camera_feeder completed');
     } catch (e: any) {
@@ -268,15 +276,15 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
 
   const handleStartNativeCamera = async () => {
     const s = settingsRef.current;
-  
+
     setVcamMessage('Starting pipeline...');
     try {
       if (!vcamState?.host_running) {
         await invoke('start_virtual_camera_host');
       }
-  
+
       await restartFullPipelineWithSettings(s);
-  
+
       setVcamMessage('');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
     } catch (e: any) {
@@ -299,15 +307,15 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
 
   const handleStartFeedOnly = async () => {
     const s = settingsRef.current;
-  
+
     setVcamMessage('Starting feed...');
     try {
       await restartAndroidStreamWithSettings(s);
       await handleStartProducer(s);
-  
+
       setVcamMessage('');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
-  
+
       if (!previewOff) {
         setTimeout(() => window.dispatchEvent(new CustomEvent('reload-preview')), 1000);
       }
@@ -331,7 +339,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
   const postSettingsToAndroid = async (s: any) => {
-    await fetch(`${baseUrl}/api/settings`, {
+    await apiFetch(baseUrl, '/api/settings', token, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -380,19 +388,19 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
 
   const updateSetting = async (key: string, value: any) => {
     const newSettings = { ...settingsRef.current, [key]: value };
-    
+
     if (key === 'torchEnabled') {
       setSettings(newSettings);
       settingsRef.current = newSettings;
-      await fetch(`${baseUrl}/api/camera/torch`, { method: 'POST', body: JSON.stringify({ enabled: value }), headers: { 'Content-Type': 'application/json' }});
+      await apiFetch(baseUrl, '/api/camera/torch', token, { method: 'POST', body: JSON.stringify({ enabled: value }), headers: { 'Content-Type': 'application/json' }});
       return;
     } else if (key === 'linearZoom') {
       setSettings(newSettings);
       settingsRef.current = newSettings;
-      await fetch(`${baseUrl}/api/camera/zoom`, { method: 'POST', body: JSON.stringify({ linearZoom: value }), headers: { 'Content-Type': 'application/json' }});
+      await apiFetch(baseUrl, '/api/camera/zoom', token, { method: 'POST', body: JSON.stringify({ linearZoom: value }), headers: { 'Content-Type': 'application/json' }});
       return;
     }
-    
+
     await applySettingsAndRefreshPreview(newSettings, [key]);
   };
 
@@ -401,7 +409,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
 
     while (Date.now() < deadline) {
       try {
-        const res = await fetch(`${baseUrl}/api/stream/metrics`);
+        const res = await apiFetch(baseUrl, '/api/stream/metrics', token);
         if (res.ok) {
           const m = await res.json();
 
@@ -455,7 +463,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
 
     const state = await invoke<VirtualCamState>('get_virtual_camera_status');
     setVcamState(state);
-    
+
     fetchStatus();
 
     if (!previewOff) {
@@ -469,7 +477,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
       console.error('Unknown profile:', profile);
       return;
     }
-  
+
     const newSettings = { ...settingsRef.current, ...preset };
     await applySettingsAndRefreshPreview(newSettings, ['profile', 'width', 'height', 'fps', 'jpegQuality']);
   };
@@ -484,7 +492,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
 
     const map: any = { 'landscape': 'portrait_cw', 'portrait_cw': 'upside_down', 'upside_down': 'portrait_ccw', 'portrait_ccw': 'landscape' };
     const nextMode = map[currentMode] || 'portrait_cw';
-    
+
     let nextAspect = '16:9'; let nextRot = '0';
     if (nextMode === 'portrait_cw') { nextAspect = '9:16'; nextRot = '90'; }
     else if (nextMode === 'portrait_ccw') { nextAspect = '9:16'; nextRot = '270'; }
@@ -496,13 +504,13 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
 
   return (
     <div className="control-panel glass-panel animate-fade" style={{ display: 'flex', flexDirection: 'column', gap: 24, padding: 24 }}>
-      
+
       {/* NATIVE WINDOWS CAMERA SECTION */}
       <div className="control-group" style={{ background: 'rgba(30, 40, 50, 0.4)', borderRadius: 12, padding: 16, border: '1px solid rgba(100, 150, 255, 0.2)' }}>
         <h3 style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, color: '#4dabf7' }}>
           <Monitor size={18} /> Native Windows Camera
         </h3>
-        
+
         {/* Status Grid */}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16, fontSize: '0.85rem' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -561,16 +569,16 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
             </div>
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 4, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
-              <button 
-                style={{ background: 'none', border: 'none', color: '#4dabf7', fontSize: '0.75rem', cursor: (vcamState?.running && vcamState?.host_running) ? 'default' : 'pointer', opacity: (vcamState?.running && vcamState?.host_running) ? 0.5 : 1 }} 
-                onClick={handleStartNativeCamera} 
+              <button
+                style={{ background: 'none', border: 'none', color: '#4dabf7', fontSize: '0.75rem', cursor: (vcamState?.running && vcamState?.host_running) ? 'default' : 'pointer', opacity: (vcamState?.running && vcamState?.host_running) ? 0.5 : 1 }}
+                onClick={handleStartNativeCamera}
                 disabled={vcamState?.running && vcamState?.host_running}
               >
                 Start All
               </button>
-              <button 
-                style={{ background: 'none', border: 'none', color: '#ff6b6b', fontSize: '0.75rem', cursor: (!vcamState?.running && !vcamState?.host_running) ? 'default' : 'pointer', opacity: (!vcamState?.running && !vcamState?.host_running) ? 0.5 : 1 }} 
-                onClick={handleStopNativeCamera} 
+              <button
+                style={{ background: 'none', border: 'none', color: '#ff6b6b', fontSize: '0.75rem', cursor: (!vcamState?.running && !vcamState?.host_running) ? 'default' : 'pointer', opacity: (!vcamState?.running && !vcamState?.host_running) ? 0.5 : 1 }}
+                onClick={handleStopNativeCamera}
                 disabled={!vcamState?.running && !vcamState?.host_running}
               >
                 Stop All
@@ -586,7 +594,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
         {/* Producer Metrics */}
         {vcamState && (
           <div style={{ background: '#0a0a0a', padding: 12, borderRadius: 8, border: '1px solid #222', fontFamily: 'monospace', fontSize: '0.75rem', color: '#51cf66' }}>
-            
+
             {/* Extended Status */}
             <div style={{ marginBottom: 8, paddingBottom: 8, borderBottom: '1px solid #222' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888' }}>
@@ -603,7 +611,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
                 <span>Executable:</span>
-                <span 
+                <span
                   style={{ color: '#4dabf7', textDecoration: 'underline', cursor: 'pointer', textAlign: 'right', wordBreak: 'break-all', maxWidth: '70%' }}
                   onClick={() => vcamState.producer_path && navigator.clipboard.writeText(vcamState.producer_path)}
                   title={vcamState.producer_path ? `${vcamState.producer_path} (Click to copy)` : 'Unknown'}
@@ -645,7 +653,7 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
                   <span>Android JPEG Encode:</span>
                   <span>{Number(androidMetrics.androidEncodeMsAvg || 0).toFixed(1)} ms</span>
                 </div>
-                
+
                 {/* Degradation Warnings */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8 }}>
                   {androidMetrics.fallbackUsed && (
@@ -762,10 +770,10 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
         <h3 style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
           <Settings2 size={16} /> Performance Profiles
         </h3>
-        
+
         <div className="control-item">
           <label>Target Profile</label>
-          <select 
+          <select
             className="input-control"
             value={settings.profile}
             onChange={(e) => updateProfile(e.target.value)}
@@ -786,9 +794,9 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
 
         <div className="control-item">
           <label>Camera Lens</label>
-          <select 
-            className="input-control" 
-            value={settings.cameraId} 
+          <select
+            className="input-control"
+            value={settings.cameraId}
             onChange={(e) => updateSetting('cameraId', e.target.value)}
           >
             {cameras.map(c => (
@@ -809,8 +817,8 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
             <button className="btn btn-secondary" style={{ padding: '6px' }} onClick={() => updateSetting('linearZoom', Math.max(0, (settings.linearZoom || 0) - 0.1))}>
               <ZoomOut size={16} />
             </button>
-            <input 
-              type="range" 
+            <input
+              type="range"
               min="0" max="100" step="1"
               style={{ flex: 1 }}
               value={((settings.linearZoom || 0) * 100)}
@@ -829,14 +837,19 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
 
         <div className="control-item">
           <label>Stream Codec</label>
-          <select 
-            className="input-control" 
-            value={settings.streamMode} 
+          <select
+            className="input-control"
+            value={settings.streamMode}
             onChange={(e) => updateSetting('streamMode', e.target.value)}
           >
-            <option value="mjpeg">MJPEG</option>
-            <option value="h264" disabled>H.264 (Experimental - Disabled in this batch)</option>
+            <option value="mjpeg">MJPEG (Stable)</option>
+            <option value="h264" disabled>H.264 (Experimental - not OBS-ready yet)</option>
           </select>
+          <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
+            H.264 exists on the phone as an experimental endpoint, but the Windows side
+            has no H.264 decoder yet, so it cannot reach the virtual camera. MJPEG is the
+            supported path.
+          </p>
         </div>
 
         {settings.streamMode === 'mjpeg' ? (
@@ -846,22 +859,22 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
                 <span>JPEG Quality</span>
                 <span>{settings.jpegQuality}%</span>
               </label>
-              <input 
-                type="range" 
+              <input
+                type="range"
                 min="40" max="95" step="1"
                 style={{ width: '100%', marginTop: 8 }}
                 value={settings.jpegQuality}
                 onChange={(e) => updateSetting('jpegQuality', parseInt(e.target.value))}
               />
             </div>
-            
+
             <div className="control-item" style={{ marginTop: 12 }}>
               <label style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span>Target Bandwidth (Auto Quality)</span>
                 <span>{settings.targetBandwidthMbps === 0 ? 'Off' : `${settings.targetBandwidthMbps} Mbps`}</span>
               </label>
-              <input 
-                type="range" 
+              <input
+                type="range"
                 min="0" max="50" step="1"
                 style={{ width: '100%', marginTop: 8 }}
                 value={settings.targetBandwidthMbps}
@@ -887,9 +900,9 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
         <div className="control-row" style={{ marginTop: 20 }}>
           <label style={{ fontSize: '0.9rem' }}>Disable Preview (Diagnostic)</label>
           <label className="switch">
-            <input 
-              type="checkbox" 
-              checked={previewOff} 
+            <input
+              type="checkbox"
+              checked={previewOff}
               onChange={(e) => setPreviewOff(e.target.checked)}
             />
             <span className="slider"></span>
@@ -905,9 +918,9 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
         <div className="control-row" style={{ marginTop: 20 }}>
           <label style={{ fontSize: '0.9rem' }}>Mirror Image</label>
           <label className="switch">
-            <input 
-              type="checkbox" 
-              checked={settings.mirror} 
+            <input
+              type="checkbox"
+              checked={settings.mirror}
               onChange={(e) => updateSetting('mirror', e.target.checked)}
             />
             <span className="slider"></span>
@@ -917,9 +930,9 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
         <div className="control-row" style={{ marginTop: 12 }}>
           <label style={{ fontSize: '0.9rem' }}>Flashlight (Torch)</label>
           <label className="switch">
-            <input 
-              type="checkbox" 
-              checked={settings.torchEnabled} 
+            <input
+              type="checkbox"
+              checked={settings.torchEnabled}
               onChange={(e) => updateSetting('torchEnabled', e.target.checked)}
             />
             <span className="slider"></span>
@@ -938,20 +951,20 @@ export default function ControlPanel({ baseUrl, fitMode, onEnterObsMode, preview
         <h3 style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, color: '#aaa' }}>
           <Video size={16} /> OBS Fallback Mode
         </h3>
-        
+
         <div className="control-item">
-          <select 
-            className="input-control" 
-            value={obsMode} 
+          <select
+            className="input-control"
+            value={obsMode}
             onChange={(e) => setObsMode(e.target.value as 'browser' | 'window')}
             style={{ marginBottom: 8, width: '100%', cursor: 'pointer' }}
           >
             <option value="browser">Mode: Browser Source (Recommended)</option>
             <option value="window">Mode: Window Capture</option>
           </select>
-          <input 
-            type="password" 
-            className="input-control" 
+          <input
+            type="password"
+            className="input-control"
             placeholder="OBS WebSocket Password (optional)"
             value={obsPassword}
             onChange={(e) => setObsPassword(e.target.value)}

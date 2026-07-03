@@ -122,6 +122,9 @@ pub fn start_virtual_camera_feeder(
     fps: f64,
     quality: Option<u32>,
     profile: Option<String>,
+    rotate: Option<u32>,
+    mirror: Option<bool>,
+    token: Option<String>,
 ) -> Result<(), String> {
     println!(">>> [Tauri] start_virtual_camera_feeder called with width={}, height={}, fps={}", width, height, fps);
     let mut child_guard = state.child.lock().unwrap();
@@ -138,7 +141,7 @@ pub fn start_virtual_camera_feeder(
     while !repo_root.join("windows").exists() && repo_root.parent().is_some() {
         repo_root = repo_root.parent().unwrap().to_path_buf();
     }
-    
+
     let exe_path_release = repo_root.join("windows/virtual-camera-mediafoundation/rust-frame-producer/target/release/rust-frame-producer.exe");
     let exe_path_debug = repo_root.join("windows/virtual-camera-mediafoundation/rust-frame-producer/target/debug/rust-frame-producer.exe");
 
@@ -164,13 +167,25 @@ pub fn start_virtual_camera_feeder(
        .arg("--height").arg(height.to_string())
        .arg("--fps").arg(fps.to_string())
        .arg("--latest-only");
-       
+
     if let Some(q) = quality {
         cmd.arg("--quality").arg(q.to_string());
     }
 
     if let Some(p) = profile {
         cmd.arg("--profile").arg(p);
+    }
+
+    if let Some(r) = rotate {
+        cmd.arg("--rotate").arg(r.to_string());
+    }
+
+    if mirror.unwrap_or(false) {
+        cmd.arg("--mirror");
+    }
+
+    if let Some(t) = token.filter(|t| !t.is_empty()) {
+        cmd.arg("--token").arg(t);
     }
 
     println!(">>> [Tauri] Executing exactly: {:?}", cmd);
@@ -204,7 +219,7 @@ pub fn start_virtual_camera_feeder(
                     let state_manager = app_clone.state::<VirtualCamManager>();
                     let mut metrics_guard = state_manager.metrics.lock().unwrap();
                     *metrics_guard = Some(metrics);
-                    
+
                     let mut time_guard = state_manager.last_metrics_time.lock().unwrap();
                     *time_guard = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
                 } else {
@@ -231,7 +246,7 @@ pub fn start_virtual_camera_feeder(
 
     let mut path_guard = state.producer_path.lock().unwrap();
     *path_guard = Some(path_string);
-    
+
     let mut err_guard = state.last_error.lock().unwrap();
     *err_guard = None;
 
@@ -246,23 +261,23 @@ pub fn stop_virtual_camera_feeder(state: State<'_, VirtualCamManager>) -> Result
         let _ = child.kill();
         let _ = child.wait();
     }
-    
+
     let mut metrics_guard = state.metrics.lock().unwrap();
     *metrics_guard = None;
-    
+
     let mut time_guard = state.last_metrics_time.lock().unwrap();
     *time_guard = None;
-    
+
     Ok(())
 }
 
 #[tauri::command]
 pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> VirtualCamState {
     let mut child_guard = state.child.lock().unwrap();
-    
+
     let mut running = false;
     let mut producer_pid = None;
-    
+
     if let Some(child) = child_guard.as_mut() {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -283,11 +298,11 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
             Err(_) => {}
         }
     }
-    
+
     if !running && child_guard.is_some() {
         *child_guard = None;
     }
-    
+
     let host_running = state.host_child.lock().unwrap().is_some();
     let mut metrics = state.metrics.lock().unwrap().clone();
     let registered = check_virtual_camera_backend();
