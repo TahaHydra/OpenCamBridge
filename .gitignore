@@ -64,4 +64,16 @@ obj/
 
 # Rust extra
 *.rlib
-*.rmeta*.winmd
+*.rmeta
+
+# WinRT metadata
+*.winmd
+
+# IDE / OS
+.idea/
+.DS_Store
+Thumbs.db
+
+# Android build outputs
+*.apk
+*.aab

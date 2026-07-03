@@ -1,11 +1,24 @@
 # OpenCamBridge
 
 OpenCamBridge is a free open-source phone-as-webcam project.
+No cloud, no account, no telemetry, no ads, no watermark.
 
 ## Architecture Pipeline
 
 - **Stable V1 (MJPEG)**: Android CameraX -> `/stream.mjpeg` -> Rust producer -> shared memory framebuffer -> Media Foundation virtual camera -> OBS.
-- **Experimental (H.264)**: An H.264 encoder endpoint (`/stream.h264`) exists on Android, but the Rust producer does not yet decode H.264 to the framebuffer. Thus, H.264 is strictly experimental and not currently OBS-ready.
+- **Experimental (H.264)**: An H.264 encoder endpoint (`/stream.h264`) exists on Android, and the Rust producer has an `--source h264` transport scaffold (connects, authenticates, parses Annex B NAL units, reports stats), but **no H.264 decoder is integrated yet**, so H.264 never reaches the virtual camera and is not OBS-ready.
+
+Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [protocol/SPEC.md](protocol/SPEC.md).
+
+## Connecting the phone
+
+- **USB (recommended, default)**: the phone binds to `127.0.0.1` only; the
+  desktop app runs `adb forward` for you (Connection screen -> USB tab).
+  Video never leaves the cable, and no token is needed.
+- **Wi-Fi (LAN)**: switch the phone to *LAN Token* mode (app -> Security tab),
+  then enter the phone URL and the 32-character access token in the desktop
+  app's Wi-Fi tab. Every endpoint except `/health` requires the token.
+  Security settings themselves can only be changed from the phone or over USB.
 
 ## Current stable workflow
 
@@ -92,8 +105,13 @@ Before tagging a release, ensure:
   - [ ] 720p30 (Balanced) works flawlessly
   - [ ] 1080p60 (Experimental) produces reasonable framerates
 - [ ] Torch and profile changes update UI state reliably
+- [ ] Full manual pass of [docs/VALIDATION.md](docs/VALIDATION.md)
+
 ## Security Note
 
 - **USB mode (default)** is recommended and binds securely to 127.0.0.1.
-- **LAN mode** requires a token for authentication.
+- **LAN mode** requires a 128-bit token; it is enforced from the moment the
+  server binds and cannot be disabled remotely, even with a valid token.
+- Security settings (mode/port/token) are changeable only from the phone or
+  over USB.
 - Open unauthenticated LAN camera access is intentionally not supported.
