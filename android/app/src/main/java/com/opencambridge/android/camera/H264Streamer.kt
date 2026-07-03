@@ -31,6 +31,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 
 /**
@@ -46,7 +47,7 @@ class H264Streamer(
     private val scope = CoroutineScope(Dispatchers.Default)
     private val rebindMutex = Mutex()
     private var zoomJob: Job? = null
-    
+
     private var cameraProvider: ProcessCameraProvider? = null
     private var currentCamera: Camera? = null
 
@@ -69,15 +70,21 @@ class H264Streamer(
     private var nv12Buffer: ByteArray? = null
     private var nv21Buffer: ByteArray? = null
 
-    suspend fun start() = suspendCoroutine<Unit> { cont ->
-        val future = ProcessCameraProvider.getInstance(context)
-        future.addListener({
-            cameraProvider = future.get()
-            scope.launch { 
-                bindCameraSafe() 
-                cont.resume(Unit)
-            }
-        }, ContextCompat.getMainExecutor(context))
+    suspend fun start() {
+        val provider = suspendCoroutine<ProcessCameraProvider> { cont ->
+            val future = ProcessCameraProvider.getInstance(context)
+            future.addListener({
+                try {
+                    cont.resume(future.get())
+                } catch (e: Exception) {
+                    cont.resumeWithException(e)
+                }
+            }, ContextCompat.getMainExecutor(context))
+        }
+        cameraProvider = provider
+        // Propagates bind/codec failures to the caller so the service can enter
+        // ERROR state instead of pretending to stream.
+        bindCameraSafe()
     }
 
     private suspend fun bindCameraSafe() {
@@ -85,11 +92,11 @@ class H264Streamer(
             StreamState.rebindInProgress.set(true)
             try {
                 val provider = cameraProvider ?: return@withLock
-                
+
                 currentCamera?.cameraControl?.enableTorch(false)
                 StreamState.torchEnabled.set(false)
                 zoomJob?.cancel()
-                
+
                 stopCodec()
 
                 withContext(Dispatchers.Main) {
@@ -121,7 +128,7 @@ class H264Streamer(
 
                 imageAnalysis.setAnalyzer(analysisExecutor, ::processFrame)
                 StreamState.imageAnalysisUseCase = imageAnalysis
-                
+
                 val preview = Preview.Builder()
                     .setResolutionSelector(resSelector)
                     .build()
@@ -131,36 +138,36 @@ class H264Streamer(
 
                 try {
                     val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis)
-                    
+
                     withContext(Dispatchers.Main) {
                         if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
                             preview.setSurfaceProvider(surfaceProvider)
                             useCases.add(preview)
                         }
                         currentCamera = provider.bindToLifecycle(
-                            lifecycleOwner, 
-                            selector, 
+                            lifecycleOwner,
+                            selector,
                             *useCases.toTypedArray()
                         )
                         observeCameraControls()
-                        
+
                         val resolution = imageAnalysis.resolutionInfo?.resolution
                         if (resolution != null) {
                             val sensorRot = imageAnalysis.resolutionInfo?.rotationDegrees ?: 0
                             val isRotated = sensorRot % 180 != 0
                             val effW = if (isRotated) resolution.height else resolution.width
                             val effH = if (isRotated) resolution.width else resolution.height
-                            
+
                             StreamState.selectedRawWidth.set(resolution.width)
                             StreamState.selectedRawHeight.set(resolution.height)
                             StreamState.selectedEffectiveWidth.set(effW)
                             StreamState.selectedEffectiveHeight.set(effH)
                             StreamState.normalizedForPolicy.set(true)
-                            
+
                             Log.i("H264Streamer", "Selected Resolution: ${resolution.width}x${resolution.height} (Effective: ${effW}x${effH})")
                         }
                     }
-                    
+
                     StreamState.streaming.set(true)
                 } catch (e: Exception) {
                     Log.e("H264Streamer", "bindToLifecycle failed: ${e.message}")
@@ -186,20 +193,15 @@ class H264Streamer(
         }
     }
 
-    fun rebindIfStreaming() {
-        scope.launch {
-            if (StreamState.streaming.get()) {
-                bindCameraSafe()
-            }
-        }
-    }
-
     // ---- Channels ----
 
     fun subscribe(): Channel<ByteArray> {
-        val channel = Channel<ByteArray>(Channel.UNLIMITED)
+        // Bounded buffer: an H.264 stream must not be silently thinned (dropping
+        // arbitrary NAL units corrupts the bitstream until the next IDR), so instead
+        // of dropping we disconnect clients that fall too far behind (see drainCodec).
+        val channel = Channel<ByteArray>(capacity = 512)
         clients.add(channel)
-        
+
         // Send SPS/PPS immediately if available
         val sps = spsPpsBuffer
         if (sps != null) {
@@ -222,7 +224,7 @@ class H264Streamer(
             format.setInteger(MediaFormat.KEY_BIT_RATE, StreamState.h264Bitrate.get())
             format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, StreamState.h264KeyframeInterval.get())
-            
+
             mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             mediaCodec?.start()
@@ -254,7 +256,7 @@ class H264Streamer(
     private fun drainCodec() {
         val bufferInfo = MediaCodec.BufferInfo()
         val codec = mediaCodec ?: return
-        
+
         while (isEncoding) {
             try {
                 val outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 10000)
@@ -274,10 +276,17 @@ class H264Streamer(
                         if (isConfig) {
                             spsPpsBuffer = data
                         }
-                        
+
                         // Always broadcast. Some hardware packs SPS/PPS inline with the first IDR keyframe!
                         for (client in clients) {
-                            client.trySend(data)
+                            val result = client.trySend(data)
+                            if (result.isFailure && !result.isClosed) {
+                                // Client is too slow to keep up; disconnect it rather than
+                                // buffering unbounded memory or corrupting its bitstream.
+                                Log.w("H264Streamer", "Dropping slow H.264 client (buffer full)")
+                                clients.remove(client)
+                                client.close()
+                            }
                         }
 
                         framesEncoded++
@@ -299,7 +308,7 @@ class H264Streamer(
             imageProxy.close()
             return
         }
-        
+
         val codec = mediaCodec
         if (codec == null) {
             imageProxy.close()
@@ -315,11 +324,11 @@ class H264Streamer(
 
             val width = imageProxy.width
             val height = imageProxy.height
-            
+
             val actualRatio = width.toFloat() / height
             val aspect16_9 = 16f / 9f
             val aspect4_3 = 4f / 3f
-            
+
             if (kotlin.math.abs(actualRatio - aspect16_9) < 0.1 || kotlin.math.abs(1f/actualRatio - aspect16_9) < 0.1) {
                 StreamState.selectedAspectRatio.set("16:9")
             } else if (kotlin.math.abs(actualRatio - aspect4_3) < 0.1 || kotlin.math.abs(1f/actualRatio - aspect4_3) < 0.1) {
@@ -327,17 +336,17 @@ class H264Streamer(
             } else {
                 StreamState.selectedAspectRatio.set(String.format(java.util.Locale.US, "%.2f", actualRatio))
             }
-            
+
             val reqAspect = StreamState.requestedAspectRatio.get()
             StreamState.aspectRatioMatch.set(reqAspect.startsWith(StreamState.selectedAspectRatio.get()))
-            
+
             val targetW = StreamState.width.get()
             val targetH = StreamState.height.get()
             val rotatedW = if (StreamState.rotationDegrees.get() % 180 != 0) height else width
             val rotatedH = if (StreamState.rotationDegrees.get() % 180 != 0) width else height
-            
+
             StreamState.resizeNeeded.set(rotatedW != targetW || rotatedH != targetH)
-            
+
             val frameSize = width * height + (width / 2) * (height / 2) * 2
 
             if (nv12Buffer?.size != frameSize) nv12Buffer = ByteArray(frameSize)
@@ -362,7 +371,7 @@ class H264Streamer(
             if (now - lastJpegTime > jpegThrottleMs) {
                 val nv21 = nv21Buffer!!
                 yuvToNv21(imageProxy, nv21)
-                
+
                 // Offload heavy compression to avoid dropping the next H.264 frame
                 val nv21Copy = nv21.clone()
                 val currentQuality = StreamState.jpegQuality.get()
@@ -399,7 +408,7 @@ class H264Streamer(
 
         val yBuf = yPlane.buffer
         yBuf.rewind()
-        
+
         var dstOffset = 0
         if (yRowStride == width) {
             val toCopy = kotlin.math.min(width * height, yBuf.remaining())
@@ -472,7 +481,7 @@ class H264Streamer(
 
         val yBuf = yPlane.buffer
         yBuf.rewind()
-        
+
         var dstOffset = 0
         if (yRowStride == width) {
             val toCopy = kotlin.math.min(width * height, yBuf.remaining())
@@ -538,28 +547,32 @@ class H264Streamer(
 
     private fun observeCameraControls() {
         val camInfo = currentCamera?.cameraInfo ?: return
-        
+
         val hasFlash = camInfo.hasFlashUnit()
         StreamState.hasTorch.set(hasFlash)
         if (!hasFlash && StreamState.torchEnabled.get()) {
             StreamState.torchEnabled.set(false)
             currentCamera?.cameraControl?.enableTorch(false)
         }
-        
+        // Restore the user's requested torch state after a (re)bind.
+        if (hasFlash && StreamState.torchRequested.get()) {
+            currentCamera?.cameraControl?.enableTorch(true)
+        }
+
         camInfo.zoomState.observe(lifecycleOwner) { state ->
             StreamState.zoomRatio.set(state.zoomRatio)
             StreamState.linearZoom.set(state.linearZoom)
         }
-        
+
         camInfo.torchState.observe(lifecycleOwner) { state ->
             StreamState.torchEnabled.set(state == androidx.camera.core.TorchState.ON)
         }
     }
-    
+
     fun setZoomRatio(ratio: Float) {
         currentCamera?.cameraControl?.setZoomRatio(ratio)
     }
-    
+
     fun setLinearZoom(linear: Float) {
         val speed = StreamState.zoomSpeed.get()
         val step = when (speed) {
@@ -572,7 +585,7 @@ class H264Streamer(
             "fast" -> 20L
             else -> 30L
         }
-        
+
         zoomJob?.cancel()
         zoomJob = scope.launch {
             var current = currentCamera?.cameraInfo?.zoomState?.value?.linearZoom ?: return@launch
@@ -584,8 +597,9 @@ class H264Streamer(
             currentCamera?.cameraControl?.setLinearZoom(linear)
         }
     }
-    
+
     fun setTorch(enabled: Boolean) {
+        StreamState.torchRequested.set(enabled)
         currentCamera?.cameraControl?.enableTorch(enabled)
     }
 }

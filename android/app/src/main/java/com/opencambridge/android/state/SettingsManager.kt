@@ -12,10 +12,11 @@ class SettingsManager(context: Context) {
     fun load() {
         StreamState.accessMode.set(prefs.getString("accessMode", "usbOnly") ?: "usbOnly")
         StreamState.port.set(prefs.getInt("port", 8080))
-        
+
         var token = prefs.getString("accessToken", "") ?: ""
         if (token.isEmpty()) {
-            token = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
+            // Full 128-bit random token (UUID is backed by SecureRandom).
+            token = java.util.UUID.randomUUID().toString().replace("-", "")
             prefs.edit().putString("accessToken", token).apply()
         }
         StreamState.accessToken.set(token)
@@ -35,9 +36,9 @@ class SettingsManager(context: Context) {
         StreamState.previewFitMode.set(prefs.getString("previewFitMode", "fill") ?: "fill")
         val savedAspectRatio = prefs.getString("aspectRatio", "16:9") ?: "16:9"
         StreamState.aspectRatio.set(if (savedAspectRatio == "auto") "16:9" else savedAspectRatio)
-        
+
         StreamState.zoomSpeed.set(prefs.getString("zoomSpeed", "normal") ?: "normal")
-        
+
         try {
             val savedRot = prefs.getString("displayRotation", "0") ?: "0"
             StreamState.displayRotation.set(if (savedRot == "auto") "0" else savedRot)
@@ -46,7 +47,7 @@ class SettingsManager(context: Context) {
             val oldInt = prefs.getInt("displayRotation", 0)
             StreamState.displayRotation.set(oldInt.toString())
         }
-        
+
         StreamState.mirror.set(prefs.getBoolean("mirror", false))
         StreamState.localPreviewEnabled.set(prefs.getBoolean("localPreviewEnabled", false))
     }

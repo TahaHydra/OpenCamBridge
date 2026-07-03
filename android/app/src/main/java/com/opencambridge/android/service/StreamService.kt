@@ -36,14 +36,14 @@ class StreamService : LifecycleService() {
     private lateinit var mjpegStreamer: MjpegStreamer
     private lateinit var h264Streamer: H264Streamer
     private lateinit var settingsManager: SettingsManager
-    
+
     private val cameraMutex = Mutex()
 
     companion object {
         const val ACTION_STOP = "com.opencambridge.android.ACTION_STOP"
-        
+
         fun startIntent(context: Context) = Intent(context, StreamService::class.java)
-        
+
         fun stopIntent(context: Context) = Intent(context, StreamService::class.java).apply {
             action = ACTION_STOP
         }
@@ -66,14 +66,14 @@ class StreamService : LifecycleService() {
             onStartCamera = { startCamera() },
             onStopCamera = { stopCamera() },
             onApplySettingsPatch = { req, source -> applySettingsPatch(req, source) },
-            onSetZoomRatio = { ratio -> 
-                if (StreamState.streamMode.get() == "h264") h264Streamer.setZoomRatio(ratio) else mjpegStreamer.setZoomRatio(ratio) 
+            onSetZoomRatio = { ratio ->
+                if (StreamState.streamMode.get() == "h264") h264Streamer.setZoomRatio(ratio) else mjpegStreamer.setZoomRatio(ratio)
             },
-            onSetLinearZoom = { linear -> 
-                if (StreamState.streamMode.get() == "h264") h264Streamer.setLinearZoom(linear) else mjpegStreamer.setLinearZoom(linear) 
+            onSetLinearZoom = { linear ->
+                if (StreamState.streamMode.get() == "h264") h264Streamer.setLinearZoom(linear) else mjpegStreamer.setLinearZoom(linear)
             },
-            onSetTorch = { enabled -> 
-                if (StreamState.streamMode.get() == "h264") h264Streamer.setTorch(enabled) else mjpegStreamer.setTorch(enabled) 
+            onSetTorch = { enabled ->
+                if (StreamState.streamMode.get() == "h264") h264Streamer.setTorch(enabled) else mjpegStreamer.setTorch(enabled)
             },
             onRecoverCamera = { recoverCamera() }
         )
@@ -98,20 +98,20 @@ class StreamService : LifecycleService() {
         val port = StreamState.port.get()
         Log.d(TAG, "StreamService started. Server on port $port.")
         AppLogger.i("System", "StreamService started on port $port")
-        
+
         // Auto-start stream
         startCamera()
-        
+
         // Start bandwidth monitoring
         lifecycleScope.launch {
             while (isActive) {
                 kotlinx.coroutines.delay(2000)
-                
+
                 val sent = StreamState.bytesSentThisSecond.getAndSet(0L)
                 val bps = sent / 2.0 // average over 2 seconds
                 val mbps = (bps * 8.0) / 1_000_000.0
                 StreamState.estimatedMbps.set(String.format(java.util.Locale.US, "%.2f", mbps))
-                
+
                 val targetBandwidth = StreamState.targetBandwidthMbps.get()
                 if (targetBandwidth > 0 && StreamState.streamMode.get() == "mjpeg" && StreamState.lifecycleState.get() == LifecycleState.STREAMING) {
                     val currentQ = StreamState.jpegQuality.get()
@@ -125,7 +125,7 @@ class StreamService : LifecycleService() {
                 }
             }
         }
-        
+
         return START_STICKY
     }
 
@@ -199,18 +199,18 @@ class StreamService : LifecycleService() {
                 if (currentState != LifecycleState.STREAMING && currentState != LifecycleState.ERROR) {
                     return@withLock
                 }
-                
+
                 Log.d(TAG, "Camera REBINDING")
                 AppLogger.i("Camera", "Camera rebinding due to setting change")
                 StreamState.lifecycleState.set(LifecycleState.REBINDING)
                 StreamState.streaming.set(false)
-                
+
                 try {
                     mjpegStreamer.stop()
                     h264Streamer.stop()
                     // Wait briefly for camera hardware to release properly
                     kotlinx.coroutines.delay(200)
-                    
+
                     if (StreamState.streamMode.get() == "h264") {
                         h264Streamer.start()
                     } else {
@@ -240,9 +240,9 @@ class StreamService : LifecycleService() {
                 } catch (e: Exception) {
                     Log.e(TAG, "Error stopping during recovery", e)
                 }
-                
+
                 kotlinx.coroutines.delay(500) // Ensure hardware teardown
-                
+
                 StreamState.lifecycleState.set(LifecycleState.STARTING)
                 StreamState.lastError.set("")
                 StreamState.streaming.set(true)
@@ -272,7 +272,7 @@ class StreamService : LifecycleService() {
     private fun applySettingsPatch(req: UpdateSettingsRequest, source: String?) {
         var requiresRebind = false
         var requiresSettingsSave = false
-        
+
         AppLogger.i("System", "Settings patch received from ${source ?: "unknown"}")
 
         // --- Camera-Affecting Settings (Rebind) ---
@@ -290,7 +290,7 @@ class StreamService : LifecycleService() {
             requiresRebind = true
             requiresSettingsSave = true
         }
-        
+
         if (req.outputWidth != null || req.outputHeight != null) {
             val finalOW = req.outputWidth ?: StreamState.outputWidth.get()
             val finalOH = req.outputHeight ?: StreamState.outputHeight.get()
@@ -299,12 +299,21 @@ class StreamService : LifecycleService() {
             requiresRebind = true
             requiresSettingsSave = true
         }
-        
+
         req.profile?.let { StreamState.profile.set(it); requiresRebind = true; requiresSettingsSave = true }
-        
+
         // --- Display-Only & Control Settings (No Rebind) ---
-        req.accessMode?.let { StreamState.accessMode.set(it); requiresSettingsSave = true }
-        req.port?.let { StreamState.port.set(it); requiresSettingsSave = true }
+        // Note: the HTTP layer only forwards accessMode/port/accessToken from
+        // loopback (phone UI or USB) clients. Mode and port changes take effect
+        // after the service restarts, because the server socket binds once.
+        req.accessMode?.let {
+            StreamState.accessMode.set(it); requiresSettingsSave = true
+            AppLogger.w("Security", "Access mode set to '$it'. Restart streaming service to apply the new bind address.")
+        }
+        req.port?.let {
+            StreamState.port.set(it); requiresSettingsSave = true
+            AppLogger.w("Security", "Port set to $it. Restart streaming service to apply.")
+        }
         req.accessToken?.let { StreamState.accessToken.set(it); requiresSettingsSave = true }
         req.jpegQuality?.let { StreamState.jpegQuality.set(it.coerceIn(1, 100)); requiresSettingsSave = true }
         req.previewFitMode?.let { StreamState.previewFitMode.set(it); requiresSettingsSave = true }
@@ -319,10 +328,10 @@ class StreamService : LifecycleService() {
         if (req.localPreviewEnabled == false) {
             StreamState.previewUseCase?.setSurfaceProvider(null)
         }
-        
+
         if (requiresSettingsSave) settingsManager.save()
         StreamState.incrementRevision(source ?: "api")
-        
+
         if (requiresRebind && StreamState.lifecycleState.get() == LifecycleState.STREAMING) {
             rebindCamera()
         }
@@ -341,10 +350,15 @@ class StreamService : LifecycleService() {
             PendingIntent.FLAG_IMMUTABLE
         )
         val port = StreamState.port.get()
+        val contentText = if (StreamState.accessMode.get() == "usbOnly") {
+            "USB mode - localhost:$port (adb forward required)"
+        } else {
+            "LAN mode - http://$ip:$port (token required)"
+        }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText("http://$ip:$port")
+            .setContentText(contentText)
             .setContentIntent(openIntent)
             .addAction(android.R.drawable.ic_media_pause, getString(R.string.action_stop), stopIntent)
             .setOngoing(true)

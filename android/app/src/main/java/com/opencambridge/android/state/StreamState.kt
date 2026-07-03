@@ -23,7 +23,7 @@ object StreamState {
     val lifecycleState = AtomicReference(LifecycleState.STOPPED)
     val lastError = AtomicReference("")
 
-    
+
     // Security & Network
     val accessMode = AtomicReference("usbOnly") // usbOnly, lanOpen, lanToken
     val port = AtomicInteger(8080)
@@ -39,7 +39,7 @@ object StreamState {
     val outputWidth = AtomicInteger(1280) // requested output width
     val outputHeight = AtomicInteger(720) // requested output height
     val profile = AtomicReference("balanced")
-    
+
     val jpegQuality = AtomicInteger(85)
     val fps = AtomicInteger(30)
     val actualFps = AtomicInteger(0)
@@ -51,12 +51,14 @@ object StreamState {
     val zoomSpeed = AtomicReference("normal") // slow, normal, fast
     val displayRotation = AtomicReference("auto") // auto, 0, 90, 180, 270
     val mirror = AtomicBoolean(false)
-    
+
     // UI/Preview
     val localPreviewEnabled = AtomicBoolean(false)
     val torchEnabled = AtomicBoolean(false)
+    /** What the user asked the torch to be. Used to restore torch after a camera rebind. */
+    val torchRequested = AtomicBoolean(false)
     val autofocusEnabled = AtomicBoolean(true) // Default true for continuous AF
-    
+
     // Transient hardware state
     val rebindInProgress = AtomicBoolean(false)
     val zoomRatio = AtomicReference(1.0f)
@@ -69,7 +71,7 @@ object StreamState {
     val encodedWidth = AtomicInteger(0)
     val encodedHeight = AtomicInteger(0)
     val rotationApplied = AtomicBoolean(false)
-    
+
     // Resolution Selection Metrics
     val selectedRawWidth = AtomicInteger(0)
     val selectedRawHeight = AtomicInteger(0)
@@ -78,7 +80,7 @@ object StreamState {
     val normalizedForPolicy = AtomicBoolean(false)
     val resolutionPolicy = AtomicReference("unknown")
     val fallbackUsed = AtomicBoolean(false)
-    
+
     val requestedAspectRatio = AtomicReference("unknown")
     val selectedAspectRatio = AtomicReference("unknown")
     val aspectRatioMatch = AtomicBoolean(false)
@@ -92,16 +94,16 @@ object StreamState {
     /** Latest JPEG frame bytes, updated by MjpegStreamer. Null before first frame. */
     val latestFrame = AtomicReference<ByteArray?>(null)
     val latestFrameRevision = AtomicLong(0L)
-    
+
     /** SurfaceProvider for CameraX Preview use case */
     var surfaceProvider: androidx.camera.core.Preview.SurfaceProvider? = null
-    
+
     /** The active Preview UseCase (if any). Enables dynamic surface rebinding without tearing down CameraX. */
     var previewUseCase: androidx.camera.core.Preview? = null
-    
+
     /** The active ImageAnalysis UseCase (if any). Enables dynamic targetRotation updates. */
     var imageAnalysisUseCase: androidx.camera.core.ImageAnalysis? = null
-    
+
     fun incrementRevision(source: String) {
         revision.incrementAndGet()
         updatedAtMillis.set(System.currentTimeMillis())

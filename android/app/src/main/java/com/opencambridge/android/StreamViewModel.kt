@@ -59,22 +59,22 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _previewFitMode = MutableStateFlow("fill")
     val previewFitMode: StateFlow<String> = _previewFitMode.asStateFlow()
-    
+
     private val _aspectRatio = MutableStateFlow("16:9")
     val aspectRatio: StateFlow<String> = _aspectRatio.asStateFlow()
-    
+
     private val _zoomSpeed = MutableStateFlow("normal")
     val zoomSpeed: StateFlow<String> = _zoomSpeed.asStateFlow()
-    
+
     private val _displayRotation = MutableStateFlow("0")
     val displayRotation: StateFlow<String> = _displayRotation.asStateFlow()
-    
+
     private val _mirror = MutableStateFlow(false)
     val mirror: StateFlow<Boolean> = _mirror.asStateFlow()
-    
+
     private val _streamMode = MutableStateFlow("mjpeg")
     val streamMode: StateFlow<String> = _streamMode.asStateFlow()
-    
+
     // Security
     private val _accessMode = MutableStateFlow("usbOnly")
     val accessMode: StateFlow<String> = _accessMode.asStateFlow()
@@ -84,7 +84,7 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _accessToken = MutableStateFlow("")
     val accessToken: StateFlow<String> = _accessToken.asStateFlow()
-    
+
     private val _logs = MutableStateFlow<List<com.opencambridge.android.state.LogEntry>>(emptyList())
     val logs: StateFlow<List<com.opencambridge.android.state.LogEntry>> = _logs.asStateFlow()
 
@@ -97,13 +97,13 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _torchEnabled = MutableStateFlow(false)
     val torchEnabled: StateFlow<Boolean> = _torchEnabled.asStateFlow()
-    
+
     private val _hasTorch = MutableStateFlow(false)
     val hasTorch: StateFlow<Boolean> = _hasTorch.asStateFlow()
-    
+
     private val _linearZoom = MutableStateFlow(0f)
     val linearZoom: StateFlow<Float> = _linearZoom.asStateFlow()
-    
+
     private val _rotationDegrees = MutableStateFlow(0)
     val rotationDegrees: StateFlow<Int> = _rotationDegrees.asStateFlow()
 
@@ -111,7 +111,7 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             _cameras.value = cameraRepo.listCameras()
         }
-        
+
         viewModelScope.launch {
             while (true) {
                 _isStreaming.value = StreamState.streaming.get()
@@ -183,50 +183,50 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     fun updatePreviewFitMode(mode: String) {
         viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"previewFitMode": "$mode", "clientType": "phone"}""") }
     }
-    
+
     fun updateAspectRatio(ratio: String) {
         viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"aspectRatio": "$ratio", "clientType": "phone"}""") }
     }
-    
+
     fun updateZoomSpeed(speed: String) {
         viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"zoomSpeed": "$speed", "clientType": "phone"}""") }
     }
-    
+
     fun updateDisplayRotation(rotation: String) {
         viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"displayRotation": "$rotation", "clientType": "phone"}""") }
     }
-    
+
     fun updateMirror(mirror: Boolean) {
         viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"mirror": $mirror, "clientType": "phone"}""") }
     }
-    
+
     fun updateStreamMode(mode: String) {
         viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"streamMode": "$mode", "clientType": "phone"}""") }
     }
-    
+
     fun updateAccessMode(mode: String) {
         viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"accessMode": "$mode", "clientType": "phone"}""") }
     }
-    
+
     fun updatePort(p: Int) {
         viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"port": $p, "clientType": "phone"}""") }
     }
-    
+
     fun regenerateToken() {
-        val newToken = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
+        val newToken = java.util.UUID.randomUUID().toString().replace("-", "")
         viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"accessToken": "$newToken", "clientType": "phone"}""") }
     }
-    
+
     fun clearLogs() {
         viewModelScope.launch { postLocalApiSuspend("/api/logs/clear", "{}") }
     }
-    
+
     fun updateTorch(enabled: Boolean) {
         viewModelScope.launch {
             postLocalApiSuspend("/api/camera/torch", """{"enabled": $enabled}""")
         }
     }
-    
+
     fun updateZoom(linearZoom: Float) {
         viewModelScope.launch { postLocalApiSuspend("/api/camera/zoom", """{"linearZoom": $linearZoom}""") }
     }

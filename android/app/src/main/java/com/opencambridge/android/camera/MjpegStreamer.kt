@@ -23,6 +23,7 @@ import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 
 /**
@@ -37,22 +38,29 @@ class MjpegStreamer(
     private val scope = CoroutineScope(Dispatchers.Main)
     private val rebindMutex = Mutex()
     private var zoomJob: Job? = null
-    
+
     private var cameraProvider: ProcessCameraProvider? = null
     private var currentCamera: Camera? = null
 
     // Reusable buffer to avoid GC churn
     private var nv21Buffer: ByteArray? = null
 
-    suspend fun start() = suspendCoroutine<Unit> { cont ->
-        val future = ProcessCameraProvider.getInstance(context)
-        future.addListener({
-            cameraProvider = future.get()
-            scope.launch { 
-                bindCameraSafe() 
-                cont.resume(Unit)
-            }
-        }, ContextCompat.getMainExecutor(context))
+    suspend fun start() {
+        val provider = suspendCoroutine<ProcessCameraProvider> { cont ->
+            val future = ProcessCameraProvider.getInstance(context)
+            future.addListener({
+                try {
+                    cont.resume(future.get())
+                } catch (e: Exception) {
+                    // Without this, a provider failure would leave the caller suspended forever.
+                    cont.resumeWithException(e)
+                }
+            }, ContextCompat.getMainExecutor(context))
+        }
+        cameraProvider = provider
+        // Propagates bind failures to the caller so the service can enter ERROR state
+        // instead of pretending to stream.
+        bindCameraSafe()
     }
 
     private suspend fun bindCameraSafe() {
@@ -60,13 +68,15 @@ class MjpegStreamer(
             StreamState.rebindInProgress.set(true)
             try {
                 val provider = cameraProvider ?: return@withLock
-                
+
                 // Force torch off and cancel zoom before unbinding to prevent driver state corruption
                 currentCamera?.cameraControl?.enableTorch(false)
                 StreamState.torchEnabled.set(false)
                 zoomJob?.cancel()
 
-                provider.unbindAll()
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    provider.unbindAll()
+                }
 
                 val selector = buildSelector(StreamState.cameraId.get())
 
@@ -80,10 +90,12 @@ class MjpegStreamer(
 
                 val targetFps = StreamState.fps.get()
 
-                val fpsRange = if (targetFps >= 60) {
-                    android.util.Range(60, 60)
-                } else {
-                    android.util.Range(30, 30)
+                val fpsRange = when {
+                    targetFps >= 60 -> android.util.Range(60, 60)
+                    // Low-FPS requests: let AE pick within a widely supported range instead of
+                    // forcing 30. The HTTP layer paces output to the exact requested FPS.
+                    targetFps < 30 -> android.util.Range(targetFps.coerceAtLeast(15), 30)
+                    else -> android.util.Range(30, 30)
                 }
 
                 val imageAnalysisBuilder = ImageAnalysis.Builder()
@@ -109,10 +121,10 @@ class MjpegStreamer(
 
                 imageAnalysis.setAnalyzer(analysisExecutor, ::processFrame)
                 StreamState.imageAnalysisUseCase = imageAnalysis
-                
+
                 val previewBuilder = Preview.Builder()
                     .setResolutionSelector(resSelector)
-                    
+
                 try {
                     androidx.camera.camera2.interop.Camera2Interop.Extender(previewBuilder)
                         .setCaptureRequestOption(
@@ -130,19 +142,19 @@ class MjpegStreamer(
 
                 try {
                     val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis)
-                    
+
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                         if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
                             preview.setSurfaceProvider(surfaceProvider)
                             useCases.add(preview)
                         }
                         currentCamera = provider.bindToLifecycle(
-                            lifecycleOwner, 
-                            selector, 
+                            lifecycleOwner,
+                            selector,
                             *useCases.toTypedArray()
                         )
                         observeCameraControls()
-                        
+
                         // Extract actual resolution selected by CameraX
                         val resolution = imageAnalysis.resolutionInfo?.resolution
                         if (resolution != null) {
@@ -150,20 +162,22 @@ class MjpegStreamer(
                             val isRotated = sensorRot % 180 != 0
                             val effW = if (isRotated) resolution.height else resolution.width
                             val effH = if (isRotated) resolution.width else resolution.height
-                            
+
                             StreamState.selectedRawWidth.set(resolution.width)
                             StreamState.selectedRawHeight.set(resolution.height)
                             StreamState.selectedEffectiveWidth.set(effW)
                             StreamState.selectedEffectiveHeight.set(effH)
                             StreamState.normalizedForPolicy.set(true)
-                            
+
                             android.util.Log.i("MjpegStreamer", "Selected Resolution: ${resolution.width}x${resolution.height} (Effective: ${effW}x${effH})")
                         }
                     }
-                    
+
                     StreamState.streaming.set(true)
                 } catch (e: Exception) {
                     android.util.Log.e("MjpegStreamer", "bindToLifecycle failed: ${e.message}")
+                    // Surface the failure instead of silently reporting STREAMING.
+                    throw e
                 }
             } finally {
                 StreamState.rebindInProgress.set(false)
@@ -180,41 +194,38 @@ class MjpegStreamer(
         }
     }
 
-    fun rebindIfStreaming() {
-        scope.launch {
-            if (StreamState.streaming.get()) {
-                bindCameraSafe()
-            }
-        }
-    }
-    
     // ---- Camera Controls ----
-    
+
     private fun observeCameraControls() {
         val camInfo = currentCamera?.cameraInfo ?: return
-        
+
         val hasFlash = camInfo.hasFlashUnit()
         StreamState.hasTorch.set(hasFlash)
         if (!hasFlash && StreamState.torchEnabled.get()) {
             StreamState.torchEnabled.set(false)
             currentCamera?.cameraControl?.enableTorch(false)
         }
-        
+        // Restore the user's requested torch state after a (re)bind; the bind path
+        // forces the torch off to avoid driver state corruption.
+        if (hasFlash && StreamState.torchRequested.get()) {
+            currentCamera?.cameraControl?.enableTorch(true)
+        }
+
         // Synchronize state with current hardware capability
         camInfo.zoomState.observe(lifecycleOwner) { state ->
             StreamState.zoomRatio.set(state.zoomRatio)
             StreamState.linearZoom.set(state.linearZoom)
         }
-        
+
         camInfo.torchState.observe(lifecycleOwner) { state ->
             StreamState.torchEnabled.set(state == androidx.camera.core.TorchState.ON)
         }
     }
-    
+
     fun setZoomRatio(ratio: Float) {
         currentCamera?.cameraControl?.setZoomRatio(ratio)
     }
-    
+
     fun setLinearZoom(linear: Float) {
         val speed = StreamState.zoomSpeed.get()
         val step = when (speed) {
@@ -227,7 +238,7 @@ class MjpegStreamer(
             "fast" -> 20L
             else -> 30L
         }
-        
+
         zoomJob?.cancel()
         zoomJob = scope.launch {
             var current = currentCamera?.cameraInfo?.zoomState?.value?.linearZoom ?: return@launch
@@ -239,8 +250,9 @@ class MjpegStreamer(
             currentCamera?.cameraControl?.setLinearZoom(linear)
         }
     }
-    
+
     fun setTorch(enabled: Boolean) {
+        StreamState.torchRequested.set(enabled)
         currentCamera?.cameraControl?.enableTorch(enabled)
     }
 
@@ -252,23 +264,23 @@ class MjpegStreamer(
             imageProxy.close()
             return
         }
-        
+
         try {
             StreamState.rotationDegrees.set(imageProxy.imageInfo.rotationDegrees)
             StreamState.frameWidth.set(imageProxy.width)
             StreamState.frameHeight.set(imageProxy.height)
-            
+
             // For metrics only - what was actually sent
             StreamState.encodedWidth.set(imageProxy.width)
             StreamState.encodedHeight.set(imageProxy.height)
-            
+
             val width = imageProxy.width
             val height = imageProxy.height
-            
+
             val actualRatio = width.toFloat() / height
             val aspect16_9 = 16f / 9f
             val aspect4_3 = 4f / 3f
-            
+
             if (kotlin.math.abs(actualRatio - aspect16_9) < 0.1 || kotlin.math.abs(1f/actualRatio - aspect16_9) < 0.1) {
                 StreamState.selectedAspectRatio.set("16:9")
             } else if (kotlin.math.abs(actualRatio - aspect4_3) < 0.1 || kotlin.math.abs(1f/actualRatio - aspect4_3) < 0.1) {
@@ -276,24 +288,24 @@ class MjpegStreamer(
             } else {
                 StreamState.selectedAspectRatio.set(String.format(java.util.Locale.US, "%.2f", actualRatio))
             }
-            
+
             val reqAspect = StreamState.requestedAspectRatio.get()
             StreamState.aspectRatioMatch.set(reqAspect.startsWith(StreamState.selectedAspectRatio.get()))
-            
+
             val targetW = StreamState.width.get()
             val targetH = StreamState.height.get()
             val rotatedW = if (StreamState.rotationDegrees.get() % 180 != 0) height else width
             val rotatedH = if (StreamState.rotationDegrees.get() % 180 != 0) width else height
-            
+
             StreamState.resizeNeeded.set(rotatedW != targetW || rotatedH != targetH)
-            
+
             val frameSize = width * height + (width / 2) * (height / 2) * 2
 
             if (nv21Buffer?.size != frameSize) nv21Buffer = ByteArray(frameSize)
             val nv21 = nv21Buffer!!
-            
+
             yuvToNv21(imageProxy, nv21)
-            
+
             val encodeStartNs = System.nanoTime()
 
             val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
@@ -304,7 +316,7 @@ class MjpegStreamer(
             val prevAvg = StreamState.androidEncodeMsAvg.get()
             val nextAvg = if (prevAvg <= 0.0) encodeMs else (prevAvg * 0.85 + encodeMs * 0.15)
             StreamState.androidEncodeMsAvg.set(nextAvg)
-            
+
             StreamState.latestFrame.set(out.toByteArray())
             StreamState.latestFrameRevision.incrementAndGet()
 
@@ -339,7 +351,7 @@ class MjpegStreamer(
 
         val yBuf = yPlane.buffer
         yBuf.rewind()
-        
+
         var dstOffset = 0
         if (yRowStride == width) {
             val toCopy = kotlin.math.min(width * height, yBuf.remaining())
