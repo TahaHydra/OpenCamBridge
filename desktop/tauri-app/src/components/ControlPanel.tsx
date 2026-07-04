@@ -247,17 +247,19 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
   const handleStartProducer = async (s: any) => {
     const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
-    const targetUrl = `${base}/stream.mjpeg`;
+    const source = s.streamMode === 'h264' ? 'h264' : 'mjpeg';
+    const targetUrl = source === 'h264' ? `${base}/stream.h264` : `${base}/stream.mjpeg`;
     // Pass display rotation/mirror to the producer so the virtual camera output
-    // matches the preview; the raw MJPEG frames from Android are unrotated.
+    // matches the preview; the raw frames from Android are unrotated.
     let rotate: number | undefined = parseInt(s.displayRotation, 10);
     if (isNaN(rotate) || rotate % 90 !== 0) rotate = undefined;
     console.log('[Tauri UI] Calling start_virtual_camera_feeder with', {
-      url: targetUrl, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, quality: s.jpegQuality, profile: s.profile, rotate, mirror: s.mirror
+      url: targetUrl, source, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, quality: s.jpegQuality, profile: s.profile, rotate, mirror: s.mirror
     });
     try {
       await invoke('start_virtual_camera_feeder', {
         url: targetUrl,
+        source,
         width: s.outputWidth || s.width,
         height: s.outputHeight || s.height,
         fps: s.fps,
@@ -367,7 +369,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     setIsSyncing(true);
 
     try {
-      const streamImpacting = ['profile', 'width', 'height', 'fps', 'jpegQuality', 'cameraId', 'streamMode'].some(k => keysChanged.includes(k));
+      const streamImpacting = ['profile', 'width', 'height', 'fps', 'jpegQuality', 'cameraId', 'streamMode', 'h264Bitrate', 'h264KeyframeInterval'].some(k => keysChanged.includes(k));
       const streamWasRunning = vcamState?.running || androidMetrics?.encodedWidth > 0;
 
       if (streamImpacting && streamWasRunning) {
@@ -406,12 +408,14 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
   const waitForAndroidResolution = async (s: any, timeoutMs = 8000) => {
     const deadline = Date.now() + timeoutMs;
+    let lastMetrics: any = null;
 
     while (Date.now() < deadline) {
       try {
         const res = await apiFetch(baseUrl, '/api/stream/metrics', token);
         if (res.ok) {
           const m = await res.json();
+          lastMetrics = m;
 
           const encodedOk =
             Number(m.encodedWidth) === Number(s.width) &&
@@ -431,9 +435,24 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       await sleep(300);
     }
 
+    // The device may legitimately pick a nearby supported size instead of the
+    // exact request (that is what the resolution policy is for). If frames are
+    // flowing, proceed with a warning instead of failing the whole pipeline.
+    const hasAnyFrame = lastMetrics && (
+      Number(lastMetrics.latestFrameRevision || 0) > 0 ||
+      Number(lastMetrics.encodedWidth || 0) > 0
+    );
+    if (hasAnyFrame) {
+      console.warn(
+        `[Tauri UI] Android is streaming ${lastMetrics.encodedWidth}x${lastMetrics.encodedHeight} ` +
+        `instead of the requested ${s.width}x${s.height}; continuing (producer resizes).`
+      );
+      return lastMetrics;
+    }
+
     throw new Error(
-      `Android did not rebind to ${s.width}x${s.height}. ` +
-      `Stop/start CameraX is broken or resolution policy rejected it.`
+      `Android did not start streaming after settings change (requested ${s.width}x${s.height}). ` +
+      `Check the phone's Logs tab for camera errors.`
     );
   };
 
@@ -700,7 +719,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                       <div style={{ marginTop: 4, fontStyle: 'italic', color: '#888' }}>
                         Bottleneck Analysis:
                         <ul style={{ margin: '2px 0 0 16px', padding: 0 }}>
-                          <li>Android Encode: {androidMetrics.encodedFps || 0} FPS ({androidMetrics.encodeMsAvg || 0}ms)</li>
+                          <li>Android Encode: {androidMetrics.actualFps || 0} FPS ({Number(androidMetrics.androidEncodeMsAvg || 0).toFixed(1)}ms)</li>
                           <li>Rust Decode: {vcamState.metrics.decode_ms_avg} ms</li>
                           <li>IPC Write: {vcamState.metrics.write_ms_avg} ms</li>
                         </ul>
@@ -843,12 +862,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
             onChange={(e) => updateSetting('streamMode', e.target.value)}
           >
             <option value="mjpeg">MJPEG (Stable)</option>
-            <option value="h264" disabled>H.264 (Experimental - not OBS-ready yet)</option>
+            <option value="h264">H.264 (Experimental)</option>
           </select>
           <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-            H.264 exists on the phone as an experimental endpoint, but the Windows side
-            has no H.264 decoder yet, so it cannot reach the virtual camera. MJPEG is the
-            supported path.
+            H.264 uses much less bandwidth at the same quality. The Windows producer
+            decodes it with a bundled software decoder. Experimental: if you see
+            artifacts or stalls, switch back to MJPEG (the stable path).
           </p>
         </div>
 
@@ -884,15 +903,39 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
             </div>
           </>
         ) : (
-          <div style={{ marginTop: 12, padding: 12, background: 'rgba(255, 179, 0, 0.1)', borderRadius: 6, border: '1px solid rgba(255, 179, 0, 0.3)' }}>
-            <p style={{ fontSize: '0.8rem', color: '#ffb300', marginBottom: 12 }}>H.264 is currently experimental. UI controls are disabled in this batch.</p>
+          <div style={{ marginTop: 12, padding: 12, background: 'rgba(255, 179, 0, 0.06)', borderRadius: 6, border: '1px solid rgba(255, 179, 0, 0.25)' }}>
+            <p style={{ fontSize: '0.75rem', color: '#ffb300', marginBottom: 12 }}>
+              H.264 is experimental. The desktop preview falls back to ~5 fps JPEG
+              snapshots; the virtual camera itself runs at full rate.
+            </p>
             <div className="control-item">
-              <label>Bitrate (Mbps)</label>
-              <input type="range" min="1" max="50" value={4} disabled style={{ width: '100%', opacity: 0.5 }} />
+              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Bitrate</span>
+                <span>{(settings.h264Bitrate / 1_000_000).toFixed(0)} Mbps</span>
+              </label>
+              <input
+                type="range"
+                min="1" max="20" step="1"
+                style={{ width: '100%', marginTop: 8 }}
+                value={Math.round(settings.h264Bitrate / 1_000_000)}
+                onChange={(e) => updateSetting('h264Bitrate', parseInt(e.target.value) * 1_000_000)}
+              />
             </div>
-            <div className="control-row" style={{ marginTop: 8 }}>
-              <label>Low Latency Profile</label>
-              <input type="checkbox" checked disabled />
+            <div className="control-item" style={{ marginTop: 12 }}>
+              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Keyframe Interval</span>
+                <span>{settings.h264KeyframeInterval}s</span>
+              </label>
+              <input
+                type="range"
+                min="1" max="10" step="1"
+                style={{ width: '100%', marginTop: 8 }}
+                value={settings.h264KeyframeInterval}
+                onChange={(e) => updateSetting('h264KeyframeInterval', parseInt(e.target.value))}
+              />
+              <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
+                Shorter intervals recover faster after network hiccups but cost bandwidth.
+              </p>
             </div>
           </div>
         )}

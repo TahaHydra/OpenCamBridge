@@ -109,6 +109,12 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
             <RefreshCw size={14} /> Reload
           </button>
         )}
+
+        {!isError && serverStatus?.streamMode === 'h264' && (
+          <div style={{ position: 'absolute', bottom: 16, left: 16, padding: '4px 10px', fontSize: '0.7rem', color: '#ffb300', background: 'rgba(0,0,0,0.6)', border: '1px solid rgba(255,179,0,0.4)', borderRadius: 4 }}>
+            H.264 active — this preview is a ~5 fps snapshot; the virtual camera runs at full rate
+          </div>
+        )}
       </div>
     </div>
   );

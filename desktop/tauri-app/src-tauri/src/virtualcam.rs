@@ -19,6 +19,9 @@ pub struct VirtualCamMetrics {
     pub dropped_jpegs: u32,
     pub jpeg_queue_len: u32,
     pub decode_ms_avg: u32,
+    // default so metrics from older producer builds still parse
+    #[serde(default)]
+    pub rotate_ms_avg: u32,
     pub resize_ms_avg: u32,
     pub write_ms_avg: u32,
     pub total_pipeline_ms: u32,
@@ -125,8 +128,14 @@ pub fn start_virtual_camera_feeder(
     rotate: Option<u32>,
     mirror: Option<bool>,
     token: Option<String>,
+    source: Option<String>,
 ) -> Result<(), String> {
-    println!(">>> [Tauri] start_virtual_camera_feeder called with width={}, height={}, fps={}", width, height, fps);
+    let source = match source.as_deref() {
+        None | Some("mjpeg") => "mjpeg",
+        Some("h264") => "h264",
+        Some(other) => return Err(format!("Unknown stream source '{}' (expected mjpeg or h264)", other)),
+    };
+    println!(">>> [Tauri] start_virtual_camera_feeder called with source={}, width={}, height={}, fps={}", source, width, height, fps);
     let mut child_guard = state.child.lock().unwrap();
     if let Some(mut child) = child_guard.take() {
         println!(">>> [Tauri] Found existing producer (PID {}). Stopping it.", child.id());
@@ -161,7 +170,7 @@ pub fn start_virtual_camera_feeder(
     let path_string = exe_path.to_string_lossy().to_string();
 
     let mut cmd = Command::new(exe_path);
-    cmd.arg("--source").arg("mjpeg")
+    cmd.arg("--source").arg(source)
        .arg("--url").arg(&url)
        .arg("--width").arg(width.to_string())
        .arg("--height").arg(height.to_string())
