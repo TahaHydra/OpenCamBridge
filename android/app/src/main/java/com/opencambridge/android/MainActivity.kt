@@ -258,8 +258,20 @@ fun MainScreen(
     var currentTab by remember { mutableStateOf(NavTab.Stream) }
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-    
+
+    // Surface control failures (failed local API POSTs) as a Snackbar so a
+    // button that silently failed is visible, not buried in the Logs tab.
+    val snackbarHostState = remember { SnackbarHostState() }
+    val controlError by viewModel.controlError.collectAsState()
+    LaunchedEffect(controlError) {
+        controlError?.let {
+            snackbarHostState.showSnackbar(it)
+            viewModel.clearControlError()
+        }
+    }
+
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
             NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
                 NavigationBarItem(
@@ -483,17 +495,34 @@ fun MainControls(
     onMirrorSelect: (Boolean) -> Unit, onStreamModeSelect: (String) -> Unit
 ) {
     if (cameras.isNotEmpty()) {
+        // Capability gating from the SAME model the desktop uses: the selected
+        // lens reports which frame rates it can actually deliver at this
+        // resolution. Unknown (0) means do not restrict.
+        val activeCam = cameras.find { it.id == selectedCameraId }
+        val maxFpsHere = activeCam?.fpsByResolution
+            ?.firstOrNull { it.width == width && it.height == height }?.maxFps ?: 0
+
+        if (rebindInProgress) {
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF33270A)), modifier = Modifier.fillMaxWidth()) {
+                Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = Color(0xFFFBC02D))
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text("Rebinding camera… controls disabled", color = Color(0xFFFBC02D), fontSize = 13.sp)
+                }
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
         // Camera Config
         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text("Camera Configuration", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                Text("Camera", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(16.dp))
                 CameraSelector(cameras, selectedCameraId, !rebindInProgress, onCameraSelect)
                 Spacer(modifier = Modifier.height(16.dp))
                 ResolutionSelector(width, height, !rebindInProgress, onResolutionSelect)
                 Spacer(modifier = Modifier.height(16.dp))
-
-                FpsSelector(fps, !rebindInProgress, onFpsSelect)
+                FpsSelector(fps, maxFpsHere, !rebindInProgress, onFpsSelect)
             }
         }
         Spacer(modifier = Modifier.height(16.dp))
@@ -501,25 +530,18 @@ fun MainControls(
         // Image Controls
         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text("Image Controls", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
-                Spacer(modifier = Modifier.height(16.dp))
-                StreamModeSelector(streamMode, !rebindInProgress, onStreamModeSelect)
-                if (streamMode == "h264") {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text("H.264 stream available at /stream.h264. MJPEG preview is running in background at 5 FPS.", color = Color.Gray, fontSize = 12.sp)
-                }
+                Text("Image", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(16.dp))
                 QualitySlider(jpegQuality, !rebindInProgress, onJpegQualitySelect)
-                Spacer(modifier = Modifier.height(16.dp))
-                ZoomSpeedSelector(zoomSpeed, !rebindInProgress, onZoomSpeedSelect)
                 Spacer(modifier = Modifier.height(16.dp))
                 ZoomSlider(linearZoom, !rebindInProgress, onZoomSelect)
                 Spacer(modifier = Modifier.height(16.dp))
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Column {
                         Text("Torch / Lamp", color = if (hasTorch && !rebindInProgress) Color.Unspecified else Color.Gray)
-                        if (!hasTorch) Text("Unsupported", color = Color.Gray, fontSize = 12.sp)
+                        if (!hasTorch) Text("Not available on this lens", color = Color.Gray, fontSize = 12.sp)
                     }
+                    // Only shown as interactive when the active lens actually has a flash.
                     Switch(checked = torchEnabled, enabled = hasTorch && !rebindInProgress, onCheckedChange = onToggleTorch, colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary))
                 }
             }
@@ -529,23 +551,29 @@ fun MainControls(
         // Output & Display
         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text("Output & Display", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                Text("Output", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(16.dp))
-                FitModeSelector(previewFitMode, !rebindInProgress, onPreviewFitModeSelect)
-                Spacer(modifier = Modifier.height(16.dp))
-                Button(
-                    onClick = { onMirrorSelect(!mirror) },
-                    enabled = !rebindInProgress,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(if (mirror) "Mirror: ON" else "Mirror: OFF")
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Button(
+                        onClick = {
+                            val currentRot = displayRotation.toIntOrNull() ?: 0
+                            onDisplayRotationSelect(((currentRot + 90) % 360).toString())
+                        },
+                        enabled = !rebindInProgress,
+                        modifier = Modifier.weight(1f).padding(end = 8.dp)
+                    ) {
+                        Text("↻ Rotate ${(displayRotation.toIntOrNull() ?: 0)}°")
+                    }
+                    Button(
+                        onClick = { onMirrorSelect(!mirror) },
+                        enabled = !rebindInProgress,
+                        modifier = Modifier.weight(1f).padding(start = 8.dp)
+                    ) {
+                        Text(if (mirror) "Mirror: ON" else "Mirror: OFF")
+                    }
                 }
-                Spacer(modifier = Modifier.height(16.dp))
-                OutputOrientationSelector(aspectRatio, displayRotation, !rebindInProgress) { ar, rot ->
-                    onAspectRatioSelect(ar)
-                    onDisplayRotationSelect(rot)
-                }
-                // OutputOrientationSelector removed the old Mirror switch
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("Video is auto-uprighted for how the phone is held. Rotate adds a 90° offset on top.", color = Color.Gray, fontSize = 12.sp)
             }
         }
         Spacer(modifier = Modifier.height(32.dp))
@@ -723,41 +751,53 @@ fun ResolutionSelector(width: Int, height: Int, enabled: Boolean, onSelect: (Int
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun FpsSelector(fps: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
+fun FpsSelector(fps: Int, maxFps: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     val options = listOf(15, 30, 60)
+    // maxFps == 0 means "unknown" (capability not reported) → do not restrict.
+    fun supported(opt: Int) = maxFps == 0 || opt <= maxFps + 2
 
-    ExposedDropdownMenuBox(
-        expanded = expanded,
-        onExpandedChange = { if (enabled) expanded = it },
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        OutlinedTextField(
-            value = "$fps fps",
-            onValueChange = {},
-            readOnly = true,
-            enabled = enabled,
-            label = { Text("FPS Limit") },
-            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled).fillMaxWidth(),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = Color(0xFF4FC3F7),
-                unfocusedBorderColor = Color(0xFF37474F)
-            )
-        )
-        ExposedDropdownMenu(
+    Column(modifier = Modifier.fillMaxWidth()) {
+        ExposedDropdownMenuBox(
             expanded = expanded,
-            onDismissRequest = { expanded = false }
+            onExpandedChange = { if (enabled) expanded = it },
+            modifier = Modifier.fillMaxWidth()
         ) {
-            options.forEach { opt ->
-                DropdownMenuItem(
-                    text = { Text("$opt fps") },
-                    onClick = {
-                        onSelect(opt)
-                        expanded = false
-                    }
+            OutlinedTextField(
+                value = "$fps fps",
+                onValueChange = {},
+                readOnly = true,
+                enabled = enabled,
+                label = { Text("Frame Rate") },
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled).fillMaxWidth(),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Color(0xFF4FC3F7),
+                    unfocusedBorderColor = Color(0xFF37474F)
                 )
+            )
+            ExposedDropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false }
+            ) {
+                options.forEach { opt ->
+                    val ok = supported(opt)
+                    DropdownMenuItem(
+                        enabled = ok,
+                        text = { Text(if (ok) "$opt fps" else "$opt fps (unsupported here)") },
+                        onClick = {
+                            if (ok) { onSelect(opt); expanded = false }
+                        }
+                    )
+                }
             }
+        }
+        if (maxFps > 0) {
+            Text(
+                "This lens reports up to $maxFps fps at this resolution via the normal camera API. " +
+                    "High-speed (slow-motion) modes, if any, are not used by the MJPEG webcam path.",
+                color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)
+            )
         }
     }
 }

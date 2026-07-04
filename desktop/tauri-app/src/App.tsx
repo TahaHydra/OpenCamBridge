@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react';
-import { Camera, Unplug, Zap, Monitor, Usb, Wifi, ShieldCheck } from 'lucide-react';
+import { Camera, Unplug, Zap, Monitor, Usb, Wifi, ShieldCheck, FileText } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import Preview from './components/Preview';
 import ControlPanel from './components/ControlPanel';
+import LogsView from './components/LogsView';
 import { apiFetch } from './services/api';
+import { startSession, logEvent } from './services/logging';
 import './App.css';
 
 interface ConnectionScreenProps {
@@ -203,6 +205,27 @@ export default function App() {
   const [fitMode, setFitMode] = useState('fill');
   const [obsMode, setObsMode] = useState(false);
   const [previewOff, setPreviewOff] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
+
+  // Start a persistent session log on connect, and record device + capability
+  // info once so a sent-in log file is self-describing.
+  useEffect(() => {
+    if (!isConnected || !baseUrl) return;
+    (async () => {
+      await startSession({ transport: token ? 'LAN (token)' : 'USB', baseUrl });
+      try {
+        const info = await (await apiFetch(baseUrl, '/api/device/info', token)).json();
+        logEvent('device', JSON.stringify(info));
+      } catch { /* device info is best-effort */ }
+      try {
+        const cams = await (await apiFetch(baseUrl, '/api/camera/list', token)).json();
+        const list = Array.isArray(cams) ? cams : cams.cameras || [];
+        for (const c of list) {
+          logEvent('capability', `lens ${c.id} ${c.label} facing=${c.facing} torch=${c.hasTorch} maxFps=${JSON.stringify(c.fpsByResolution || [])} highSpeed=${c.supportsHighSpeed ? JSON.stringify(c.highSpeedFpsRanges || []) : 'no'}`);
+        }
+      } catch { /* capabilities best-effort */ }
+    })();
+  }, [isConnected, baseUrl, token]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -274,6 +297,9 @@ export default function App() {
             <div className={`status-dot ${stateClass}`}></div>
             <span style={{ textTransform: 'uppercase', letterSpacing: 1 }}>{serverStatus?.lifecycleState || 'UNKNOWN'}</span>
           </div>
+          <button className="btn btn-secondary" onClick={() => setShowLogs(true)} style={{ padding: '6px 12px', fontSize: '0.8rem' }} title="Session logs">
+            <FileText size={14} /> Logs
+          </button>
           <button className="btn btn-secondary" onClick={() => { setIsConnected(false); setToken(''); }} style={{ padding: '6px 12px', fontSize: '0.8rem' }}>
             <Unplug size={14} /> Disconnect
           </button>
@@ -302,6 +328,8 @@ export default function App() {
 
         <ControlPanel baseUrl={baseUrl} token={token} fitMode={fitMode} setFitMode={setFitMode} onEnterObsMode={() => setObsMode(true)} previewOff={previewOff} setPreviewOff={setPreviewOff} />
       </main>
+
+      {showLogs && <LogsView onClose={() => setShowLogs(false)} />}
     </div>
   );
 }

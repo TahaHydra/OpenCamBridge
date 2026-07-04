@@ -88,6 +88,12 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private val _logs = MutableStateFlow<List<com.opencambridge.android.state.LogEntry>>(emptyList())
     val logs: StateFlow<List<com.opencambridge.android.state.LogEntry>> = _logs.asStateFlow()
 
+    // Transient, user-facing control-failure message (shown as a Snackbar) so a
+    // button that silently failed its local API call is visible, not just logged.
+    private val _controlError = MutableStateFlow<String?>(null)
+    val controlError: StateFlow<String?> = _controlError.asStateFlow()
+    fun clearControlError() { _controlError.value = null }
+
     // Preview / Controls
     private val _localPreviewEnabled = MutableStateFlow(false)
     val localPreviewEnabled: StateFlow<Boolean> = _localPreviewEnabled.asStateFlow()
@@ -260,18 +266,21 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 conn.readTimeout = 1000
                 conn.outputStream.write(jsonPayload.toByteArray())
                 val code = conn.responseCode // Wait for completion
-                // Surface failed control calls instead of silently dropping them,
-                // so a button that does nothing shows up in the Logs tab.
+                // Surface failed control calls instead of silently dropping them:
+                // both to the Logs tab and as a transient Snackbar, so a button
+                // that does nothing is never invisible.
                 if (code !in 200..299) {
                     com.opencambridge.android.state.AppLogger.w(
                         "Control", "POST $path failed: HTTP $code"
                     )
+                    _controlError.value = "Action failed (HTTP $code): ${path.substringAfterLast('/')}"
                 }
                 conn.disconnect()
             } catch (e: Exception) {
                 com.opencambridge.android.state.AppLogger.w(
                     "Control", "POST $path failed: ${e.javaClass.simpleName}: ${e.message}"
                 )
+                _controlError.value = "Action failed: ${path.substringAfterLast('/')} (${e.javaClass.simpleName})"
             }
         }
     }

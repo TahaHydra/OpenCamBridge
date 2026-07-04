@@ -906,55 +906,16 @@ class ControlServer(
     }
 
     private suspend fun serveCameraCapabilities(call: RoutingCall) {
+        // Unified capability model: this endpoint now returns the SAME canonical
+        // CameraInfoDto list as /api/camera/list (torch, lens type, per-resolution
+        // max FPS, high-speed diagnostics). Previously it returned a separate,
+        // thinner CameraCapabilityDto — a duplicate that could drift from the
+        // real model. Kept as an alias so existing callers keep working.
         try {
-            // ProcessCameraProvider.getInstance(...).get() can block briefly on
-            // first use; keep it off the server's event loop. Note: the old
-            // implementation responded with Map<String, Any>, which kotlinx
-            // serialization cannot encode - this endpoint used to 500 at runtime.
-            val provider = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                androidx.camera.lifecycle.ProcessCameraProvider.getInstance(context).get()
+            val cameras = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                cameraRepo.listCameras()
             }
-
-            val capabilities = mutableListOf<CameraCapabilityDto>()
-
-            for (camInfo in provider.availableCameraInfos) {
-                val facing = if (camInfo.lensFacing == androidx.camera.core.CameraSelector.LENS_FACING_BACK) "back"
-                             else if (camInfo.lensFacing == androidx.camera.core.CameraSelector.LENS_FACING_FRONT) "front"
-                             else "external"
-
-                val zoomState = camInfo.zoomState.value
-                val minZoom = zoomState?.minZoomRatio ?: 1.0f
-                val maxZoom = zoomState?.maxZoomRatio ?: 1.0f
-
-                try {
-                    val c2info = Camera2CameraInfo.from(camInfo)
-                    val id = c2info.cameraId
-
-                    var label = "$facing camera $id"
-                    val focalLengths = c2info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-                    if (focalLengths != null && focalLengths.isNotEmpty()) {
-                        val minFocal = focalLengths.minOrNull() ?: 50f
-                        if (minFocal < 3.0f) label = "$facing ultrawide"
-                        else if (minFocal > 5.0f) label = "$facing telephoto"
-                        else label = "$facing wide/main"
-                    }
-
-                    capabilities.add(
-                        CameraCapabilityDto(
-                            id = id,
-                            facing = facing,
-                            label = label,
-                            minZoom = minZoom,
-                            maxZoom = maxZoom,
-                            sensorRotation = camInfo.sensorRotationDegrees
-                        )
-                    )
-                } catch (e: Exception) {
-                    // fallback if Camera2Interop fails for this camera; skip it
-                }
-            }
-
-            call.respond(capabilities)
+            call.respond(cameras)
         } catch (e: Exception) {
             call.respond(HttpStatusCode.InternalServerError, SimpleResult(false, "Error: ${e.message}"))
         }

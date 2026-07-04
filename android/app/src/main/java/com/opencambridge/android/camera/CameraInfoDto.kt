@@ -26,7 +26,16 @@ data class CameraInfoDto(
      *  size is not supported (or the duration is unknown). Used to enable/disable
      *  60 fps in the UI per lens+resolution instead of pretending every phone
      *  can do it. */
-    val fpsByResolution: List<ResolutionFpsDto> = emptyList()
+    val fpsByResolution: List<ResolutionFpsDto> = emptyList(),
+
+    /** Diagnostics only (NOT used by the MJPEG webcam path). Whether the camera
+     *  advertises CONSTRAINED_HIGH_SPEED_VIDEO and the slow-motion sizes/ranges
+     *  it exposes there. This explains devices (e.g. some OnePlus/LineageOS
+     *  builds) that only offer 30 fps to normal ImageAnalysis yet have 120/240
+     *  fps slow-motion modes the standard capture path cannot use. */
+    val supportsHighSpeed: Boolean = false,
+    val highSpeedSizes: List<SizeDto> = emptyList(),
+    val highSpeedFpsRanges: List<FpsRangeDto> = emptyList()
 )
 
 @Serializable

@@ -1,5 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod adb;
+mod logger;
 mod virtualcam;
 
 #[tauri::command]
@@ -14,6 +15,7 @@ pub fn run() {
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
         .manage(virtualcam::VirtualCamManager::new())
+        .manage(logger::SessionLog::new())
         .invoke_handler(tauri::generate_handler![
             greet,
             adb::get_adb_status,
@@ -26,7 +28,13 @@ pub fn run() {
             virtualcam::stop_virtual_camera_host,
             virtualcam::start_virtual_camera_feeder,
             virtualcam::stop_virtual_camera_feeder,
-            virtualcam::get_virtual_camera_status
+            virtualcam::get_virtual_camera_status,
+            logger::start_log_session,
+            logger::append_log,
+            logger::get_log_path,
+            logger::read_log_tail,
+            logger::clear_log,
+            logger::open_logs_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

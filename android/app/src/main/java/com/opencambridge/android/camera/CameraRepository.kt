@@ -119,6 +119,29 @@ class CameraRepository(private val context: Context) {
             }
         }
 
+        // High-speed (constrained slow-motion) capability — diagnostics only.
+        // The normal ImageAnalysis/YUV path cannot use these modes, so a device
+        // may report 30 fps max above yet expose 120/240 fps here.
+        val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
+        val supportsHighSpeed = caps.contains(
+            CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO
+        )
+        var highSpeedSizes: List<SizeDto> = emptyList()
+        var highSpeedFpsRanges: List<FpsRangeDto> = emptyList()
+        if (supportsHighSpeed && configMap != null) {
+            try {
+                highSpeedSizes = configMap.highSpeedVideoSizes
+                    ?.map { SizeDto(it.width, it.height) }
+                    ?.sortedByDescending { it.width * it.height } ?: emptyList()
+                highSpeedFpsRanges = configMap.highSpeedVideoFpsRanges
+                    ?.map { FpsRangeDto(it.lower, it.upper) }
+                    ?.distinct()
+                    ?.sortedByDescending { it.max } ?: emptyList()
+            } catch (e: Exception) {
+                Log.w("CameraRepository", "High-speed query failed for $id: ${e.message}")
+            }
+        }
+
         val lensType = lensType(facing, focalLengths)
         val label = buildLabel(facing, focalLengths, id)
 
@@ -136,7 +159,10 @@ class CameraRepository(private val context: Context) {
             zoomRatioMax = zoomMax,
             hasTorch = hasTorch,
             lensType = lensType,
-            fpsByResolution = fpsByResolution
+            fpsByResolution = fpsByResolution,
+            supportsHighSpeed = supportsHighSpeed,
+            highSpeedSizes = highSpeedSizes,
+            highSpeedFpsRanges = highSpeedFpsRanges
         )
     }
 

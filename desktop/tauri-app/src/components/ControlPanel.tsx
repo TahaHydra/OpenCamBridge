@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { Play, Square, Settings2, Sliders, RefreshCw, ZoomIn, ZoomOut, Monitor, Video, ShieldAlert } from 'lucide-react';
 import { connectAndSetupObs, ObsStatus } from '../services/obs';
 import { apiFetch, buildUrl } from '../services/api';
+import { logEvent, logError, logTestMarker } from '../services/logging';
 import { invoke } from '@tauri-apps/api/core';
 
 interface VirtualCamMetrics {
@@ -160,6 +161,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   // without digging through the terminal. Capped to the most recent entries.
   const [diagLog, setDiagLog] = useState<string[]>([]);
   const lastDiagRef = useRef<Record<string, string>>({});
+  // Refs so the periodic metrics sampler can read current state without being a
+  // dependency (avoids re-creating the interval every poll).
+  const vcamStateRef = useRef<VirtualCamState | null>(null);
+  const androidMetricsRef = useRef<any>(null);
   const addDiag = useCallback((key: string, message: string) => {
     // De-duplicate consecutive identical messages per key so a repeating error
     // does not flood the log every poll.
@@ -167,6 +172,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     lastDiagRef.current[key] = message;
     const ts = new Date().toLocaleTimeString();
     setDiagLog(prev => [...prev.slice(-199), `[${ts}] ${message}`]);
+    // Mirror to the persistent session log file. Errors are tagged so they
+    // stand out; everything else is an INFO event.
+    const isErr = /fail|error|unreachable|below target/i.test(message);
+    (isErr ? logError : logEvent)(key, message);
   }, []);
 
   // Capabilities of the currently selected lens, reported honestly by Android.
@@ -323,6 +332,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   }, [androidStreamStatus, addDiag]);
 
   useEffect(() => {
+    androidMetricsRef.current = androidMetrics;
     if (androidMetrics?.actualFps != null) {
       addDiag('androidFps', `Android capture: ${androidMetrics.actualFps}/${settingsRef.current.fps} fps at ${androidMetrics.encodedWidth}x${androidMetrics.encodedHeight}`);
     }
@@ -330,6 +340,28 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       addDiag('resFallback', `Resolution fallback: ${androidMetrics.resolutionPolicy} (${androidMetrics.selectedRawWidth}x${androidMetrics.selectedRawHeight})`);
     }
   }, [androidMetrics, addDiag]);
+
+  useEffect(() => { vcamStateRef.current = vcamState; }, [vcamState]);
+
+  // Sampled metrics summary to the persistent log every 10s — a readable
+  // one-liner, not per-second spam.
+  useEffect(() => {
+    const id = setInterval(() => {
+      const s = settingsRef.current;
+      const m = vcamStateRef.current?.metrics;
+      const am = androidMetricsRef.current;
+      if (!m && !am) return;
+      const parts = [
+        `${s.streamMode} ${s.width}x${s.height}@${s.fps} q${s.jpegQuality}`,
+        `androidFps=${am?.actualFps ?? '?'}`,
+        m ? `prodIn=${m.decoded_fps} prodOut=${m.written_fps}` : 'prod=off',
+        m ? `mbps=${m.estimated_mbps} lat=${m.total_pipeline_ms}ms drop=${m.dropped_jpegs} q=${m.jpeg_queue_len}` : '',
+        (vcamStateRef.current?.last_error || m?.last_error) ? `err=${vcamStateRef.current?.last_error || m?.last_error}` : '',
+      ].filter(Boolean);
+      logEvent('metrics', parts.join('  '));
+    }, 10000);
+    return () => clearInterval(id);
+  }, []);
 
   const copyDiagnostics = async () => {
     const s = settingsRef.current;
@@ -667,11 +699,13 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       ...settingsRef.current,
       width: w, height: h, outputWidth: w, outputHeight: h, profile,
     };
+    logTestMarker('START', `${next.streamMode} ${w}x${h}@${next.fps} lens=${next.cameraId} q${next.jpegQuality}`);
     await applySettingsAndRefreshPreview(next, ['width', 'height', 'profile']);
   };
 
   const updateFps = async (fps: number) => {
     const next = { ...settingsRef.current, fps };
+    logTestMarker('START', `${next.streamMode} ${next.width}x${next.height}@${fps} lens=${next.cameraId} q${next.jpegQuality}`);
     await applySettingsAndRefreshPreview(next, ['fps']);
   };
 
@@ -1064,11 +1098,20 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
             Resolution and frame rate are independent.
             {maxFpsHere > 0
-              ? ` This lens reports up to ${maxFpsHere} fps at ${settings.width}x${settings.height}.`
+              ? ` This lens reports up to ${maxFpsHere} fps at ${settings.width}x${settings.height} via the normal camera API.`
               : ' Actual rate depends on the phone camera and lighting.'}
             {androidMetrics?.actualFps != null &&
               ` Delivering ${androidMetrics.actualFps}/${settings.fps} fps now.`}
           </p>
+          {devMode && activeCam?.supportsHighSpeed && (
+            <p style={{ fontSize: '0.68rem', color: '#ffb300', marginTop: 4 }}>
+              Diagnostics: this lens has high-speed (slow-motion) modes
+              {Array.isArray(activeCam.highSpeedFpsRanges) && activeCam.highSpeedFpsRanges.length > 0
+                ? ` up to ${Math.max(...activeCam.highSpeedFpsRanges.map((r: any) => r.max))} fps`
+                : ''}, but Android's constrained high-speed session is not usable by the
+              MJPEG webcam path — so the webcam max stays the normal-API value above.
+            </p>
+          )}
         </div>
 
         {devMode && (
