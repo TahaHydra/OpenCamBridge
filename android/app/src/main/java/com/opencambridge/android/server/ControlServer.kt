@@ -659,29 +659,27 @@ class ControlServer(
                     img.classList.remove('fit-contain', 'fit-cover');
                     img.classList.add(lastMode === 'fill' ? 'fit-cover' : 'fit-contain');
 
-                    const rot = parseInt(lastRot || '0', 10) || 0;
+                    // The /stream.mjpeg frames are already rotated on the phone
+                    // (auto-upright + manual offset), so this view must NOT
+                    // rotate the content again — mirror only. The box keeps the
+                    // 16:9 virtual-camera canvas; portrait frames letterbox.
                     const boxW = box.clientWidth;
                     const boxH = box.clientHeight;
-
-                    if (rot === 90 || rot === 270) {
-                        rotator.style.width = boxH + 'px';
-                        rotator.style.height = boxW + 'px';
-                    } else {
-                        rotator.style.width = boxW + 'px';
-                        rotator.style.height = boxH + 'px';
-                    }
+                    rotator.style.width = boxW + 'px';
+                    rotator.style.height = boxH + 'px';
 
                     const scaleX = lastMirror ? -1 : 1;
-                    rotator.style.transform = `translate(-50%, -50%) rotate(${'$'}{rot}deg) scaleX(${'$'}{scaleX})`;
+                    rotator.style.transform = `translate(-50%, -50%) scaleX(${'$'}{scaleX})`;
                 }
 
                 function updateOrientation(mode) {
-                    let aspect = '16:9';
+                    // Manual rotation offset only; the output canvas stays the
+                    // 16:9 virtual camera and frames are rotated on the phone.
                     let rot = '0';
-                    if (mode === 'portrait_cw') { aspect = '9:16'; rot = '90'; }
-                    else if (mode === 'portrait_ccw') { aspect = '9:16'; rot = '270'; }
-                    else if (mode === 'upside_down') { aspect = '16:9'; rot = '180'; }
-                    patchSetting({ aspectRatio: aspect, displayRotation: rot });
+                    if (mode === 'portrait_cw') { rot = '90'; }
+                    else if (mode === 'portrait_ccw') { rot = '270'; }
+                    else if (mode === 'upside_down') { rot = '180'; }
+                    patchSetting({ displayRotation: rot });
                 }
 
                 function rotate90() {

@@ -64,13 +64,21 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
   else if (layout === '1:1') boxClass = 'layout-square';
 
   // The phone rotates the /stream.mjpeg frames themselves now, so the preview
-  // must NOT rotate the content again — only mirror is applied here. The box
-  // aspect follows the selected orientation so the already-rotated frame fits.
+  // must NOT rotate the content again — only mirror is applied here.
   const rotatorStyle: any = {
     transform: `translate(-50%, -50%) scaleX(${mirror ? -1 : 1})`,
     width: boxSize.w ? `${boxSize.w}px` : '100%',
     height: boxSize.h ? `${boxSize.h}px` : '100%',
   };
+
+  // This preview is the desktop's view of the SAME feed every app receives from
+  // the virtual camera. The producer letterboxes portrait frames into the fixed
+  // 16:9 output, so when the phone streams portrait (held vertical, or a
+  // 90/270 manual offset) force "contain" here too — "fill" would crop the
+  // sides and the preview would no longer match what OBS/Teams actually get.
+  const framePortrait =
+    (serverStatus?.encodedHeight ?? 0) > (serverStatus?.encodedWidth ?? 0);
+  const effectiveFit = framePortrait ? 'fit' : fitMode;
 
   return (
     <div className="preview-wrapper animate-fade">
@@ -79,7 +87,7 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
           <img
             ref={imgRef}
             src={mjpegUrl}
-            className={`preview-img ${fitMode === 'fit' ? 'fit-contain' : 'fit-cover'}`}
+            className={`preview-img ${effectiveFit === 'fit' ? 'fit-contain' : 'fit-cover'}`}
             onError={handleError}
             onLoad={handleLoad}
             alt="Live Stream"

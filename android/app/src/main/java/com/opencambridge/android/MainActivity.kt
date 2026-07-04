@@ -825,23 +825,18 @@ fun FitModeSelector(fitMode: String, enabled: Boolean, onSelect: (String) -> Uni
 fun OutputOrientationSelector(aspectRatio: String, displayRotation: String, enabled: Boolean, onSelect: (String, String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     
-    val options = listOf(
-        Pair("16:9", "0"),
-        Pair("9:16", "90"),
-        Pair("9:16", "270"),
-        Pair("16:9", "180")
-    )
     // The stream is auto-uprighted for the phone's physical orientation; these
-    // values are a manual offset applied on top of that.
+    // values are a manual offset applied on top of that. The output canvas is
+    // always the 16:9 virtual camera — rotation no longer flips the box aspect.
+    val options = listOf("0", "90", "180", "270")
     val labels = mapOf(
-        Pair("16:9", "0") to "Upright (auto)",
-        Pair("9:16", "90") to "+90°",
-        Pair("9:16", "270") to "+270°",
-        Pair("16:9", "180") to "+180° (flip)"
+        "0" to "Upright (auto)",
+        "90" to "+90°",
+        "180" to "+180° (flip)",
+        "270" to "+270°"
     )
 
-    val currentKey = Pair(aspectRatio, displayRotation)
-    val currentValue = labels[currentKey] ?: "Upright (auto)"
+    val currentValue = labels[displayRotation] ?: "Upright (auto)"
 
     ExposedDropdownMenuBox(
         expanded = expanded,
@@ -869,7 +864,7 @@ fun OutputOrientationSelector(aspectRatio: String, displayRotation: String, enab
                 DropdownMenuItem(
                     text = { Text(labels[opt] ?: "") },
                     onClick = {
-                        onSelect(opt.first, opt.second)
+                        onSelect("16:9", opt)
                         expanded = false
                     }
                 )
