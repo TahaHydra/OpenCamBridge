@@ -91,6 +91,11 @@ object StreamState {
     val bytesSentThisSecond = AtomicLong(0L)
     val estimatedMbps = AtomicReference("0.0")
 
+    // Connected stream clients. Used for metrics and to skip JPEG encoding
+    // when nobody is consuming the MJPEG stream.
+    val mjpegClientCount = AtomicInteger(0)
+    val h264ClientCount = AtomicInteger(0)
+
     /** Latest JPEG frame bytes, updated by MjpegStreamer. Null before first frame. */
     val latestFrame = AtomicReference<ByteArray?>(null)
     val latestFrameRevision = AtomicLong(0L)
@@ -161,7 +166,9 @@ object StreamState {
         selectedEffectiveHeight = selectedEffectiveHeight.get(),
         normalizedForPolicy = normalizedForPolicy.get(),
         resolutionPolicy = resolutionPolicy.get(),
-        fallbackUsed = fallbackUsed.get()
+        fallbackUsed = fallbackUsed.get(),
+        mjpegClients = mjpegClientCount.get(),
+        h264Clients = h264ClientCount.get()
     )
 }
 
@@ -217,5 +224,7 @@ data class StreamStatusDto(
     val selectedEffectiveHeight: Int = 0,
     val normalizedForPolicy: Boolean = false,
     val resolutionPolicy: String = "unknown",
-    val fallbackUsed: Boolean = false
+    val fallbackUsed: Boolean = false,
+    val mjpegClients: Int = 0,
+    val h264Clients: Int = 0
 )

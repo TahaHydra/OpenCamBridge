@@ -42,8 +42,13 @@ class MjpegStreamer(
     private var cameraProvider: ProcessCameraProvider? = null
     private var currentCamera: Camera? = null
 
-    // Reusable buffer to avoid GC churn
+    // Reusable buffers to avoid GC churn at 30-60 fps
     private var nv21Buffer: ByteArray? = null
+    private val jpegStream = ByteArrayOutputStream(512 * 1024)
+
+    // Encode-side pacing: skip camera frames beyond the requested FPS so we do
+    // not burn CPU JPEG-encoding frames the HTTP layer would drop anyway.
+    private var lastEncodeNs = 0L
 
     suspend fun start() {
         val provider = suspendCoroutine<ProcessCameraProvider> { cont ->
@@ -90,32 +95,30 @@ class MjpegStreamer(
 
                 val targetFps = StreamState.fps.get()
 
-                val fpsRange = when {
-                    targetFps >= 60 -> android.util.Range(60, 60)
-                    // Low-FPS requests: let AE pick within a widely supported range instead of
-                    // forcing 30. The HTTP layer paces output to the exact requested FPS.
-                    targetFps < 30 -> android.util.Range(targetFps.coerceAtLeast(15), 30)
-                    else -> android.util.Range(30, 30)
-                }
+                // Pick an FPS range the *device* actually supports; hardcoded
+                // ranges like [30,30] do not exist on all sensors.
+                val fpsRange = FpsRanges.choose(context, StreamState.cameraId.get(), targetFps)
 
                 val imageAnalysisBuilder = ImageAnalysis.Builder()
                     .setResolutionSelector(resSelector)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
 
-                try {
-                    androidx.camera.camera2.interop.Camera2Interop.Extender(imageAnalysisBuilder)
-                        .setCaptureRequestOption(
-                            android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                            fpsRange
-                        )
-                    android.util.Log.i(
-                        "OpenCamBridge",
-                        "Binding MJPEG CameraX profile=${StreamState.profile.get()} requested=${StreamState.width.get()}x${StreamState.height.get()} fps=$targetFps fpsRange=$fpsRange preview=${StreamState.localPreviewEnabled.get()}"
-                    )
-                } catch (e: Exception) {
-                    android.util.Log.w("OpenCamBridge", "Could not set FPS range $fpsRange", e)
+                if (fpsRange != null) {
+                    try {
+                        androidx.camera.camera2.interop.Camera2Interop.Extender(imageAnalysisBuilder)
+                            .setCaptureRequestOption(
+                                android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                                fpsRange
+                            )
+                    } catch (e: Exception) {
+                        android.util.Log.w("OpenCamBridge", "Could not set FPS range $fpsRange", e)
+                    }
                 }
+                android.util.Log.i(
+                    "OpenCamBridge",
+                    "Binding MJPEG CameraX camera=${StreamState.cameraId.get()} profile=${StreamState.profile.get()} requested=${StreamState.width.get()}x${StreamState.height.get()} fps=$targetFps fpsRange=$fpsRange preview=${StreamState.localPreviewEnabled.get()}"
+                )
 
                 val imageAnalysis = imageAnalysisBuilder.build()
 
@@ -125,14 +128,16 @@ class MjpegStreamer(
                 val previewBuilder = Preview.Builder()
                     .setResolutionSelector(resSelector)
 
-                try {
-                    androidx.camera.camera2.interop.Camera2Interop.Extender(previewBuilder)
-                        .setCaptureRequestOption(
-                            android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                            fpsRange
-                        )
-                } catch (e: Exception) {
-                    android.util.Log.w("OpenCamBridge", "Could not set FPS range on preview", e)
+                if (fpsRange != null) {
+                    try {
+                        androidx.camera.camera2.interop.Camera2Interop.Extender(previewBuilder)
+                            .setCaptureRequestOption(
+                                android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                                fpsRange
+                            )
+                    } catch (e: Exception) {
+                        android.util.Log.w("OpenCamBridge", "Could not set FPS range on preview", e)
+                    }
                 }
 
                 val preview = previewBuilder.build()
@@ -274,6 +279,23 @@ class MjpegStreamer(
             StreamState.encodedWidth.set(imageProxy.width)
             StreamState.encodedHeight.set(imageProxy.height)
 
+            // CPU saver 1: pace JPEG encoding to the requested FPS (with 10%
+            // jitter tolerance) instead of encoding every camera frame the
+            // HTTP layer would drop anyway.
+            // CPU saver 2: with zero connected MJPEG clients, keep the latest
+            // frame fresh at ~2 fps only (status/preview pickup stays instant,
+            // battery does not burn encoding for nobody).
+            val nowNs = System.nanoTime()
+            val targetFps = StreamState.fps.get().coerceIn(1, 120)
+            val minIntervalNs = (1_000_000_000L / targetFps) * 9 / 10
+            val idleIntervalNs = 500_000_000L
+            val sinceLastNs = nowNs - lastEncodeNs
+            val idle = StreamState.mjpegClientCount.get() == 0
+            if (sinceLastNs < minIntervalNs || (idle && sinceLastNs < idleIntervalNs)) {
+                return
+            }
+            lastEncodeNs = nowNs
+
             val width = imageProxy.width
             val height = imageProxy.height
 
@@ -309,15 +331,15 @@ class MjpegStreamer(
             val encodeStartNs = System.nanoTime()
 
             val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-            val out = ByteArrayOutputStream()
-            yuvImage.compressToJpeg(Rect(0, 0, width, height), StreamState.jpegQuality.get(), out)
+            jpegStream.reset()
+            yuvImage.compressToJpeg(Rect(0, 0, width, height), StreamState.jpegQuality.get(), jpegStream)
 
             val encodeMs = (System.nanoTime() - encodeStartNs) / 1_000_000.0
             val prevAvg = StreamState.androidEncodeMsAvg.get()
             val nextAvg = if (prevAvg <= 0.0) encodeMs else (prevAvg * 0.85 + encodeMs * 0.15)
             StreamState.androidEncodeMsAvg.set(nextAvg)
 
-            StreamState.latestFrame.set(out.toByteArray())
+            StreamState.latestFrame.set(jpegStream.toByteArray())
             StreamState.latestFrameRevision.incrementAndGet()
 
             val now = System.currentTimeMillis()
@@ -410,8 +432,6 @@ class MjpegStreamer(
         }
     }
 
-    private fun buildSelector(cameraId: String): CameraSelector = when (cameraId) {
-        "1"  -> CameraSelector.DEFAULT_FRONT_CAMERA
-        else -> CameraSelector.DEFAULT_BACK_CAMERA
-    }
+    private fun buildSelector(cameraId: String): CameraSelector =
+        CameraSelectors.forCameraId(cameraId)
 }

@@ -12,7 +12,9 @@ data class CameraInfoDto(
     val hardwareLevel: String?,
     val supportedSizes: List<SizeDto>,
     val supportedFpsRanges: List<FpsRangeDto>,
-    val label: String
+    val label: String,
+    val zoomRatioMin: Float = 1.0f,
+    val zoomRatioMax: Float = 1.0f
 )
 
 @Serializable

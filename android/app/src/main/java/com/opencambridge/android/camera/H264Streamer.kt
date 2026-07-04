@@ -55,6 +55,15 @@ class H264Streamer(
     private var isEncoding = false
     private var encodeJob: Job? = null
 
+    // Dimensions the encoder was configured with. Frames that do not match are
+    // dropped instead of being fed to the codec as misinterpreted memory.
+    private var codecWidth = 0
+    private var codecHeight = 0
+
+    // Raw input layout negotiated with the encoder (NV12 vs I420). Assuming
+    // NV12 everywhere corrupts color/geometry on planar-input devices.
+    private var codecColorFormat = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
+
     private var spsPpsBuffer: ByteArray? = null
     private val clients = CopyOnWriteArrayList<Channel<ByteArray>>()
 
@@ -104,27 +113,35 @@ class H264Streamer(
                 }
 
                 val selector = buildSelector(StreamState.cameraId.get())
-                val width = StreamState.width.get()
-                val height = StreamState.height.get()
                 val fps = StreamState.fps.get()
-
-                // TODO: H264Streamer starts MediaCodec before knowing actual CameraX selected resolution.
-                // Before real H264, configure codec after selected ImageAnalysis resolution is confirmed, or enforce exact match.
-                startCodec(width, height, fps)
+                val fpsRange = FpsRanges.choose(context, StreamState.cameraId.get(), fps)
 
                 val resSelector = ResolutionPolicy.buildSelector(
                     profile = StreamState.profile.get(),
-                    requestedWidth = width,
-                    requestedHeight = height,
+                    requestedWidth = StreamState.width.get(),
+                    requestedHeight = StreamState.height.get(),
                     allowNative = StreamState.profile.get() == "native",
                     allowAspectFallback = false
                 )
 
-                val imageAnalysis = ImageAnalysis.Builder()
+                val imageAnalysisBuilder = ImageAnalysis.Builder()
                     .setResolutionSelector(resSelector)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                    .build()
+
+                if (fpsRange != null) {
+                    try {
+                        androidx.camera.camera2.interop.Camera2Interop.Extender(imageAnalysisBuilder)
+                            .setCaptureRequestOption(
+                                android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                                fpsRange
+                            )
+                    } catch (e: Exception) {
+                        Log.w("H264Streamer", "Could not set FPS range $fpsRange", e)
+                    }
+                }
+
+                val imageAnalysis = imageAnalysisBuilder.build()
 
                 imageAnalysis.setAnalyzer(analysisExecutor, ::processFrame)
                 StreamState.imageAnalysisUseCase = imageAnalysis
@@ -138,6 +155,12 @@ class H264Streamer(
 
                 try {
                     val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis)
+
+                    // The encoder is configured with whatever buffer size
+                    // CameraX actually selected — feeding it the requested size
+                    // when the device picked another one corrupts the stream.
+                    var selectedW = StreamState.width.get()
+                    var selectedH = StreamState.height.get()
 
                     withContext(Dispatchers.Main) {
                         if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
@@ -164,13 +187,21 @@ class H264Streamer(
                             StreamState.selectedEffectiveHeight.set(effH)
                             StreamState.normalizedForPolicy.set(true)
 
+                            selectedW = resolution.width
+                            selectedH = resolution.height
+
                             Log.i("H264Streamer", "Selected Resolution: ${resolution.width}x${resolution.height} (Effective: ${effW}x${effH})")
                         }
                     }
 
+                    // Start the encoder only now that the real capture size is
+                    // known. Frames delivered before this point are dropped by
+                    // processFrame (isEncoding is still false).
+                    startCodec(selectedW, selectedH, fps)
+
                     StreamState.streaming.set(true)
                 } catch (e: Exception) {
-                    Log.e("H264Streamer", "bindToLifecycle failed: ${e.message}")
+                    Log.e("H264Streamer", "bind/codec start failed: ${e.message}")
                     throw e
                 }
             } finally {
@@ -190,6 +221,7 @@ class H264Streamer(
             StreamState.latestFrame.set(null)
             clients.forEach { it.close() }
             clients.clear()
+            StreamState.h264ClientCount.set(0)
         }
     }
 
@@ -201,6 +233,7 @@ class H264Streamer(
         // of dropping we disconnect clients that fall too far behind (see drainCodec).
         val channel = Channel<ByteArray>(capacity = 512)
         clients.add(channel)
+        StreamState.h264ClientCount.set(clients.size)
 
         // Send SPS/PPS immediately if available
         val sps = spsPpsBuffer
@@ -212,6 +245,7 @@ class H264Streamer(
 
     fun unsubscribe(channel: Channel<ByteArray>) {
         clients.remove(channel)
+        StreamState.h264ClientCount.set(clients.size)
         channel.close()
     }
 
@@ -219,23 +253,70 @@ class H264Streamer(
 
     private fun startCodec(width: Int, height: Int, fps: Int) {
         try {
+            mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+
+            // Negotiate a concrete raw input layout instead of requesting
+            // "flexible" and guessing: pick semi-planar (NV12) when supported,
+            // planar (I420) otherwise, and convert camera frames accordingly.
+            val caps = try {
+                mediaCodec?.codecInfo?.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            } catch (e: Exception) {
+                null
+            }
+            val supportedColors = caps?.colorFormats?.toList() ?: emptyList()
+            codecColorFormat = when {
+                supportedColors.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) ->
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
+                supportedColors.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar) ->
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar
+                else ->
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
+            }
+
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
-            format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+            format.setInteger(MediaFormat.KEY_COLOR_FORMAT, codecColorFormat)
             format.setInteger(MediaFormat.KEY_BIT_RATE, StreamState.h264Bitrate.get())
             format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, StreamState.h264KeyframeInterval.get())
 
-            mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            // CBR keeps streaming bandwidth steady; request it only when the
+            // encoder advertises support (some reject it at configure time).
+            try {
+                if (caps?.encoderCapabilities?.isBitrateModeSupported(
+                        MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+                    ) == true
+                ) {
+                    format.setInteger(
+                        MediaFormat.KEY_BITRATE_MODE,
+                        MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+                    )
+                }
+            } catch (e: Exception) {
+                // keep the encoder's default rate control
+            }
+
+            // Ask the encoder to repeat SPS/PPS before every IDR frame so late
+            // joiners and reconnecting decoders can sync mid-stream. Vendor
+            // key; encoders that do not know it ignore it.
+            format.setInteger("prepend-sps-pps-to-idr-frames", 1)
+
             mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             mediaCodec?.start()
+
+            codecWidth = width
+            codecHeight = height
 
             isEncoding = true
             encodeJob = scope.launch {
                 drainCodec()
             }
-            Log.i("H264Streamer", "Started H.264 Codec: ${width}x${height} @ ${fps}fps, ${StreamState.h264Bitrate.get()} bps")
+            Log.i(
+                "H264Streamer",
+                "Started H.264 Codec: ${width}x${height} @ ${fps}fps, ${StreamState.h264Bitrate.get()} bps, colorFormat=$codecColorFormat"
+            )
         } catch (e: Exception) {
             Log.e("H264Streamer", "Failed to start MediaCodec", e)
+            stopCodec()
             throw e
         }
     }
@@ -285,6 +366,7 @@ class H264Streamer(
                                 // buffering unbounded memory or corrupting its bitstream.
                                 Log.w("H264Streamer", "Dropping slow H.264 client (buffer full)")
                                 clients.remove(client)
+                                StreamState.h264ClientCount.set(clients.size)
                                 client.close()
                             }
                         }
@@ -325,6 +407,17 @@ class H264Streamer(
             val width = imageProxy.width
             val height = imageProxy.height
 
+            // Never feed the encoder a buffer size it was not configured for.
+            if (width != codecWidth || height != codecHeight) {
+                Log.w("H264Streamer", "Dropping ${width}x${height} frame; codec expects ${codecWidth}x${codecHeight}")
+                return
+            }
+
+            // Metrics: what is actually being encoded (also lets the desktop
+            // confirm a rebind completed in H.264 mode).
+            StreamState.encodedWidth.set(width)
+            StreamState.encodedHeight.set(height)
+
             val actualRatio = width.toFloat() / height
             val aspect16_9 = 16f / 9f
             val aspect4_3 = 4f / 3f
@@ -352,17 +445,33 @@ class H264Streamer(
             if (nv12Buffer?.size != frameSize) nv12Buffer = ByteArray(frameSize)
             if (nv21Buffer?.size != frameSize) nv21Buffer = ByteArray(frameSize)
 
-            // Feed frame to encodered H.264
+            // Feed frame to the H.264 encoder in its negotiated input layout
             val inputBufferIndex = codec.dequeueInputBuffer(10000)
             if (inputBufferIndex >= 0) {
                 val inputBuffer = codec.getInputBuffer(inputBufferIndex)
                 if (inputBuffer != null) {
-                    val nv12 = nv12Buffer!!
-                    yuvToNv12(imageProxy, nv12)
+                    val raw = nv12Buffer!!
+                    if (codecColorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar) {
+                        yuvToI420(imageProxy, raw)
+                    } else {
+                        yuvToNv12(imageProxy, raw)
+                    }
                     inputBuffer.clear()
-                    inputBuffer.put(nv12)
+                    inputBuffer.put(raw)
                     val pts = imageProxy.imageInfo.timestamp / 1000 // Convert nanoseconds to microseconds
-                    codec.queueInputBuffer(inputBufferIndex, 0, nv12.size, pts, 0)
+                    codec.queueInputBuffer(inputBufferIndex, 0, raw.size, pts, 0)
+
+                    // FPS window metrics (same accounting as the MJPEG path,
+                    // so /api/stream/metrics is truthful in H.264 mode too).
+                    val nowMs = System.currentTimeMillis()
+                    StreamState.framesThisSecond.incrementAndGet()
+                    val windowStart = StreamState.fpsWindowStartMs.get()
+                    if (nowMs - windowStart >= 1000L) {
+                        if (StreamState.fpsWindowStartMs.compareAndSet(windowStart, nowMs)) {
+                            val count = StreamState.framesThisSecond.getAndSet(0)
+                            StreamState.actualFps.set(count)
+                        }
+                    }
                 }
             }
 
@@ -467,6 +576,68 @@ class H264Streamer(
         }
     }
 
+    /**
+     * Converts a YUV_420_888 ImageProxy to planar I420 (all Y, then all U,
+     * then all V) for encoders that negotiated COLOR_FormatYUV420Planar.
+     */
+    private fun yuvToI420(image: ImageProxy, outBuf: ByteArray) {
+        val width = image.width
+        val height = image.height
+
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+
+        val yRowStride = yPlane.rowStride
+        val yBuf = yPlane.buffer
+        yBuf.rewind()
+
+        var dstOffset = 0
+        if (yRowStride == width) {
+            val toCopy = kotlin.math.min(width * height, yBuf.remaining())
+            yBuf.get(outBuf, 0, toCopy)
+            dstOffset = width * height
+        } else {
+            for (row in 0 until height) {
+                yBuf.position(row * yRowStride)
+                val toCopy = kotlin.math.min(width, yBuf.remaining())
+                yBuf.get(outBuf, dstOffset, toCopy)
+                dstOffset += width
+            }
+        }
+
+        val chromaH = height / 2
+        val chromaW = width / 2
+
+        // U plane then V plane, each downsampled chromaW x chromaH.
+        for (plane in listOf(uPlane, vPlane)) {
+            val rowStride = plane.rowStride
+            val pixelStride = plane.pixelStride
+            val buf = plane.buffer
+            for (row in 0 until chromaH) {
+                if (pixelStride == 1) {
+                    val pos = row * rowStride
+                    if (pos < buf.limit()) {
+                        buf.position(pos)
+                        val toCopy = kotlin.math.min(chromaW, buf.remaining())
+                        buf.get(outBuf, dstOffset, toCopy)
+                    }
+                    dstOffset += chromaW
+                } else {
+                    for (col in 0 until chromaW) {
+                        val srcIndex = row * rowStride + col * pixelStride
+                        if (srcIndex < buf.limit()) {
+                            buf.position(srcIndex)
+                            outBuf[dstOffset++] = if (buf.remaining() > 0) buf.get() else 0
+                        } else {
+                            outBuf[dstOffset++] = 0
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private fun yuvToNv21(image: ImageProxy, outBuf: ByteArray) {
         val width = image.width
         val height = image.height
@@ -540,10 +711,8 @@ class H264Streamer(
         }
     }
 
-    private fun buildSelector(cameraId: String): CameraSelector = when (cameraId) {
-        "1" -> CameraSelector.DEFAULT_FRONT_CAMERA
-        else -> CameraSelector.DEFAULT_BACK_CAMERA
-    }
+    private fun buildSelector(cameraId: String): CameraSelector =
+        CameraSelectors.forCameraId(cameraId)
 
     private fun observeCameraControls() {
         val camInfo = currentCamera?.cameraInfo ?: return

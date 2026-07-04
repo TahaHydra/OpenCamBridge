@@ -930,17 +930,17 @@ class ControlServer(
 
     private suspend fun serveCameraCapabilities(call: RoutingCall) {
         try {
-            val providerFuture = androidx.camera.lifecycle.ProcessCameraProvider.getInstance(context)
-            val provider = providerFuture.get()
-            if (provider == null) {
-                call.respond(HttpStatusCode.ServiceUnavailable, SimpleResult(false, "Camera provider not ready"))
-                return
+            // ProcessCameraProvider.getInstance(...).get() can block briefly on
+            // first use; keep it off the server's event loop. Note: the old
+            // implementation responded with Map<String, Any>, which kotlinx
+            // serialization cannot encode - this endpoint used to 500 at runtime.
+            val provider = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                androidx.camera.lifecycle.ProcessCameraProvider.getInstance(context).get()
             }
 
-            val capabilities = mutableListOf<Map<String, Any>>()
-            val cameraInfos = provider.availableCameraInfos
+            val capabilities = mutableListOf<CameraCapabilityDto>()
 
-            for (camInfo in cameraInfos) {
+            for (camInfo in provider.availableCameraInfos) {
                 val facing = if (camInfo.lensFacing == androidx.camera.core.CameraSelector.LENS_FACING_BACK) "back"
                              else if (camInfo.lensFacing == androidx.camera.core.CameraSelector.LENS_FACING_FRONT) "front"
                              else "external"
@@ -949,34 +949,31 @@ class ControlServer(
                 val minZoom = zoomState?.minZoomRatio ?: 1.0f
                 val maxZoom = zoomState?.maxZoomRatio ?: 1.0f
 
-                var label = "$facing camera"
-                var sensorRotation = camInfo.sensorRotationDegrees
-
                 try {
                     val c2info = Camera2CameraInfo.from(camInfo)
                     val id = c2info.cameraId
 
-                    label = "${facing} camera $id"
-
+                    var label = "$facing camera $id"
                     val focalLengths = c2info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
                     if (focalLengths != null && focalLengths.isNotEmpty()) {
                         val minFocal = focalLengths.minOrNull() ?: 50f
-                        if (minFocal < 3.0f) label = "${facing} ultrawide"
-                        else if (minFocal > 5.0f) label = "${facing} telephoto"
-                        else label = "${facing} wide/main"
+                        if (minFocal < 3.0f) label = "$facing ultrawide"
+                        else if (minFocal > 5.0f) label = "$facing telephoto"
+                        else label = "$facing wide/main"
                     }
 
-                    val map = mutableMapOf<String, Any>(
-                        "id" to id,
-                        "facing" to facing,
-                        "label" to label,
-                        "minZoom" to minZoom,
-                        "maxZoom" to maxZoom,
-                        "sensorRotation" to sensorRotation
+                    capabilities.add(
+                        CameraCapabilityDto(
+                            id = id,
+                            facing = facing,
+                            label = label,
+                            minZoom = minZoom,
+                            maxZoom = maxZoom,
+                            sensorRotation = camInfo.sensorRotationDegrees
+                        )
                     )
-                    capabilities.add(map)
                 } catch (e: Exception) {
-                    // fallback if Camera2Interop fails
+                    // fallback if Camera2Interop fails for this camera; skip it
                 }
             }
 
@@ -1153,6 +1150,9 @@ class ControlServer(
     private suspend fun ByteWriteChannel.streamMjpegFrames() {
         var lastRevision = -1L
         var lastSentAtMs = 0L
+        // Client accounting lets the camera side skip JPEG work when nobody
+        // is watching, and surfaces "who is connected" in the status DTO.
+        StreamState.mjpegClientCount.incrementAndGet()
         try {
             while (currentCoroutineContext().isActive) {
                 // Throttle based on requested FPS
@@ -1199,6 +1199,8 @@ class ControlServer(
             }
         } catch (_: Exception) {
             // Client disconnected
+        } finally {
+            StreamState.mjpegClientCount.decrementAndGet()
         }
     }
 
@@ -1240,7 +1242,7 @@ class ControlServer(
                 container = if (mode == "h264") "raw Annex B byte stream (no container)" else "multipart/x-mixed-replace",
                 experimental = mode == "h264",
                 notes = if (mode == "h264")
-                    "SPS/PPS are sent as the first bytes to each new /stream.h264 subscriber when available; some encoders also repeat them inline before IDR frames. Not consumed by the Windows virtual camera yet."
+                    "SPS/PPS are sent as the first bytes to each new /stream.h264 subscriber when available, and the encoder is asked to repeat them before IDR frames. The Windows producer can decode this stream (--source h264, experimental)."
                 else
                     "Stable path. Each part is a complete JPEG image."
             )
@@ -1284,6 +1286,16 @@ private data class DeviceInfoDto(val app: String, val version: String, val platf
 
 @Serializable
 data class SimpleResult(val success: Boolean, val message: String)
+
+@Serializable
+data class CameraCapabilityDto(
+    val id: String,
+    val facing: String,
+    val label: String,
+    val minZoom: Float,
+    val maxZoom: Float,
+    val sensorRotation: Int
+)
 
 @Serializable
 data class CameraControlsDto(
