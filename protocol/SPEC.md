@@ -221,8 +221,15 @@ encoding, in two composed parts:
    `targetRotation`; each frame is then rotated by
    `imageInfo.rotationDegrees`. Held vertical, horizontal, or upside down, the
    streamed video is always upright.
-2. **Manual offset**: the user's Rotate button (`displayRotation`,
-   0/90/180/270) is added on top, for fixed mounts or intentional flips.
+2. **Manual offset**: `displayRotation` (0/90/180/270) is added on top. It
+   remains in the API, but the product UIs no longer expose a rotate button —
+   they expose an **orientation mode** instead (stored in `aspectRatio`:
+   `auto` | `16:9` | `9:16`) that shapes the preview canvas: `auto` follows the
+   phone (vertical phone -> 9:16 preview box), the other two pin it, with
+   letterboxing on mismatch. Selecting a mode resets `displayRotation` to 0 so
+   stale offsets cannot leave the stream sideways. The virtual camera output
+   itself stays 16:9 (consuming apps expect a landscape webcam); vertical video
+   is pillarboxed there.
 
 Because `/stream.mjpeg` frames arrive already rotated, **no consumer rotates
 again**: the desktop app launches the producer with `--rotate 0`, the `/obs`

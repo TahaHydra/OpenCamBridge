@@ -56,29 +56,32 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
     return () => window.removeEventListener('reload-preview', handleReload);
   }, []);
 
-  const layout = serverStatus?.aspectRatio || '16:9';
+  const layout = serverStatus?.aspectRatio || 'auto';
   const mirror = serverStatus?.mirror || false;
 
-  let boxClass = 'layout-landscape';
-  if (layout === '9:16') boxClass = 'layout-portrait';
-  else if (layout === '1:1') boxClass = 'layout-square';
+  // The phone streams already-rotated, always-upright frames. The orientation
+  // mode only shapes this VIEW:
+  //  - 'auto': the preview box follows the frame the phone is sending right
+  //    now (hold the phone vertical -> 9:16 box, horizontal -> 16:9 box).
+  //  - '16:9' / '9:16': the box is pinned; mismatching frames letterbox.
+  const framePortrait =
+    (serverStatus?.encodedHeight ?? 0) > (serverStatus?.encodedWidth ?? 0);
+  const boxPortrait =
+    layout === '9:16' ? true :
+    layout === '16:9' ? false :
+    framePortrait; // auto
+  const boxClass = boxPortrait ? 'layout-portrait' : 'layout-landscape';
 
-  // The phone rotates the /stream.mjpeg frames themselves now, so the preview
-  // must NOT rotate the content again — only mirror is applied here.
+  // No content rotation here (frames arrive rotated) — mirror only.
   const rotatorStyle: any = {
     transform: `translate(-50%, -50%) scaleX(${mirror ? -1 : 1})`,
     width: boxSize.w ? `${boxSize.w}px` : '100%',
     height: boxSize.h ? `${boxSize.h}px` : '100%',
   };
 
-  // This preview is the desktop's view of the SAME feed every app receives from
-  // the virtual camera. The producer letterboxes portrait frames into the fixed
-  // 16:9 output, so when the phone streams portrait (held vertical, or a
-  // 90/270 manual offset) force "contain" here too — "fill" would crop the
-  // sides and the preview would no longer match what OBS/Teams actually get.
-  const framePortrait =
-    (serverStatus?.encodedHeight ?? 0) > (serverStatus?.encodedWidth ?? 0);
-  const effectiveFit = framePortrait ? 'fit' : fitMode;
+  // When frame and box orientation differ, force letterbox — "fill" would crop
+  // and the preview would no longer represent the actual feed.
+  const effectiveFit = framePortrait !== boxPortrait ? 'fit' : fitMode;
 
   return (
     <div className="preview-wrapper animate-fade">

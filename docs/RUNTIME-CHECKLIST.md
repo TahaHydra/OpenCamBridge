@@ -47,21 +47,26 @@ profile). Read the desktop **Diagnostics** panel for target-vs-actual FPS.
 - [ ] Diagnostics shows "Delivering N/target fps"; N is honest, not faked.
 - [ ] Default lens on connect is main/back-wide, not telephoto.
 
-## Rotation (auto-upright + one manual offset button)
+## Orientation (auto-upright content + Auto/Horizontal/Vertical view toggle)
 
-The stream auto-uprights for the phone's physical orientation; the Rotate
-button adds a manual offset (0 → 90 → 180 → 270 → 0) on top. In OBS confirm:
+The stream content is always auto-uprighted for the phone's physical
+orientation. The Orientation toggle (synced across phone app, web UI, Tauri)
+shapes the VIEW: Auto follows the phone; Horizontal/Vertical pin the box.
 
-- [ ] Offset 0, phone **vertical**: content upright, pillarboxed (black side
-      bars) in the 16:9 output — not sideways, not stretched, not cropped.
-- [ ] Offset 0, phone **horizontal**: content upright, full-frame 16:9.
-- [ ] Turning the phone mid-stream (vertical ↔ horizontal) re-uprights the
-      video within ~1s without restarting the stream.
-- [ ] Phone upside down: still upright at offset 0.
-- [ ] Offset +180: image flips (for upside-down mounts).
-- [ ] Offset +90/+270: image turns sideways relative to upright (intentional).
-- [ ] Phone and desktop always show the same manual offset value.
-- [ ] Desktop preview matches what OBS/virtual camera shows (same 16:9 canvas).
+- [ ] **Auto**, phone vertical: Tauri preview box becomes 9:16 with upright
+      full-height video (no giant side bars in the preview).
+- [ ] **Auto**, phone horizontal: preview box becomes 16:9, upright full-frame.
+- [ ] **Auto**, turning the phone mid-stream: content re-uprights AND the
+      preview box follows within ~1-2s, no stream restart.
+- [ ] Phone upside down: content still upright.
+- [ ] **Horizontal** pinned, phone vertical: 16:9 box, upright video
+      pillarboxed (not cropped, not stretched, not sideways).
+- [ ] **Vertical** pinned, phone horizontal: 9:16 box, upright video
+      letterboxed top/bottom.
+- [ ] OBS / virtual camera (always 16:9): vertical video appears upright and
+      pillarboxed; horizontal video full-frame.
+- [ ] The toggle shows the same value on phone app, phone web UI, and Tauri.
+- [ ] Mirror works from both sides and stays in sync.
 
 ## Torch (capability-based)
 

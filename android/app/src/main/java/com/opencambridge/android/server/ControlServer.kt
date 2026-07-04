@@ -568,16 +568,12 @@ class ControlServer(
                         </select>
                       </div>
                       <div class="control-group">
-                        <label>Output Orientation</label>
-                        <div style="display:flex; gap:8px;">
-                          <select id="orient-select" style="flex:1;" onchange="updateOrientation(this.value)">
-                              <option value="landscape">Landscape (0°)</option>
-                              <option value="portrait_cw">Portrait CW (90°)</option>
-                              <option value="portrait_ccw">Portrait CCW (270°)</option>
-                              <option value="upside_down">Upside Down (180°)</option>
-                          </select>
-                          <button onclick="rotate90()" style="flex:none; padding:10px; background:#333; color:white; border:1px solid #444;" title="Rotate 90°">↻</button>
-                        </div>
+                        <label>Orientation</label>
+                        <select id="orient-select" onchange="updateOrientation(this.value)">
+                            <option value="auto">Auto (follow phone)</option>
+                            <option value="16:9">Horizontal (16:9)</option>
+                            <option value="9:16">Vertical (9:16)</option>
+                        </select>
                       </div>
                       <div class="control-row">
                         <label>Mirror</label>
@@ -673,25 +669,12 @@ class ControlServer(
                 }
 
                 function updateOrientation(mode) {
-                    // Manual rotation offset only; the output canvas stays the
-                    // 16:9 virtual camera and frames are rotated on the phone.
-                    let rot = '0';
-                    if (mode === 'portrait_cw') { rot = '90'; }
-                    else if (mode === 'portrait_ccw') { rot = '270'; }
-                    else if (mode === 'upside_down') { rot = '180'; }
-                    patchSetting({ displayRotation: rot });
-                }
-
-                function rotate90() {
-                    const sel = document.getElementById('orient-select');
-                    const map = {
-                        'landscape': 'portrait_cw',
-                        'portrait_cw': 'upside_down',
-                        'upside_down': 'portrait_ccw',
-                        'portrait_ccw': 'landscape'
-                    };
-                    sel.value = map[sel.value] || 'portrait_cw';
-                    updateOrientation(sel.value);
+                    // Orientation mode is 'auto' | '16:9' | '9:16'. It controls
+                    // the VIEW: content is auto-uprighted on the phone, and the
+                    // preview box follows the phone (auto) or is pinned. Also
+                    // clears any legacy manual rotation offset so old saved
+                    // rotations cannot leave the stream sideways.
+                    patchSetting({ aspectRatio: mode, displayRotation: '0' });
                 }
 
                 let currentRevision = 0;
@@ -734,17 +717,11 @@ class ControlServer(
                         document.getElementById('zs-select').value = status.zoomSpeed || 'normal';
                         document.getElementById('sm-select').value = status.streamMode || 'mjpeg';
 
-                        let rotStr = status.displayRotation;
-                        if (rotStr == null || rotStr === '') rotStr = 'auto';
-                        let layoutStr = status.aspectRatio || '16:9';
-
-                        let orientMode = 'landscape';
-                        if (layoutStr === '9:16' && rotStr === '90') orientMode = 'portrait_cw';
-                        else if (layoutStr === '9:16' && rotStr === '270') orientMode = 'portrait_ccw';
-                        else if (rotStr === '180') orientMode = 'upside_down';
-
                         const orientSel = document.getElementById('orient-select');
-                        if (orientSel) orientSel.value = orientMode;
+                        if (orientSel) {
+                            const ar = status.aspectRatio;
+                            orientSel.value = (ar === '9:16' || ar === '16:9') ? ar : 'auto';
+                        }
                         document.getElementById('mirror-check').checked = !!status.mirror;
                         document.getElementById('preview-check').checked = !!status.localPreviewEnabled;
 
@@ -762,14 +739,16 @@ class ControlServer(
                             document.getElementById('quality-val').innerText = status.jpegQuality;
                         }
 
-                        let rot = status.displayRotation;
-                        if (rot === 'auto' || rot == null) rot = '0';
-                        rot = parseInt(rot);
+                        // 'auto' orientation: the view follows the actual frame
+                        // the phone is streaming right now (portrait when held
+                        // vertical). Forced modes pin the box.
+                        let layout = status.aspectRatio || 'auto';
+                        if (layout !== '9:16' && layout !== '16:9') {
+                            const fp = (status.encodedHeight || 0) > (status.encodedWidth || 0);
+                            layout = fp ? '9:16' : '16:9';
+                        }
 
-                        let layout = status.aspectRatio || '16:9';
-                        if (layout === 'auto') layout = '16:9';
-
-                        applyDisplaySettings(status.previewFitMode, rot, !!status.mirror, layout);
+                        applyDisplaySettings(status.previewFitMode, 0, !!status.mirror, layout);
 
                         if(status.rebindInProgress) {
                             document.getElementById('header-rebind-warning').style.display = 'inline';

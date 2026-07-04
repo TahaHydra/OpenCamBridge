@@ -34,8 +34,9 @@ class SettingsManager(context: Context) {
         StreamState.fps.set(prefs.getInt("fps", 30))
         StreamState.jpegQuality.set(prefs.getInt("jpegQuality", 85))
         StreamState.previewFitMode.set(prefs.getString("previewFitMode", "fill") ?: "fill")
-        val savedAspectRatio = prefs.getString("aspectRatio", "16:9") ?: "16:9"
-        StreamState.aspectRatio.set(if (savedAspectRatio == "auto") "16:9" else savedAspectRatio)
+        // Orientation mode: "auto" (view follows how the phone is held),
+        // "16:9" (pinned horizontal), or "9:16" (pinned vertical).
+        StreamState.aspectRatio.set(prefs.getString("aspectRatio", "auto") ?: "auto")
 
         StreamState.zoomSpeed.set(prefs.getString("zoomSpeed", "normal") ?: "normal")
 

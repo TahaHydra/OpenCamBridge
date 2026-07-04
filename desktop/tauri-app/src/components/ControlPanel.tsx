@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Play, Square, Settings2, Sliders, RefreshCw, RotateCw, ZoomIn, ZoomOut, Monitor, Video, ShieldAlert } from 'lucide-react';
+import { Play, Square, Settings2, Sliders, RefreshCw, ZoomIn, ZoomOut, Monitor, Video, ShieldAlert } from 'lucide-react';
 import { connectAndSetupObs, ObsStatus } from '../services/obs';
 import { apiFetch, buildUrl } from '../services/api';
 import { invoke } from '@tauri-apps/api/core';
@@ -481,7 +481,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         fps: s.fps,
         jpegQuality: s.jpegQuality,
         cameraId: s.cameraId,
-        aspectRatio: s.aspectRatio || '16:9',
+        aspectRatio: s.aspectRatio || 'auto',
+        // These two were missing, so desktop orientation/mirror changes never
+        // actually reached the phone (and polling snapped the UI back).
+        displayRotation: s.displayRotation ?? '0',
+        mirror: !!s.mirror,
         streamMode: s.streamMode,
         targetBandwidthMbps: s.targetBandwidthMbps,
         h264Bitrate: s.h264Bitrate,
@@ -671,17 +675,21 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     await applySettingsAndRefreshPreview(next, ['fps']);
   };
 
-  // Manual rotation is an OFFSET on top of the phone's automatic upright
-  // orientation (the phone tracks vertical/horizontal itself and rotates the
-  // streamed pixels). So 0 = upright however the phone is held; the button is
-  // for upside-down mounts or intentional flips. The preview box stays 16:9 —
-  // the same fixed canvas as the virtual camera — and rotated portrait content
-  // letterboxes inside it exactly like OBS shows it.
-  const handleRotate = async () => {
-    const rot = parseInt(settings.displayRotation, 10) || 0;
-    const nextRot = ((rot + 90) % 360).toString();
-    addDiag('rotate', `Manual rotation offset -> ${nextRot}°`);
-    updateSetting('displayRotation', nextRot);
+  // Orientation mode ('auto' | '16:9' | '9:16'). Content is always
+  // auto-uprighted on the phone for how it is physically held; this controls
+  // the VIEW: Auto lets the preview follow the phone (vertical phone -> 9:16
+  // preview), Horizontal/Vertical pin it. Selecting a mode also clears any
+  // legacy manual rotation offset so old saved rotations cannot leave the
+  // stream sideways. The virtual camera output itself stays 16:9 (consuming
+  // apps expect a landscape webcam); vertical video is pillarboxed there.
+  const orientationMode =
+    settings.aspectRatio === '9:16' || settings.aspectRatio === '16:9'
+      ? settings.aspectRatio
+      : 'auto';
+  const updateOrientationMode = async (mode: string) => {
+    addDiag('orientation', `Orientation mode -> ${mode}`);
+    const next = { ...settingsRef.current, aspectRatio: mode, displayRotation: '0' };
+    await applySettingsAndRefreshPreview(next, ['aspectRatio', 'displayRotation']);
   };
 
   // V1 is MJPEG-only for normal users: leaving Developer mode forces the codec
@@ -1236,9 +1244,21 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         </div>
 
         <div className="control-item" style={{ marginTop: 20 }}>
-          <button className="btn btn-secondary" style={{ width: '100%' }} onClick={handleRotate}>
-            <RotateCw size={16} /> Rotate Output 90°
-          </button>
+          <label>Orientation</label>
+          <select
+            className="input-control"
+            value={orientationMode}
+            onChange={(e) => updateOrientationMode(e.target.value)}
+          >
+            <option value="auto">Auto (follow phone)</option>
+            <option value="16:9">Horizontal (16:9)</option>
+            <option value="9:16">Vertical (9:16)</option>
+          </select>
+          <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
+            The video is always upright. Auto resizes this preview to match how
+            the phone is held; Horizontal/Vertical pin it. The virtual camera
+            apps receive stays 16:9 — vertical video shows there with side bars.
+          </p>
         </div>
 
         <div className="control-row" style={{ marginTop: 20 }}>

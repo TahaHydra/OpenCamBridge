@@ -533,25 +533,12 @@ fun MainControls(
                 Spacer(modifier = Modifier.height(16.dp))
                 FitModeSelector(previewFitMode, !rebindInProgress, onPreviewFitModeSelect)
                 Spacer(modifier = Modifier.height(16.dp))
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Button(
-                        onClick = {
-                            val currentRot = displayRotation.toIntOrNull() ?: 0
-                            val newRot = (currentRot + 90) % 360
-                            onDisplayRotationSelect(newRot.toString())
-                        },
-                        enabled = !rebindInProgress,
-                        modifier = Modifier.fillMaxWidth(0.5f).padding(end = 8.dp)
-                    ) {
-                        Text("↻ Rotate 90°")
-                    }
-                    Button(
-                        onClick = { onMirrorSelect(!mirror) },
-                        enabled = !rebindInProgress,
-                        modifier = Modifier.fillMaxWidth().padding(start = 8.dp)
-                    ) {
-                        Text(if (mirror) "Mirror: ON" else "Mirror: OFF")
-                    }
+                Button(
+                    onClick = { onMirrorSelect(!mirror) },
+                    enabled = !rebindInProgress,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(if (mirror) "Mirror: ON" else "Mirror: OFF")
                 }
                 Spacer(modifier = Modifier.height(16.dp))
                 OutputOrientationSelector(aspectRatio, displayRotation, !rebindInProgress) { ar, rot ->
@@ -825,18 +812,18 @@ fun FitModeSelector(fitMode: String, enabled: Boolean, onSelect: (String) -> Uni
 fun OutputOrientationSelector(aspectRatio: String, displayRotation: String, enabled: Boolean, onSelect: (String, String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     
-    // The stream is auto-uprighted for the phone's physical orientation; these
-    // values are a manual offset applied on top of that. The output canvas is
-    // always the 16:9 virtual camera — rotation no longer flips the box aspect.
-    val options = listOf("0", "90", "180", "270")
+    // Orientation mode. Content is always auto-uprighted for how the phone is
+    // physically held; this only controls the VIEW: Auto follows the phone
+    // (vertical phone -> 9:16 preview), Horizontal/Vertical pin it. Selecting a
+    // mode also clears any legacy manual rotation offset.
+    val options = listOf("auto", "16:9", "9:16")
     val labels = mapOf(
-        "0" to "Upright (auto)",
-        "90" to "+90°",
-        "180" to "+180° (flip)",
-        "270" to "+270°"
+        "auto" to "Auto (follow phone)",
+        "16:9" to "Horizontal (16:9)",
+        "9:16" to "Vertical (9:16)"
     )
 
-    val currentValue = labels[displayRotation] ?: "Upright (auto)"
+    val currentValue = labels[aspectRatio] ?: "Auto (follow phone)"
 
     ExposedDropdownMenuBox(
         expanded = expanded,
@@ -864,7 +851,7 @@ fun OutputOrientationSelector(aspectRatio: String, displayRotation: String, enab
                 DropdownMenuItem(
                     text = { Text(labels[opt] ?: "") },
                     onClick = {
-                        onSelect("16:9", opt)
+                        onSelect(opt, "0")
                         expanded = false
                     }
                 )
