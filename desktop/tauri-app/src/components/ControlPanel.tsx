@@ -132,6 +132,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   }, [settings]);
 
   const [isSyncing, setIsSyncing] = useState(false);
+  // Mirror of isSyncing readable from the status-poll callback without adding it
+  // as a dependency. While a local apply is in flight we must not let a stale
+  // poll overwrite the user's just-made selection with the pre-change server
+  // value (which would make the desktop controls appear to "snap back").
+  const isSyncingRef = useRef(false);
 
   const [obsPassword, setObsPassword] = useState('');
   const [obsMode, setObsMode] = useState<'browser' | 'window'>('browser');
@@ -177,19 +182,37 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       .then(data => {
         const status = data.status || data;
         if (status) {
-          setSettings(prev => ({
-            ...prev,
-            cameraId: status.cameraId ?? prev.cameraId,
-            displayRotation: status.displayRotation ?? prev.displayRotation,
-            aspectRatio: status.aspectRatio ?? prev.aspectRatio,
-            mirror: status.mirror ?? prev.mirror,
-            torchEnabled: status.torchEnabled ?? prev.torchEnabled,
-            linearZoom: status.linearZoom ?? prev.linearZoom,
-            streamMode: status.streamMode ?? prev.streamMode,
-            targetBandwidthMbps: status.targetBandwidthMbps ?? prev.targetBandwidthMbps,
-            h264Bitrate: status.h264Bitrate ?? prev.h264Bitrate,
-            h264KeyframeInterval: status.h264KeyframeInterval ?? prev.h264KeyframeInterval
-          }));
+          setSettings(prev => {
+            const merged: any = {
+              ...prev,
+              // Display/control fields are safe to mirror on every poll so a
+              // change made on the phone shows up on the desktop within ~1s.
+              cameraId: status.cameraId ?? prev.cameraId,
+              displayRotation: status.displayRotation ?? prev.displayRotation,
+              aspectRatio: status.aspectRatio ?? prev.aspectRatio,
+              mirror: status.mirror ?? prev.mirror,
+              torchEnabled: status.torchEnabled ?? prev.torchEnabled,
+              linearZoom: status.linearZoom ?? prev.linearZoom,
+              streamMode: status.streamMode ?? prev.streamMode,
+              targetBandwidthMbps: status.targetBandwidthMbps ?? prev.targetBandwidthMbps,
+              h264Bitrate: status.h264Bitrate ?? prev.h264Bitrate,
+              h264KeyframeInterval: status.h264KeyframeInterval ?? prev.h264KeyframeInterval
+            };
+            // Stream-shaping fields (resolution/fps/quality/profile) also need to
+            // reflect phone-side changes, but only when the desktop is not in the
+            // middle of applying its own change — otherwise an in-flight poll
+            // would revert the user's selection before it lands.
+            if (!isSyncingRef.current) {
+              merged.profile = status.profile ?? prev.profile;
+              merged.width = status.width ?? prev.width;
+              merged.height = status.height ?? prev.height;
+              merged.outputWidth = status.outputWidth ?? prev.outputWidth;
+              merged.outputHeight = status.outputHeight ?? prev.outputHeight;
+              merged.fps = status.fps ?? prev.fps;
+              merged.jpegQuality = status.jpegQuality ?? prev.jpegQuality;
+            }
+            return merged;
+          });
         }
       })
       .catch(console.error);
@@ -367,11 +390,15 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     setSettings(nextSettings);
     settingsRef.current = nextSettings;
     setIsSyncing(true);
+    isSyncingRef.current = true;
 
     try {
-      // h264Bitrate is intentionally absent: Android applies it to the live
-      // encoder via MediaCodec.setParameters, no pipeline restart needed.
-      const streamImpacting = ['profile', 'width', 'height', 'fps', 'jpegQuality', 'cameraId', 'streamMode', 'h264KeyframeInterval'].some(k => keysChanged.includes(k));
+      // h264Bitrate and jpegQuality are intentionally absent: Android applies
+      // both to the live pipeline without a rebind (bitrate via
+      // MediaCodec.setParameters; JPEG quality is read per-frame). Restarting
+      // the whole pipeline on every quality-slider step was the source of the
+      // repeated producer restarts.
+      const streamImpacting = ['profile', 'width', 'height', 'fps', 'cameraId', 'streamMode', 'h264KeyframeInterval'].some(k => keysChanged.includes(k));
       const streamWasRunning = vcamState?.running || androidMetrics?.encodedWidth > 0;
 
       if (streamImpacting && streamWasRunning) {
@@ -387,6 +414,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       setVcamMessage(`Settings apply failed: ${err.toString()}`);
     } finally {
       setIsSyncing(false);
+      isSyncingRef.current = false;
     }
   };
 
@@ -501,6 +529,24 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
     const newSettings = { ...settingsRef.current, ...preset };
     await applySettingsAndRefreshPreview(newSettings, ['profile', 'width', 'height', 'fps', 'jpegQuality']);
+  };
+
+  // Resolution and FPS are independent knobs, not baked into profile names.
+  // Picking a resolution selects a capture policy that permits that size on the
+  // phone (via `profile`) but leaves the frame rate untouched, so any
+  // resolution can pair with any FPS (e.g. 720p30, 720p60, 1080p30, 1080p60).
+  const updateResolution = async (w: number, h: number) => {
+    const profile = w >= 1920 ? 'quality' : w >= 1280 ? 'balanced' : 'low-latency';
+    const next = {
+      ...settingsRef.current,
+      width: w, height: h, outputWidth: w, outputHeight: h, profile,
+    };
+    await applySettingsAndRefreshPreview(next, ['width', 'height', 'profile']);
+  };
+
+  const updateFps = async (fps: number) => {
+    const next = { ...settingsRef.current, fps };
+    await applySettingsAndRefreshPreview(next, ['fps']);
   };
 
   const handleRotate = async () => {
@@ -793,18 +839,58 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         </h3>
 
         <div className="control-item">
-          <label>Target Profile</label>
+          <label>Resolution</label>
+          <select
+            className="input-control"
+            value={`${settings.width}x${settings.height}`}
+            onChange={(e) => {
+              const [w, h] = e.target.value.split('x').map(Number);
+              updateResolution(w, h);
+            }}
+          >
+            <option value="640x480">480p (640x480)</option>
+            <option value="960x540">540p (960x540)</option>
+            <option value="1280x720">720p (1280x720)</option>
+            <option value="1920x1080">1080p (1920x1080)</option>
+          </select>
+        </div>
+
+        <div className="control-item" style={{ marginTop: 12 }}>
+          <label>Frame Rate</label>
+          <select
+            className="input-control"
+            value={settings.fps}
+            onChange={(e) => updateFps(parseInt(e.target.value, 10))}
+          >
+            <option value={15}>15 fps</option>
+            <option value={30}>30 fps</option>
+            <option value={60}>60 fps</option>
+          </select>
+          <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
+            Resolution and frame rate are independent. Reaching 60&nbsp;fps depends
+            on the phone camera supporting it at the chosen resolution and lighting;
+            the FPS readout below shows the actual delivered rate.
+          </p>
+        </div>
+
+        <div className="control-item" style={{ marginTop: 12 }}>
+          <label>Capture Profile (advanced)</label>
           <select
             className="input-control"
             value={settings.profile}
             onChange={(e) => updateProfile(e.target.value)}
           >
-            <option value="low-latency">Low Latency (960x540 @ 30fps, Q70)</option>
-            <option value="balanced">Balanced (1280x720 @ 30fps, Q85)</option>
+            <option value="low-latency">Low Latency (960x540, Q70)</option>
+            <option value="balanced">Balanced (1280x720, Q85)</option>
             <option value="balanced-720p60">Balanced 60 (1280x720 @ 60fps, Q80)</option>
-            <option value="quality">Quality (1920x1080 @ 30fps, Q90)</option>
+            <option value="quality">Quality (1920x1080, Q90)</option>
             <option value="experimental-1080p60">Experimental (1080p @ 60fps)</option>
           </select>
+          <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
+            Presets set resolution, quality (and, for the "60" presets, frame rate)
+            together. Use the Resolution and Frame Rate controls above for
+            independent selection.
+          </p>
         </div>
       </div>
 

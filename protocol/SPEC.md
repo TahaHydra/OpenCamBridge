@@ -127,8 +127,15 @@ What exists today:
 - SPS/PPS: the codec-config buffer is cached and sent as the first bytes to
   each new subscriber when available. Some device encoders additionally repeat
   SPS/PPS inline before IDR frames. Consumers must tolerate both.
-- Encoder profile/level are device defaults (not negotiated). Keyframe
-  interval and bitrate are configurable via settings.
+- Encoder profile: the encoder is asked for **Constrained Baseline** (no
+  CABAC, no B-slices, no 8x8 transform) when it advertises support, because
+  that is the H.264 subset the Windows-side openh264 software decoder handles
+  most reliably. Encoders that do not offer the profile keep their default.
+  Keyframe interval and bitrate are configurable via settings.
+- 1080p60 caveat: real-time software decoding of 1080p60 H.264 with openh264 is
+  CPU-bound and may not sustain 60 fps; when the decoder falls behind, the
+  producer drops to the next keyframe (visible as a brief jump) and reports the
+  transient error in `last_error`. MJPEG is the recommended path for 1080p60.
 - Slow subscribers are disconnected rather than having NAL units dropped
   (dropping arbitrary NALs would corrupt the stream until the next IDR).
 
@@ -202,6 +209,19 @@ rust-frame-producer --source <mjpeg|test-pattern|h264> --url <stream url>
 Without `--rotate`, portrait sources are auto-rotated 90 degrees into
 landscape outputs (legacy behavior). One metrics JSON line is printed per
 second on stdout; `last_error` is `null` or a human-readable string.
+
+Rotation and the fixed output size: the Media Foundation virtual camera
+renders a fixed output resolution (`--width` x `--height`), so a rotated frame
+must be fit into that box. When the rotation keeps the frame's orientation
+matching the output box (no rotation, 180 degrees, or auto-rotate of a portrait
+source into a landscape box) the frame is stretched to fill exactly as before —
+for matching aspect ratios (the stable 16:9 MJPEG case) this is a plain resize
+with no visible change. When an explicit `--rotate 90`/`--rotate 270` leaves
+portrait content in a landscape output box (or vice-versa) the frame is scaled
+to fit while preserving its aspect ratio and centered with black bars, instead
+of being stretched. This is what makes rotation produce an upright image with no
+cropping or vertical squashing; the output dimensions themselves stay fixed
+because the virtual camera media type is fixed.
 
 ## V1 scope
 

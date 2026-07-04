@@ -339,7 +339,17 @@ class StreamService : LifecycleService() {
         req.zoomSpeed?.let { StreamState.zoomSpeed.set(it); requiresSettingsSave = true }
         req.displayRotation?.let { StreamState.displayRotation.set(it); requiresSettingsSave = true }
         req.mirror?.let { StreamState.mirror.set(it); requiresSettingsSave = true }
-        req.localPreviewEnabled?.let { StreamState.localPreviewEnabled.set(it); requiresSettingsSave = true }
+        req.localPreviewEnabled?.let {
+            val was = StreamState.localPreviewEnabled.get()
+            StreamState.localPreviewEnabled.set(it)
+            requiresSettingsSave = true
+            // Turning the phone preview ON mid-stream must (re)bind the CameraX
+            // Preview use case — it is only bound when preview is enabled at bind
+            // time, so without a rebind the preview surface never receives frames
+            // (the "preview button does nothing" bug). Turning it OFF only
+            // detaches the surface below, keeping the stream uninterrupted.
+            if (it && !was) requiresRebind = true
+        }
         req.targetBandwidthMbps?.let { StreamState.targetBandwidthMbps.set(it); requiresSettingsSave = true }
 
         // Dynamic preview surface detach

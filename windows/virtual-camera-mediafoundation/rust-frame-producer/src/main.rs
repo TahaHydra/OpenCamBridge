@@ -314,6 +314,36 @@ struct StageTimings {
     write_ms: u32,
 }
 
+/// Scales `src` to fit inside `out_w` x `out_h` while preserving its aspect
+/// ratio, centered on an opaque black canvas (BGRA). Used when a 90/270
+/// rotation leaves portrait content that would otherwise be stretched into a
+/// landscape output. No pixels are cropped; unused space becomes black bars.
+fn letterbox_into(src: &image::RgbaImage, out_w: u32, out_h: u32) -> Vec<u8> {
+    let sw = src.width().max(1) as f64;
+    let sh = src.height().max(1) as f64;
+    let scale = (out_w as f64 / sw).min(out_h as f64 / sh);
+    let new_w = ((sw * scale).round() as u32).clamp(1, out_w);
+    let new_h = ((sh * scale).round() as u32).clamp(1, out_h);
+    let resized = image::imageops::resize(src, new_w, new_h, image::imageops::FilterType::Triangle);
+    let resized_raw = resized.into_raw();
+
+    let mut canvas = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
+    // Opaque black background (BGRA: alpha in byte 3).
+    for px in canvas.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+
+    let off_x = (out_w - new_w) / 2;
+    let off_y = (out_h - new_h) / 2;
+    let row_bytes = (new_w as usize) * 4;
+    for row in 0..new_h as usize {
+        let dst = (((off_y as usize + row) * out_w as usize + off_x as usize) * 4) as usize;
+        let sptr = row * row_bytes;
+        canvas[dst..dst + row_bytes].copy_from_slice(&resized_raw[sptr..sptr + row_bytes]);
+    }
+    canvas
+}
+
 fn orient_resize_write(
     rgba: image::RgbaImage,
     rotate_arg: Option<u32>,
@@ -351,10 +381,28 @@ fn orient_resize_write(
     let rotate_ms = rotate_start.elapsed().as_millis() as u32;
 
     let resize_start = Instant::now();
-    let final_frame = if oriented.width() != out_w || oriented.height() != out_h {
-        image::imageops::resize(&oriented, out_w, out_h, image::imageops::FilterType::Triangle).into_raw()
+    // The Media Foundation virtual camera renders a fixed output size, so the
+    // frame must land in an `out_w` x `out_h` buffer no matter how it was
+    // rotated.
+    //
+    // - Same orientation as the output box (no rotation, or a rotation that
+    //   keeps landscape/portrait): stretch to fill, exactly as before. For a
+    //   matching aspect ratio (the stable 16:9 MJPEG case) this is a plain
+    //   resize with no visible change.
+    // - Orientation flipped by an explicit 90/270 rotation (portrait content in
+    //   a landscape box): fit while preserving aspect and pad with black.
+    //   Stretching here is what produced the "vertically cropped"/squashed
+    //   image; letterboxing rotates correctly without cropping.
+    let oriented_landscape = oriented.width() >= oriented.height();
+    let box_landscape = out_w >= out_h;
+    let final_frame = if oriented_landscape == box_landscape {
+        if oriented.width() != out_w || oriented.height() != out_h {
+            image::imageops::resize(&oriented, out_w, out_h, image::imageops::FilterType::Triangle).into_raw()
+        } else {
+            oriented.into_raw()
+        }
     } else {
-        oriented.into_raw()
+        letterbox_into(&oriented, out_w, out_h)
     };
     let resize_ms = resize_start.elapsed().as_millis() as u32;
 

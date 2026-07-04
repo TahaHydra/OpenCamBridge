@@ -164,8 +164,12 @@ class H264Streamer(
                     var selectedH = StreamState.height.get()
 
                     withContext(Dispatchers.Main) {
-                        if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
-                            preview.setSurfaceProvider(surfaceProvider)
+                        if (StreamState.localPreviewEnabled.get()) {
+                            // Bind the Preview whenever it is enabled, even if the
+                            // Compose PreviewView has not published its surface yet;
+                            // setSurfaceProvider attaches it dynamically once ready
+                            // (see StreamViewModel.setSurfaceProvider).
+                            if (surfaceProvider != null) preview.setSurfaceProvider(surfaceProvider)
                             useCases.add(preview)
                         }
                         currentCamera = provider.bindToLifecycle(
@@ -363,6 +367,29 @@ class H264Streamer(
             // joiners and reconnecting decoders can sync mid-stream. Vendor
             // key; encoders that do not know it ignore it.
             format.setInteger("prepend-sps-pps-to-idr-frames", 1)
+
+            // Prefer Constrained Baseline: no CABAC, no B-frames, no 8x8
+            // transform — the H.264 subset the bundled openh264 software decoder
+            // on the Windows side handles most reliably. High profile (many
+            // phones' default) with CABAC is heavier to software-decode and is a
+            // likely contributor to the "Native:16"/data-error-concealed decode
+            // failures seen on 1080p. Only requested when the encoder advertises
+            // it, so configure() never fails on encoders that lack it; those
+            // simply keep their default profile.
+            try {
+                val wantProfile = MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedBaseline
+                val matching = caps?.profileLevels?.filter { it.profile == wantProfile } ?: emptyList()
+                if (matching.isNotEmpty()) {
+                    format.setInteger(MediaFormat.KEY_PROFILE, wantProfile)
+                    // Some encoders require KEY_LEVEL to be set alongside
+                    // KEY_PROFILE; pick the highest level offered for the profile.
+                    val level = matching.maxByOrNull { it.level }?.level
+                    if (level != null) format.setInteger(MediaFormat.KEY_LEVEL, level)
+                    Log.i("H264Streamer", "Requesting Constrained Baseline profile (level $level)")
+                }
+            } catch (e: Exception) {
+                Log.w("H264Streamer", "Could not request Constrained Baseline profile: ${e.message}")
+            }
 
             mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             mediaCodec?.start()

@@ -149,8 +149,12 @@ class MjpegStreamer(
                     val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis)
 
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                        if (StreamState.localPreviewEnabled.get() && surfaceProvider != null) {
-                            preview.setSurfaceProvider(surfaceProvider)
+                        if (StreamState.localPreviewEnabled.get()) {
+                            // Bind the Preview whenever it is enabled, even if the
+                            // Compose PreviewView has not published its surface yet;
+                            // setSurfaceProvider attaches it dynamically once ready
+                            // (see StreamViewModel.setSurfaceProvider).
+                            if (surfaceProvider != null) preview.setSurfaceProvider(surfaceProvider)
                             useCases.add(preview)
                         }
                         currentCamera = provider.bindToLifecycle(
