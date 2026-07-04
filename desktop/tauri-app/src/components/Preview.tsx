@@ -79,9 +79,15 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
     height: boxSize.h ? `${boxSize.h}px` : '100%',
   };
 
-  // When frame and box orientation differ, force letterbox — "fill" would crop
-  // and the preview would no longer represent the actual feed.
-  const effectiveFit = framePortrait !== boxPortrait ? 'fit' : fitMode;
+  // Fit rule per mode:
+  // - Pinned Horizontal (16:9) with a portrait frame: letterbox, because 16:9
+  //   IS the virtual camera canvas and apps see exactly this pillarboxed view.
+  // - Pinned Vertical (9:16) with a landscape frame: honor "fill" (center-crop)
+  //   so the vertical canvas is actually filled edge-to-edge — a letterboxed
+  //   16:9 band jammed inside a 9:16 box is useless as a vertical view.
+  // - Auto: box always matches the frame, so the user's fit mode applies as-is.
+  const effectiveFit =
+    layout === '16:9' && framePortrait ? 'fit' : fitMode;
 
   return (
     <div className="preview-wrapper animate-fade">
