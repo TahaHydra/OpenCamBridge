@@ -109,8 +109,14 @@ if (!(Test-Path $builtInstaller)) {
 try {
     Copy-Item $builtInstaller $targetInstaller -Force -ErrorAction Stop
 } catch {
-    Write-Host "Host exe is locked (VirtualCamera_Installer still running). Close it or rerun without -NoKill." -ForegroundColor Red
-    exit 1
+    $builtHash = (Get-FileHash $builtInstaller -Algorithm SHA256).Hash
+    $targetHash = if (Test-Path $targetInstaller) { (Get-FileHash $targetInstaller -Algorithm SHA256).Hash } else { "" }
+    if ($builtHash -eq $targetHash) {
+        Write-Host "Host exe is locked (running) but already up to date; skipping copy." -ForegroundColor Yellow
+    } else {
+        Write-Host "Host exe is locked (VirtualCamera_Installer still running) and OUTDATED. Close it or rerun without -NoKill." -ForegroundColor Red
+        exit 1
+    }
 }
 
 Write-Host "Built DLL:" -ForegroundColor Green
@@ -121,5 +127,23 @@ Get-Item $targetDll | Select-Object FullName,Length,LastWriteTime
 
 Write-Host "Virtual camera host exe:" -ForegroundColor Green
 Get-Item $targetInstaller | Select-Object FullName,Length,LastWriteTime
+
+# The COM registration decides which DLL the Windows FrameServer actually
+# loads. If it points at another clone/path, rebuilding here changes nothing
+# for the live camera — warn loudly instead of letting that stay silent.
+try {
+    $regKey = "HKLM:\Software\Classes\CLSID\{8CF75B14-3F68-46BC-80DF-5FB86AED931E}\InprocServer32"
+    $registeredDll = (Get-ItemProperty -Path $regKey -ErrorAction Stop).'(default)'
+    if ($registeredDll -and ($registeredDll -ne $targetDll)) {
+        Write-Host ""
+        Write-Host "WARNING: the virtual camera COM registration points at a DIFFERENT DLL:" -ForegroundColor Red
+        Write-Host "  registered: $registeredDll" -ForegroundColor Red
+        Write-Host "  this build: $targetDll" -ForegroundColor Red
+        Write-Host "The camera keeps loading the registered DLL - your rebuild will NOT take effect." -ForegroundColor Red
+        Write-Host "Fix: run windows\virtual-camera-mediafoundation\register_hklm.bat as Administrator, then restart the camera pipeline." -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "Note: virtual camera COM object not registered yet. Run windows\virtual-camera-mediafoundation\register_hklm.bat as Administrator once." -ForegroundColor Yellow
+}
 
 Write-Host "Media Foundation DLL + host build/copy done." -ForegroundColor Green
