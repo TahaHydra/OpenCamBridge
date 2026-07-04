@@ -490,6 +490,11 @@ class H264Streamer(
                         val out = ByteArrayOutputStream()
                         yuvImage.compressToJpeg(Rect(0, 0, width, height), currentQuality, out)
                         StreamState.latestFrame.set(out.toByteArray())
+                        // The MJPEG HTTP loop only pushes a frame when the
+                        // revision changes; without this, every /stream.mjpeg
+                        // preview (desktop, phone web UI, /obs) freezes on the
+                        // first frame while in H.264 mode.
+                        StreamState.latestFrameRevision.incrementAndGet()
                     } catch (e: Exception) {
                         Log.e("H264Streamer", "Async JPEG fallback failed", e)
                     }

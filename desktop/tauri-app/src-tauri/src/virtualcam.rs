@@ -26,6 +26,10 @@ pub struct VirtualCamMetrics {
     pub write_ms_avg: u32,
     pub total_pipeline_ms: u32,
     pub bytes_per_sec: usize,
+    // Producer emits this; the desktop "Est. Bandwidth" readout stayed blank
+    // without the field. Default keeps older producer builds parseable.
+    #[serde(default)]
+    pub estimated_mbps: String,
     pub pixel_format: String,
     pub last_error: Option<String>,
 }
