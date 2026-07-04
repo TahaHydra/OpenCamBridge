@@ -4,7 +4,10 @@ use std::ptr::{null_mut, copy_nonoverlapping};
 use std::time::{Instant, Duration};
 use std::thread::{sleep, spawn};
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::io::Read;
+use openh264::decoder::Decoder;
+use openh264::formats::YUVSource;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_ABANDONED};
 use windows::Win32::Security::{SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR};
@@ -36,7 +39,8 @@ struct OpenCamBridgeFrameHeader {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Frame source: "mjpeg" (stable), "test-pattern", or "h264" (EXPERIMENTAL scaffold, no decode yet)
+    /// Frame source: "mjpeg" (stable), "test-pattern", or "h264"
+    /// (experimental; decoded with the bundled openh264 decoder)
     #[arg(short, long)]
     source: String,
 
@@ -301,6 +305,66 @@ fn backoff_secs(consecutive_failures: u32) -> u64 {
     }
 }
 
+/// Rotation/mirror/resize applied to a decoded frame before it is written to
+/// the shared framebuffer. The pixel data is BGRA stored in an RgbaImage; all
+/// operations used here are channel-order agnostic.
+struct StageTimings {
+    rotate_ms: u32,
+    resize_ms: u32,
+    write_ms: u32,
+}
+
+fn orient_resize_write(
+    rgba: image::RgbaImage,
+    rotate_arg: Option<u32>,
+    mirror: bool,
+    out_w: u32,
+    out_h: u32,
+    ipc: &SharedMemoryIpc,
+    frame_counter: u64,
+) -> StageTimings {
+    let src_w = rgba.width();
+    let src_h = rgba.height();
+
+    let rotate_start = Instant::now();
+    // Explicit --rotate wins; otherwise auto-rotate portrait sources into
+    // landscape outputs (legacy behavior).
+    let rotation = match rotate_arg {
+        Some(r) => r % 360,
+        None => {
+            if src_w < src_h && out_w >= out_h { 90 } else { 0 }
+        }
+    };
+    let rotated = match rotation {
+        90 => image::imageops::rotate90(&rgba),
+        180 => image::imageops::rotate180(&rgba),
+        270 => image::imageops::rotate270(&rgba),
+        _ => rgba,
+    };
+    // Mirror is applied after rotation so it always means "flip left/right as
+    // seen by the viewer".
+    let oriented = if mirror {
+        image::imageops::flip_horizontal(&rotated)
+    } else {
+        rotated
+    };
+    let rotate_ms = rotate_start.elapsed().as_millis() as u32;
+
+    let resize_start = Instant::now();
+    let final_frame = if oriented.width() != out_w || oriented.height() != out_h {
+        image::imageops::resize(&oriented, out_w, out_h, image::imageops::FilterType::Triangle).into_raw()
+    } else {
+        oriented.into_raw()
+    };
+    let resize_ms = resize_start.elapsed().as_millis() as u32;
+
+    let write_start = Instant::now();
+    ipc.write_frame(frame_counter, &final_frame, out_w, out_h);
+    let write_ms = write_start.elapsed().as_millis() as u32;
+
+    StageTimings { rotate_ms, resize_ms, write_ms }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_mjpeg_reader(
     url: String,
@@ -402,18 +466,15 @@ fn start_mjpeg_reader(
 }
 
 // ---------------------------------------------------------------------------
-// H.264 EXPERIMENTAL SCAFFOLD
+// H.264 (EXPERIMENTAL)
 //
-// STATUS: transport + Annex B parsing only. There is NO H.264 decoder wired in
-// yet, so this source NEVER writes frames to the virtual camera framebuffer.
-// It exists to validate the network path and bitstream shape end-to-end, and
-// to give the desktop app honest telemetry about what is (not) happening.
+// Transport: raw Annex B byte stream from /stream.h264 (see protocol/SPEC.md).
+// Decode: bundled openh264 (compiled from source at build time). Decoded
+// frames are converted to BGRA and written to the shared framebuffer through
+// the same rotation/mirror/resize pipeline as the MJPEG path.
 //
-// Decoder integration candidates, in rough order of preference for this repo:
-//   1. Windows Media Foundation H.264 MFT (no new redistributable, needs
-//      IMFTransform COM plumbing + NV12 -> BGRA conversion).
-//   2. openh264 crate (Cisco binary license considerations).
-//   3. ffmpeg-based decode in a separate helper process.
+// This path is experimental until it has been validated on real devices; the
+// MJPEG path remains Stable V1.
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -423,56 +484,74 @@ struct H264Stats {
     pps_seen: bool,
     idr_count: u64,
     bytes_total: u64,
+    dropped_nals: u64,
 }
 
-/// Scans an Annex B byte stream for completed NAL units, updating stats.
-/// Retains the trailing partial NAL in `pending` for the next chunk.
-fn scan_annex_b(pending: &mut Vec<u8>, stats: &Arc<Mutex<H264Stats>>) {
-    let mut positions: Vec<usize> = Vec::new();
+#[derive(Default)]
+struct DecodeStats {
+    frames: u32,
+    ms_sum: u32,
+}
+
+/// Extracts complete NAL units (each including its start code) from `pending`.
+/// The trailing, possibly incomplete NAL stays in `pending` for the next chunk.
+fn extract_nal_units(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut starts: Vec<usize> = Vec::new();
     let mut i = 0usize;
-    while i + 3 < pending.len() {
-        if pending[i] == 0 && pending[i + 1] == 0 && (pending[i + 2] == 1 || (pending[i + 2] == 0 && pending[i + 3] == 1)) {
-            positions.push(i);
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-
-    if positions.len() < 2 {
-        return;
-    }
-
-    {
-        let mut s = stats.lock().unwrap();
-        for w in positions.windows(2) {
-            let start = w[0];
-            let header_idx = if pending[start + 2] == 1 { start + 3 } else { start + 4 };
-            if header_idx < w[1] {
-                let nal_type = pending[header_idx] & 0x1F;
-                s.nal_count += 1;
-                match nal_type {
-                    7 => s.sps_seen = true,
-                    8 => s.pps_seen = true,
-                    5 => s.idr_count += 1,
-                    _ => {}
-                }
+    while i + 2 < pending.len() {
+        if pending[i] == 0 && pending[i + 1] == 0 {
+            if pending[i + 2] == 1 {
+                starts.push(i);
+                i += 3;
+                continue;
+            }
+            if i + 3 < pending.len() && pending[i + 2] == 0 && pending[i + 3] == 1 {
+                starts.push(i);
+                i += 4;
+                continue;
             }
         }
+        i += 1;
     }
 
-    let last = *positions.last().unwrap();
+    if starts.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut units = Vec::with_capacity(starts.len() - 1);
+    for w in starts.windows(2) {
+        units.push(pending[w[0]..w[1]].to_vec());
+    }
+    let last = *starts.last().unwrap();
     pending.drain(..last);
+    units
+}
+
+/// NAL unit type of a start-code-prefixed NAL (0 if malformed).
+fn nal_unit_type(nal: &[u8]) -> u8 {
+    if nal.len() >= 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1 {
+        return nal[3] & 0x1F;
+    }
+    if nal.len() >= 5 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1 {
+        return nal[4] & 0x1F;
+    }
+    0
 }
 
 fn start_h264_reader(
     url: String,
     token: Option<String>,
+    tx: SyncSender<Vec<u8>>,
     stats: Arc<Mutex<H264Stats>>,
     last_error: Arc<Mutex<Option<String>>>,
 ) {
     spawn(move || {
         let mut failures: u32 = 0;
+        // When the decoder queue overflows we cannot drop arbitrary NALs
+        // (that corrupts the bitstream); we drop everything until the next
+        // IDR and resume from that clean keyframe.
+        let mut waiting_for_idr = false;
+
         loop {
             let client = match build_http_client() {
                 Ok(c) => c,
@@ -492,7 +571,12 @@ fn start_h264_reader(
             match request.send() {
                 Ok(mut res) => {
                     if !res.status().is_success() {
-                        set_error(&last_error, format!("H.264 stream returned HTTP {}", res.status()));
+                        let hint = if res.status().as_u16() == 401 {
+                            " (unauthorized: check the LAN access token)"
+                        } else {
+                            ""
+                        };
+                        set_error(&last_error, format!("H.264 stream returned HTTP {}{}", res.status(), hint));
                         failures = failures.saturating_add(1);
                     } else {
                         failures = 0;
@@ -503,15 +587,62 @@ fn start_h264_reader(
 
                         loop {
                             match res.read(&mut buf) {
-                                Ok(0) => break,
+                                Ok(0) => {
+                                    set_error(&last_error, "H.264 stream ended (server closed connection); reconnecting".to_string());
+                                    break;
+                                }
                                 Ok(n) => {
                                     {
                                         stats.lock().unwrap().bytes_total += n as u64;
                                     }
                                     pending.extend_from_slice(&buf[..n]);
-                                    scan_annex_b(&mut pending, &stats);
+
+                                    for nal in extract_nal_units(&mut pending) {
+                                        let nal_type = nal_unit_type(&nal);
+                                        {
+                                            let mut s = stats.lock().unwrap();
+                                            s.nal_count += 1;
+                                            match nal_type {
+                                                7 => s.sps_seen = true,
+                                                8 => s.pps_seen = true,
+                                                5 => s.idr_count += 1,
+                                                _ => {}
+                                            }
+                                        }
+
+                                        // Parameter sets and keyframes end a
+                                        // skip period; everything else is
+                                        // dropped while we wait for one.
+                                        let is_sync_point = matches!(nal_type, 5 | 7 | 8);
+                                        if waiting_for_idr && !is_sync_point {
+                                            stats.lock().unwrap().dropped_nals += 1;
+                                            continue;
+                                        }
+
+                                        match tx.try_send(nal) {
+                                            Ok(()) => {
+                                                if waiting_for_idr && nal_type == 5 {
+                                                    waiting_for_idr = false;
+                                                }
+                                            }
+                                            Err(TrySendError::Full(_)) => {
+                                                waiting_for_idr = true;
+                                                let mut s = stats.lock().unwrap();
+                                                s.dropped_nals += 1;
+                                                if s.dropped_nals == 1 || s.dropped_nals % 100 == 0 {
+                                                    eprintln!("H.264 decoder queue full; dropped {} NAL units so far (resyncing at next keyframe)", s.dropped_nals);
+                                                }
+                                            }
+                                            Err(TrySendError::Disconnected(_)) => {
+                                                set_error(&last_error, "H.264 decoder stopped; reader exiting".to_string());
+                                                return;
+                                            }
+                                        }
+                                    }
+
                                     if pending.len() > 4_000_000 {
                                         pending.clear();
+                                        waiting_for_idr = true;
                                     }
                                 }
                                 Err(e) => {
@@ -520,6 +651,9 @@ fn start_h264_reader(
                                 }
                             }
                         }
+                        // Mid-stream reconnects land at an arbitrary bitstream
+                        // position; wait for the next clean sync point.
+                        waiting_for_idr = true;
                     }
                 }
                 Err(e) => {
@@ -532,48 +666,65 @@ fn start_h264_reader(
     });
 }
 
-/// Emits honest metrics for the H.264 scaffold: transport statistics plus an
-/// explicit "decode not implemented" error so no UI can mistake this for a
-/// working video path. Never writes to the framebuffer.
-fn run_h264_scaffold(args: Args, _ipc: SharedMemoryIpc) {
-    eprintln!("WARNING: --source h264 is an EXPERIMENTAL transport scaffold.");
-    eprintln!("WARNING: No H.264 decoder is integrated; NO frames will reach the virtual camera.");
-
-    let url = args.url.clone().expect("URL is required for h264 source");
-    let stats = Arc::new(Mutex::new(H264Stats::default()));
-    let last_error = Arc::new(Mutex::new(None::<String>));
-
-    start_h264_reader(url, args.token.clone(), stats.clone(), last_error.clone());
-
-    let width = args.width.unwrap_or(1280);
-    let height = args.height.unwrap_or(720);
-    let fps = args.fps.unwrap_or(30);
-
-    loop {
-        sleep(Duration::from_secs(1));
-
-        let (nals, sps, pps, idr, bytes) = {
-            let s = stats.lock().unwrap();
-            (s.nal_count, s.sps_seen, s.pps_seen, s.idr_count, s.bytes_total)
-        };
-        let transport_err = { last_error.lock().unwrap().clone() };
-
-        let status = match transport_err {
-            Some(e) => format!(
-                "H264_DECODE_NOT_IMPLEMENTED: no frames written to framebuffer. Transport error: {}",
-                e
-            ),
-            None => format!(
-                "H264_DECODE_NOT_IMPLEMENTED: transport OK (nals={}, sps={}, pps={}, idr={}, bytes={}) but no frames written to framebuffer",
-                nals, sps, pps, idr, bytes
-            ),
+fn start_h264_decoder(
+    rx: Receiver<Vec<u8>>,
+    latest_frame: Arc<Mutex<Option<image::RgbaImage>>>,
+    decode_stats: Arc<Mutex<DecodeStats>>,
+    last_error: Arc<Mutex<Option<String>>>,
+) {
+    spawn(move || {
+        let mut decoder = match Decoder::new() {
+            Ok(d) => d,
+            Err(e) => {
+                set_error(&last_error, format!("H.264 decoder init failed: {}; no frames will be produced", e));
+                return;
+            }
         };
 
-        println!(
-            r#"{{"source":"h264","profile":"{}","source_width":0,"source_height":0,"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":0,"written_fps":0,"dropped_jpegs":0,"jpeg_queue_len":0,"decode_ms_avg":0,"rotate_ms_avg":0,"resize_ms_avg":0,"write_ms_avg":0,"total_pipeline_ms":0,"bytes_per_sec":{},"estimated_mbps":"0.00","pixel_format":"BGRA32","last_error":"{}"}}"#,
-            json_escape(&args.profile), width, height, fps, bytes, json_escape(&status)
-        );
-    }
+        let mut rgb_buf: Vec<u8> = Vec::new();
+
+        while let Ok(nal) = rx.recv() {
+            let decode_start = Instant::now();
+            match decoder.decode(&nal) {
+                Ok(Some(yuv)) => {
+                    let (w, h) = yuv.dimensions();
+                    if w == 0 || h == 0 {
+                        continue;
+                    }
+
+                    rgb_buf.resize(w * h * 3, 0);
+                    yuv.write_rgb8(&mut rgb_buf);
+
+                    // RGB -> BGRA (framebuffer format is BGRA32).
+                    let mut bgra = Vec::with_capacity(w * h * 4);
+                    for px in rgb_buf.chunks_exact(3) {
+                        bgra.push(px[2]);
+                        bgra.push(px[1]);
+                        bgra.push(px[0]);
+                        bgra.push(255);
+                    }
+
+                    if let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, bgra) {
+                        {
+                            let mut s = decode_stats.lock().unwrap();
+                            s.frames += 1;
+                            s.ms_sum += decode_start.elapsed().as_millis() as u32;
+                        }
+                        *latest_frame.lock().unwrap() = Some(img);
+                        clear_error(&last_error);
+                    }
+                }
+                Ok(None) => {
+                    // Parameter set or partial data; no picture yet.
+                }
+                Err(e) => {
+                    // Expected right after a mid-stream (re)connect until the
+                    // next keyframe arrives; the decoder recovers on its own.
+                    set_error(&last_error, format!("H.264 decode error (recovers at next keyframe): {}", e));
+                }
+            }
+        }
+    });
 }
 
 fn main() {
@@ -622,21 +773,23 @@ fn main() {
     let ipc = SharedMemoryIpc::new().expect("Failed to initialize IPC");
     eprintln!("Framebuffer backend: {}", ipc.backend_name);
 
-    if args.source == "h264" {
-        run_h264_scaffold(args, ipc);
-        return;
-    }
-
     let mut frame_counter = 0u64;
     let target_duration = Duration::from_secs_f64(1.0 / fps as f64);
     let mut next_frame_deadline = Instant::now();
     let mut last_print = Instant::now();
     let mut output_fps_counter = 0;
 
+    // MJPEG source state
     let latest_jpeg = Arc::new(Mutex::new(None));
     let http_jpeg_counter = Arc::new(Mutex::new(0));
     let dropped_jpeg_counter = Arc::new(Mutex::new(0));
     let mjpeg_bytes_counter = Arc::new(Mutex::new(0u64));
+
+    // H.264 source state
+    let latest_h264_frame: Arc<Mutex<Option<image::RgbaImage>>> = Arc::new(Mutex::new(None));
+    let h264_stats = Arc::new(Mutex::new(H264Stats::default()));
+    let h264_decode_stats = Arc::new(Mutex::new(DecodeStats::default()));
+
     let last_error = Arc::new(Mutex::new(None::<String>));
 
     if args.source == "mjpeg" {
@@ -650,6 +803,12 @@ fn main() {
             mjpeg_bytes_counter.clone(),
             last_error.clone(),
         );
+    } else if args.source == "h264" {
+        eprintln!("NOTE: --source h264 is experimental. Decoding uses the bundled openh264; MJPEG remains the stable path.");
+        let url = args.url.clone().expect("URL is required for h264 source");
+        let (tx, rx) = sync_channel::<Vec<u8>>(512);
+        start_h264_reader(url, args.token.clone(), tx, h264_stats.clone(), last_error.clone());
+        start_h264_decoder(rx, latest_h264_frame.clone(), h264_decode_stats.clone(), last_error.clone());
     }
 
     let mut sum_decode_ms = 0;
@@ -695,41 +854,10 @@ fn main() {
                         }
                         sum_decode_ms += decode_start.elapsed().as_millis() as u32;
 
-                        let rotate_start = Instant::now();
-                        // Explicit --rotate wins; otherwise auto-rotate portrait
-                        // sources into landscape outputs (legacy behavior).
-                        let rotation = match args.rotate {
-                            Some(r) => r % 360,
-                            None => {
-                                if source_w < source_h && width >= height { 90 } else { 0 }
-                            }
-                        };
-                        let rotated = match rotation {
-                            90 => image::imageops::rotate90(&rgba),
-                            180 => image::imageops::rotate180(&rgba),
-                            270 => image::imageops::rotate270(&rgba),
-                            _ => rgba,
-                        };
-                        // Mirror is applied after rotation so it always means
-                        // "flip left/right as seen by the viewer".
-                        let oriented = if args.mirror {
-                            image::imageops::flip_horizontal(&rotated)
-                        } else {
-                            rotated
-                        };
-                        sum_rotate_ms += rotate_start.elapsed().as_millis() as u32;
-
-                        let resize_start = Instant::now();
-                        let final_frame = if oriented.width() != width || oriented.height() != height {
-                            image::imageops::resize(&oriented, width, height, image::imageops::FilterType::Triangle).into_raw()
-                        } else {
-                            oriented.into_raw()
-                        };
-                        sum_resize_ms += resize_start.elapsed().as_millis() as u32;
-
-                        let write_start = Instant::now();
-                        ipc.write_frame(frame_counter, &final_frame, width, height);
-                        sum_write_ms += write_start.elapsed().as_millis() as u32;
+                        let timings = orient_resize_write(rgba, args.rotate, args.mirror, width, height, &ipc, frame_counter);
+                        sum_rotate_ms += timings.rotate_ms;
+                        sum_resize_ms += timings.resize_ms;
+                        sum_write_ms += timings.write_ms;
 
                         frame_counter += 1;
                         output_fps_counter += 1;
@@ -741,6 +869,25 @@ fn main() {
                 }
                 loop_total_ms = start_time.elapsed().as_millis() as u32;
             }
+        } else if args.source == "h264" {
+            let frame_opt = {
+                let mut lock = latest_h264_frame.lock().unwrap();
+                lock.take() // latest-only, same policy as the MJPEG path
+            };
+
+            if let Some(rgba) = frame_opt {
+                source_w = rgba.width();
+                source_h = rgba.height();
+
+                let timings = orient_resize_write(rgba, args.rotate, args.mirror, width, height, &ipc, frame_counter);
+                sum_rotate_ms += timings.rotate_ms;
+                sum_resize_ms += timings.resize_ms;
+                sum_write_ms += timings.write_ms;
+
+                frame_counter += 1;
+                output_fps_counter += 1;
+                loop_total_ms = start_time.elapsed().as_millis() as u32;
+            }
         }
         sum_total_ms += loop_total_ms;
 
@@ -749,7 +896,9 @@ fn main() {
             let mut http_fps = ((output_fps_counter as f64) / interval_secs).round() as u32;
             let mut dropped_jpegs = 0;
             let mut queue_len = 0;
-            let mut mjpeg_bytes = 0;
+            let mut source_bytes = 0u64;
+            let mut decoded_this_window = decoded_fps_counter;
+            let mut decode_ms_avg_external: Option<u32> = None;
 
             if args.source == "mjpeg" {
                 let mut lock = http_jpeg_counter.lock().unwrap();
@@ -764,19 +913,47 @@ fn main() {
                 if jpeg_lock.is_some() { queue_len = 1; }
 
                 let mut bytes_lock = mjpeg_bytes_counter.lock().unwrap();
-                mjpeg_bytes = *bytes_lock;
+                source_bytes = *bytes_lock;
                 *bytes_lock = 0;
+            } else if args.source == "h264" {
+                http_fps = 0;
+
+                // Bytes received this window
+                {
+                    let mut s = h264_stats.lock().unwrap();
+                    source_bytes = s.bytes_total;
+                    s.bytes_total = 0;
+                }
+
+                // Decode happens on its own thread; read-and-reset its window.
+                {
+                    let mut d = h264_decode_stats.lock().unwrap();
+                    decoded_this_window = ((d.frames as f64) / interval_secs).round() as u32;
+                    decode_ms_avg_external = Some(if d.frames > 0 { d.ms_sum / d.frames } else { 0 });
+                    d.frames = 0;
+                    d.ms_sum = 0;
+                }
+
+                let frame_lock = latest_h264_frame.lock().unwrap();
+                if frame_lock.is_some() { queue_len = 1; }
             }
 
             let denom = if output_fps_counter > 0 { output_fps_counter } else { 1 };
-            let avg_decode = sum_decode_ms / denom;
+            let avg_decode = match decode_ms_avg_external {
+                Some(v) => v,
+                None => sum_decode_ms / denom,
+            };
             let avg_rotate = sum_rotate_ms / denom;
             let avg_resize = sum_resize_ms / denom;
             let avg_write = sum_write_ms / denom;
             let avg_total = sum_total_ms / denom;
 
-            let mbps = (mjpeg_bytes as f64 * 8.0) / 1_000_000.0;
-            let decoded_fps_normalized = ((decoded_fps_counter as f64) / interval_secs).round() as u32;
+            let mbps = (source_bytes as f64 * 8.0) / 1_000_000.0;
+            let decoded_fps_normalized = if args.source == "h264" {
+                decoded_this_window
+            } else {
+                ((decoded_fps_counter as f64) / interval_secs).round() as u32
+            };
             let written_fps_normalized = ((output_fps_counter as f64) / interval_secs).round() as u32;
 
             let err_snapshot = { last_error.lock().unwrap().clone() };
@@ -789,7 +966,7 @@ fn main() {
                 args.source, json_escape(&args.profile), source_w, source_h, width, height, fps,
                 http_fps, decoded_fps_normalized, written_fps_normalized, dropped_jpegs, queue_len,
                 avg_decode, avg_rotate, avg_resize, avg_write, avg_total,
-                mjpeg_bytes, mbps, last_error_json
+                source_bytes, mbps, last_error_json
             );
 
             last_print = Instant::now();
