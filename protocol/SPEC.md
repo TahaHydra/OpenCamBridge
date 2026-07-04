@@ -132,14 +132,25 @@ What exists today:
 - Slow subscribers are disconnected rather than having NAL units dropped
   (dropping arbitrary NALs would corrupt the stream until the next IDR).
 
-What does NOT exist yet:
+- The encoder negotiates a concrete raw input layout (NV12 or I420) with the
+  device codec and is configured only after CameraX reports the actually
+  selected capture size, so the bitstream geometry always matches the frames.
+- The encoder is asked to repeat SPS/PPS before IDR frames
+  (`prepend-sps-pps-to-idr-frames`); encoders that do not support the key
+  ignore it, so consumers must still tolerate config-only startup.
 
-- The Windows Rust frame producer has **no H.264 decoder**. Its
-  `--source h264` mode is a transport scaffold only: it connects,
-  authenticates, parses Annex B NAL units, and reports statistics, but writes
-  **no frames** to the virtual camera framebuffer and reports
-  `H264_DECODE_NOT_IMPLEMENTED` in its metrics. H.264 is therefore not
-  OBS-ready.
+Windows consumption (experimental):
+
+- The Rust frame producer's `--source h264` mode decodes the Annex B stream
+  with the bundled **openh264** decoder (compiled from source at build time)
+  and writes BGRA frames to the shared framebuffer through the same
+  rotation/mirror/resize pipeline as MJPEG.
+- On decoder-queue overflow or a mid-stream reconnect, the producer drops
+  data only until the next SPS/PPS/IDR sync point rather than feeding the
+  decoder a corrupt bitstream; decode errors before the first keyframe are
+  expected and reported in `last_error`, then clear on recovery.
+- This path is **experimental until validated on real devices**; MJPEG
+  remains the Stable V1 path.
 
 ## Shared framebuffer format (Windows IPC)
 
@@ -186,7 +197,9 @@ second on stdout; `last_error` is `null` or a human-readable string.
 ## V1 scope
 
 - MJPEG is the stable V1 path.
-- H.264 stream is experimental (endpoint exists but not yet consumed by the Windows virtual camera).
+- H.264 is experimental end-to-end: Android encodes it, and the Windows
+  producer can decode it into the virtual camera (openh264), but it has not
+  been validated on devices yet.
 - No audio.  
 - No iOS.  
 - No macOS virtual camera driver yet.

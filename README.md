@@ -6,7 +6,11 @@ No cloud, no account, no telemetry, no ads, no watermark.
 ## Architecture Pipeline
 
 - **Stable V1 (MJPEG)**: Android CameraX -> `/stream.mjpeg` -> Rust producer -> shared memory framebuffer -> Media Foundation virtual camera -> OBS.
-- **Experimental (H.264)**: An H.264 encoder endpoint (`/stream.h264`) exists on Android, and the Rust producer has an `--source h264` transport scaffold (connects, authenticates, parses Annex B NAL units, reports stats), but **no H.264 decoder is integrated yet**, so H.264 never reaches the virtual camera and is not OBS-ready.
+- **Experimental (H.264)**: Android MediaCodec -> `/stream.h264` (Annex B) -> Rust producer `--source h264` -> bundled openh264 decoder -> shared memory framebuffer -> virtual camera. Implemented end-to-end but **not yet validated on real devices**; switch back to MJPEG if you see artifacts or stalls.
+
+All lenses the phone exposes (main, ultrawide, telephoto, front, external)
+are selectable; the app negotiates per-device resolutions, FPS ranges, and
+encoder input formats instead of assuming fixed values.
 
 Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [protocol/SPEC.md](protocol/SPEC.md).
 
@@ -92,7 +96,10 @@ Invoke-RestMethod http://127.0.0.1:8080/api/stream/metrics
 - No audio support.
 - No iOS app.
 - No macOS virtual camera driver yet.
-- H.264 stream cannot yet be consumed by the OBS virtual camera pipeline.
+- H.264 mode is experimental (implemented end-to-end, not yet device-validated).
+- Building the Rust producer now requires a C/C++ compiler (openh264 is
+  compiled from source; installing `nasm` is optional and only enables its
+  faster assembly routines).
 
 ## Release Checklist
 
@@ -105,6 +112,8 @@ Before tagging a release, ensure:
   - [ ] 720p30 (Balanced) works flawlessly
   - [ ] 1080p60 (Experimental) produces reasonable framerates
 - [ ] Torch and profile changes update UI state reliably
+- [ ] Every lens in the camera dropdown actually switches the picture
+- [ ] H.264 mode shows video in OBS (or is consciously left experimental)
 - [ ] Full manual pass of [docs/VALIDATION.md](docs/VALIDATION.md)
 
 ## Security Note

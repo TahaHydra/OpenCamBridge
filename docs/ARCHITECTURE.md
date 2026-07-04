@@ -19,7 +19,7 @@ Ktor HTTP server (ControlServer)
    |  LAN: token-authenticated HTTP
    v
 rust-frame-producer.exe
-   decode JPEG -> BGRA32 -> rotate/mirror/resize
+   decode JPEG (or H.264 via openh264) -> BGRA32 -> rotate/mirror/resize
    |
    v
 Shared memory framebuffer (OCBF header + BGRA pixels)
@@ -47,14 +47,21 @@ the virtual camera host, mirrors settings to the phone, and shows metrics.
   ERROR state; they are not swallowed.
 - `MjpegStreamer` - CameraX ImageAnalysis -> NV21 -> JPEG into
   `StreamState.latestFrame` (single latest-frame slot; HTTP side fans out).
-- `H264Streamer` - CameraX -> NV12 -> MediaCodec AVC; broadcasts Annex B
-  buffers to per-client bounded channels; slow clients are disconnected.
+  Encoding is paced to the requested FPS and idles at ~2 fps when zero
+  MJPEG clients are connected.
+- `H264Streamer` - CameraX -> MediaCodec AVC; the encoder is configured
+  after CameraX reports the selected capture size, negotiates its raw input
+  layout (NV12 or I420) per device, and broadcasts Annex B buffers to
+  per-client bounded channels; slow clients are disconnected.
 - `ControlServer` - Ktor CIO server; REST API + streams + embedded web UI.
   See `protocol/SPEC.md` for the auth rules (bind-time enforcement,
   loopback-only security settings, constant-time token compare).
 - `StreamState` - atomics-based shared state (single source of truth),
   including `torchRequested` so torch survives rebinds.
 - `ResolutionPolicy` - profile-driven CameraX resolution selection.
+- `CameraSelectors` / `FpsRanges` / `CameraRepository` - per-device lens
+  selection by Camera2 id (ultrawide/telephoto/etc. with graceful fallback)
+  and AE FPS ranges chosen from what the device actually reports.
 
 ### Rust frame producer (`windows/.../rust-frame-producer/`)
 
@@ -66,11 +73,13 @@ Single binary, three sources:
   at token problems), JPEG decode -> BGRA, explicit `--rotate`/`--mirror`
   or portrait auto-rotate, resize, shared-memory write with QPC timestamp.
 - `--source test-pattern`: synthetic frames for debugging the vcam side alone.
-- `--source h264` (EXPERIMENTAL SCAFFOLD): transport + Annex B NAL parsing
-  and statistics only. **No decoder is integrated; it never writes frames**
-  and reports `H264_DECODE_NOT_IMPLEMENTED` in metrics. Decoder candidates,
-  in order of preference: Windows Media Foundation H.264 MFT (no new
-  redistributables), the openh264 crate, or an ffmpeg helper process.
+- `--source h264` (EXPERIMENTAL): Annex B transport with a reader thread
+  that extracts complete NAL units into a bounded queue, and a decoder
+  thread using the bundled **openh264** (compiled from source at build
+  time). On queue overflow or mid-stream reconnect it drops data only until
+  the next SPS/PPS/IDR sync point, so the decoder never sees a corrupt
+  bitstream. Decoded frames go through the same rotate/mirror/resize/write
+  pipeline as MJPEG. Experimental until validated on real devices.
 
 Metrics: one JSON line per second on stdout (parsed by the Tauri app);
 errors also go to stderr (surfaced as `last_error` in the desktop UI).

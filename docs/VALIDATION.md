@@ -8,6 +8,9 @@ before merging or releasing.
 
 - [ ] Android: `cd android && .\gradlew.bat assembleDebug`
 - [ ] Producer: `cd windows\virtual-camera-mediafoundation\rust-frame-producer && cargo build --release`
+      (now compiles openh264 from source: needs a C/C++ compiler in the
+      environment; if the build complains about assembly, install `nasm` or
+      it should fall back to plain C)
 - [ ] Desktop: `cd desktop\tauri-app && npm install && npm run tauri build` (or `npx tsc --noEmit` for a fast type check)
 
 Fix anything that does not compile before continuing.
@@ -45,13 +48,32 @@ Fix anything that does not compile before continuing.
 - [ ] Rotate Output 90: OBS image rotates accordingly after pipeline restart.
 - [ ] Preview orientation and OBS orientation match in all 4 rotations.
 
-## 5. H.264 experimental honesty
+## 5. H.264 experimental path (now end-to-end; validate hard)
 
 - [ ] Phone in h264 stream mode: `ffplay http://127.0.0.1:8080/stream.h264` (over adb forward) plays video. Confirm new subscribers get SPS/PPS (start ffplay AFTER the stream has been running a while).
 - [ ] `/api/stream/info` reports codec `h264-annexb`, experimental=true.
-- [ ] `rust-frame-producer --source h264 --url ...` connects, prints NAL statistics in metrics, reports `H264_DECODE_NOT_IMPLEMENTED`, and writes NO frames (OBS shows the previous/test-pattern frame, not h264 video).
-- [ ] Desktop UI keeps H.264 selector disabled with the honest explanation.
+- [ ] Desktop: switch Stream Codec to H.264 -> pipeline restarts, producer runs with `--source h264`, and **OBS shows live video** with correct colors (no green/purple tint - that would indicate an encoder input-format negotiation bug on this device) and correct geometry (no diagonal shearing).
+- [ ] Producer metrics in h264 mode: `decoded_fps` ≈ camera FPS, `decode_ms_avg` sane (< ~15ms at 720p), `last_error` null after the first keyframe.
+- [ ] Kill and restart the Android app mid-h264-stream: producer reconnects, logs decode errors only until the next keyframe, then video resumes.
+- [ ] Bitrate slider (desktop) visibly changes quality/bandwidth; keyframe interval change survives the rebind.
+- [ ] Rotate/mirror in h264 mode affect OBS output the same as in MJPEG mode.
+- [ ] Desktop preview in h264 mode shows the "~5 fps snapshot" note and updates slowly (expected; the virtual camera is full rate).
 - [ ] Slow-client disconnect: open `/stream.h264` with a paused consumer (e.g. `curl --limit-rate 1k`) and confirm Android logs "Dropping slow H.264 client" instead of OOMing.
+- [ ] Encoded size == selected capture size: change resolution while in h264 mode and confirm the stream stays clean (codec is reconfigured after bind now).
+
+## 5b. Multi-lens / device universality
+
+- [ ] Camera dropdown (phone UI, web UI, desktop) lists every lens with a sensible label (wide/ultrawide/telephoto).
+- [ ] Selecting an ultrawide or telephoto id actually changes the picture (previously any id other than "1" silently used the main back camera).
+- [ ] Selecting a bogus/stale camera id (e.g. settings restored from another phone) falls back to the default camera instead of erroring.
+- [ ] `/api/camera/capabilities` returns JSON (it used to 500 - Map serialization bug).
+- [ ] FPS 60 on a 30fps-max lens: stream still starts (closest supported range is used).
+- [ ] `/api/camera/status` shows `mjpegClients`/`h264Clients` counts matching reality.
+
+## 5c. MJPEG efficiency (new behavior)
+
+- [ ] With no preview and no producer connected (0 clients), phone CPU drops noticeably after ~1s (encoder idles at ~2fps); connecting a client restores full FPS immediately.
+- [ ] With FPS limit 15 and a 30fps camera, Android encode work is ~15fps (check `androidEncodeMsAvg` / battery, and producer `http_jpeg_fps` ≈ 15).
 
 ## 6. Producer robustness
 
@@ -68,6 +90,6 @@ Fix anything that does not compile before continuing.
 
 ## Known-incomplete (do not expect these to work)
 
-- H.264 -> virtual camera: not implemented (scaffold only).
 - `register_virtual_camera_backend` from the desktop UI: still directs to the manual installer.
-- Camera selection beyond front/back binary mapping (cameraId "1" = front, otherwise back) in the streamers.
+- H.264 is implemented end-to-end but carries an "experimental" label until
+  section 5 above passes on at least one real device.
