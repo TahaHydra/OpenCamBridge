@@ -159,18 +159,14 @@ HRESULT SharedMemoryClient::ReadFrame(BYTE* pBuf, DWORD len, LONG pitch, DWORD w
         {
             BYTE* srcData = static_cast<BYTE*>(m_pMappedView) + sizeof(OpenCamBridgeFrameHeader);
             
-            // The shared framebuffer is TOP-DOWN BGRA (see protocol/SPEC.md),
-            // but the RGB32 media types this source advertises carry no
-            // MF_MT_DEFAULT_STRIDE, so the MF pipeline falls back to
-            // MFGetStrideForBitmapInfoHeader, which is negative for RGB
-            // formats -> consumers treat the sample as BOTTOM-UP. Copy the
-            // rows inverted so apps see the image right side up; a straight
-            // top-down copy shows every consumer an upside-down picture.
-            DWORD copyBytes = min(static_cast<DWORD>(pitch < 0 ? -pitch : pitch), header->stride);
             if (header->width == width && header->height == height) {
                 if (len >= header->dataSize) {
-                    for (DWORD y = 0; y < height; ++y) {
-                        memcpy(pBuf + y * pitch, srcData + (height - 1 - y) * header->stride, copyBytes);
+                    if (pitch == static_cast<LONG>(header->stride)) {
+                        memcpy(pBuf, srcData, header->dataSize);
+                    } else {
+                        for (DWORD y = 0; y < height; ++y) {
+                            memcpy(pBuf + y * pitch, srcData + y * header->stride, min(static_cast<DWORD>(pitch), header->stride));
+                        }
                     }
                     hr = S_OK;
                 } else {
@@ -180,12 +176,12 @@ HRESULT SharedMemoryClient::ReadFrame(BYTE* pBuf, DWORD len, LONG pitch, DWORD w
                 char msg[256];
                 sprintf_s(msg, sizeof(msg), "OpenCamBridge: mismatch framebuffer=%lux%lu requested=%lux%lu\n", header->width, header->height, width, height);
                 OutputDebugStringA(msg);
-
+                
                 for (DWORD y = 0; y < height; ++y) {
-                    DWORD srcY = (((height - 1 - y) * header->height) / height);
+                    DWORD srcY = (y * header->height) / height;
                     DWORD* dstRow = reinterpret_cast<DWORD*>(pBuf + y * pitch);
                     DWORD* srcRow = reinterpret_cast<DWORD*>(srcData + srcY * header->stride);
-
+                    
                     for (DWORD x = 0; x < width; ++x) {
                         DWORD srcX = (x * header->width) / width;
                         dstRow[x] = srcRow[srcX];

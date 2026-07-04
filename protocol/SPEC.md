@@ -179,10 +179,6 @@ camera media source. Backing store, in order of preference:
    `Global\OpenCamBridgeFrameMutex`.
 
 Layout: a packed little-endian header followed immediately by pixel data.
-Pixel rows are stored **top-down** (row 0 = top of the image). The Media
-Foundation consumer copies them inverted into its sample buffers, because the
-RGB32 media types it advertises carry no `MF_MT_DEFAULT_STRIDE` and the MF
-pipeline therefore treats samples as bottom-up.
 
 | Field         | Type | Meaning                                   |
 |---------------|------|-------------------------------------------|
