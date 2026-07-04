@@ -179,6 +179,13 @@ camera media source. Backing store, in order of preference:
    `Global\OpenCamBridgeFrameMutex`.
 
 Layout: a packed little-endian header followed immediately by pixel data.
+Pixel rows are stored **top-down** (row 0 = top of the image). The Media
+Foundation consumer copies rows straight and declares the surface top-down by
+setting a **positive** `MF_MT_DEFAULT_STRIDE` (= width*4) on its RGB32 media
+types. RGB32 in MF otherwise defaults to bottom-up (negative derived stride),
+which makes consumers such as OBS render the image upside down. Orientation is
+fixed via that media-type attribute, never by flipping rows in the copy (a
+flipped copy with a negative locked pitch writes out of bounds → black screen).
 
 | Field         | Type | Meaning                                   |
 |---------------|------|-------------------------------------------|

@@ -37,6 +37,15 @@ namespace winrt::WindowsSample::implementation
             uint32_t bitrate = (uint32_t)(width * height * 4 * 8 * fps);
             spMediaType->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
             MFSetAttributeRatio(spMediaType.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+            // Declare the surface TOP-DOWN. The shared framebuffer is top-down
+            // BGRA, but RGB32 in Media Foundation defaults to bottom-up (the
+            // derived MFGetStrideForBitmapInfoHeader stride is negative for RGB),
+            // so consumers such as OBS render the image upside down. A POSITIVE
+            // default stride (width*4) signals top-down. This is metadata only —
+            // ReadFrame's straight copy is left exactly as the known-good build,
+            // so this cannot reintroduce the out-of-bounds write / black screen
+            // that physically flipping rows in the copy loop caused.
+            spMediaType->SetUINT32(MF_MT_DEFAULT_STRIDE, (uint32_t)(width * 4));
             return S_OK;
         };
 

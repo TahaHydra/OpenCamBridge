@@ -241,19 +241,41 @@ impl Drop for SharedMemoryIpc {
     }
 }
 
+/// Orientation test pattern. Deliberately NOT symmetric so a vertical flip or
+/// horizontal mirror is obvious in OBS without needing the phone:
+///   - top band RED, bottom band BLUE (detects upside-down)
+///   - a GREEN square in the TOP-LEFT corner (detects mirror + which corner is
+///     "origin")
+///   - a thin moving white scanline so you can tell it is live, not frozen
+/// Run: rust-frame-producer --source test-pattern --width 1280 --height 720
+/// Correct in OBS = red on top, blue on bottom, green square top-left.
 fn generate_test_pattern(frame_counter: u64, width: u32, height: u32) -> Vec<u8> {
-    let data_size = width * height * 4;
-    let mut buf = vec![0u8; data_size as usize];
-    let offset = (frame_counter % height as u64) as u32;
+    let data_size = (width * height * 4) as usize;
+    let mut buf = vec![0u8; data_size];
+
+    let band = height / 3;
+    let marker = (width.min(height)) / 6; // top-left corner square
+    let scan = (frame_counter % height as u64) as u32; // moving scanline row
 
     for y in 0..height {
+        // BGRA channel values for this row's base colour.
+        let (mut b, mut g, mut r) = if y < band {
+            (0u8, 0u8, 220u8)          // top: RED
+        } else if y >= height - band {
+            (220u8, 0u8, 0u8)          // bottom: BLUE
+        } else {
+            (40u8, 40u8, 40u8)         // middle: dark gray
+        };
+        if y == scan { b = 255; g = 255; r = 255; } // white scanline
+
         for x in 0..width {
             let index = ((y * width * 4) + (x * 4)) as usize;
-            let gray = ((y + offset) % 256) as u8;
-            buf[index] = gray;     // B
-            buf[index + 1] = gray; // G
-            buf[index + 2] = gray; // R
-            buf[index + 3] = 255;  // A
+            if y < marker && x < marker {
+                buf[index] = 0; buf[index + 1] = 220; buf[index + 2] = 0; // GREEN top-left
+            } else {
+                buf[index] = b; buf[index + 1] = g; buf[index + 2] = r;
+            }
+            buf[index + 3] = 255;
         }
     }
     buf
