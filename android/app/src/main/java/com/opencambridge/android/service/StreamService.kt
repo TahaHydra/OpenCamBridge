@@ -278,8 +278,26 @@ class StreamService : LifecycleService() {
         // --- Camera-Affecting Settings (Rebind) ---
         req.cameraId?.let { StreamState.cameraId.set(it); requiresRebind = true; requiresSettingsSave = true }
         req.streamMode?.let { StreamState.streamMode.set(it); requiresRebind = true; requiresSettingsSave = true }
-        req.h264Bitrate?.let { StreamState.h264Bitrate.set(it); requiresRebind = true; requiresSettingsSave = true }
-        req.h264KeyframeInterval?.let { StreamState.h264KeyframeInterval.set(it); requiresRebind = true; requiresSettingsSave = true }
+        req.h264Bitrate?.let {
+            StreamState.h264Bitrate.set(it)
+            requiresSettingsSave = true
+            // Prefer applying the bitrate to the live encoder (no stream
+            // interruption). Only rebind when H.264 is actually streaming and
+            // the dynamic update failed; in MJPEG mode the value simply takes
+            // effect at the next H.264 start.
+            if (StreamState.streamMode.get() == "h264" &&
+                StreamState.lifecycleState.get() == LifecycleState.STREAMING &&
+                !h264Streamer.updateBitrate(it)
+            ) {
+                requiresRebind = true
+            }
+        }
+        req.h264KeyframeInterval?.let {
+            StreamState.h264KeyframeInterval.set(it)
+            requiresSettingsSave = true
+            // Keyframe interval cannot be changed on a running codec.
+            if (StreamState.streamMode.get() == "h264") requiresRebind = true
+        }
         req.fps?.let { StreamState.fps.set(it.coerceIn(1, 120)); requiresRebind = true; requiresSettingsSave = true }
 
         if (req.width != null || req.height != null) {

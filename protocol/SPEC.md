@@ -138,6 +138,15 @@ What exists today:
 - The encoder is asked to repeat SPS/PPS before IDR frames
   (`prepend-sps-pps-to-idr-frames`); encoders that do not support the key
   ignore it, so consumers must still tolerate config-only startup.
+- Every new `/stream.h264` subscriber triggers an immediate sync-frame
+  request, so consumers get decodable video right away instead of waiting up
+  to a keyframe interval.
+- B-slices are disabled (`max-bframes` 0): lower latency, and the openh264
+  decoder on the Windows side does not support them. Low-latency and
+  realtime-priority hints are set where the encoder supports them.
+- `h264Bitrate` changes are applied to the running encoder via
+  `MediaCodec.setParameters` (no camera rebind, no stream interruption);
+  `h264KeyframeInterval` changes still require a rebind.
 
 Windows consumption (experimental):
 

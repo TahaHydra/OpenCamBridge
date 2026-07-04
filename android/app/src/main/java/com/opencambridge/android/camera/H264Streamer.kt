@@ -7,6 +7,7 @@ import android.graphics.YuvImage
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Bundle
 import android.util.Log
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
@@ -240,7 +241,46 @@ class H264Streamer(
         if (sps != null) {
             channel.trySend(sps)
         }
+
+        // Ask the encoder for an immediate IDR so the new subscriber gets
+        // decodable video right away instead of waiting up to a full
+        // keyframe interval (2s by default). This is what makes producer
+        // reconnects feel instant.
+        requestKeyFrame()
+
         return channel
+    }
+
+    /** Requests an immediate sync frame from the encoder (best effort). */
+    fun requestKeyFrame() {
+        val codec = mediaCodec ?: return
+        try {
+            val params = Bundle()
+            params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            codec.setParameters(params)
+        } catch (e: Exception) {
+            Log.w("H264Streamer", "requestKeyFrame failed (harmless): ${e.message}")
+        }
+    }
+
+    /**
+     * Applies a new bitrate to the running encoder without restarting the
+     * camera pipeline. Returns false when it could not be applied (caller
+     * should fall back to a rebind).
+     */
+    fun updateBitrate(bps: Int): Boolean {
+        val codec = mediaCodec ?: return false
+        if (!isEncoding) return false
+        return try {
+            val params = Bundle()
+            params.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, bps)
+            codec.setParameters(params)
+            Log.i("H264Streamer", "Bitrate updated dynamically to $bps bps")
+            true
+        } catch (e: Exception) {
+            Log.w("H264Streamer", "Dynamic bitrate update failed; rebind required: ${e.message}")
+            false
+        }
     }
 
     fun unsubscribe(channel: Channel<ByteArray>) {
@@ -273,11 +313,35 @@ class H264Streamer(
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
             }
 
+            // Clamp the requested bitrate to what this encoder supports, so a
+            // high slider setting cannot fail configure() on weaker encoders.
+            val requestedBitrate = StreamState.h264Bitrate.get()
+            val bitrate = try {
+                caps?.videoCapabilities?.bitrateRange?.clamp(requestedBitrate) ?: requestedBitrate
+            } catch (e: Exception) {
+                requestedBitrate
+            }
+            if (bitrate != requestedBitrate) {
+                Log.w("H264Streamer", "Bitrate $requestedBitrate outside encoder range; clamped to $bitrate")
+            }
+
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, codecColorFormat)
-            format.setInteger(MediaFormat.KEY_BIT_RATE, StreamState.h264Bitrate.get())
+            format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, StreamState.h264KeyframeInterval.get())
+
+            // Latency/compatibility hints. Unknown format keys are ignored by
+            // codecs, so these are safe everywhere they are not supported:
+            // - "low-latency" (MediaFormat.KEY_LOW_LATENCY, API 30): skip
+            //   internal buffering where the encoder supports it.
+            // - "priority" 0: realtime priority for the codec instance.
+            // - "max-bframes" 0: never emit B-slices. The openh264 decoder on
+            //   the Windows side cannot decode B-slices, and B-frames add
+            //   reorder latency anyway.
+            format.setInteger("low-latency", 1)
+            format.setInteger("priority", 0)
+            format.setInteger("max-bframes", 0)
 
             // CBR keeps streaming bandwidth steady; request it only when the
             // encoder advertises support (some reject it at configure time).
@@ -312,7 +376,7 @@ class H264Streamer(
             }
             Log.i(
                 "H264Streamer",
-                "Started H.264 Codec: ${width}x${height} @ ${fps}fps, ${StreamState.h264Bitrate.get()} bps, colorFormat=$codecColorFormat"
+                "Started H.264 Codec: ${width}x${height} @ ${fps}fps, $bitrate bps, colorFormat=$codecColorFormat"
             )
         } catch (e: Exception) {
             Log.e("H264Streamer", "Failed to start MediaCodec", e)

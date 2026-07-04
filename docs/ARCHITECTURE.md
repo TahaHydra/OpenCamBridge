@@ -79,7 +79,10 @@ Single binary, three sources:
   time). On queue overflow or mid-stream reconnect it drops data only until
   the next SPS/PPS/IDR sync point, so the decoder never sees a corrupt
   bitstream. Decoded frames go through the same rotate/mirror/resize/write
-  pipeline as MJPEG. Experimental until validated on real devices.
+  pipeline as MJPEG, but the H.264 main loop is event-driven: the decoder
+  wakes the writer the moment a frame is ready (writes still paced to the
+  target FPS), so latency does not include waiting for the next fixed tick.
+  Experimental until validated on real devices.
 
 Metrics: one JSON line per second on stdout (parsed by the Tauri app);
 errors also go to stderr (surfaced as `last_error` in the desktop UI).

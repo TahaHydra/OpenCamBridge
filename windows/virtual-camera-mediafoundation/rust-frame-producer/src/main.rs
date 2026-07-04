@@ -97,7 +97,7 @@ impl SharedMemoryIpc {
                 return Err("Failed to create preferred security descriptor".into());
             }
 
-            let mut sa = SECURITY_ATTRIBUTES {
+            let sa = SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: p_sd.0,
                 bInheritHandle: windows::Win32::Foundation::BOOL(0),
@@ -671,6 +671,7 @@ fn start_h264_decoder(
     latest_frame: Arc<Mutex<Option<image::RgbaImage>>>,
     decode_stats: Arc<Mutex<DecodeStats>>,
     last_error: Arc<Mutex<Option<String>>>,
+    wake_tx: SyncSender<()>,
 ) {
     spawn(move || {
         let mut decoder = match Decoder::new() {
@@ -681,8 +682,6 @@ fn start_h264_decoder(
             }
         };
 
-        let mut rgb_buf: Vec<u8> = Vec::new();
-
         while let Ok(nal) = rx.recv() {
             let decode_start = Instant::now();
             match decoder.decode(&nal) {
@@ -692,25 +691,26 @@ fn start_h264_decoder(
                         continue;
                     }
 
-                    rgb_buf.resize(w * h * 3, 0);
-                    yuv.write_rgb8(&mut rgb_buf);
-
-                    // RGB -> BGRA (framebuffer format is BGRA32).
-                    let mut bgra = Vec::with_capacity(w * h * 4);
-                    for px in rgb_buf.chunks_exact(3) {
-                        bgra.push(px[2]);
-                        bgra.push(px[1]);
-                        bgra.push(px[0]);
-                        bgra.push(255);
+                    // Single pass: RGBA out of the decoder, then an in-place
+                    // R<->B swap to get the BGRA the framebuffer expects.
+                    let mut buf = vec![0u8; w * h * 4];
+                    yuv.write_rgba8(&mut buf);
+                    for px in buf.chunks_exact_mut(4) {
+                        px.swap(0, 2);
                     }
 
-                    if let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, bgra) {
+                    if let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, buf) {
                         {
                             let mut s = decode_stats.lock().unwrap();
                             s.frames += 1;
                             s.ms_sum += decode_start.elapsed().as_millis() as u32;
                         }
                         *latest_frame.lock().unwrap() = Some(img);
+                        // Wake the writer immediately instead of letting the
+                        // frame wait for the next pacing tick (saves up to a
+                        // full frame interval of latency). Capacity-1 channel;
+                        // a pending wake already covers this frame.
+                        let _ = wake_tx.try_send(());
                         clear_error(&last_error);
                     }
                 }
@@ -725,6 +725,133 @@ fn start_h264_decoder(
             }
         }
     });
+}
+
+/// Dedicated H.264 main loop. Unlike the fixed-tick MJPEG loop, this one is
+/// event-driven: the decoder thread wakes it the moment a frame is ready, so
+/// end-to-end latency does not include waiting for the next pacing tick.
+/// Writes are still paced to the target FPS; every NAL is decoded regardless
+/// (the reference chain must stay intact even when frames are not written).
+fn run_h264(args: &Args, ipc: &SharedMemoryIpc, width: u32, height: u32, fps: u32) {
+    eprintln!("NOTE: --source h264 is experimental. Decoding uses the bundled openh264; MJPEG remains the stable path.");
+
+    let url = args.url.clone().expect("URL is required for h264 source");
+    let (nal_tx, nal_rx) = sync_channel::<Vec<u8>>(512);
+    let (wake_tx, wake_rx) = sync_channel::<()>(1);
+
+    let latest_frame: Arc<Mutex<Option<image::RgbaImage>>> = Arc::new(Mutex::new(None));
+    let stats = Arc::new(Mutex::new(H264Stats::default()));
+    let decode_stats = Arc::new(Mutex::new(DecodeStats::default()));
+    let last_error = Arc::new(Mutex::new(None::<String>));
+
+    start_h264_reader(url, args.token.clone(), nal_tx, stats.clone(), last_error.clone());
+    start_h264_decoder(nal_rx, latest_frame.clone(), decode_stats.clone(), last_error.clone(), wake_tx);
+
+    let min_write_interval = Duration::from_secs_f64(1.0 / fps as f64);
+    // 10% tolerance so normal jitter does not halve the effective rate.
+    let pace_threshold = min_write_interval.mul_f64(0.9);
+    let mut last_write = Instant::now() - min_write_interval;
+    let mut last_print = Instant::now();
+    let mut decoder_alive = true;
+
+    let mut frame_counter = 0u64;
+    let mut written_counter: u32 = 0;
+    let mut sum_rotate_ms: u32 = 0;
+    let mut sum_resize_ms: u32 = 0;
+    let mut sum_write_ms: u32 = 0;
+    let mut source_w: u32 = 0;
+    let mut source_h: u32 = 0;
+
+    loop {
+        let next_print = last_print + Duration::from_secs(1);
+
+        if decoder_alive {
+            let timeout = next_print.saturating_duration_since(Instant::now());
+            match wake_rx.recv_timeout(timeout) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    // Decoder thread is gone (init failure); keep printing
+                    // metrics so the desktop shows the error.
+                    decoder_alive = false;
+                }
+            }
+        } else {
+            let wait = next_print
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100));
+            if wait > Duration::ZERO {
+                sleep(wait);
+            }
+        }
+
+        // Pace-check first: when we are ahead of schedule the frame stays in
+        // the slot (possibly replaced by a newer one) and is picked up by a
+        // later wake or the metrics tick, so the last frame of a burst is
+        // never lost.
+        if last_write.elapsed() >= pace_threshold {
+            let frame_opt = { latest_frame.lock().unwrap().take() };
+            if let Some(rgba) = frame_opt {
+                source_w = rgba.width();
+                source_h = rgba.height();
+                let timings = orient_resize_write(rgba, args.rotate, args.mirror, width, height, ipc, frame_counter);
+                sum_rotate_ms += timings.rotate_ms;
+                sum_resize_ms += timings.resize_ms;
+                sum_write_ms += timings.write_ms;
+                frame_counter += 1;
+                written_counter += 1;
+                last_write = Instant::now();
+            }
+        }
+
+        if Instant::now() >= next_print {
+            let interval_secs = last_print.elapsed().as_secs_f64().max(0.001);
+
+            let source_bytes = {
+                let mut s = stats.lock().unwrap();
+                let b = s.bytes_total;
+                s.bytes_total = 0;
+                b
+            };
+            let (decoded_fps, decode_ms_avg) = {
+                let mut d = decode_stats.lock().unwrap();
+                let f = ((d.frames as f64) / interval_secs).round() as u32;
+                let avg = if d.frames > 0 { d.ms_sum / d.frames } else { 0 };
+                d.frames = 0;
+                d.ms_sum = 0;
+                (f, avg)
+            };
+            let queue_len: u32 = if latest_frame.lock().unwrap().is_some() { 1 } else { 0 };
+
+            let denom = if written_counter > 0 { written_counter } else { 1 };
+            let avg_rotate = sum_rotate_ms / denom;
+            let avg_resize = sum_resize_ms / denom;
+            let avg_write = sum_write_ms / denom;
+            let avg_total = decode_ms_avg + avg_rotate + avg_resize + avg_write;
+
+            let written_fps = ((written_counter as f64) / interval_secs).round() as u32;
+            let mbps = (source_bytes as f64 * 8.0) / 1_000_000.0;
+
+            let err_snapshot = { last_error.lock().unwrap().clone() };
+            let last_error_json = match &err_snapshot {
+                Some(e) => format!("\"{}\"", json_escape(e)),
+                None => "null".to_string(),
+            };
+
+            println!(r#"{{"source":"h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"dropped_jpegs":0,"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"BGRA32","last_error":{}}}"#,
+                json_escape(&args.profile), source_w, source_h, width, height, fps,
+                decoded_fps, written_fps, queue_len,
+                decode_ms_avg, avg_rotate, avg_resize, avg_write, avg_total,
+                source_bytes, mbps, last_error_json
+            );
+
+            last_print = Instant::now();
+            written_counter = 0;
+            sum_rotate_ms = 0;
+            sum_resize_ms = 0;
+            sum_write_ms = 0;
+        }
+    }
 }
 
 fn main() {
@@ -773,6 +900,12 @@ fn main() {
     let ipc = SharedMemoryIpc::new().expect("Failed to initialize IPC");
     eprintln!("Framebuffer backend: {}", ipc.backend_name);
 
+    if args.source == "h264" {
+        // Event-driven loop, fully separate from the MJPEG/test-pattern path.
+        run_h264(&args, &ipc, width, height, fps);
+        return;
+    }
+
     let mut frame_counter = 0u64;
     let target_duration = Duration::from_secs_f64(1.0 / fps as f64);
     let mut next_frame_deadline = Instant::now();
@@ -784,11 +917,6 @@ fn main() {
     let http_jpeg_counter = Arc::new(Mutex::new(0));
     let dropped_jpeg_counter = Arc::new(Mutex::new(0));
     let mjpeg_bytes_counter = Arc::new(Mutex::new(0u64));
-
-    // H.264 source state
-    let latest_h264_frame: Arc<Mutex<Option<image::RgbaImage>>> = Arc::new(Mutex::new(None));
-    let h264_stats = Arc::new(Mutex::new(H264Stats::default()));
-    let h264_decode_stats = Arc::new(Mutex::new(DecodeStats::default()));
 
     let last_error = Arc::new(Mutex::new(None::<String>));
 
@@ -803,12 +931,6 @@ fn main() {
             mjpeg_bytes_counter.clone(),
             last_error.clone(),
         );
-    } else if args.source == "h264" {
-        eprintln!("NOTE: --source h264 is experimental. Decoding uses the bundled openh264; MJPEG remains the stable path.");
-        let url = args.url.clone().expect("URL is required for h264 source");
-        let (tx, rx) = sync_channel::<Vec<u8>>(512);
-        start_h264_reader(url, args.token.clone(), tx, h264_stats.clone(), last_error.clone());
-        start_h264_decoder(rx, latest_h264_frame.clone(), h264_decode_stats.clone(), last_error.clone());
     }
 
     let mut sum_decode_ms = 0;
@@ -869,25 +991,6 @@ fn main() {
                 }
                 loop_total_ms = start_time.elapsed().as_millis() as u32;
             }
-        } else if args.source == "h264" {
-            let frame_opt = {
-                let mut lock = latest_h264_frame.lock().unwrap();
-                lock.take() // latest-only, same policy as the MJPEG path
-            };
-
-            if let Some(rgba) = frame_opt {
-                source_w = rgba.width();
-                source_h = rgba.height();
-
-                let timings = orient_resize_write(rgba, args.rotate, args.mirror, width, height, &ipc, frame_counter);
-                sum_rotate_ms += timings.rotate_ms;
-                sum_resize_ms += timings.resize_ms;
-                sum_write_ms += timings.write_ms;
-
-                frame_counter += 1;
-                output_fps_counter += 1;
-                loop_total_ms = start_time.elapsed().as_millis() as u32;
-            }
         }
         sum_total_ms += loop_total_ms;
 
@@ -897,8 +1000,6 @@ fn main() {
             let mut dropped_jpegs = 0;
             let mut queue_len = 0;
             let mut source_bytes = 0u64;
-            let mut decoded_this_window = decoded_fps_counter;
-            let mut decode_ms_avg_external: Option<u32> = None;
 
             if args.source == "mjpeg" {
                 let mut lock = http_jpeg_counter.lock().unwrap();
@@ -915,45 +1016,17 @@ fn main() {
                 let mut bytes_lock = mjpeg_bytes_counter.lock().unwrap();
                 source_bytes = *bytes_lock;
                 *bytes_lock = 0;
-            } else if args.source == "h264" {
-                http_fps = 0;
-
-                // Bytes received this window
-                {
-                    let mut s = h264_stats.lock().unwrap();
-                    source_bytes = s.bytes_total;
-                    s.bytes_total = 0;
-                }
-
-                // Decode happens on its own thread; read-and-reset its window.
-                {
-                    let mut d = h264_decode_stats.lock().unwrap();
-                    decoded_this_window = ((d.frames as f64) / interval_secs).round() as u32;
-                    decode_ms_avg_external = Some(if d.frames > 0 { d.ms_sum / d.frames } else { 0 });
-                    d.frames = 0;
-                    d.ms_sum = 0;
-                }
-
-                let frame_lock = latest_h264_frame.lock().unwrap();
-                if frame_lock.is_some() { queue_len = 1; }
             }
 
             let denom = if output_fps_counter > 0 { output_fps_counter } else { 1 };
-            let avg_decode = match decode_ms_avg_external {
-                Some(v) => v,
-                None => sum_decode_ms / denom,
-            };
+            let avg_decode = sum_decode_ms / denom;
             let avg_rotate = sum_rotate_ms / denom;
             let avg_resize = sum_resize_ms / denom;
             let avg_write = sum_write_ms / denom;
             let avg_total = sum_total_ms / denom;
 
             let mbps = (source_bytes as f64 * 8.0) / 1_000_000.0;
-            let decoded_fps_normalized = if args.source == "h264" {
-                decoded_this_window
-            } else {
-                ((decoded_fps_counter as f64) / interval_secs).round() as u32
-            };
+            let decoded_fps_normalized = ((decoded_fps_counter as f64) / interval_secs).round() as u32;
             let written_fps_normalized = ((output_fps_counter as f64) / interval_secs).round() as u32;
 
             let err_snapshot = { last_error.lock().unwrap().clone() };

@@ -54,8 +54,10 @@ Fix anything that does not compile before continuing.
 - [ ] `/api/stream/info` reports codec `h264-annexb`, experimental=true.
 - [ ] Desktop: switch Stream Codec to H.264 -> pipeline restarts, producer runs with `--source h264`, and **OBS shows live video** with correct colors (no green/purple tint - that would indicate an encoder input-format negotiation bug on this device) and correct geometry (no diagonal shearing).
 - [ ] Producer metrics in h264 mode: `decoded_fps` ≈ camera FPS, `decode_ms_avg` sane (< ~15ms at 720p), `last_error` null after the first keyframe.
-- [ ] Kill and restart the Android app mid-h264-stream: producer reconnects, logs decode errors only until the next keyframe, then video resumes.
-- [ ] Bitrate slider (desktop) visibly changes quality/bandwidth; keyframe interval change survives the rebind.
+- [ ] Kill and restart the Android app mid-h264-stream: producer reconnects and video resumes near-instantly (each new subscriber triggers an immediate IDR request on the encoder).
+- [ ] Bitrate slider (desktop) changes quality/bandwidth **live, without the stream restarting** (dynamic MediaCodec.setParameters); keyframe interval change still restarts the pipeline.
+- [ ] ffprobe/ffplay the stream and confirm there are no B-frames (has_b_frames=0) — the encoder is configured with max-bframes 0 for latency and openh264 compatibility.
+- [ ] Latency feel: wave a hand in front of the phone and compare OBS latency between MJPEG and H.264 modes; H.264 should be comparable or better (event-driven producer writes, no pacing-tick wait).
 - [ ] Rotate/mirror in h264 mode affect OBS output the same as in MJPEG mode.
 - [ ] Desktop preview in h264 mode shows the "~5 fps snapshot" note and updates slowly (expected; the virtual camera is full rate).
 - [ ] Slow-client disconnect: open `/stream.h264` with a paused consumer (e.g. `curl --limit-rate 1k`) and confirm Android logs "Dropping slow H.264 client" instead of OOMing.

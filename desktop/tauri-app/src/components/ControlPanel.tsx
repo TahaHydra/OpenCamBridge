@@ -369,7 +369,9 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     setIsSyncing(true);
 
     try {
-      const streamImpacting = ['profile', 'width', 'height', 'fps', 'jpegQuality', 'cameraId', 'streamMode', 'h264Bitrate', 'h264KeyframeInterval'].some(k => keysChanged.includes(k));
+      // h264Bitrate is intentionally absent: Android applies it to the live
+      // encoder via MediaCodec.setParameters, no pipeline restart needed.
+      const streamImpacting = ['profile', 'width', 'height', 'fps', 'jpegQuality', 'cameraId', 'streamMode', 'h264KeyframeInterval'].some(k => keysChanged.includes(k));
       const streamWasRunning = vcamState?.running || androidMetrics?.encodedWidth > 0;
 
       if (streamImpacting && streamWasRunning) {
@@ -920,6 +922,9 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                 value={Math.round(settings.h264Bitrate / 1_000_000)}
                 onChange={(e) => updateSetting('h264Bitrate', parseInt(e.target.value) * 1_000_000)}
               />
+              <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
+                Applies live — no stream interruption.
+              </p>
             </div>
             <div className="control-item" style={{ marginTop: 12 }}>
               <label style={{ display: 'flex', justifyContent: 'space-between' }}>
