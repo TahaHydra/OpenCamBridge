@@ -41,6 +41,17 @@ cd C:\Dev\OpenCamBridge
 .\dev-start.ps1
 ```
 
+`dev-build-vcam.ps1` works on a fresh clone with no manual NuGet steps: it
+restores the pinned packages from `VirtualCameraMediaSource\packages.config`
+into `windows\virtual-camera-mediafoundation\packages` (location fixed by the
+`nuget.config` next to the `.sln`) the first time, which needs network access;
+later runs are offline. It builds the `.vcxproj` with an explicit
+`/p:SolutionDir` so package imports and the output dir
+(`windows\virtual-camera-mediafoundation\x64\Release`) resolve exactly like a
+Visual Studio solution build. Flags: `-ForceKillApps` also closes
+Teams/Zoom/etc. when the DLL is locked; `-NoKill` skips all process/service
+kills (useful for CI or scripted verification).
+
 ## OBS setup
 
 Use:
