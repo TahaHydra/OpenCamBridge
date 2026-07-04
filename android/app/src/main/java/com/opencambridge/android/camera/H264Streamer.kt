@@ -144,6 +144,10 @@ class H264Streamer(
 
                 val imageAnalysis = imageAnalysisBuilder.build()
 
+                // Keep rotation metadata consistent with the MJPEG path; the
+                // H.264 pixels themselves are not rotated (dev-only path).
+                imageAnalysis.targetRotation = StreamState.deviceSurfaceRotation.get()
+
                 imageAnalysis.setAnalyzer(analysisExecutor, ::processFrame)
                 StreamState.imageAnalysisUseCase = imageAnalysis
 

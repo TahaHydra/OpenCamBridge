@@ -210,18 +210,34 @@ Without `--rotate`, portrait sources are auto-rotated 90 degrees into
 landscape outputs (legacy behavior). One metrics JSON line is printed per
 second on stdout; `last_error` is `null` or a human-readable string.
 
-Rotation and the fixed output size: the Media Foundation virtual camera
-renders a fixed output resolution (`--width` x `--height`), so a rotated frame
-must be fit into that box. When the rotation keeps the frame's orientation
-matching the output box (no rotation, 180 degrees, or auto-rotate of a portrait
-source into a landscape box) the frame is stretched to fill exactly as before —
-for matching aspect ratios (the stable 16:9 MJPEG case) this is a plain resize
-with no visible change. When an explicit `--rotate 90`/`--rotate 270` leaves
-portrait content in a landscape output box (or vice-versa) the frame is scaled
-to fit while preserving its aspect ratio and centered with black bars, instead
-of being stretched. This is what makes rotation produce an upright image with no
-cropping or vertical squashing; the output dimensions themselves stay fixed
-because the virtual camera media type is fixed.
+## Rotation model (V1, MJPEG)
+
+Rotation is applied to the actual pixels **on the phone**, before JPEG
+encoding, in two composed parts:
+
+1. **Auto-upright**: the streaming service tracks the phone's *physical*
+   orientation (accelerometer `OrientationEventListener`, works in background
+   and with display auto-rotate locked) and feeds it to CameraX as
+   `targetRotation`; each frame is then rotated by
+   `imageInfo.rotationDegrees`. Held vertical, horizontal, or upside down, the
+   streamed video is always upright.
+2. **Manual offset**: the user's Rotate button (`displayRotation`,
+   0/90/180/270) is added on top, for fixed mounts or intentional flips.
+
+Because `/stream.mjpeg` frames arrive already rotated, **no consumer rotates
+again**: the desktop app launches the producer with `--rotate 0`, the `/obs`
+page uses `rotate=0`, and the desktop preview applies only mirroring. Frame
+dimensions on the wire flip between landscape and portrait as the phone turns;
+consumers must not assume a fixed frame size.
+
+Producer fitting into the fixed output size: the Media Foundation virtual
+camera renders a fixed output resolution (`--width` x `--height`), so each
+frame is fit into that box. A frame whose orientation matches the box is
+resized to fill (a plain no-op resize in the matching-16:9 case); a portrait
+frame in the landscape box is scaled to fit preserving aspect ratio and
+centered with black side bars — never cropped, never stretched. The `--rotate`
+CLI flag still exists for standalone/manual producer use, but the desktop app
+always passes 0 now.
 
 ## V1 scope
 

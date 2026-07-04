@@ -671,23 +671,16 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     await applySettingsAndRefreshPreview(next, ['fps']);
   };
 
+  // Manual rotation is an OFFSET on top of the phone's automatic upright
+  // orientation (the phone tracks vertical/horizontal itself and rotates the
+  // streamed pixels). So 0 = upright however the phone is held; the button is
+  // for upside-down mounts or intentional flips. The preview box stays 16:9 —
+  // the same fixed canvas as the virtual camera — and rotated portrait content
+  // letterboxes inside it exactly like OBS shows it.
   const handleRotate = async () => {
-    const aspect = settings.aspectRatio || '16:9';
-    const rot = settings.displayRotation || '0';
-    let currentMode = 'landscape';
-    if (aspect === '9:16' && rot === '90') currentMode = 'portrait_cw';
-    else if (aspect === '9:16' && rot === '270') currentMode = 'portrait_ccw';
-    else if (rot === '180') currentMode = 'upside_down';
-
-    const map: any = { 'landscape': 'portrait_cw', 'portrait_cw': 'upside_down', 'upside_down': 'portrait_ccw', 'portrait_ccw': 'landscape' };
-    const nextMode = map[currentMode] || 'portrait_cw';
-
-    let nextAspect = '16:9'; let nextRot = '0';
-    if (nextMode === 'portrait_cw') { nextAspect = '9:16'; nextRot = '90'; }
-    else if (nextMode === 'portrait_ccw') { nextAspect = '9:16'; nextRot = '270'; }
-    else if (nextMode === 'upside_down') { nextAspect = '16:9'; nextRot = '180'; }
-
-    updateSetting('aspectRatio', nextAspect);
+    const rot = parseInt(settings.displayRotation, 10) || 0;
+    const nextRot = ((rot + 90) % 360).toString();
+    addDiag('rotate', `Manual rotation offset -> ${nextRot}°`);
     updateSetting('displayRotation', nextRot);
   };
 

@@ -59,6 +59,13 @@ object StreamState {
     val torchRequested = AtomicBoolean(false)
     val autofocusEnabled = AtomicBoolean(true) // Default true for continuous AF
 
+    /** Physical device orientation as a Surface.ROTATION_* value, kept current
+     *  by StreamService's OrientationEventListener. Applied as targetRotation on
+     *  the ImageAnalysis use case so imageInfo.rotationDegrees always describes
+     *  the rotation needed to make the frame upright for how the phone is
+     *  actually held (vertical, horizontal, upside down). */
+    val deviceSurfaceRotation = AtomicInteger(android.view.Surface.ROTATION_0)
+
     // Transient hardware state
     val rebindInProgress = AtomicBoolean(false)
     val zoomRatio = AtomicReference(1.0f)

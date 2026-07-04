@@ -44,6 +44,7 @@ class MjpegStreamer(
 
     // Reusable buffers to avoid GC churn at 30-60 fps
     private var nv21Buffer: ByteArray? = null
+    private var nv21RotatedBuffer: ByteArray? = null
     private val jpegStream = ByteArrayOutputStream(512 * 1024)
 
     // Encode-side pacing: skip camera frames beyond the requested FPS so we do
@@ -121,6 +122,10 @@ class MjpegStreamer(
                 )
 
                 val imageAnalysis = imageAnalysisBuilder.build()
+
+                // Seed with the current physical orientation; the service's
+                // OrientationEventListener keeps it updated afterwards.
+                imageAnalysis.targetRotation = StreamState.deviceSurfaceRotation.get()
 
                 imageAnalysis.setAnalyzer(analysisExecutor, ::processFrame)
                 StreamState.imageAnalysisUseCase = imageAnalysis
@@ -279,10 +284,6 @@ class MjpegStreamer(
             StreamState.frameWidth.set(imageProxy.width)
             StreamState.frameHeight.set(imageProxy.height)
 
-            // For metrics only - what was actually sent
-            StreamState.encodedWidth.set(imageProxy.width)
-            StreamState.encodedHeight.set(imageProxy.height)
-
             // CPU saver 1: pace JPEG encoding to the requested FPS (with 10%
             // jitter tolerance) instead of encoding every camera frame the
             // HTTP layer would drop anyway.
@@ -318,13 +319,6 @@ class MjpegStreamer(
             val reqAspect = StreamState.requestedAspectRatio.get()
             StreamState.aspectRatioMatch.set(reqAspect.startsWith(StreamState.selectedAspectRatio.get()))
 
-            val targetW = StreamState.width.get()
-            val targetH = StreamState.height.get()
-            val rotatedW = if (StreamState.rotationDegrees.get() % 180 != 0) height else width
-            val rotatedH = if (StreamState.rotationDegrees.get() % 180 != 0) width else height
-
-            StreamState.resizeNeeded.set(rotatedW != targetW || rotatedH != targetH)
-
             val frameSize = width * height + (width / 2) * (height / 2) * 2
 
             if (nv21Buffer?.size != frameSize) nv21Buffer = ByteArray(frameSize)
@@ -334,30 +328,57 @@ class MjpegStreamer(
 
             val encodeStartNs = System.nanoTime()
 
-            val quality = StreamState.jpegQuality.get()
-            val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-            jpegStream.reset()
-            yuvImage.compressToJpeg(Rect(0, 0, width, height), quality, jpegStream)
-            var frameBytes = jpegStream.toByteArray()
+            // Rotate the ACTUAL streamed pixels so the video output of the phone
+            // is upright no matter how the phone is physically held.
+            //
+            //   total = auto-upright + manual offset
+            //
+            // - auto-upright: imageInfo.rotationDegrees. Because the service
+            //   feeds the physical device orientation into targetRotation, this
+            //   value tracks the phone being vertical, horizontal, or upside
+            //   down (it is NOT a constant per device).
+            // - manual offset: the user's Rotate button (displayRotation), for
+            //   fixed mounts or intentional flips.
+            //
+            // The rotation happens on the NV21 buffer BEFORE JPEG encoding (a
+            // memory permutation — no decode/re-encode). Every consumer (desktop
+            // preview, Rust producer, /obs, OBS) reads this same /stream.mjpeg,
+            // so nothing downstream may rotate again; portrait frames are
+            // letterboxed by the producer into the fixed 16:9 virtual camera.
+            val autoRot = imageProxy.imageInfo.rotationDegrees
+            val manualRot = (StreamState.displayRotation.get().toIntOrNull() ?: 0).mod(360)
+            val totalRot = (autoRot + manualRot).mod(360)
 
-            // Rotate the ACTUAL streamed frame (not just the preview box) so the
-            // phone's video output is physically turned. Every consumer — the
-            // desktop preview, the Rust producer, and /obs — reads this same
-            // /stream.mjpeg, so rotating here rotates the picture everywhere and
-            // downstream must NOT rotate again. Only runs when the user selected
-            // a rotation; at 0 the stable MJPEG path is byte-for-byte unchanged.
-            val rotationDeg = (StreamState.displayRotation.get().toIntOrNull() ?: 0).mod(360)
-            if (rotationDeg != 0) {
-                rotateJpeg(frameBytes, rotationDeg, quality)?.let { frameBytes = it }
+            val outBuf: ByteArray
+            val outW: Int
+            val outH: Int
+            if (totalRot != 0) {
+                if (nv21RotatedBuffer?.size != frameSize) nv21RotatedBuffer = ByteArray(frameSize)
+                val dst = nv21RotatedBuffer!!
+                rotateNv21(nv21, dst, width, height, totalRot)
+                outBuf = dst
+                if (totalRot % 180 != 0) { outW = height; outH = width } else { outW = width; outH = height }
+            } else {
+                outBuf = nv21
+                outW = width
+                outH = height
             }
-            StreamState.rotationApplied.set(rotationDeg != 0)
+            StreamState.rotationApplied.set(totalRot != 0)
+            StreamState.encodedWidth.set(outW)
+            StreamState.encodedHeight.set(outH)
+            StreamState.resizeNeeded.set(outW != StreamState.width.get() || outH != StreamState.height.get())
+
+            val quality = StreamState.jpegQuality.get()
+            val yuvImage = YuvImage(outBuf, ImageFormat.NV21, outW, outH, null)
+            jpegStream.reset()
+            yuvImage.compressToJpeg(Rect(0, 0, outW, outH), quality, jpegStream)
 
             val encodeMs = (System.nanoTime() - encodeStartNs) / 1_000_000.0
             val prevAvg = StreamState.androidEncodeMsAvg.get()
             val nextAvg = if (prevAvg <= 0.0) encodeMs else (prevAvg * 0.85 + encodeMs * 0.15)
             StreamState.androidEncodeMsAvg.set(nextAvg)
 
-            StreamState.latestFrame.set(frameBytes)
+            StreamState.latestFrame.set(jpegStream.toByteArray())
             StreamState.latestFrameRevision.incrementAndGet()
 
             val now = System.currentTimeMillis()
@@ -451,25 +472,61 @@ class MjpegStreamer(
     }
 
     /**
-     * Rotates an encoded JPEG by [degrees] (90/180/270) and re-encodes it.
-     * Uses Android's own bitmap codecs so colour/orientation are always correct;
-     * the extra decode+encode only happens when the user picked a rotation, so
-     * the un-rotated fast path pays nothing. Returns null on failure (caller
-     * keeps the un-rotated frame).
+     * Rotates an NV21 frame by 90/180/270 degrees clockwise into [dst], as a
+     * pure memory permutation — no JPEG decode/re-encode, so it is cheap enough
+     * to run per frame. For 90/270 the output dimensions are (height x width).
+     * NV21 layout: full-res Y plane, then interleaved V,U at quarter resolution.
      */
-    private fun rotateJpeg(jpeg: ByteArray, degrees: Int, quality: Int): ByteArray? {
-        return try {
-            val src = android.graphics.BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return null
-            val matrix = android.graphics.Matrix().apply { postRotate(degrees.toFloat()) }
-            val rotated = android.graphics.Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
-            val out = ByteArrayOutputStream(jpeg.size)
-            rotated.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, out)
-            if (rotated != src) rotated.recycle()
-            src.recycle()
-            out.toByteArray()
-        } catch (e: Exception) {
-            android.util.Log.w("MjpegStreamer", "JPEG rotation failed: ${e.message}")
-            null
+    private fun rotateNv21(src: ByteArray, dst: ByteArray, width: Int, height: Int, degrees: Int) {
+        val ySize = width * height
+        val total = ySize + ySize / 2
+        when (degrees) {
+            90 -> {
+                var i = 0
+                for (x in 0 until width) {
+                    for (y in height - 1 downTo 0) {
+                        dst[i++] = src[y * width + x]
+                    }
+                }
+                i = ySize
+                for (x in 0 until width step 2) {
+                    for (y in height / 2 - 1 downTo 0) {
+                        val p = ySize + y * width + x
+                        dst[i++] = src[p]     // V
+                        dst[i++] = src[p + 1] // U
+                    }
+                }
+            }
+            180 -> {
+                var i = 0
+                for (p in ySize - 1 downTo 0) {
+                    dst[i++] = src[p]
+                }
+                i = ySize
+                var p = total - 2
+                while (p >= ySize) {
+                    dst[i++] = src[p]     // V
+                    dst[i++] = src[p + 1] // U
+                    p -= 2
+                }
+            }
+            270 -> {
+                var i = 0
+                for (x in width - 1 downTo 0) {
+                    for (y in 0 until height) {
+                        dst[i++] = src[y * width + x]
+                    }
+                }
+                i = ySize
+                for (x in width - 2 downTo 0 step 2) {
+                    for (y in 0 until height / 2) {
+                        val p = ySize + y * width + x
+                        dst[i++] = src[p]     // V
+                        dst[i++] = src[p + 1] // U
+                    }
+                }
+            }
+            else -> System.arraycopy(src, 0, dst, 0, total)
         }
     }
 

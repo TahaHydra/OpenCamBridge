@@ -47,17 +47,21 @@ profile). Read the desktop **Diagnostics** panel for target-vs-actual FPS.
 - [ ] Diagnostics shows "Delivering N/target fps"; N is honest, not faked.
 - [ ] Default lens on connect is main/back-wide, not telephoto.
 
-## Rotation (one manual button, phone + desktop synced)
+## Rotation (auto-upright + one manual offset button)
 
-Cycle the Rotate button: 0 → 90 → 180 → 270 → 0. In OBS confirm:
+The stream auto-uprights for the phone's physical orientation; the Rotate
+button adds a manual offset (0 → 90 → 180 → 270 → 0) on top. In OBS confirm:
 
-- [ ] 0°: upright, full frame, no bars.
-- [ ] 90°/270°: content is **actually rotated and upright**, not sideways;
-      portrait content is pillarboxed (black side bars), **not** stretched or
-      vertically cropped.
-- [ ] 180°: upright, inverted correctly.
-- [ ] Phone held vertical and horizontal both produce a usable upright image.
-- [ ] Phone and desktop always show the same rotation value.
+- [ ] Offset 0, phone **vertical**: content upright, pillarboxed (black side
+      bars) in the 16:9 output — not sideways, not stretched, not cropped.
+- [ ] Offset 0, phone **horizontal**: content upright, full-frame 16:9.
+- [ ] Turning the phone mid-stream (vertical ↔ horizontal) re-uprights the
+      video within ~1s without restarting the stream.
+- [ ] Phone upside down: still upright at offset 0.
+- [ ] Offset +180: image flips (for upside-down mounts).
+- [ ] Offset +90/+270: image turns sideways relative to upright (intentional).
+- [ ] Phone and desktop always show the same manual offset value.
+- [ ] Desktop preview matches what OBS/virtual camera shows (same 16:9 canvas).
 
 ## Torch (capability-based)
 

@@ -36,6 +36,7 @@ class StreamService : LifecycleService() {
     private lateinit var mjpegStreamer: MjpegStreamer
     private lateinit var h264Streamer: H264Streamer
     private lateinit var settingsManager: SettingsManager
+    private var orientationListener: android.view.OrientationEventListener? = null
 
     private val cameraMutex = Mutex()
 
@@ -77,6 +78,34 @@ class StreamService : LifecycleService() {
             },
             onRecoverCamera = { recoverCamera() }
         )
+
+        // Track the PHYSICAL device orientation (accelerometer, works with the
+        // app in background and with display auto-rotate locked) and feed it to
+        // CameraX as targetRotation. imageInfo.rotationDegrees then reports the
+        // exact rotation that makes the frame upright for how the phone is held
+        // right now — vertical, horizontal, or upside down — which is what the
+        // MJPEG streamer bakes into the actual streamed pixels. Without this the
+        // stream is only upright for one specific phone orientation.
+        orientationListener = object : android.view.OrientationEventListener(this) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN) return // e.g. flat on a desk: keep last known
+                val surfaceRotation = when (orientation) {
+                    in 45..134 -> android.view.Surface.ROTATION_270
+                    in 135..224 -> android.view.Surface.ROTATION_180
+                    in 225..314 -> android.view.Surface.ROTATION_90
+                    else -> android.view.Surface.ROTATION_0
+                }
+                if (StreamState.deviceSurfaceRotation.getAndSet(surfaceRotation) != surfaceRotation) {
+                    StreamState.imageAnalysisUseCase?.targetRotation = surfaceRotation
+                    AppLogger.i("Rotation", "Device orientation changed -> targetRotation=$surfaceRotation")
+                }
+            }
+        }
+        if (orientationListener?.canDetectOrientation() == true) {
+            orientationListener?.enable()
+        } else {
+            AppLogger.w("Rotation", "Device cannot detect orientation; stream stays upright only for the natural (vertical) position")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -132,6 +161,7 @@ class StreamService : LifecycleService() {
     override fun onDestroy() {
         Log.d(TAG, "StreamService destroying")
         AppLogger.i("System", "StreamService stopping completely")
+        orientationListener?.disable()
         stopCamera()
         controlServer.stop()
         super.onDestroy()

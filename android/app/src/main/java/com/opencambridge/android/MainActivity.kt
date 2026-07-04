@@ -831,15 +831,17 @@ fun OutputOrientationSelector(aspectRatio: String, displayRotation: String, enab
         Pair("9:16", "270"),
         Pair("16:9", "180")
     )
+    // The stream is auto-uprighted for the phone's physical orientation; these
+    // values are a manual offset applied on top of that.
     val labels = mapOf(
-        Pair("16:9", "0") to "Landscape (0°)",
-        Pair("9:16", "90") to "Portrait CW (90°)",
-        Pair("9:16", "270") to "Portrait CCW (270°)",
-        Pair("16:9", "180") to "Upside Down (180°)"
+        Pair("16:9", "0") to "Upright (auto)",
+        Pair("9:16", "90") to "+90°",
+        Pair("9:16", "270") to "+270°",
+        Pair("16:9", "180") to "+180° (flip)"
     )
-    
+
     val currentKey = Pair(aspectRatio, displayRotation)
-    val currentValue = labels[currentKey] ?: "Landscape (0°)"
+    val currentValue = labels[currentKey] ?: "Upright (auto)"
 
     ExposedDropdownMenuBox(
         expanded = expanded,
