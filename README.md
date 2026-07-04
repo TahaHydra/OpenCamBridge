@@ -135,7 +135,10 @@ npm ci
 npx tsc --noEmit
 cargo check --manifest-path .\src-tauri\Cargo.toml
 
-# Media Foundation virtual camera DLL (from repo root)
+# Media Foundation virtual camera DLL + host exe (from repo root)
+# Builds VirtualCameraMediaSource.dll AND VirtualCamera_Installer.exe (the
+# virtual camera host the desktop app launches) and puts both where the
+# desktop app expects them.
 .\dev-build-vcam.ps1
 ```
 

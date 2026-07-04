@@ -761,10 +761,28 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
             <div>
               <div style={{ fontSize: '0.8rem', color: '#888', marginBottom: 6 }}>Desktop Virtual Camera:</div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                <button className="btn btn-secondary" onClick={() => invoke('start_virtual_camera_host')} disabled={vcamState?.host_running}>
+                <button className="btn btn-secondary" onClick={async () => {
+                  try {
+                    await invoke('start_virtual_camera_host');
+                    setVcamMessage('');
+                    addDiag('host', 'Virtual camera host started');
+                  } catch (e: any) {
+                    setVcamMessage(`Virtual camera host failed: ${e}`);
+                    addDiag('host', `Host start failed: ${e}`);
+                  }
+                  invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState).catch(() => {});
+                }} disabled={vcamState?.host_running}>
                   <Play size={14} style={{ marginRight: 6 }} /> Start
                 </button>
-                <button className="btn btn-secondary" onClick={() => invoke('stop_virtual_camera_host')} disabled={!vcamState?.host_running}>
+                <button className="btn btn-secondary" onClick={async () => {
+                  try {
+                    await invoke('stop_virtual_camera_host');
+                    addDiag('host', 'Virtual camera host stopped');
+                  } catch (e: any) {
+                    addDiag('host', `Host stop failed: ${e}`);
+                  }
+                  invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState).catch(() => {});
+                }} disabled={!vcamState?.host_running}>
                   <Square size={14} style={{ marginRight: 6 }} /> Stop
                 </button>
               </div>

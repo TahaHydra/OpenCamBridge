@@ -22,9 +22,16 @@ npm ci
 npx tsc --noEmit
 cargo check --manifest-path .\src-tauri\Cargo.toml
 
-# Virtual camera Media Foundation DLL (from repo root, clean clone)
+# Virtual camera Media Foundation DLL + host exe (from repo root, clean clone)
 .\dev-build-vcam.ps1
 ```
+
+## Virtual camera host
+
+- [ ] Desktop "Virtual Camera: Start" starts the host (VirtualCamera_Installer
+      --mode host); status shows Running and OBS lists "OpenCamBridge Camera".
+- [ ] If the host exe is missing or the host dies, the UI shows the error and
+      status flips to Stopped (no phantom "Running").
 
 ## MJPEG capture matrix (main/back-wide lens unless noted)
 

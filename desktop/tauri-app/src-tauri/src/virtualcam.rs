@@ -85,8 +85,16 @@ pub fn register_virtual_camera_backend() -> Result<String, String> {
 #[tauri::command]
 pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<(), String> {
     let mut host_guard = state.host_child.lock().unwrap();
-    if host_guard.is_some() {
-        return Ok(()); // Already running
+
+    // A stale handle to a dead host must not block a restart (this made the
+    // Start button a silent no-op after the host crashed or failed to start).
+    if let Some(child) = host_guard.as_mut() {
+        match child.try_wait() {
+            Ok(None) => return Ok(()), // genuinely still running
+            _ => {
+                *host_guard = None;
+            }
+        }
     }
 
     let mut repo_root = std::env::current_dir().unwrap();
@@ -95,6 +103,14 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
     }
 
     let exe_path_release = repo_root.join("windows/virtual-camera-mediafoundation/VirtualCamera_Installer/x64/Release/VirtualCamera_Installer.exe");
+    if !exe_path_release.exists() {
+        let msg = format!(
+            "VirtualCamera_Installer.exe not found at {}. Run .\\dev-build-vcam.ps1 (it builds and copies the host exe).",
+            exe_path_release.display()
+        );
+        *state.last_error.lock().unwrap() = Some(msg.clone());
+        return Err(msg);
+    }
     let exe_path = std::fs::canonicalize(&exe_path_release).unwrap_or(exe_path_release);
 
     let child = Command::new(exe_path)
@@ -103,8 +119,13 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let msg = format!("Failed to start virtual camera host: {}", e);
+            *state.last_error.lock().unwrap() = Some(msg.clone());
+            msg
+        })?;
 
+    println!(">>> [Tauri] Spawned virtual camera host with PID: {}", child.id());
     *host_guard = Some(child);
     Ok(())
 }
@@ -316,7 +337,26 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
         *child_guard = None;
     }
 
-    let host_running = state.host_child.lock().unwrap().is_some();
+    // Reap the host like the producer: a host that exited (crash, COM error)
+    // must show as Stopped instead of a phantom "Running".
+    let host_running = {
+        let mut host_guard = state.host_child.lock().unwrap();
+        let mut alive = false;
+        if let Some(child) = host_guard.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut err_guard = state.last_error.lock().unwrap();
+                    *err_guard = Some(format!("Virtual camera host exited with {}", status));
+                }
+                Ok(None) => alive = true,
+                Err(_) => {}
+            }
+        }
+        if !alive && host_guard.is_some() {
+            *host_guard = None;
+        }
+        alive
+    };
     let mut metrics = state.metrics.lock().unwrap().clone();
     let registered = check_virtual_camera_backend();
     let producer_path = state.producer_path.lock().unwrap().clone();

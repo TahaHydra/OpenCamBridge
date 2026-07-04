@@ -225,12 +225,18 @@ input[type=range]::-webkit-slider-runnable-track {
 /* Preview Section */
 .preview-wrapper {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   height: 100%;
+  min-height: 0;
 }
 
+/* The stage is the largest box of the target aspect that fits the pane: one
+   dimension is driven by the container, the other follows aspect-ratio, and
+   the max-* cap handles unusually shaped panes. `flex: 1` must NOT be set
+   here — an explicit flex height fights aspect-ratio and collapses the
+   portrait box into a small strip surrounded by dead space. */
 .preview-stage {
-  flex: 1;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -239,20 +245,19 @@ input[type=range]::-webkit-slider-runnable-track {
   overflow: hidden;
   position: relative;
   border: 1px solid var(--surface-border);
-  margin: 0 auto;
 }
 
 .preview-stage.layout-landscape {
-  width: min(100%, calc(80vh * 16 / 9));
+  width: 100%;
+  height: auto;
+  max-height: 100%;
   aspect-ratio: 16 / 9;
 }
 .preview-stage.layout-portrait {
-  width: min(100%, calc(80vh * 9 / 16));
+  height: 100%;
+  width: auto;
+  max-width: 100%;
   aspect-ratio: 9 / 16;
-}
-.preview-stage.layout-square {
-  width: min(100%, 80vh);
-  aspect-ratio: 1 / 1;
 }
 
 .stream-rotator {

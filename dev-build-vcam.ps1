@@ -10,10 +10,15 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $mfRoot = "$root\windows\virtual-camera-mediafoundation"
 $vcxproj = "$mfRoot\VirtualCameraMediaSource\VirtualCameraMediaSource.vcxproj"
+$installerProj = "$mfRoot\VirtualCamera_Installer\VirtualCamera_Installer.vcxproj"
 # Solution-level output dir: the build passes SolutionDir, so OutDir resolves to
 # $(SolutionDir)x64\Release\ exactly like a Visual Studio solution build.
 $builtDll = "$mfRoot\x64\Release\VirtualCameraMediaSource.dll"
 $targetDll = "$mfRoot\VirtualCamera_Installer\x64\Release\VirtualCameraMediaSource.dll"
+# The installer exe doubles as the virtual camera HOST (--mode host); the
+# desktop app launches it from the path below, so build it and put it there.
+$builtInstaller = "$mfRoot\x64\Release\VirtualCamera_Installer.exe"
+$targetInstaller = "$mfRoot\VirtualCamera_Installer\x64\Release\VirtualCamera_Installer.exe"
 
 $vsDevCmd = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
 
@@ -53,18 +58,21 @@ $solutionDirArg = "/p:SolutionDir=`"$mfRoot\\`""
 [xml]$pkgConfig = Get-Content "$mfRoot\VirtualCameraMediaSource\packages.config"
 $cppwinrtVer = ($pkgConfig.packages.package | Where-Object id -eq 'Microsoft.Windows.CppWinRT').version
 $wilVer = ($pkgConfig.packages.package | Where-Object id -eq 'Microsoft.Windows.ImplementationLibrary').version
+[xml]$instPkgConfig = Get-Content "$mfRoot\VirtualCamera_Installer\packages.config"
+$vcrtVer = ($instPkgConfig.packages.package | Where-Object id -eq 'Microsoft.VCRTForwarders.140').version
 $cppwinrtExe = "$mfRoot\packages\Microsoft.Windows.CppWinRT.$cppwinrtVer\bin\cppwinrt.exe"
 $wilTargets = "$mfRoot\packages\Microsoft.Windows.ImplementationLibrary.$wilVer\build\native\Microsoft.Windows.ImplementationLibrary.targets"
+$vcrtTargets = "$mfRoot\packages\Microsoft.VCRTForwarders.140.$vcrtVer\build\native\Microsoft.VCRTForwarders.140.targets"
 
-if (!(Test-Path $cppwinrtExe) -or !(Test-Path $wilTargets)) {
-    Write-Host "Restoring NuGet packages (CppWinRT $cppwinrtVer, WIL $wilVer)..." -ForegroundColor Yellow
-    cmd /c "call `"$vsDevCmd`" -arch=amd64 && msbuild `"$vcxproj`" /t:Restore /p:RestorePackagesConfig=true /p:Configuration=Release /p:Platform=x64 $solutionDirArg /v:minimal"
-    if (!(Test-Path $cppwinrtExe) -or !(Test-Path $wilTargets)) {
+if (!(Test-Path $cppwinrtExe) -or !(Test-Path $wilTargets) -or !(Test-Path $vcrtTargets)) {
+    Write-Host "Restoring NuGet packages (CppWinRT $cppwinrtVer, WIL $wilVer, VCRTForwarders $vcrtVer)..." -ForegroundColor Yellow
+    cmd /c "call `"$vsDevCmd`" -arch=amd64 && msbuild `"$vcxproj`" /t:Restore /p:RestorePackagesConfig=true /p:Configuration=Release /p:Platform=x64 $solutionDirArg /v:minimal && msbuild `"$installerProj`" /t:Restore /p:RestorePackagesConfig=true /p:Configuration=Release /p:Platform=x64 $solutionDirArg /v:minimal"
+    if (!(Test-Path $cppwinrtExe) -or !(Test-Path $wilTargets) -or !(Test-Path $vcrtTargets)) {
         Write-Host "NuGet restore failed: expected packages under $mfRoot\packages (needs network access on first build)." -ForegroundColor Red
         exit 1
     }
 } else {
-    Write-Host "NuGet packages already restored (CppWinRT $cppwinrtVer, WIL $wilVer)." -ForegroundColor Green
+    Write-Host "NuGet packages already restored (CppWinRT $cppwinrtVer, WIL $wilVer, VCRTForwarders $vcrtVer)." -ForegroundColor Green
 }
 
 Write-Host "Building VirtualCameraMediaSource.vcxproj with v143..." -ForegroundColor Yellow
@@ -87,10 +95,31 @@ try {
     exit 1
 }
 
+Write-Host "Building VirtualCamera_Installer.vcxproj (virtual camera host exe)..." -ForegroundColor Yellow
+
+$cmdHost = "call `"$vsDevCmd`" -arch=amd64 && msbuild `"$installerProj`" /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 $solutionDirArg"
+
+cmd /c $cmdHost
+
+if (!(Test-Path $builtInstaller)) {
+    Write-Host "Build finished but host exe not found: $builtInstaller" -ForegroundColor Red
+    exit 1
+}
+
+try {
+    Copy-Item $builtInstaller $targetInstaller -Force -ErrorAction Stop
+} catch {
+    Write-Host "Host exe is locked (VirtualCamera_Installer still running). Close it or rerun without -NoKill." -ForegroundColor Red
+    exit 1
+}
+
 Write-Host "Built DLL:" -ForegroundColor Green
 Get-Item $builtDll | Select-Object FullName,Length,LastWriteTime
 
 Write-Host "Installed DLL:" -ForegroundColor Green
 Get-Item $targetDll | Select-Object FullName,Length,LastWriteTime
 
-Write-Host "Media Foundation DLL build/copy done." -ForegroundColor Green
+Write-Host "Virtual camera host exe:" -ForegroundColor Green
+Get-Item $targetInstaller | Select-Object FullName,Length,LastWriteTime
+
+Write-Host "Media Foundation DLL + host build/copy done." -ForegroundColor Green
