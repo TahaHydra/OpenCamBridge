@@ -71,16 +71,43 @@ class CameraRepository(private val context: Context) {
 
         // Get supported sizes for YUV_420_888 (since we use it for ImageAnalysis)
         val configMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val sizes = configMap?.getOutputSizes(ImageFormat.YUV_420_888)
-            ?.map { SizeDto(it.width, it.height) }
-            ?.sortedByDescending { it.width * it.height }
-            ?: emptyList()
+        val outputSizes = configMap?.getOutputSizes(ImageFormat.YUV_420_888)?.toList() ?: emptyList()
+        val sizes = outputSizes
+            .map { SizeDto(it.width, it.height) }
+            .sortedByDescending { it.width * it.height }
 
         // Get supported FPS ranges
         val fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
             ?.map { FpsRangeDto(it.lower, it.upper) }
             ?.sortedByDescending { it.max }
             ?: emptyList()
+
+        // Torch availability is per-camera: some lenses (e.g. telephoto,
+        // ultrawide, front) have no flash even when the main lens does. Report it
+        // honestly so the UI only offers torch where it exists.
+        val hasTorch = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+
+        // Honest per-resolution max FPS. The AE target-fps ranges advertise what
+        // the sensor *can* do in principle, but the achievable rate at a given
+        // capture size is bounded by that size's minimum frame duration. This is
+        // the signal the UI uses to decide whether 60 fps is real for a given
+        // lens + resolution (instead of assuming every phone can do it).
+        val standardSizes = listOf(640 to 480, 960 to 540, 1280 to 720, 1920 to 1080)
+        val maxAeFps = fpsRanges.maxOfOrNull { it.max } ?: 30
+        val fpsByResolution = standardSizes.mapNotNull { (w, h) ->
+            val match = outputSizes.firstOrNull { it.width == w && it.height == h }
+                ?: return@mapNotNull null
+            val minDurNs = try {
+                configMap?.getOutputMinFrameDuration(ImageFormat.YUV_420_888, match) ?: 0L
+            } catch (e: Exception) {
+                0L
+            }
+            val durFps = if (minDurNs > 0L) (1_000_000_000.0 / minDurNs).toInt() else maxAeFps
+            // The real ceiling is the lower of what the size allows and what the
+            // sensor's AE ranges advertise.
+            val maxFps = minOf(durFps, maxAeFps).coerceAtLeast(1)
+            ResolutionFpsDto(w, h, maxFps)
+        }
 
         // Zoom ratio range (API 30+); older devices only report max digital zoom.
         var zoomMin = 1.0f
@@ -92,6 +119,7 @@ class CameraRepository(private val context: Context) {
             }
         }
 
+        val lensType = lensType(facing, focalLengths)
         val label = buildLabel(facing, focalLengths, id)
 
         return CameraInfoDto(
@@ -105,8 +133,22 @@ class CameraRepository(private val context: Context) {
             supportedFpsRanges = fpsRanges,
             label = label,
             zoomRatioMin = zoomMin,
-            zoomRatioMax = zoomMax
+            zoomRatioMax = zoomMax,
+            hasTorch = hasTorch,
+            lensType = lensType,
+            fpsByResolution = fpsByResolution
         )
+    }
+
+    /** Rough lens classification from focal length, back cameras only. */
+    private fun lensType(facing: String, focalLengths: List<Float>): String {
+        if (facing != "back" || focalLengths.isEmpty()) return ""
+        val fl = focalLengths.minOrNull() ?: return ""
+        return when {
+            fl < 3.0f -> "ultrawide"
+            fl > 5.0f -> "telephoto"
+            else -> "wide"
+        }
     }
 
     private fun buildLabel(facing: String, focalLengths: List<Float>, id: String): String {

@@ -1,76 +1,97 @@
-# Runtime verification checklist (phone + OBS)
+# V1 runtime verification checklist (phone + OBS)
 
 These checks require real hardware (an Android phone + OBS on Windows) and are
-**not** covered by the automated build checks. Run them after building all
-components. The build checks that *are* automated:
+**not** covered by the automated build checks. V1 is the stable **MJPEG** path;
+H.264 is developer-only.
+
+## Automated build checks (must pass before committing)
 
 ```powershell
 # Android
-cd android; .\gradlew.bat assembleDebug
+cd android
+.\gradlew.bat assembleDebug
+adb install -r .\app\build\outputs\apk\debug\app-debug.apk
 
 # Rust producer
-cd windows\virtual-camera-mediafoundation\rust-frame-producer; cargo build --release
+cd windows\virtual-camera-mediafoundation\rust-frame-producer
+cargo build --release
 
 # Desktop
-cd desktop\tauri-app; npm ci; npx tsc --noEmit; cargo check --manifest-path .\src-tauri\Cargo.toml
+cd desktop\tauri-app
+npm ci
+npx tsc --noEmit
+cargo check --manifest-path .\src-tauri\Cargo.toml
 
-# Virtual camera Media Foundation DLL (from a clean clone)
+# Virtual camera Media Foundation DLL (from repo root, clean clone)
 .\dev-build-vcam.ps1
 ```
 
-## Codec x resolution x FPS matrix
+## MJPEG capture matrix (main/back-wide lens unless noted)
 
-For each row: set it from the desktop **Resolution** and **Frame Rate**
-controls (independent of the Capture Profile preset), start the pipeline, and
-open the OpenCamBridge Camera in OBS. Record the **Android FPS** and producer
-**written_fps** shown in the desktop metrics panel.
+Set Resolution and Frame Rate from the desktop controls (independent of any
+profile). Read the desktop **Diagnostics** panel for target-vs-actual FPS.
 
-| Codec | Resolution | Target FPS | Expected | What to confirm |
-|-------|-----------|-----------|----------|-----------------|
-| MJPEG | 1280x720  | 30 | Stable 30 | Baseline; must remain perfect |
-| MJPEG | 1280x720  | 60 | ~50-60 if sensor+light allow | Actual FPS readout climbs above 30 |
-| MJPEG | 1920x1080 | 30 | Stable 30 | No regression vs. before |
-| MJPEG | 1920x1080 | 60 | Device dependent | Readout shows achieved rate honestly |
-| H.264 | 1280x720  | 30 | Stable 30, no jumps | No `Native:16`; steady frames |
-| H.264 | 1280x720  | 60 | Stable if CPU allows | Watch `last_error` and jumps |
-| H.264 | 1920x1080 | 30 | Stable 30 | No decode errors |
-| H.264 | 1920x1080 | 60 | May be "Not Viable" | Documented software-decode limit |
+| Lens | Resolution | FPS | Expected |
+|------|-----------|-----|----------|
+| back-wide | 640x480   | 30 | Stable |
+| back-wide | 640x480   | 60 | Stable if lens reports it (else option disabled) |
+| back-wide | 1280x720  | 30 | Stable (baseline) |
+| back-wide | 1280x720  | 60 | ~60 on capable lens; honest lower value otherwise |
+| back-wide | 1920x1080 | 30 | Stable |
+| back-wide | 1920x1080 | 60 | If supported; else falls back with clear readout |
+| telephoto | 1280x720  | 30/60 | Only if exposed; 30-only is acceptable and shown |
+| front     | 1280x720  | 30 | Stable |
 
-Notes:
-- **FPS is delivered by the phone camera.** If the readout stays at 30 for a 60
-  request, the sensor/use-case/lighting does not support 60 at that resolution;
-  this is a hardware limit, not the app forcing 30. The metrics panel now shows
-  the actual delivered FPS next to the target so the bottleneck is visible.
-- 60 fps and resolution are independent settings; any resolution can pair with
-  any frame rate.
+- [ ] The 60 fps option is **disabled** when the selected lens can't do 60 at
+      that resolution (capability-driven, not guessed).
+- [ ] Diagnostics shows "Delivering N/target fps"; N is honest, not faked.
+- [ ] Default lens on connect is main/back-wide, not telephoto.
 
-## Rotation (must rotate, must not crop)
+## Rotation (one manual button, phone + desktop synced)
 
-For each output orientation (Rotate Output 90 deg on the desktop, or the phone's
-Output Orientation control), confirm in OBS:
+Cycle the Rotate button: 0 → 90 → 180 → 270 → 0. In OBS confirm:
 
-- [ ] Landscape (0 deg): full-frame, no bars, upright.
-- [ ] Portrait CW (90 deg): image is upright and **not vertically squashed**;
-      portrait content sits centered with black side bars (pillarbox), no
-      cropping.
-- [ ] Portrait CCW (270 deg): same as 90 deg, opposite direction.
-- [ ] Upside down (180 deg): full-frame, inverted correctly.
-- [ ] Mirror toggle flips left/right after rotation, as seen by the viewer.
+- [ ] 0°: upright, full frame, no bars.
+- [ ] 90°/270°: content is **actually rotated and upright**, not sideways;
+      portrait content is pillarboxed (black side bars), **not** stretched or
+      vertically cropped.
+- [ ] 180°: upright, inverted correctly.
+- [ ] Phone held vertical and horizontal both produce a usable upright image.
+- [ ] Phone and desktop always show the same rotation value.
 
-## Phone preview button
+## Torch (capability-based)
 
-- [ ] With streaming running, toggle **Preview on phone** ON: the phone shows
-      live camera frames within ~1s (a brief rebind occurs).
-- [ ] Toggle it OFF: preview stops, the stream to OBS is uninterrupted.
-- [ ] Toggle ON again mid-stream: preview returns (this was previously black).
+- [ ] Torch control is shown **only** when the active lens has a flash.
+- [ ] Switching to a lens without flash hides the torch control.
+- [ ] Switching to main/back-wide (with flash) shows and toggles torch.
+- [ ] A torch failure shows a message and a Diagnostics/Logs entry (not silent).
 
-## Phone <-> desktop state sync
+## Phone ↔ desktop sync
 
-- [ ] Change FPS / resolution / codec / JPEG quality / rotation / torch on the
-      **phone**, confirm the **desktop** control reflects it within ~1-2s.
-- [ ] Change the same settings on the **desktop**, confirm the **phone** UI
-      reflects it within ~1s.
-- [ ] Drag the desktop **JPEG Quality** slider: the producer must **not**
-      restart (no PID change in the metrics panel) — quality applies live.
-- [ ] Switch codec MJPEG <-> H.264 a few times: exactly one producer restart per
-      switch, no restart storm.
+- [ ] Change lens / resolution / FPS / quality / bandwidth / mirror / rotation /
+      torch on the **phone** → desktop reflects it within ~1–2s.
+- [ ] Change the same on the **desktop** → phone UI reflects it within ~1s.
+- [ ] No phone control is decorative: every button either works or is
+      hidden/disabled; failures appear in the phone Logs tab.
+- [ ] Dragging the desktop JPEG Quality slider does **not** restart the producer.
+
+## Codec / Developer mode
+
+- [ ] Default codec is MJPEG; H.264 is not visible in normal mode.
+- [ ] Enabling Developer/Experimental mode reveals the codec selector, capture
+      profiles, and verbose metrics.
+- [ ] H.264 is labeled experimental/unstable and never auto-starts.
+- [ ] Turning Developer mode off resets the codec to MJPEG.
+
+## Security
+
+- [ ] LAN without a token fails (401) on every endpoint except `/health`.
+- [ ] LAN with the correct token works.
+- [ ] USB mode (127.0.0.1 via adb forward) needs no token.
+
+## Diagnostics
+
+- [ ] Desktop Diagnostics panel shows lens/resolution/FPS, target-vs-actual FPS,
+      producer in/out FPS, bandwidth, latency, dropped frames, rotation, and
+      last errors.
+- [ ] Copy produces a pasteable snapshot; Clear empties the log.

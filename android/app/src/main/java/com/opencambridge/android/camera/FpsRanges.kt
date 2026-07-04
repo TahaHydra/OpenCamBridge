@@ -37,14 +37,21 @@ object FpsRanges {
                 ?.takeIf { it.isNotEmpty() }
                 ?: return null
 
-            // Prefer a range that contains the target, with the upper bound as
-            // close to the target as possible (avoids running the sensor faster
-            // than needed) and the narrowest span (fixed-rate ranges give the
-            // steadiest cadence). If nothing contains the target (e.g. 60 fps
-            // requested on a 30 fps sensor), take the closest available range.
+            // Prefer a range that contains the target. Among those, strongly
+            // prefer a FIXED-rate range (lower == upper): a variable range like
+            // [15,60] lets auto-exposure drop the sensor rate in low light, which
+            // is the cause of "requested 60, actually getting 30/40" and jittery
+            // cadence. A fixed range such as [60,60] pins the rate. After that,
+            // keep the upper bound close to the target and the span narrow. If
+            // nothing contains the target (e.g. 60 requested on a 30 fps sensor),
+            // fall back to the closest available range.
             val containing = ranges.filter { targetFps >= it.lower && targetFps <= it.upper }
             containing.minWithOrNull(
-                compareBy({ it.upper - targetFps }, { it.upper - it.lower })
+                compareBy(
+                    { if (it.lower == it.upper) 0 else 1 }, // fixed-rate first
+                    { it.upper - targetFps },               // then upper near target
+                    { it.upper - it.lower }                 // then narrowest span
+                )
             ) ?: ranges.minByOrNull { abs(it.upper - targetFps) * 2 + abs(it.lower - targetFps) }
         } catch (e: Exception) {
             null

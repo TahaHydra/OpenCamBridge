@@ -514,15 +514,27 @@ fn start_mjpeg_reader(
 }
 
 // ---------------------------------------------------------------------------
-// H.264 (EXPERIMENTAL)
+// H.264 (EXPERIMENTAL — DEVELOPER-ONLY, NOT A V1 RELEASE PATH)
 //
 // Transport: raw Annex B byte stream from /stream.h264 (see protocol/SPEC.md).
 // Decode: bundled openh264 (compiled from source at build time). Decoded
 // frames are converted to BGRA and written to the shared framebuffer through
 // the same rotation/mirror/resize pipeline as the MJPEG path.
 //
-// This path is experimental until it has been validated on real devices; the
-// MJPEG path remains Stable V1.
+// V1 status: MJPEG is the stable public path. H.264 is hidden behind the
+// desktop's Developer/Experimental mode and must never auto-start.
+//
+// TODO (H.264 rewrite, not a V1 blocker): the current per-NAL feed to openh264
+// still fails on some Android MediaCodec output with
+//   "OpenH264 ... error. Native:16" (dsDataErrorConcealed)
+// i.e. reference/data loss the decoder conceals — typically when frames are
+// dropped under load (software-decoding 1080p60 in real time is CPU-bound) or
+// when the encoder emits a profile/framing the decoder mishandles. A proper fix
+// likely needs: (1) access-unit framing (feed a whole AU: SPS+PPS+IDR / all
+// slices of a frame together, keyed off AUD or first-VCL detection) instead of
+// one NAL per decode call; (2) enforcing Constrained Baseline on the encoder
+// (done on the Android side) end-to-end; and/or (3) evaluating a hardware
+// (D3D11VA/NVDEC) or more tolerant decoder. Until then, prefer MJPEG.
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]

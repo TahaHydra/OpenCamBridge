@@ -150,6 +150,39 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   const [androidMetrics, setAndroidMetrics] = useState<any>(null);
   const [now, setNow] = useState(Date.now() / 1000);
 
+  // Developer / Experimental mode. Off by default: V1 is a stable MJPEG product.
+  // When off, H.264 codec selection, capture profiles, and the verbose producer
+  // metrics are hidden — normal users just pick resolution/fps/quality.
+  const [devMode, setDevMode] = useState<boolean>(() => localStorage.getItem('ocb.devMode') === '1');
+  useEffect(() => { localStorage.setItem('ocb.devMode', devMode ? '1' : '0'); }, [devMode]);
+
+  // Rolling diagnostics log surfaced in-app so runtime problems can be copied
+  // without digging through the terminal. Capped to the most recent entries.
+  const [diagLog, setDiagLog] = useState<string[]>([]);
+  const lastDiagRef = useRef<Record<string, string>>({});
+  const addDiag = useCallback((key: string, message: string) => {
+    // De-duplicate consecutive identical messages per key so a repeating error
+    // does not flood the log every poll.
+    if (lastDiagRef.current[key] === message) return;
+    lastDiagRef.current[key] = message;
+    const ts = new Date().toLocaleTimeString();
+    setDiagLog(prev => [...prev.slice(-199), `[${ts}] ${message}`]);
+  }, []);
+
+  // Capabilities of the currently selected lens, reported honestly by Android.
+  const activeCam: any = cameras.find(c => c.id === settings.cameraId);
+  // Torch: hide only when the active lens explicitly reports no flash. If the
+  // field is absent (older phone build / capability unknown) keep it visible so
+  // version skew never hides a working torch.
+  const torchSupported = activeCam ? activeCam.hasTorch !== false : false;
+  const fpsCapFor = (w: number, h: number): number => {
+    const e = activeCam?.fpsByResolution?.find((r: any) => r.width === w && r.height === h);
+    return e ? e.maxFps : 0; // 0 = unknown (do not restrict)
+  };
+  const maxFpsHere = fpsCapFor(settings.width, settings.height);
+  const supports60 = maxFpsHere === 0 || maxFpsHere >= 50;
+  const supports30 = maxFpsHere === 0 || maxFpsHere >= 25;
+
   const handleStartObs = async () => {
     if (obsMode === 'window' && onEnterObsMode) {
       onEnterObsMode();
@@ -221,8 +254,25 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   useEffect(() => {
     apiFetch(baseUrl, '/api/camera/list', token)
       .then(res => res.json())
-      .then(data => setCameras(Array.isArray(data) ? data : data.cameras || []))
-      .catch(console.error);
+      .then(data => {
+        const list = Array.isArray(data) ? data : data.cameras || [];
+        setCameras(list);
+        // Prefer main/back-wide as the default lens (not telephoto/ultrawide),
+        // but only when the current selection is not a real camera yet — never
+        // override an explicit phone/user choice.
+        const haveActive = list.some((c: any) => c.id === settingsRef.current.cameraId);
+        if (!haveActive && list.length) {
+          const preferred =
+            list.find((c: any) => c.facing === 'back' && c.lensType === 'wide') ||
+            list.find((c: any) => c.facing === 'back') ||
+            list[0];
+          if (preferred) {
+            setSettings(prev => ({ ...prev, cameraId: preferred.id }));
+            addDiag('lens', `Default lens: ${preferred.label} (${preferred.id})`);
+          }
+        }
+      })
+      .catch(e => addDiag('cameraList', `Camera list fetch failed: ${e}`));
 
     fetchStatus();
 
@@ -251,6 +301,60 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
     return () => clearInterval(interval);
   }, [baseUrl, token, fetchStatus]);
+
+  // --- Diagnostics capture (reactive, so log entries are deduped per source) ---
+  useEffect(() => {
+    if (vcamState?.last_error) addDiag('producerErr', `Producer: ${vcamState.last_error}`);
+    const m = vcamState?.metrics;
+    if (m?.last_error) addDiag('decodeErr', `Producer decode: ${m.last_error}`);
+    if (m) {
+      const drift = Math.abs((m.written_fps || 0) - (m.fps_target || 0));
+      if (m.fps_target > 0 && (m.written_fps || 0) < m.fps_target - 5) {
+        addDiag('fpsDrift', `FPS below target: out ${m.written_fps}/${m.fps_target} (in ${m.decoded_fps})`);
+      } else if (drift <= 5) {
+        addDiag('fpsDrift', `FPS on target: ${m.written_fps}/${m.fps_target}`);
+      }
+    }
+  }, [vcamState, addDiag]);
+
+  useEffect(() => {
+    if (androidStreamStatus === 'error') addDiag('androidConn', 'Android control server unreachable');
+    else if (androidStreamStatus === 'running') addDiag('androidConn', 'Android control server reachable');
+  }, [androidStreamStatus, addDiag]);
+
+  useEffect(() => {
+    if (androidMetrics?.actualFps != null) {
+      addDiag('androidFps', `Android capture: ${androidMetrics.actualFps}/${settingsRef.current.fps} fps at ${androidMetrics.encodedWidth}x${androidMetrics.encodedHeight}`);
+    }
+    if (androidMetrics?.fallbackUsed) {
+      addDiag('resFallback', `Resolution fallback: ${androidMetrics.resolutionPolicy} (${androidMetrics.selectedRawWidth}x${androidMetrics.selectedRawHeight})`);
+    }
+  }, [androidMetrics, addDiag]);
+
+  const copyDiagnostics = async () => {
+    const s = settingsRef.current;
+    const m = vcamState?.metrics;
+    const snapshot = [
+      '=== OpenCamBridge diagnostics snapshot ===',
+      `Connection: ${token ? 'LAN (token)' : 'USB'}  base=${baseUrl}`,
+      `Android control server: ${androidStreamStatus}`,
+      `Lens: ${activeCam ? `${activeCam.label} (${activeCam.id})` : s.cameraId}  torch=${torchSupported}`,
+      `Resolution: ${s.width}x${s.height}  requested fps: ${s.fps}  maxFps@res: ${maxFpsHere || 'unknown'}`,
+      `Codec: ${s.streamMode}  jpegQuality: ${s.jpegQuality}  targetBandwidth: ${s.targetBandwidthMbps || 'off'}`,
+      `Rotation: ${s.displayRotation}  mirror: ${s.mirror}`,
+      `Android FPS actual: ${androidMetrics?.actualFps ?? '?'}  encoded: ${androidMetrics?.encodedWidth}x${androidMetrics?.encodedHeight}`,
+      m ? `Producer: in ${m.decoded_fps} / out ${m.written_fps} fps target ${m.fps_target}, ${m.estimated_mbps} Mbps, ${m.total_pipeline_ms}ms, dropped ${m.dropped_jpegs}, queue ${m.jpeg_queue_len}` : 'Producer: not running',
+      `Producer last error: ${vcamState?.last_error || m?.last_error || 'none'}`,
+      '=== event log ===',
+      ...diagLog,
+    ].join('\n');
+    try {
+      await navigator.clipboard.writeText(snapshot);
+      addDiag('copy', 'Diagnostics copied to clipboard');
+    } catch (e) {
+      addDiag('copy', `Copy failed: ${e}`);
+    }
+  };
 
   const handleRegisterVcam = async () => {
     setIsVcamRegistering(true);
@@ -424,12 +528,29 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     if (key === 'torchEnabled') {
       setSettings(newSettings);
       settingsRef.current = newSettings;
-      await apiFetch(baseUrl, '/api/camera/torch', token, { method: 'POST', body: JSON.stringify({ enabled: value }), headers: { 'Content-Type': 'application/json' }});
+      try {
+        const res = await apiFetch(baseUrl, '/api/camera/torch', token, { method: 'POST', body: JSON.stringify({ enabled: value }), headers: { 'Content-Type': 'application/json' }});
+        if (!res.ok) {
+          const body = await res.text().catch(() => '');
+          addDiag('torch', `Torch ${value ? 'on' : 'off'} failed: HTTP ${res.status} ${body}`);
+          setVcamMessage(`Torch not available on this camera (HTTP ${res.status}).`);
+        } else {
+          addDiag('torch', `Torch ${value ? 'on' : 'off'}`);
+        }
+      } catch (e: any) {
+        addDiag('torch', `Torch request failed: ${e}`);
+        setVcamMessage(`Torch request failed: ${e}`);
+      }
       return;
     } else if (key === 'linearZoom') {
       setSettings(newSettings);
       settingsRef.current = newSettings;
-      await apiFetch(baseUrl, '/api/camera/zoom', token, { method: 'POST', body: JSON.stringify({ linearZoom: value }), headers: { 'Content-Type': 'application/json' }});
+      try {
+        const res = await apiFetch(baseUrl, '/api/camera/zoom', token, { method: 'POST', body: JSON.stringify({ linearZoom: value }), headers: { 'Content-Type': 'application/json' }});
+        if (!res.ok) addDiag('zoom', `Zoom failed: HTTP ${res.status}`);
+      } catch (e: any) {
+        addDiag('zoom', `Zoom request failed: ${e}`);
+      }
       return;
     }
 
@@ -569,6 +690,18 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     updateSetting('displayRotation', nextRot);
   };
 
+  // V1 is MJPEG-only for normal users: leaving Developer mode forces the codec
+  // back to the stable MJPEG path so H.264 can never be left running by accident.
+  useEffect(() => {
+    if (!devMode && settingsRef.current.streamMode !== 'mjpeg') {
+      const next = { ...settingsRef.current, streamMode: 'mjpeg' };
+      setSettings(next);
+      settingsRef.current = next;
+      addDiag('codec', 'Developer mode off — codec reset to MJPEG');
+      postSettingsToAndroid(next).catch(() => {});
+    }
+  }, [devMode, addDiag]);
+
   return (
     <div className="control-panel glass-panel animate-fade" style={{ display: 'flex', flexDirection: 'column', gap: 24, padding: 24 }}>
 
@@ -658,8 +791,50 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           <p style={{ fontSize: '0.8rem', color: '#aaa', marginBottom: 12, fontStyle: 'italic' }}>{vcamMessage}</p>
         )}
 
-        {/* Producer Metrics */}
+        {/* Compact product status (always visible) */}
         {vcamState && (
+          <div style={{ background: 'rgba(20,25,30,0.5)', padding: 12, borderRadius: 8, border: '1px solid #222', fontSize: '0.8rem', marginBottom: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+              <span style={{ color: '#888' }}>Status</span>
+              <span style={{ color: vcamState.running ? '#51cf66' : '#888' }}>{vcamState.running ? 'Streaming' : 'Idle'}</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+              <span style={{ color: '#888' }}>FPS (out / target)</span>
+              <span style={{ color: (vcamState.metrics && vcamState.metrics.written_fps >= settings.fps - 5) ? '#51cf66' : '#ffb300' }}>
+                {vcamState.metrics ? `${vcamState.metrics.written_fps} / ${settings.fps}` : '— / ' + settings.fps}
+                {androidMetrics?.actualFps != null ? ` (phone ${androidMetrics.actualFps})` : ''}
+              </span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: '#888' }}>Output</span>
+              <span>{vcamState.metrics ? `${vcamState.metrics.output_width}x${vcamState.metrics.output_height} ${settings.streamMode.toUpperCase()}` : `${settings.width}x${settings.height}`}</span>
+            </div>
+            {(vcamState.last_error || vcamState.metrics?.last_error) && (
+              <div style={{ marginTop: 6, color: '#ff6b6b', fontSize: '0.75rem', wordBreak: 'break-all' }}>
+                {vcamState.last_error || vcamState.metrics?.last_error}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Diagnostics log (always visible; copyable) */}
+        <div style={{ background: '#0a0a0a', padding: 12, borderRadius: 8, border: '1px solid #222', marginBottom: 12 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <span style={{ color: '#4dabf7', fontSize: '0.85rem', fontWeight: 600 }}>Diagnostics</span>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn btn-secondary" style={{ padding: '2px 10px', fontSize: '0.7rem' }} onClick={copyDiagnostics}>Copy</button>
+              <button className="btn btn-secondary" style={{ padding: '2px 10px', fontSize: '0.7rem' }} onClick={() => { setDiagLog([]); lastDiagRef.current = {}; }}>Clear</button>
+            </div>
+          </div>
+          <div style={{ maxHeight: 140, overflowY: 'auto', fontFamily: 'monospace', fontSize: '0.68rem', color: '#9aa', lineHeight: 1.5 }}>
+            {diagLog.length === 0
+              ? <span style={{ color: '#555' }}>No events yet.</span>
+              : diagLog.slice().reverse().map((l, i) => (<div key={i}>{l}</div>))}
+          </div>
+        </div>
+
+        {/* Verbose producer metrics (developer mode) */}
+        {devMode && vcamState && (
           <div style={{ background: '#0a0a0a', padding: 12, borderRadius: 8, border: '1px solid #222', fontFamily: 'monospace', fontSize: '0.75rem', color: '#51cf66' }}>
 
             {/* Extended Status */}
@@ -835,7 +1010,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
       <div className="control-group">
         <h3 style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-          <Settings2 size={16} /> Performance Profiles
+          <Settings2 size={16} /> Resolution &amp; Frame Rate
         </h3>
 
         <div className="control-item">
@@ -863,35 +1038,39 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
             onChange={(e) => updateFps(parseInt(e.target.value, 10))}
           >
             <option value={15}>15 fps</option>
-            <option value={30}>30 fps</option>
-            <option value={60}>60 fps</option>
+            <option value={30} disabled={!supports30}>30 fps{!supports30 ? ' (unsupported here)' : ''}</option>
+            <option value={60} disabled={!supports60}>60 fps{!supports60 ? ' (unsupported here)' : ''}</option>
           </select>
           <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-            Resolution and frame rate are independent. Reaching 60&nbsp;fps depends
-            on the phone camera supporting it at the chosen resolution and lighting;
-            the FPS readout below shows the actual delivered rate.
+            Resolution and frame rate are independent.
+            {maxFpsHere > 0
+              ? ` This lens reports up to ${maxFpsHere} fps at ${settings.width}x${settings.height}.`
+              : ' Actual rate depends on the phone camera and lighting.'}
+            {androidMetrics?.actualFps != null &&
+              ` Delivering ${androidMetrics.actualFps}/${settings.fps} fps now.`}
           </p>
         </div>
 
-        <div className="control-item" style={{ marginTop: 12 }}>
-          <label>Capture Profile (advanced)</label>
-          <select
-            className="input-control"
-            value={settings.profile}
-            onChange={(e) => updateProfile(e.target.value)}
-          >
-            <option value="low-latency">Low Latency (960x540, Q70)</option>
-            <option value="balanced">Balanced (1280x720, Q85)</option>
-            <option value="balanced-720p60">Balanced 60 (1280x720 @ 60fps, Q80)</option>
-            <option value="quality">Quality (1920x1080, Q90)</option>
-            <option value="experimental-1080p60">Experimental (1080p @ 60fps)</option>
-          </select>
-          <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-            Presets set resolution, quality (and, for the "60" presets, frame rate)
-            together. Use the Resolution and Frame Rate controls above for
-            independent selection.
-          </p>
-        </div>
+        {devMode && (
+          <div className="control-item" style={{ marginTop: 12 }}>
+            <label>Capture Profile (advanced)</label>
+            <select
+              className="input-control"
+              value={settings.profile}
+              onChange={(e) => updateProfile(e.target.value)}
+            >
+              <option value="low-latency">Low Latency (960x540, Q70)</option>
+              <option value="balanced">Balanced (1280x720, Q85)</option>
+              <option value="balanced-720p60">Balanced 60 (1280x720 @ 60fps, Q80)</option>
+              <option value="quality">Quality (1920x1080, Q90)</option>
+              <option value="experimental-1080p60">Experimental (1080p @ 60fps)</option>
+            </select>
+            <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
+              Developer preset: sets resolution + quality (+fps for "60" presets)
+              together. Normal users use the Resolution and Frame Rate controls.
+            </p>
+          </div>
+        )}
       </div>
 
       <div className="control-group">
@@ -942,24 +1121,26 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           )}
         </div>
 
-        <div className="control-item">
-          <label>Stream Codec</label>
-          <select
-            className="input-control"
-            value={settings.streamMode}
-            onChange={(e) => updateSetting('streamMode', e.target.value)}
-          >
-            <option value="mjpeg">MJPEG (Stable)</option>
-            <option value="h264">H.264 (Experimental)</option>
-          </select>
-          <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-            H.264 uses much less bandwidth at the same quality. The Windows producer
-            decodes it with a bundled software decoder. Experimental: if you see
-            artifacts or stalls, switch back to MJPEG (the stable path).
-          </p>
-        </div>
+        {devMode && (
+          <div className="control-item">
+            <label>Stream Codec (Developer)</label>
+            <select
+              className="input-control"
+              value={settings.streamMode}
+              onChange={(e) => updateSetting('streamMode', e.target.value)}
+            >
+              <option value="mjpeg">MJPEG (Stable)</option>
+              <option value="h264">H.264 (Experimental / unstable)</option>
+            </select>
+            <p style={{ fontSize: '0.7rem', color: '#ffb300', marginTop: 4 }}>
+              ⚠️ H.264 is experimental and may fail on some devices (the bundled
+              openh264 decoder errors on certain phone encoder output). MJPEG is
+              the stable V1 path. Use H.264 only for testing.
+            </p>
+          </div>
+        )}
 
-        {settings.streamMode === 'mjpeg' ? (
+        {(settings.streamMode === 'mjpeg' || !devMode) ? (
           <>
             <div className="control-item" style={{ marginTop: 12 }}>
               <label style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -1043,6 +1224,23 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           </label>
         </div>
 
+        <div className="control-row" style={{ marginTop: 12 }}>
+          <label style={{ fontSize: '0.9rem' }}>
+            Developer / Experimental Mode
+            <span style={{ display: 'block', fontSize: '0.7rem', color: '#888' }}>
+              Shows H.264 codec, capture profiles, and verbose metrics.
+            </span>
+          </label>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={devMode}
+              onChange={(e) => setDevMode(e.target.checked)}
+            />
+            <span className="slider"></span>
+          </label>
+        </div>
+
         <div className="control-item" style={{ marginTop: 20 }}>
           <button className="btn btn-secondary" style={{ width: '100%' }} onClick={handleRotate}>
             <RotateCw size={16} /> Rotate Output 90°
@@ -1061,17 +1259,24 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           </label>
         </div>
 
-        <div className="control-row" style={{ marginTop: 12 }}>
-          <label style={{ fontSize: '0.9rem' }}>Flashlight (Torch)</label>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={settings.torchEnabled}
-              onChange={(e) => updateSetting('torchEnabled', e.target.checked)}
-            />
-            <span className="slider"></span>
-          </label>
-        </div>
+        {torchSupported ? (
+          <div className="control-row" style={{ marginTop: 12 }}>
+            <label style={{ fontSize: '0.9rem' }}>Flashlight (Torch)</label>
+            <label className="switch">
+              <input
+                type="checkbox"
+                checked={settings.torchEnabled}
+                onChange={(e) => updateSetting('torchEnabled', e.target.checked)}
+              />
+              <span className="slider"></span>
+            </label>
+          </div>
+        ) : activeCam ? (
+          <div className="control-row" style={{ marginTop: 12 }}>
+            <label style={{ fontSize: '0.9rem', color: '#888' }}>Flashlight (Torch)</label>
+            <span style={{ fontSize: '0.75rem', color: '#888' }}>Not available on this lens</span>
+          </div>
+        ) : null}
 
         {isSyncing && (
           <div style={{ marginTop: 16, fontSize: '0.8rem', color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'center' }}>

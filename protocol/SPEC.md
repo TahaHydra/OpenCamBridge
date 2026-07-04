@@ -225,10 +225,14 @@ because the virtual camera media type is fixed.
 
 ## V1 scope
 
-- MJPEG is the stable V1 path.
-- H.264 is experimental end-to-end: Android encodes it, and the Windows
-  producer can decode it into the virtual camera (openh264), but it has not
-  been validated on devices yet.
+- MJPEG is the stable V1 path and the default codec.
+- H.264 is **developer-only** for V1: it is hidden behind the desktop app's
+  Developer/Experimental mode, never auto-starts, and the bundled openh264
+  decoder still fails (`Native:16`) on some phone encoder output. It remains in
+  the tree for future work but is not a V1 release path.
+- Camera capabilities (per-lens torch availability and per-resolution max FPS)
+  are reported by `/api/camera/list` so the UI only offers controls the active
+  lens actually supports.
 - No audio.  
 - No iOS.  
 - No macOS virtual camera driver yet.

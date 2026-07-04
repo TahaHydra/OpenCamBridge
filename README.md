@@ -3,14 +3,29 @@
 OpenCamBridge is a free open-source phone-as-webcam project.
 No cloud, no account, no telemetry, no ads, no watermark.
 
+## V1 scope
+
+OpenCamBridge V1 is a clean, privacy-first, open-source Android-to-Windows
+webcam: no cloud, no account, no telemetry, no ads, no watermark. USB-first,
+LAN optional with a token. **MJPEG is the stable production path.** H.264 is
+kept in the tree but hidden behind Developer/Experimental mode and is not a V1
+release path.
+
+Normal users independently choose Resolution, Frame Rate, JPEG Quality, and
+target Bandwidth/Auto-quality — the app no longer drives capture through bundled
+profile presets. FPS and resolution are separate controls; the UI only offers a
+frame rate the selected lens actually reports at the chosen resolution.
+
 ## Architecture Pipeline
 
 - **Stable V1 (MJPEG)**: Android CameraX -> `/stream.mjpeg` -> Rust producer -> shared memory framebuffer -> Media Foundation virtual camera -> OBS.
-- **Experimental (H.264)**: Android MediaCodec -> `/stream.h264` (Annex B) -> Rust producer `--source h264` -> bundled openh264 decoder -> shared memory framebuffer -> virtual camera. Implemented end-to-end but **not yet validated on real devices**; switch back to MJPEG if you see artifacts or stalls.
+- **Developer-only (H.264, experimental/unstable)**: Android MediaCodec (Constrained Baseline) -> `/stream.h264` (Annex B) -> Rust producer `--source h264` -> bundled openh264 decoder -> shared memory framebuffer -> virtual camera. Hidden unless Developer/Experimental mode is enabled in the desktop app; never auto-starts. The openh264 decoder still errors (`Native:16`) on some phone encoder output — use MJPEG.
 
 All lenses the phone exposes (main, ultrawide, telephoto, front, external)
-are selectable; the app negotiates per-device resolutions, FPS ranges, and
-encoder input formats instead of assuming fixed values.
+are selectable; the app negotiates per-device resolutions, FPS ranges, torch
+availability, and encoder input formats instead of assuming fixed values. The
+desktop hides torch on lenses without a flash and disables frame rates a lens
+cannot deliver at the chosen resolution.
 
 Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [protocol/SPEC.md](protocol/SPEC.md).
 
@@ -59,8 +74,8 @@ Use:
 * Source: Video Capture Device
 * Device: OpenCamBridge Camera
 * Resolution/FPS Type: Custom
-* Balanced: 1280x720 @ 30
-* 1080p60 experimental: 1920x1080 @ 60
+* Match the Resolution and Frame Rate you selected in the desktop app
+  (e.g. 1280x720 @ 30, or 1920x1080 @ 60 on a phone/lens that supports it)
 * Video Format: Any or RGB32
 
 Do not use Device Default during development.
@@ -102,30 +117,82 @@ Invoke-RestMethod http://127.0.0.1:8080/api/stream/metrics
 - macOS virtual camera driver
 - HEVC
 
+## Build from source
+
+```powershell
+# Android APK
+cd android
+.\gradlew.bat assembleDebug
+adb install -r .\app\build\outputs\apk\debug\app-debug.apk
+
+# Rust frame producer
+cd windows\virtual-camera-mediafoundation\rust-frame-producer
+cargo build --release
+
+# Desktop app
+cd desktop\tauri-app
+npm ci
+npx tsc --noEmit
+cargo check --manifest-path .\src-tauri\Cargo.toml
+
+# Media Foundation virtual camera DLL (from repo root)
+.\dev-build-vcam.ps1
+```
+
+## Diagnostics
+
+The desktop app has a copyable **Diagnostics** panel (in the control panel)
+showing the selected lens/resolution/FPS, target-vs-actual FPS, producer
+in/out FPS, bandwidth, latency, dropped frames, torch/rotation state, and the
+last errors. Use **Copy** to grab a snapshot for bug reports. The Android app
+has a **Logs** tab covering control/camera errors.
+
 ## Known Limitations
 
 - No audio support.
 - No iOS app.
 - No macOS virtual camera driver yet.
-- H.264 mode is experimental (implemented end-to-end, not yet device-validated).
-- Building the Rust producer now requires a C/C++ compiler (openh264 is
-  compiled from source; installing `nasm` is optional and only enables its
-  faster assembly routines).
+- **H.264 is developer-only and unstable**: the bundled openh264 decoder still
+  errors (`Native:16`) on some phone encoder output. MJPEG is the supported V1
+  path. See the TODO in `rust-frame-producer/src/main.rs` for the rewrite plan.
+- 60 FPS depends on the phone lens + resolution + lighting; the UI reports the
+  actual delivered rate and only offers frame rates the lens supports.
+- Building the Rust producer requires a C/C++ compiler (openh264 is compiled
+  from source; installing `nasm` is optional and only enables its faster
+  assembly routines).
 
 ## Release Checklist
 
 Before tagging a release, ensure:
 - [ ] Android build completes (`.\gradlew.bat assembleDebug` / `assembleRelease`)
-- [ ] Rust producer builds (`cargo build`)
+- [ ] Rust producer builds (`cargo build --release`)
+- [ ] Desktop type-checks and its backend compiles (`npx tsc --noEmit`, `cargo check --manifest-path .\src-tauri\Cargo.toml`)
 - [ ] Tauri app builds (`npm run tauri build`)
+- [ ] Virtual camera DLL builds from a clean clone (`.\dev-build-vcam.ps1`)
 - [ ] Pipeline runs correctly via `dev-reset.ps1` and `dev-start.ps1`
-- [ ] OBS Custom Resolution is tested:
-  - [ ] 720p30 (Balanced) works flawlessly
-  - [ ] 1080p60 (Experimental) produces reasonable framerates
-- [ ] Torch and profile changes update UI state reliably
+- [ ] Runtime matrix in [docs/RUNTIME-CHECKLIST.md](docs/RUNTIME-CHECKLIST.md) passes on target devices
+- [ ] MJPEG 720p60 works on a supported phone; 1080p falls back honestly when unsupported
+- [ ] Torch shows only on lenses that support it and works there
 - [ ] Every lens in the camera dropdown actually switches the picture
-- [ ] H.264 mode shows video in OBS (or is consciously left experimental)
-- [ ] Full manual pass of [docs/VALIDATION.md](docs/VALIDATION.md)
+- [ ] Phone and desktop controls stay in sync
+- [ ] H.264 is hidden unless Developer mode is on; MJPEG is the default
+- [ ] SHA256 hashes generated for all release artifacts (below)
+
+## Generating release artifact hashes
+
+Publish a SHA256 for every binary you ship (APK, installer, producer exe) so
+users can verify downloads:
+
+```powershell
+# Single file
+Get-FileHash .\app-release.apk -Algorithm SHA256
+
+# All artifacts in a folder -> SHA256SUMS.txt
+Get-ChildItem .\release\* -File |
+  Get-FileHash -Algorithm SHA256 |
+  ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+  Out-File -Encoding ascii .\release\SHA256SUMS.txt
+```
 
 ## Security Note
 

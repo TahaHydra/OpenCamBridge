@@ -259,10 +259,19 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 conn.connectTimeout = 1000
                 conn.readTimeout = 1000
                 conn.outputStream.write(jsonPayload.toByteArray())
-                conn.responseCode // Wait for completion
+                val code = conn.responseCode // Wait for completion
+                // Surface failed control calls instead of silently dropping them,
+                // so a button that does nothing shows up in the Logs tab.
+                if (code !in 200..299) {
+                    com.opencambridge.android.state.AppLogger.w(
+                        "Control", "POST $path failed: HTTP $code"
+                    )
+                }
                 conn.disconnect()
             } catch (e: Exception) {
-                // Ignore. Server probably not running.
+                com.opencambridge.android.state.AppLogger.w(
+                    "Control", "POST $path failed: ${e.javaClass.simpleName}: ${e.message}"
+                )
             }
         }
     }
