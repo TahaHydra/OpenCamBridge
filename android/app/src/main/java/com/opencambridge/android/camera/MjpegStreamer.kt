@@ -334,16 +334,30 @@ class MjpegStreamer(
 
             val encodeStartNs = System.nanoTime()
 
+            val quality = StreamState.jpegQuality.get()
             val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
             jpegStream.reset()
-            yuvImage.compressToJpeg(Rect(0, 0, width, height), StreamState.jpegQuality.get(), jpegStream)
+            yuvImage.compressToJpeg(Rect(0, 0, width, height), quality, jpegStream)
+            var frameBytes = jpegStream.toByteArray()
+
+            // Rotate the ACTUAL streamed frame (not just the preview box) so the
+            // phone's video output is physically turned. Every consumer — the
+            // desktop preview, the Rust producer, and /obs — reads this same
+            // /stream.mjpeg, so rotating here rotates the picture everywhere and
+            // downstream must NOT rotate again. Only runs when the user selected
+            // a rotation; at 0 the stable MJPEG path is byte-for-byte unchanged.
+            val rotationDeg = (StreamState.displayRotation.get().toIntOrNull() ?: 0).mod(360)
+            if (rotationDeg != 0) {
+                rotateJpeg(frameBytes, rotationDeg, quality)?.let { frameBytes = it }
+            }
+            StreamState.rotationApplied.set(rotationDeg != 0)
 
             val encodeMs = (System.nanoTime() - encodeStartNs) / 1_000_000.0
             val prevAvg = StreamState.androidEncodeMsAvg.get()
             val nextAvg = if (prevAvg <= 0.0) encodeMs else (prevAvg * 0.85 + encodeMs * 0.15)
             StreamState.androidEncodeMsAvg.set(nextAvg)
 
-            StreamState.latestFrame.set(jpegStream.toByteArray())
+            StreamState.latestFrame.set(frameBytes)
             StreamState.latestFrameRevision.incrementAndGet()
 
             val now = System.currentTimeMillis()
@@ -433,6 +447,29 @@ class MjpegStreamer(
                 }
                 dstOffset += width
             }
+        }
+    }
+
+    /**
+     * Rotates an encoded JPEG by [degrees] (90/180/270) and re-encodes it.
+     * Uses Android's own bitmap codecs so colour/orientation are always correct;
+     * the extra decode+encode only happens when the user picked a rotation, so
+     * the un-rotated fast path pays nothing. Returns null on failure (caller
+     * keeps the un-rotated frame).
+     */
+    private fun rotateJpeg(jpeg: ByteArray, degrees: Int, quality: Int): ByteArray? {
+        return try {
+            val src = android.graphics.BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return null
+            val matrix = android.graphics.Matrix().apply { postRotate(degrees.toFloat()) }
+            val rotated = android.graphics.Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+            val out = ByteArrayOutputStream(jpeg.size)
+            rotated.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, out)
+            if (rotated != src) rotated.recycle()
+            src.recycle()
+            out.toByteArray()
+        } catch (e: Exception) {
+            android.util.Log.w("MjpegStreamer", "JPEG rotation failed: ${e.message}")
+            null
         }
     }
 

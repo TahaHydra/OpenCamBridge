@@ -56,7 +56,6 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
     return () => window.removeEventListener('reload-preview', handleReload);
   }, []);
 
-  const rot = parseInt(serverStatus?.displayRotation || '0') || 0;
   const layout = serverStatus?.aspectRatio || '16:9';
   const mirror = serverStatus?.mirror || false;
 
@@ -64,16 +63,14 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
   if (layout === '9:16') boxClass = 'layout-portrait';
   else if (layout === '1:1') boxClass = 'layout-square';
 
+  // The phone rotates the /stream.mjpeg frames themselves now, so the preview
+  // must NOT rotate the content again — only mirror is applied here. The box
+  // aspect follows the selected orientation so the already-rotated frame fits.
   const rotatorStyle: any = {
-    transform: `translate(-50%, -50%) rotate(${rot}deg) scaleX(${mirror ? -1 : 1})`,
+    transform: `translate(-50%, -50%) scaleX(${mirror ? -1 : 1})`,
+    width: boxSize.w ? `${boxSize.w}px` : '100%',
+    height: boxSize.h ? `${boxSize.h}px` : '100%',
   };
-  if (rot === 90 || rot === 270) {
-    rotatorStyle.width = boxSize.h ? `${boxSize.h}px` : '100%';
-    rotatorStyle.height = boxSize.w ? `${boxSize.w}px` : '100%';
-  } else {
-    rotatorStyle.width = boxSize.w ? `${boxSize.w}px` : '100%';
-    rotatorStyle.height = boxSize.h ? `${boxSize.h}px` : '100%';
-  }
 
   return (
     <div className="preview-wrapper animate-fade">

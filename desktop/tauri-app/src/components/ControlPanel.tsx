@@ -194,12 +194,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       setObsStatus(null);
     }
 
-    let rot = settings.displayRotation;
-    if (rot === 'auto' || !rot) rot = '0';
+    // The phone already rotates the /stream.mjpeg frames, so the /obs page must
+    // not rotate again.
     const obsUrl = buildUrl(baseUrl, '/obs', token, {
       fit: fitMode === 'fill' ? 'cover' : 'contain',
       mirror: settings.mirror ? 'true' : 'false',
-      rotate: rot,
+      rotate: '0',
     });
 
     const success = await connectAndSetupObs(obsPassword, obsUrl, obsMode, (status) => setObsStatus(status));
@@ -376,10 +376,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
     const source = s.streamMode === 'h264' ? 'h264' : 'mjpeg';
     const targetUrl = source === 'h264' ? `${base}/stream.h264` : `${base}/stream.mjpeg`;
-    // Pass display rotation/mirror to the producer so the virtual camera output
-    // matches the preview; the raw frames from Android are unrotated.
-    let rotate: number | undefined = parseInt(s.displayRotation, 10);
-    if (isNaN(rotate) || rotate % 90 !== 0) rotate = undefined;
+    // Rotation is applied on the phone now (the /stream.mjpeg frames are already
+    // rotated), so the producer must NOT rotate again — pass 0 explicitly, which
+    // also disables its portrait auto-rotate. The producer still letterboxes a
+    // portrait frame into the fixed landscape output.
+    const rotate = 0;
     console.log('[Tauri UI] Calling start_virtual_camera_feeder with', {
       url: targetUrl, source, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, quality: s.jpegQuality, profile: s.profile, rotate, mirror: s.mirror
     });
