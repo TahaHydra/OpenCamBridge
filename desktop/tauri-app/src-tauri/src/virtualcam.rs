@@ -287,7 +287,9 @@ pub fn start_virtual_camera_feeder(
                 let l = line.trim_start();
                 let benign = l.is_empty()
                     || l.starts_with("Framebuffer backend:")
-                    || l.starts_with("NOTE:");
+                    || l.starts_with("NOTE:")
+                    || l.starts_with("Resize backend preference:")
+                    || l.starts_with("JPEG decode preference:");
                 if !benign {
                     let state_manager = app_clone_err.state::<VirtualCamManager>();
                     let mut err_guard = state_manager.last_error.lock().unwrap();
