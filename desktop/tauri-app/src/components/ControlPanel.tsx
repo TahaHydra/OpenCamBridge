@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Play, Square, Settings2, Sliders, RefreshCw, ZoomIn, ZoomOut, Monitor, Video, ShieldAlert } from 'lucide-react';
+import { Play, Square, Settings2, Sliders, RefreshCw, RotateCw, ZoomIn, ZoomOut, Monitor, Video, ShieldAlert } from 'lucide-react';
 import { connectAndSetupObs, ObsStatus } from '../services/obs';
 import { apiFetch, buildUrl } from '../services/api';
 import { logEvent, logError, logTestMarker } from '../services/logging';
@@ -799,9 +799,19 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       ? settings.aspectRatio
       : 'auto';
   const updateOrientationMode = async (mode: string) => {
-    addDiag('orientation', `Orientation mode -> ${mode}`);
+    addDiag('orientation', `Preview layout -> ${mode}`);
     const next = { ...settingsRef.current, aspectRatio: mode, displayRotation: '0' };
     await applySettingsAndRefreshPreview(next, ['aspectRatio', 'displayRotation']);
+  };
+
+  // Manual rotate: cycles the on-phone rotation offset 0->90->180->270. It is a
+  // display field (applied on the phone, no rebind), so it does not restart the
+  // pipeline.
+  const rotateOutput = async () => {
+    const cur = parseInt(settings.displayRotation, 10) || 0;
+    const next = { ...settingsRef.current, displayRotation: ((cur + 90) % 360).toString() };
+    addDiag('rotate', `Rotate -> ${next.displayRotation}°`);
+    await applySettingsAndRefreshPreview(next, ['displayRotation']);
   };
 
   // V1 is MJPEG-only for normal users: leaving Developer mode forces the codec
@@ -858,64 +868,50 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 16 }}>
-            <div>
-              <div style={{ fontSize: '0.8rem', color: '#888', marginBottom: 6 }}>Phone Camera Stream:</div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                <button className="btn btn-secondary" onClick={handleStartFeedOnly} disabled={vcamState?.running}>
-                  <Play size={14} style={{ marginRight: 6 }} /> Start
-                </button>
-                <button className="btn btn-secondary" onClick={handleStopFeedOnly} disabled={!vcamState?.running}>
-                  <Square size={14} style={{ marginRight: 6 }} /> Stop
-                </button>
-              </div>
-            </div>
-
-            <div>
-              <div style={{ fontSize: '0.8rem', color: '#888', marginBottom: 6 }}>Desktop Virtual Camera:</div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                <button className="btn btn-secondary" onClick={async () => {
-                  try {
-                    await invoke('start_virtual_camera_host');
-                    setVcamMessage('');
-                    addDiag('host', 'Virtual camera host started');
-                  } catch (e: any) {
-                    setVcamMessage(`Virtual camera host failed: ${e}`);
-                    addDiag('host', `Host start failed: ${e}`);
-                  }
-                  invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState).catch(() => {});
-                }} disabled={vcamState?.host_running}>
-                  <Play size={14} style={{ marginRight: 6 }} /> Start
-                </button>
-                <button className="btn btn-secondary" onClick={async () => {
-                  try {
-                    await invoke('stop_virtual_camera_host');
-                    addDiag('host', 'Virtual camera host stopped');
-                  } catch (e: any) {
-                    addDiag('host', `Host stop failed: ${e}`);
-                  }
-                  invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState).catch(() => {});
-                }} disabled={!vcamState?.host_running}>
-                  <Square size={14} style={{ marginRight: 6 }} /> Stop
-                </button>
-              </div>
-            </div>
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 4, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
-              <button
-                style={{ background: 'none', border: 'none', color: '#4dabf7', fontSize: '0.75rem', cursor: (vcamState?.running && vcamState?.host_running) ? 'default' : 'pointer', opacity: (vcamState?.running && vcamState?.host_running) ? 0.5 : 1 }}
-                onClick={handleStartNativeCamera}
-                disabled={vcamState?.running && vcamState?.host_running}
-              >
-                Start All
+            {/* Primary product control: ONE button starts the whole webcam
+                (Android stream + virtual camera host + producer to OBS). */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+              <button className="btn btn-primary" onClick={handleStartNativeCamera} disabled={!!(vcamState?.running && vcamState?.host_running)}>
+                <Play size={16} style={{ marginRight: 6 }} /> Start Webcam
               </button>
-              <button
-                style={{ background: 'none', border: 'none', color: '#ff6b6b', fontSize: '0.75rem', cursor: (!vcamState?.running && !vcamState?.host_running) ? 'default' : 'pointer', opacity: (!vcamState?.running && !vcamState?.host_running) ? 0.5 : 1 }}
-                onClick={handleStopNativeCamera}
-                disabled={!vcamState?.running && !vcamState?.host_running}
-              >
-                Stop All
+              <button className="btn btn-secondary" onClick={handleStopNativeCamera} disabled={!vcamState?.running && !vcamState?.host_running}>
+                <Square size={16} style={{ marginRight: 6 }} /> Stop Webcam
               </button>
             </div>
+            <p style={{ fontSize: '0.75rem', color: vcamState?.running ? '#51cf66' : '#ffb300', margin: 0 }}>
+              {vcamState?.running
+                ? "Sending to OBS — add a Video Capture Device and pick 'OpenCamBridge Camera'."
+                : 'Phone preview only — not sending to OBS. Press Start Webcam.'}
+            </p>
+
+            {/* Granular pipeline controls: developer mode only. */}
+            {devMode && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 4, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                <div style={{ fontSize: '0.72rem', color: '#666' }}>Developer: granular pipeline controls</div>
+                <div>
+                  <div style={{ fontSize: '0.8rem', color: '#888', marginBottom: 6 }}>Phone stream only (feed):</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                    <button className="btn btn-secondary" onClick={handleStartFeedOnly} disabled={vcamState?.running}><Play size={14} style={{ marginRight: 6 }} /> Start</button>
+                    <button className="btn btn-secondary" onClick={handleStopFeedOnly} disabled={!vcamState?.running}><Square size={14} style={{ marginRight: 6 }} /> Stop</button>
+                  </div>
+                </div>
+                <div>
+                  <div style={{ fontSize: '0.8rem', color: '#888', marginBottom: 6 }}>Virtual camera host:</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                    <button className="btn btn-secondary" onClick={async () => {
+                      try { await invoke('start_virtual_camera_host'); setVcamMessage(''); addDiag('host', 'Virtual camera host started'); }
+                      catch (e: any) { setVcamMessage(`Virtual camera host failed: ${e}`); addDiag('host', `Host start failed: ${e}`); }
+                      invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState).catch(() => {});
+                    }} disabled={vcamState?.host_running}><Play size={14} style={{ marginRight: 6 }} /> Start</button>
+                    <button className="btn btn-secondary" onClick={async () => {
+                      try { await invoke('stop_virtual_camera_host'); addDiag('host', 'Virtual camera host stopped'); }
+                      catch (e: any) { addDiag('host', `Host stop failed: ${e}`); }
+                      invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState).catch(() => {});
+                    }} disabled={!vcamState?.host_running}><Square size={14} style={{ marginRight: 6 }} /> Stop</button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -1383,22 +1379,33 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         </div>
 
         <div className="control-item" style={{ marginTop: 20 }}>
-          <label>Orientation</label>
-          <select
-            className="input-control"
-            value={orientationMode}
-            onChange={(e) => updateOrientationMode(e.target.value)}
-          >
-            <option value="auto">Auto (follow phone)</option>
-            <option value="16:9">Horizontal (16:9)</option>
-            <option value="9:16">Vertical (9:16)</option>
-          </select>
+          <label>Rotate</label>
+          <button className="btn btn-secondary" style={{ width: '100%' }} onClick={rotateOutput}>
+            <RotateCw size={16} style={{ marginRight: 6 }} /> Rotate 90°  (now {parseInt(settings.displayRotation, 10) || 0}°)
+          </button>
           <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-            The video is always upright. Auto resizes this preview to match how
-            the phone is held; Horizontal/Vertical pin it. The virtual camera
-            apps receive stays 16:9 — vertical video shows there with side bars.
+            Video is auto-uprighted for how the phone is held; this adds a 90° offset.
           </p>
         </div>
+
+        {devMode && (
+          <div className="control-item" style={{ marginTop: 16 }}>
+            <label>Preview layout (developer)</label>
+            <select
+              className="input-control"
+              value={orientationMode}
+              onChange={(e) => updateOrientationMode(e.target.value)}
+            >
+              <option value="auto">Auto (follow phone)</option>
+              <option value="16:9">Horizontal (16:9)</option>
+              <option value="9:16">Vertical (9:16)</option>
+            </select>
+            <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
+              Shapes only THIS preview box. The virtual camera apps receive stays
+              16:9 — vertical video shows there with side bars.
+            </p>
+          </div>
+        )}
 
         <div className="control-row" style={{ marginTop: 20 }}>
           <label style={{ fontSize: '0.9rem' }}>Mirror Image</label>
