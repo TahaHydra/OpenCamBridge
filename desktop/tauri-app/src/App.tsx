@@ -221,7 +221,7 @@ export default function App() {
         const cams = await (await apiFetch(baseUrl, '/api/camera/list', token)).json();
         const list = Array.isArray(cams) ? cams : cams.cameras || [];
         for (const c of list) {
-          logEvent('capability', `lens ${c.id} ${c.label} facing=${c.facing} torch=${c.hasTorch} maxFps=${JSON.stringify(c.fpsByResolution || [])} highSpeed=${c.supportsHighSpeed ? JSON.stringify(c.highSpeedFpsRanges || []) : 'no'}`);
+          logEvent('capability', `lens ${c.id} "${c.label}" facing=${c.facing} lensType=${c.lensType || '?'} mono=${!!c.isMonochrome} torch=${c.hasTorch} focal=${JSON.stringify(c.focalLengths || [])} maxFps=${JSON.stringify(c.fpsByResolution || [])} highSpeed=${c.supportsHighSpeed ? JSON.stringify(c.highSpeedFpsRanges || []) : 'no'}`);
         }
       } catch { /* capabilities best-effort */ }
     })();

@@ -81,7 +81,7 @@ class CameraRepository(private val context: Context) {
         return cameras.map { cam ->
             when {
                 cam.facing == "back" && cam.isMonochrome ->
-                    cam.copy(label = "Back monochrome", lensType = "mono")
+                    cam.copy(label = "Back monochrome (B&W)", lensType = "mono")
                 cam.facing == "back" -> {
                     val fl = focalOf(cam)
                     val (type, name) = when {

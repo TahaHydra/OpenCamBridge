@@ -375,7 +375,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         `androidFps=${am?.actualFps ?? '?'}`,
         // Android per-stage profiling (ms): YUV->NV21, rotate, JPEG encode, total.
         am ? `android[yuv=${(am.yuvMsAvg ?? 0).toFixed?.(1) ?? am.yuvMsAvg} rot=${(am.rotateMsAvg ?? 0).toFixed?.(1) ?? am.rotateMsAvg} jpeg=${(am.jpegMsAvg ?? 0).toFixed?.(1) ?? am.jpegMsAvg} enc=${(am.androidEncodeMsAvg ?? 0).toFixed?.(1) ?? am.androidEncodeMsAvg}]` : '',
-        m ? `prodIn=${m.decoded_fps} prodOut=${m.written_fps}` : 'prod=off',
+        m ? `prodIn=${m.decoded_fps} prodOut=${m.written_fps}` : 'prod=off (producer not started — OBS is not receiving frames)',
         // Producer per-stage profiling (ms) + which optimized paths ran.
         m ? `prod[decode=${m.decode_ms_avg}(${m.decode_backend ?? '?'}) rot=${m.rotate_ms_avg} resize=${m.resize_ms_avg}(${m.resize_backend ?? '?'}) write=${m.write_ms_avg}]` : '',
         m ? `mbps=${m.estimated_mbps} lat=${m.total_pipeline_ms}ms drop=${m.dropped_jpegs} q=${m.jpeg_queue_len}` : '',
@@ -577,13 +577,16 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       if (streamImpacting && producerRunning) {
         // Producer is feeding OBS: a resolution/fps/lens/codec change needs both
         // the Android stream AND the producer restarted.
+        addDiag('apply', `[${keysChanged.join(',')}] -> full pipeline restart (Android + producer)`);
         await restartFullPipelineWithSettings(nextSettings);
       } else if (streamImpacting && androidStreaming) {
         // Only the phone stream/preview is live (producer OFF). Rebind Android
         // alone — do NOT start the producer. Preview reconnects itself when
         // frames resume (metrics-based recovery in Preview).
+        addDiag('apply', `[${keysChanged.join(',')}] -> Android rebind only (producer off)`);
         await restartAndroidStreamWithSettings(nextSettings);
       } else {
+        addDiag('apply', `[${keysChanged.join(',')}] -> settings only (no rebind)`);
         // Non-stream-impacting change (quality/mirror/rotation/bandwidth), or
         // nothing is live. The running MJPEG already reflects quality/rotation
         // live and mirror is a preview transform, so do NOT reload the preview.
