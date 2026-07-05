@@ -37,10 +37,60 @@ class CameraRepository(private val context: Context) {
             }
         }
 
-        // Disambiguate duplicate labels ("Back wide") by appending the id.
-        val labelCounts = cameras.groupingBy { it.label }.eachCount()
-        return cameras.map { cam ->
+        // Assign human labels/lens types RELATIVELY (see classifyLenses) rather
+        // than from a naive absolute focal-length threshold, which mislabels
+        // modern main sensors (e.g. S24 main ~6mm) as "telephoto".
+        val labeled = classifyLenses(cameras)
+
+        // Disambiguate duplicate labels by appending the id.
+        val labelCounts = labeled.groupingBy { it.label }.eachCount()
+        return labeled.map { cam ->
             if ((labelCounts[cam.label] ?: 0) > 1) cam.copy(label = "${cam.label} #${cam.id}") else cam
+        }
+    }
+
+    /**
+     * Labels lenses by comparing focal lengths ACROSS the device's back cameras
+     * instead of using absolute thresholds. On phones the ultrawide has a much
+     * shorter focal than the main (~0.5x) and a telephoto a much longer one
+     * (>=1.4x). We first find the "main" focal (the shortest focal that is not an
+     * ultrawide outlier), then classify each back lens relative to it. Anything
+     * that does not clearly fit becomes "Back camera N" so a wrong guess never
+     * confuses users. Front/external cameras are labeled by facing + id.
+     */
+    private fun classifyLenses(cameras: List<CameraInfoDto>): List<CameraInfoDto> {
+        fun focalOf(c: CameraInfoDto) = c.focalLengths.minOrNull() ?: 0f
+        val backs = cameras.filter { it.facing == "back" && focalOf(it) > 0f }.sortedBy { focalOf(it) }
+
+        // Establish the main (1x) focal length.
+        val mainFocal: Float = when {
+            backs.isEmpty() -> 0f
+            backs.size == 1 -> focalOf(backs[0])
+            else -> {
+                val smallest = focalOf(backs[0])
+                val second = focalOf(backs[1])
+                // If the smallest is much wider than the next, it's the ultrawide
+                // and the main is the second; otherwise the smallest is the main.
+                if (smallest < 0.75f * second) second else smallest
+            }
+        }
+
+        return cameras.map { cam ->
+            when (cam.facing) {
+                "back" -> {
+                    val fl = focalOf(cam)
+                    val (type, name) = when {
+                        fl <= 0f || mainFocal <= 0f -> "" to "Back camera ${cam.id}"
+                        fl <= 0.75f * mainFocal -> "ultrawide" to "Back ultrawide"
+                        fl >= 1.4f * mainFocal -> "telephoto" to "Back telephoto"
+                        fl <= 1.15f * mainFocal -> "wide" to "Back main"
+                        else -> "" to "Back camera ${cam.id}"
+                    }
+                    cam.copy(label = name, lensType = type)
+                }
+                "front" -> cam.copy(label = "Front camera ${cam.id}", lensType = "")
+                else -> cam.copy(label = "${cam.facing.replaceFirstChar { it.uppercase() }} camera ${cam.id}", lensType = "")
+            }
         }
     }
 
@@ -142,9 +192,6 @@ class CameraRepository(private val context: Context) {
             }
         }
 
-        val lensType = lensType(facing, focalLengths)
-        val label = buildLabel(facing, focalLengths, id)
-
         return CameraInfoDto(
             id = id,
             facing = facing,
@@ -154,45 +201,16 @@ class CameraRepository(private val context: Context) {
             hardwareLevel = hardwareLevel,
             supportedSizes = sizes,
             supportedFpsRanges = fpsRanges,
-            label = label,
+            // label/lensType are assigned later by classifyLenses (relative).
+            label = "Back camera $id",
             zoomRatioMin = zoomMin,
             zoomRatioMax = zoomMax,
             hasTorch = hasTorch,
-            lensType = lensType,
+            lensType = "",
             fpsByResolution = fpsByResolution,
             supportsHighSpeed = supportsHighSpeed,
             highSpeedSizes = highSpeedSizes,
             highSpeedFpsRanges = highSpeedFpsRanges
         )
-    }
-
-    /** Rough lens classification from focal length, back cameras only. */
-    private fun lensType(facing: String, focalLengths: List<Float>): String {
-        if (facing != "back" || focalLengths.isEmpty()) return ""
-        val fl = focalLengths.minOrNull() ?: return ""
-        return when {
-            fl < 3.0f -> "ultrawide"
-            fl > 5.0f -> "telephoto"
-            else -> "wide"
-        }
-    }
-
-    private fun buildLabel(facing: String, focalLengths: List<Float>, id: String): String {
-        val base = facing.replaceFirstChar { it.uppercase() }
-        if (facing != "back" || focalLengths.isEmpty()) {
-            return "$base Camera $id"
-        }
-
-        // Very rough heuristic for focal lengths on mobile phones:
-        // < 3mm is usually ultrawide
-        // 3mm - 5mm is usually standard wide
-        // > 5mm is usually telephoto
-        val fl = focalLengths.minOrNull() ?: focalLengths.first()
-        val suffix = when {
-            fl < 3.0f -> "ultrawide"
-            fl > 5.0f -> "telephoto"
-            else -> "wide"
-        }
-        return "$base $suffix"
     }
 }
