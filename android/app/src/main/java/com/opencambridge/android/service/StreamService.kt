@@ -79,6 +79,22 @@ class StreamService : LifecycleService() {
             onRecoverCamera = { recoverCamera() }
         )
 
+        // Expose the same control handlers in-process so the phone UI can call
+        // them directly instead of POSTing to its own loopback server.
+        ServiceBridge.applyPatch = { req, source -> applySettingsPatch(req, source) }
+        ServiceBridge.setTorch = { enabled ->
+            if (StreamState.streamMode.get() == "h264") h264Streamer.setTorch(enabled) else mjpegStreamer.setTorch(enabled)
+        }
+        ServiceBridge.setLinearZoom = { linear ->
+            if (StreamState.streamMode.get() == "h264") h264Streamer.setLinearZoom(linear) else mjpegStreamer.setLinearZoom(linear)
+        }
+        ServiceBridge.setZoomRatio = { ratio ->
+            if (StreamState.streamMode.get() == "h264") h264Streamer.setZoomRatio(ratio) else mjpegStreamer.setZoomRatio(ratio)
+        }
+        ServiceBridge.startCamera = { startCamera() }
+        ServiceBridge.stopCamera = { stopCamera() }
+        ServiceBridge.recoverCamera = { recoverCamera() }
+
         // Track the PHYSICAL device orientation (accelerometer, works with the
         // app in background and with display auto-rotate locked) and feed it to
         // CameraX as targetRotation. imageInfo.rotationDegrees then reports the
@@ -161,6 +177,7 @@ class StreamService : LifecycleService() {
     override fun onDestroy() {
         Log.d(TAG, "StreamService destroying")
         AppLogger.i("System", "StreamService stopping completely")
+        ServiceBridge.clear()
         orientationListener?.disable()
         stopCamera()
         controlServer.stop()

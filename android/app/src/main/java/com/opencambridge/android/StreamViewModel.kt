@@ -6,7 +6,10 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.opencambridge.android.camera.CameraInfoDto
 import com.opencambridge.android.camera.CameraRepository
+import com.opencambridge.android.server.UpdateSettingsRequest
 import com.opencambridge.android.service.NetworkUtils
+import com.opencambridge.android.service.ServiceBridge
+import com.opencambridge.android.state.AppLogger
 import com.opencambridge.android.state.SettingsManager
 import com.opencambridge.android.state.StreamState
 import kotlinx.coroutines.delay
@@ -170,67 +173,28 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun toggleLocalPreview(enabled: Boolean) {
-        // We still save the preference, but if it's disabled, we detach the surface explicitly.
-        // It's handled by ControlServer now, but we can also detach instantly here.
         if (!enabled) {
             StreamState.previewUseCase?.setSurfaceProvider(null)
         }
-        viewModelScope.launch {
-            postLocalApiSuspend("/api/settings", """{"localPreviewEnabled": $enabled, "clientType": "phone"}""")
-        }
+        controlPatch(UpdateSettingsRequest(localPreviewEnabled = enabled, clientType = "phone"))
     }
 
-    fun selectCamera(cameraId: String) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"cameraId": "$cameraId", "clientType": "phone"}""") }
-    }
-
-    fun updateResolution(w: Int, h: Int) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"width": $w, "height": $h, "clientType": "phone"}""") }
-    }
-
-    fun updateFps(f: Int) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"fps": $f, "clientType": "phone"}""") }
-    }
-
-    fun updateJpegQuality(q: Int) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"jpegQuality": $q, "clientType": "phone"}""") }
-    }
-
-    fun updatePreviewFitMode(mode: String) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"previewFitMode": "$mode", "clientType": "phone"}""") }
-    }
-
-    fun updateAspectRatio(ratio: String) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"aspectRatio": "$ratio", "clientType": "phone"}""") }
-    }
-
-    fun updateZoomSpeed(speed: String) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"zoomSpeed": "$speed", "clientType": "phone"}""") }
-    }
-
-    fun updateDisplayRotation(rotation: String) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"displayRotation": "$rotation", "clientType": "phone"}""") }
-    }
-
-    fun updateMirror(mirror: Boolean) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"mirror": $mirror, "clientType": "phone"}""") }
-    }
-
-    fun updateStreamMode(mode: String) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"streamMode": "$mode", "clientType": "phone"}""") }
-    }
-
-    fun updateAccessMode(mode: String) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"accessMode": "$mode", "clientType": "phone"}""") }
-    }
-
-    fun updatePort(p: Int) {
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"port": $p, "clientType": "phone"}""") }
-    }
+    fun selectCamera(cameraId: String) = controlPatch(UpdateSettingsRequest(cameraId = cameraId, clientType = "phone"))
+    fun updateResolution(w: Int, h: Int) = controlPatch(UpdateSettingsRequest(width = w, height = h, clientType = "phone"))
+    fun updateFps(f: Int) = controlPatch(UpdateSettingsRequest(fps = f, clientType = "phone"))
+    fun updateJpegQuality(q: Int) = controlPatch(UpdateSettingsRequest(jpegQuality = q, clientType = "phone"))
+    fun updatePreviewFitMode(mode: String) = controlPatch(UpdateSettingsRequest(previewFitMode = mode, clientType = "phone"))
+    fun updateAspectRatio(ratio: String) = controlPatch(UpdateSettingsRequest(aspectRatio = ratio, clientType = "phone"))
+    fun updateZoomSpeed(speed: String) = controlPatch(UpdateSettingsRequest(zoomSpeed = speed, clientType = "phone"))
+    fun updateDisplayRotation(rotation: String) = controlPatch(UpdateSettingsRequest(displayRotation = rotation, clientType = "phone"))
+    fun updateMirror(mirror: Boolean) = controlPatch(UpdateSettingsRequest(mirror = mirror, clientType = "phone"))
+    fun updateStreamMode(mode: String) = controlPatch(UpdateSettingsRequest(streamMode = mode, clientType = "phone"))
+    fun updateAccessMode(mode: String) = controlPatch(UpdateSettingsRequest(accessMode = mode, clientType = "phone"))
+    fun updatePort(p: Int) = controlPatch(UpdateSettingsRequest(port = p, clientType = "phone"))
 
     fun regenerateToken() {
         val newToken = java.util.UUID.randomUUID().toString().replace("-", "")
-        viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"accessToken": "$newToken", "clientType": "phone"}""") }
+        controlPatch(UpdateSettingsRequest(accessToken = newToken, clientType = "phone"))
     }
 
     fun setDeveloperMode(enabled: Boolean) {
@@ -243,68 +207,76 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun clearLogs() {
-        viewModelScope.launch { postLocalApiSuspend("/api/logs/clear", "{}") }
+        AppLogger.clear()
     }
 
     fun updateTorch(enabled: Boolean) {
-        viewModelScope.launch {
-            postLocalApiSuspend("/api/camera/torch", """{"enabled": $enabled}""")
+        val h = ServiceBridge.setTorch
+        if (h != null) {
+            try { h(enabled) } catch (e: Exception) {
+                AppLogger.e("Control", "Torch failed: ${e.message}")
+                _controlError.value = "Torch failed: ${e.javaClass.simpleName}"
+            }
+        } else {
+            // No camera running: reflect intent so the switch is consistent.
+            StreamState.torchRequested.set(enabled)
+            StreamState.torchEnabled.set(enabled)
         }
     }
 
     fun updateZoom(linearZoom: Float) {
-        viewModelScope.launch { postLocalApiSuspend("/api/camera/zoom", """{"linearZoom": $linearZoom}""") }
+        val h = ServiceBridge.setLinearZoom
+        if (h != null) h(linearZoom) else StreamState.linearZoom.set(linearZoom)
     }
 
     fun stopStream() {
-        viewModelScope.launch { postLocalApiSuspend("/api/stream/stop", "{}") }
+        ServiceBridge.stopCamera?.invoke()
     }
 
     fun startStream() {
-        // We still need to ensure the service is running, but if it is, this API call tells it to start the camera pipeline.
-        viewModelScope.launch { postLocalApiSuspend("/api/stream/start", "{}") }
+        // If the service is running, ask it to start the camera pipeline; the
+        // initial service launch itself is handled by MainActivity.
+        ServiceBridge.startCamera?.invoke()
     }
 
-    // buildSettingsJson is no longer needed since we patch individually
-
-    private suspend fun postLocalApiSuspend(path: String, jsonPayload: String) {
-        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            try {
-                val port = StreamState.port.get()
-                val token = StreamState.accessToken.get()
-                java.net.HttpURLConnection.setFollowRedirects(false)
-                val url = java.net.URL("http://127.0.0.1:$port$path")
-                val conn = url.openConnection() as java.net.HttpURLConnection
-                conn.requestMethod = "POST"
-                conn.doOutput = true
-                conn.setRequestProperty("Content-Type", "application/json")
-                if (token.isNotEmpty()) {
-                    conn.setRequestProperty("X-OpenCamBridge-Token", token)
-                }
-                // Generous timeouts: the loopback server can be briefly busy
-                // during a camera (re)bind, especially on slower devices
-                // (e.g. LineageOS on the OnePlus 9). 1s was too short and made
-                // every button surface a spurious IOException/timeout.
-                conn.connectTimeout = 5000
-                conn.readTimeout = 5000
-                conn.outputStream.write(jsonPayload.toByteArray())
-                val code = conn.responseCode // Wait for completion
-                // Surface failed control calls instead of silently dropping them:
-                // both to the Logs tab and as a transient Snackbar, so a button
-                // that does nothing is never invisible.
-                if (code !in 200..299) {
-                    com.opencambridge.android.state.AppLogger.w(
-                        "Control", "POST $path failed: HTTP $code"
-                    )
-                    _controlError.value = "Action failed (HTTP $code): ${path.substringAfterLast('/')}"
-                }
-                conn.disconnect()
-            } catch (e: Exception) {
-                com.opencambridge.android.state.AppLogger.w(
-                    "Control", "POST $path failed: ${e.javaClass.simpleName}: ${e.message}"
-                )
-                _controlError.value = "Action failed: ${path.substringAfterLast('/')} (${e.javaClass.simpleName})"
-            }
+    /**
+     * Applies a settings patch IN-PROCESS via the running service (no loopback
+     * HTTP — that's what caused IOExceptions on slow devices). If the service is
+     * not running yet, persist locally so the change takes effect at next start.
+     * The HTTP API remains for desktop/web/remote clients.
+     */
+    private fun controlPatch(req: UpdateSettingsRequest) {
+        val h = ServiceBridge.applyPatch
+        try {
+            if (h != null) h(req, "phone") else persistPatchLocally(req)
+        } catch (e: Exception) {
+            AppLogger.e("Control", "Apply failed: ${e.javaClass.simpleName}: ${e.message}")
+            _controlError.value = "Action failed: ${e.javaClass.simpleName}"
         }
+    }
+
+    /** Fallback used when the service is not running: persist to StreamState +
+     *  SharedPreferences so settings take effect on the next stream start. */
+    private fun persistPatchLocally(req: UpdateSettingsRequest) {
+        req.cameraId?.let { StreamState.cameraId.set(it) }
+        req.width?.let { StreamState.width.set(it) }
+        req.height?.let { StreamState.height.set(it) }
+        req.outputWidth?.let { StreamState.outputWidth.set(it) }
+        req.outputHeight?.let { StreamState.outputHeight.set(it) }
+        req.profile?.let { StreamState.profile.set(it) }
+        req.fps?.let { StreamState.fps.set(it.coerceIn(1, 120)) }
+        req.jpegQuality?.let { StreamState.jpegQuality.set(it.coerceIn(1, 100)) }
+        req.previewFitMode?.let { StreamState.previewFitMode.set(it) }
+        req.aspectRatio?.let { StreamState.aspectRatio.set(it) }
+        req.zoomSpeed?.let { StreamState.zoomSpeed.set(it) }
+        req.displayRotation?.let { StreamState.displayRotation.set(it) }
+        req.mirror?.let { StreamState.mirror.set(it) }
+        req.streamMode?.let { StreamState.streamMode.set(it) }
+        req.localPreviewEnabled?.let { StreamState.localPreviewEnabled.set(it) }
+        req.accessMode?.let { StreamState.accessMode.set(it) }
+        req.port?.let { StreamState.port.set(it) }
+        req.accessToken?.let { StreamState.accessToken.set(it) }
+        settingsManager.save()
+        StreamState.incrementRevision("phone")
     }
 }
