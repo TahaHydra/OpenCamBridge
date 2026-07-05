@@ -287,6 +287,13 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
     const interval = setInterval(() => {
       setNow(Date.now() / 1000);
+      // Pull phone-side setting changes into the desktop every tick. Without
+      // this, /api/camera/status was only read on mount and after the desktop's
+      // own edits, so changing quality/fps/rotation/torch/etc. on the PHONE
+      // never propagated to the desktop UI. fetchStatus() is guarded by
+      // isSyncingRef so it won't clobber an in-flight desktop change.
+      fetchStatus();
+
       invoke<VirtualCamState>('get_virtual_camera_status')
         .then(setVcamState)
         .catch(console.error);

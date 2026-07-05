@@ -558,11 +558,15 @@ fun MainControls(
                 Spacer(modifier = Modifier.height(16.dp))
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Column {
-                        Text("Torch / Lamp", color = if (hasTorch && !rebindInProgress) Color.Unspecified else Color.Gray)
+                        Text("Torch / Lamp", color = if (hasTorch) Color.Unspecified else Color.Gray)
                         if (!hasTorch) Text("Not available on this lens", color = Color.Gray, fontSize = 12.sp)
                     }
-                    // Only shown as interactive when the active lens actually has a flash.
-                    Switch(checked = torchEnabled, enabled = hasTorch && !rebindInProgress, onCheckedChange = onToggleTorch, colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary))
+                    // Gate ONLY on hasTorch, not on rebindInProgress: torch is a
+                    // camera-control call (null-safe), so it must stay pressable.
+                    // Previously a rebind (or a rebind flag that stuck after a
+                    // torch toggle from the desktop) greyed the switch out and it
+                    // never came back.
+                    Switch(checked = torchEnabled, enabled = hasTorch, onCheckedChange = onToggleTorch, colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary))
                 }
             }
         }

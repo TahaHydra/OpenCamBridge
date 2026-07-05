@@ -270,9 +270,21 @@ pub fn start_virtual_camera_feeder(
         for line in reader.lines() {
             if let Ok(line) = line {
                 println!(">>> [Producer STDERR] {}", line);
-                let state_manager = app_clone_err.state::<VirtualCamManager>();
-                let mut err_guard = state_manager.last_error.lock().unwrap();
-                *err_guard = Some(line.clone());
+                // The producer prints benign informational lines to stderr at
+                // startup ("Framebuffer backend: ...", the experimental H.264
+                // NOTE). Treating those as last_error made every metrics line and
+                // the session log show a fake "err=..." forever. Real errors are
+                // already carried in the per-second metrics JSON (last_error) on
+                // stdout; only promote genuinely error-ish stderr lines here.
+                let l = line.trim_start();
+                let benign = l.is_empty()
+                    || l.starts_with("Framebuffer backend:")
+                    || l.starts_with("NOTE:");
+                if !benign {
+                    let state_manager = app_clone_err.state::<VirtualCamManager>();
+                    let mut err_guard = state_manager.last_error.lock().unwrap();
+                    *err_guard = Some(line.clone());
+                }
             }
         }
         println!(">>> [Tauri] STDERR thread exiting.");

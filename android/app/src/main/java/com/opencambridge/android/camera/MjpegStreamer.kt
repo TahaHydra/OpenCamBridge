@@ -120,6 +120,13 @@ class MjpegStreamer(
                     "OpenCamBridge",
                     "Binding MJPEG CameraX camera=${StreamState.cameraId.get()} profile=${StreamState.profile.get()} requested=${StreamState.width.get()}x${StreamState.height.get()} fps=$targetFps fpsRange=$fpsRange preview=${StreamState.localPreviewEnabled.get()}"
                 )
+                // Surface the chosen AE range in the app Logs tab: if a 60 fps
+                // request resolves to a variable range like [30,60] (or a lower
+                // fixed range), that explains a delivered rate below target.
+                com.opencambridge.android.state.AppLogger.i(
+                    "Camera",
+                    "Bind cam=${StreamState.cameraId.get()} req=${StreamState.width.get()}x${StreamState.height.get()}@$targetFps aeRange=${fpsRange ?: "default"}"
+                )
 
                 val imageAnalysis = imageAnalysisBuilder.build()
 
