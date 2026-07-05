@@ -382,9 +382,18 @@ class StreamService : LifecycleService() {
         }
         req.targetBandwidthMbps?.let { StreamState.targetBandwidthMbps.set(it); requiresSettingsSave = true }
 
-        // Dynamic preview surface detach
+        // Dynamic preview surface detach. CameraX requires setSurfaceProvider to
+        // run on the MAIN thread; this patch is applied from the Ktor HTTP worker
+        // thread, so calling it directly threw and returned HTTP 500 when the
+        // preview was disabled. Post to main and swallow any error.
         if (req.localPreviewEnabled == false) {
-            StreamState.previewUseCase?.setSurfaceProvider(null)
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                try {
+                    StreamState.previewUseCase?.setSurfaceProvider(null)
+                } catch (e: Exception) {
+                    AppLogger.w("Camera", "Preview detach failed: ${e.message}")
+                }
+            }
         }
 
         if (requiresSettingsSave) settingsManager.save()

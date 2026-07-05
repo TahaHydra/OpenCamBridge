@@ -274,6 +274,11 @@ class MjpegStreamer(
 
     fun setTorch(enabled: Boolean) {
         StreamState.torchRequested.set(enabled)
+        // Reflect the requested state immediately so status/UI sync even if the
+        // torchState observer is slow or does not emit OFF on some devices
+        // (the "torch won't turn off/sync from phone" bug). The observer, when
+        // it fires, confirms the same value.
+        StreamState.torchEnabled.set(enabled)
         currentCamera?.cameraControl?.enableTorch(enabled)
     }
 

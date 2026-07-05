@@ -869,6 +869,9 @@ class H264Streamer(
 
     fun setTorch(enabled: Boolean) {
         StreamState.torchRequested.set(enabled)
+        // Reflect immediately so status/UI sync even if the torchState observer
+        // is slow or does not emit OFF on some devices.
+        StreamState.torchEnabled.set(enabled)
         currentCamera?.cameraControl?.enableTorch(enabled)
     }
 }

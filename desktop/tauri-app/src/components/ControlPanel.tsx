@@ -138,6 +138,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   // poll overwrite the user's just-made selection with the pre-change server
   // value (which would make the desktop controls appear to "snap back").
   const isSyncingRef = useRef(false);
+  // After a local change, ignore incoming status merges until this time so a
+  // lagging phone status poll can't revert the value the user just set (the
+  // "I changed quality and had to reload the page for it to move" bug). The
+  // phone needs a beat to apply and report the new value.
+  const settleUntilRef = useRef(0);
+  const bumpSettle = () => { settleUntilRef.current = Date.now() + 2500; };
 
   const [obsPassword, setObsPassword] = useState('');
   const [obsMode, setObsMode] = useState<'browser' | 'window'>('browser');
@@ -223,7 +229,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       .then(res => res.json())
       .then(data => {
         const status = data.status || data;
-        if (status) {
+        // Within the settle window after a local edit, do not merge status at
+        // all — the user's just-set values are authoritative until the phone
+        // has had time to apply and report them back.
+        if (status && Date.now() >= settleUntilRef.current) {
           setSettings(prev => {
             const merged: any = {
               ...prev,
@@ -541,6 +550,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   const applySettingsAndRefreshPreview = async (nextSettings: any, keysChanged: string[]) => {
     setSettings(nextSettings);
     settingsRef.current = nextSettings;
+    bumpSettle();
     setIsSyncing(true);
     isSyncingRef.current = true;
 
@@ -579,6 +589,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     if (key === 'torchEnabled') {
       setSettings(newSettings);
       settingsRef.current = newSettings;
+      bumpSettle();
       try {
         const res = await apiFetch(baseUrl, '/api/camera/torch', token, { method: 'POST', body: JSON.stringify({ enabled: value }), headers: { 'Content-Type': 'application/json' }});
         if (!res.ok) {
@@ -596,6 +607,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     } else if (key === 'linearZoom') {
       setSettings(newSettings);
       settingsRef.current = newSettings;
+      bumpSettle();
       try {
         const res = await apiFetch(baseUrl, '/api/camera/zoom', token, { method: 'POST', body: JSON.stringify({ linearZoom: value }), headers: { 'Content-Type': 'application/json' }});
         if (!res.ok) addDiag('zoom', `Zoom failed: HTTP ${res.status}`);

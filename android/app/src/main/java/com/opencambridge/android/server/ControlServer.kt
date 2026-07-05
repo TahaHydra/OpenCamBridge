@@ -1027,8 +1027,16 @@ class ControlServer(
             securityFieldsStripped = true
         }
 
-        // Delegate patch application to the central stream controller
-        onApplySettingsPatch(req, req.clientType ?: "api")
+        // Delegate patch application to the central stream controller. Guard it
+        // so a failure in one setting can never turn a control action into an
+        // HTTP 500 (which the UI shows as a scary "action failed").
+        try {
+            onApplySettingsPatch(req, req.clientType ?: "api")
+        } catch (e: Exception) {
+            AppLogger.e("System", "Settings apply failed: ${e.javaClass.simpleName}: ${e.message}")
+            call.respond(HttpStatusCode.OK, SimpleResult(false, "Some settings failed to apply: ${e.message}"))
+            return
+        }
 
         val message = if (securityFieldsStripped) {
             "Settings updated. Security settings (accessMode/port/accessToken) were ignored: they can only be changed from the phone or over USB."
