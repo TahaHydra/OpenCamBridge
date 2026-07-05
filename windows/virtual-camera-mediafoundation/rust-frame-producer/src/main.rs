@@ -408,6 +408,28 @@ fn letterbox_into(src: &image::RgbaImage, out_w: u32, out_h: u32, allow_simd: bo
     (canvas, backend)
 }
 
+/// Decodes a JPEG to an RgbaImage whose bytes are BGRA (the framebuffer format)
+/// using the faster pure-Rust zune-jpeg decoder. Returns None on any error so
+/// the caller falls back to the image crate.
+fn fast_jpeg_decode_bgra(jpeg: &[u8]) -> Option<image::RgbaImage> {
+    use zune_jpeg::zune_core::colorspace::ColorSpace;
+    use zune_jpeg::zune_core::options::DecoderOptions;
+    use zune_jpeg::JpegDecoder;
+
+    let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
+    let mut decoder = JpegDecoder::new_with_options(jpeg, opts);
+    let mut pixels = decoder.decode().ok()?;
+    let (w, h) = decoder.dimensions()?;
+    if pixels.len() < w * h * 4 {
+        return None;
+    }
+    // RGBA -> BGRA in place.
+    for px in pixels.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    image::RgbaImage::from_raw(w as u32, h as u32, pixels)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn orient_resize_write(
     rgba: image::RgbaImage,
@@ -1049,6 +1071,10 @@ fn main() {
     // path — the kill switch if a SIMD build ever produces bad output.
     let allow_simd = std::env::var("OCB_DISABLE_SIMD_RESIZE").is_err();
     eprintln!("Resize backend preference: {}", if allow_simd { "simd (fallback: standard)" } else { "standard (simd disabled)" });
+    // Faster pure-Rust JPEG decode (fallback: image crate). Disable with
+    // OCB_DISABLE_FASTJPEG if it ever misdecodes.
+    let allow_fastjpeg = std::env::var("OCB_DISABLE_FASTJPEG").is_err();
+    eprintln!("JPEG decode preference: {}", if allow_fastjpeg { "zune (fallback: image)" } else { "image (fastjpeg disabled)" });
 
     if args.source == "h264" {
         // Event-driven loop, fully separate from the MJPEG/test-pattern path.
@@ -1093,6 +1119,7 @@ fn main() {
     let mut source_h = 0;
     let mut last_backend: &str = "skipped";
     let mut last_rotation: u32 = 0;
+    let mut last_decode_backend: &str = "standard";
 
     loop {
         let start_time = Instant::now();
@@ -1123,41 +1150,45 @@ fn main() {
 
             if let Some(jpeg_data) = jpeg_opt {
                 let decode_start = Instant::now();
-                // TODO (perf, not a V1 blocker): the `image` crate's pure-Rust
-                // JPEG decoder is the likely PC-side bottleneck at 1080p60 (watch
-                // decode_ms_avg in the metrics line). A future optional path could
-                // decode via the `turbojpeg` crate / libjpeg-turbo (SIMD), gated
-                // behind a cargo feature so default builds and CI checks stay
-                // clean and dependency-free. Do NOT migrate now; MJPEG via `image`
-                // is the stable, portable path.
-                match image::load_from_memory(&jpeg_data) {
-                    Ok(img) => {
-                        let mut rgba = img.to_rgba8();
-                        source_w = rgba.width();
-                        source_h = rgba.height();
-
-                        // RGBA -> BGRA in place (framebuffer format is BGRA32).
-                        for pixel in rgba.pixels_mut() {
-                            let r = pixel[0];
-                            pixel[0] = pixel[2];
-                            pixel[2] = r;
+                // Decode to an RgbaImage whose bytes are BGRA (framebuffer
+                // format). Prefer the faster pure-Rust zune-jpeg decoder; fall
+                // back to the image crate on any failure (or when disabled).
+                let mut decode_backend = "zune";
+                let mut rgba_opt: Option<image::RgbaImage> =
+                    if allow_fastjpeg { fast_jpeg_decode_bgra(&jpeg_data) } else { None };
+                if rgba_opt.is_none() {
+                    decode_backend = "standard";
+                    match image::load_from_memory(&jpeg_data) {
+                        Ok(img) => {
+                            let mut rgba = img.to_rgba8();
+                            // RGBA -> BGRA in place (framebuffer format is BGRA32).
+                            for pixel in rgba.pixels_mut() {
+                                let r = pixel[0];
+                                pixel[0] = pixel[2];
+                                pixel[2] = r;
+                            }
+                            rgba_opt = Some(rgba);
                         }
-                        sum_decode_ms += decode_start.elapsed().as_millis() as u32;
-
-                        let timings = orient_resize_write(rgba, args.rotate, args.mirror, width, height, &ipc, frame_counter, allow_simd);
-                        sum_rotate_ms += timings.rotate_ms;
-                        sum_resize_ms += timings.resize_ms;
-                        sum_write_ms += timings.write_ms;
-                        last_backend = timings.resize_backend;
-                        last_rotation = timings.rotation;
-
-                        frame_counter += 1;
-                        output_fps_counter += 1;
-                        decoded_fps_counter += 1;
+                        Err(e) => set_error(&last_error, format!("JPEG decode failed: {}", e)),
                     }
-                    Err(e) => {
-                        set_error(&last_error, format!("JPEG decode failed: {}", e));
-                    }
+                }
+
+                if let Some(rgba) = rgba_opt {
+                    source_w = rgba.width();
+                    source_h = rgba.height();
+                    sum_decode_ms += decode_start.elapsed().as_millis() as u32;
+                    last_decode_backend = decode_backend;
+
+                    let timings = orient_resize_write(rgba, args.rotate, args.mirror, width, height, &ipc, frame_counter, allow_simd);
+                    sum_rotate_ms += timings.rotate_ms;
+                    sum_resize_ms += timings.resize_ms;
+                    sum_write_ms += timings.write_ms;
+                    last_backend = timings.resize_backend;
+                    last_rotation = timings.rotation;
+
+                    frame_counter += 1;
+                    output_fps_counter += 1;
+                    decoded_fps_counter += 1;
                 }
                 loop_total_ms = start_time.elapsed().as_millis() as u32;
             }
@@ -1205,11 +1236,11 @@ fn main() {
                 None => "null".to_string(),
             };
 
-            println!(r#"{{"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"dropped_jpegs":{},"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"BGRA32","resize_backend":"{}","rotation":{},"last_error":{}}}"#,
+            println!(r#"{{"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"dropped_jpegs":{},"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"BGRA32","decode_backend":"{}","resize_backend":"{}","rotation":{},"last_error":{}}}"#,
                 args.source, json_escape(&args.profile), source_w, source_h, width, height, fps,
                 http_fps, decoded_fps_normalized, written_fps_normalized, dropped_jpegs, queue_len,
                 avg_decode, avg_rotate, avg_resize, avg_write, avg_total,
-                source_bytes, mbps, last_backend, last_rotation, last_error_json
+                source_bytes, mbps, last_decode_backend, last_backend, last_rotation, last_error_json
             );
 
             last_print = Instant::now();

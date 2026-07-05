@@ -31,6 +31,14 @@ pub struct VirtualCamMetrics {
     #[serde(default)]
     pub estimated_mbps: String,
     pub pixel_format: String,
+    // Which optimized paths actually ran (defaults keep older producer builds
+    // parseable): "zune"/"standard" decode, "simd"/"standard"/"skipped" resize.
+    #[serde(default)]
+    pub decode_backend: String,
+    #[serde(default)]
+    pub resize_backend: String,
+    #[serde(default)]
+    pub rotation: u32,
     pub last_error: Option<String>,
 }
 

@@ -26,6 +26,9 @@ interface VirtualCamMetrics {
   bytes_per_sec: number;
   estimated_mbps: string;
   pixel_format: string;
+  decode_backend?: string;
+  resize_backend?: string;
+  rotation?: number;
   last_error: string | null;
 }
 
@@ -373,8 +376,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         // Android per-stage profiling (ms): YUV->NV21, rotate, JPEG encode, total.
         am ? `android[yuv=${(am.yuvMsAvg ?? 0).toFixed?.(1) ?? am.yuvMsAvg} rot=${(am.rotateMsAvg ?? 0).toFixed?.(1) ?? am.rotateMsAvg} jpeg=${(am.jpegMsAvg ?? 0).toFixed?.(1) ?? am.jpegMsAvg} enc=${(am.androidEncodeMsAvg ?? 0).toFixed?.(1) ?? am.androidEncodeMsAvg}]` : '',
         m ? `prodIn=${m.decoded_fps} prodOut=${m.written_fps}` : 'prod=off',
-        // Producer per-stage profiling (ms): decode, rotate, resize, write.
-        m ? `prod[decode=${m.decode_ms_avg} rot=${m.rotate_ms_avg} resize=${m.resize_ms_avg} write=${m.write_ms_avg}]` : '',
+        // Producer per-stage profiling (ms) + which optimized paths ran.
+        m ? `prod[decode=${m.decode_ms_avg}(${m.decode_backend ?? '?'}) rot=${m.rotate_ms_avg} resize=${m.resize_ms_avg}(${m.resize_backend ?? '?'}) write=${m.write_ms_avg}]` : '',
         m ? `mbps=${m.estimated_mbps} lat=${m.total_pipeline_ms}ms drop=${m.dropped_jpegs} q=${m.jpeg_queue_len}` : '',
         (vcamStateRef.current?.last_error || m?.last_error) ? `err=${vcamStateRef.current?.last_error || m?.last_error}` : '',
       ].filter(Boolean);
