@@ -320,6 +320,11 @@ class StreamService : LifecycleService() {
         var requiresRebind = false
         var requiresSettingsSave = false
 
+        // Record the desktop apply id (if any) so status.appliedVersion reflects
+        // that this change has been applied — the desktop uses it to know when it
+        // is safe to trust incoming status for stream-shaping fields.
+        req.applyId?.let { StreamState.appliedSettingsVersion.set(it) }
+
         AppLogger.i("System", "Settings patch received from ${source ?: "unknown"}")
 
         // --- Camera-Affecting Settings (Rebind) ---

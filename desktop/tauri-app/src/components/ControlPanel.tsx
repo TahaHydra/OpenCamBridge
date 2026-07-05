@@ -147,6 +147,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   // phone needs a beat to apply and report the new value.
   const settleUntilRef = useRef(0);
   const bumpSettle = () => { settleUntilRef.current = Date.now() + 2500; };
+  // Monotonic apply id. Each desktop settings POST carries the next value; the
+  // phone echoes the highest it has applied in status.appliedVersion. We refuse
+  // to merge stream-shaping fields from status until the phone has caught up to
+  // our latest apply — otherwise a slow CameraX rebind lets stale status snap
+  // the resolution/fps dropdowns back to the old value.
+  const localApplyVersionRef = useRef(0);
 
   const [obsPassword, setObsPassword] = useState('');
   const [obsMode, setObsMode] = useState<'browser' | 'window'>('browser');
@@ -232,31 +238,30 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       .then(res => res.json())
       .then(data => {
         const status = data.status || data;
-        // Within the settle window after a local edit, do not merge status at
-        // all — the user's just-set values are authoritative until the phone
-        // has had time to apply and report them back.
-        if (status && Date.now() >= settleUntilRef.current) {
+        if (status) {
+          // The phone has caught up to our latest apply once appliedVersion >=
+          // our local apply id. Until then, keep the user's just-selected
+          // stream-shaping values (no snapback from stale rebind status).
+          const androidCaughtUp = Number(status.appliedVersion || 0) >= localApplyVersionRef.current;
           setSettings(prev => {
             const merged: any = {
               ...prev,
-              // Display/control fields are safe to mirror on every poll so a
-              // change made on the phone shows up on the desktop within ~1s.
-              cameraId: status.cameraId ?? prev.cameraId,
+              // Display/control fields round-trip fast and are safe to mirror on
+              // every poll, so phone-side changes show on the desktop within ~1s.
               displayRotation: status.displayRotation ?? prev.displayRotation,
               aspectRatio: status.aspectRatio ?? prev.aspectRatio,
               mirror: status.mirror ?? prev.mirror,
               torchEnabled: status.torchEnabled ?? prev.torchEnabled,
               linearZoom: status.linearZoom ?? prev.linearZoom,
-              streamMode: status.streamMode ?? prev.streamMode,
               targetBandwidthMbps: status.targetBandwidthMbps ?? prev.targetBandwidthMbps,
               h264Bitrate: status.h264Bitrate ?? prev.h264Bitrate,
               h264KeyframeInterval: status.h264KeyframeInterval ?? prev.h264KeyframeInterval
             };
-            // Stream-shaping fields (resolution/fps/quality/profile) also need to
-            // reflect phone-side changes, but only when the desktop is not in the
-            // middle of applying its own change — otherwise an in-flight poll
-            // would revert the user's selection before it lands.
-            if (!isSyncingRef.current) {
+            // Stream-shaping fields (resolution/fps/quality/profile/lens/codec):
+            // only merge once the phone has applied our latest change, so an
+            // in-flight rebind can't revert the dropdowns.
+            if (androidCaughtUp) {
+              merged.cameraId = status.cameraId ?? prev.cameraId;
               merged.profile = status.profile ?? prev.profile;
               merged.width = status.width ?? prev.width;
               merged.height = status.height ?? prev.height;
@@ -264,6 +269,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
               merged.outputHeight = status.outputHeight ?? prev.outputHeight;
               merged.fps = status.fps ?? prev.fps;
               merged.jpegQuality = status.jpegQuality ?? prev.jpegQuality;
+              merged.streamMode = status.streamMode ?? prev.streamMode;
             }
             return merged;
           });
@@ -534,10 +540,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
   const postSettingsToAndroid = async (s: any) => {
+    localApplyVersionRef.current += 1;
     await apiFetch(baseUrl, '/api/settings', token, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        applyId: localApplyVersionRef.current,
         profile: s.profile,
         width: s.width,
         height: s.height,

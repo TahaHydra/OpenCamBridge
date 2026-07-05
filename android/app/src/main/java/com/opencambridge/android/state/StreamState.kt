@@ -19,6 +19,12 @@ object StreamState {
     val updatedAtMillis = AtomicLong(System.currentTimeMillis())
     val lastUpdatedBy = AtomicReference("system")
 
+    /** Highest desktop apply id that has been applied here. The desktop sends a
+     *  monotonically increasing applyId with each settings change and refuses to
+     *  merge stream-shaping status fields until it sees this catch up — so a slow
+     *  CameraX rebind can't let a stale status snap the desktop dropdowns back. */
+    val appliedSettingsVersion = AtomicLong(0L)
+
     val streaming = AtomicBoolean(false) // Deprecated, use lifecycleState
     val lifecycleState = AtomicReference(LifecycleState.STOPPED)
     val lastError = AtomicReference("")
@@ -139,6 +145,7 @@ object StreamState {
         streaming = streaming.get(),
         lifecycleState = lifecycleState.get().name,
         latestFrameRevision = latestFrameRevision.get(),
+        appliedVersion = appliedSettingsVersion.get(),
         lastError = lastError.get(),
         accessMode = accessMode.get(),
         port = port.get(),
@@ -204,6 +211,7 @@ data class StreamStatusDto(
     val streaming: Boolean,
     val lifecycleState: String,
     val latestFrameRevision: Long = 0L,
+    val appliedVersion: Long = 0L,
     val lastError: String,
     val accessMode: String,
     val port: Int,

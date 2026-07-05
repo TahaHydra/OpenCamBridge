@@ -1278,6 +1278,9 @@ private data class AspectRatioRequest(val aspectRatio: String)
 data class UpdateSettingsRequest(
     val clientRevision: Long? = null,
     val clientType: String? = null,
+    /** Monotonic desktop apply id; echoed back in status.appliedVersion so the
+     *  desktop knows when its change has been applied (anti status-snapback). */
+    val applyId: Long? = null,
     val cameraId: String? = null,
     val width: Int? = null,
     val height: Int? = null,
