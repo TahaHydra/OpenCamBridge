@@ -334,20 +334,62 @@ struct StageTimings {
     rotate_ms: u32,
     resize_ms: u32,
     write_ms: u32,
+    /// Which resize path ran: "simd", "standard", or "skipped".
+    resize_backend: &'static str,
+    /// Rotation applied to this frame (0/90/180/270), for the metrics log.
+    rotation: u32,
+}
+
+/// SIMD-accelerated BGRA resize via fast_image_resize. Returns None on any
+/// error so the caller falls back to the standard `image` resize. Resizing is
+/// per-channel, so BGRA-in-an-RgbaImage is handled correctly as U8x4.
+fn simd_resize(src: &image::RgbaImage, new_w: u32, new_h: u32) -> Option<Vec<u8>> {
+    use fast_image_resize as fr;
+    if new_w == 0 || new_h == 0 {
+        return None;
+    }
+    let src_img = fr::images::Image::from_vec_u8(
+        src.width(),
+        src.height(),
+        src.as_raw().clone(),
+        fr::PixelType::U8x4,
+    )
+    .ok()?;
+    let mut dst_img = fr::images::Image::new(new_w, new_h, fr::PixelType::U8x4);
+    let mut resizer = fr::Resizer::new();
+    resizer.resize(&src_img, &mut dst_img, None).ok()?;
+    Some(dst_img.into_vec())
+}
+
+/// Resizes `src` to new_w x new_h. Prefers the SIMD path; falls back to the
+/// standard `image` resize if SIMD is disabled, errors, or returns an
+/// unexpected buffer size (defensive: a wrong-size SIMD result must never reach
+/// the framebuffer). Returns the BGRA bytes and the backend that produced them.
+fn resize_rgba(src: &image::RgbaImage, new_w: u32, new_h: u32, allow_simd: bool) -> (Vec<u8>, &'static str) {
+    if allow_simd {
+        if let Some(out) = simd_resize(src, new_w, new_h) {
+            if out.len() == (new_w as usize) * (new_h as usize) * 4 {
+                return (out, "simd");
+            }
+        }
+    }
+    (
+        image::imageops::resize(src, new_w, new_h, image::imageops::FilterType::Triangle).into_raw(),
+        "standard",
+    )
 }
 
 /// Scales `src` to fit inside `out_w` x `out_h` while preserving its aspect
 /// ratio, centered on an opaque black canvas (BGRA). Used when a 90/270
 /// rotation leaves portrait content that would otherwise be stretched into a
 /// landscape output. No pixels are cropped; unused space becomes black bars.
-fn letterbox_into(src: &image::RgbaImage, out_w: u32, out_h: u32) -> Vec<u8> {
+fn letterbox_into(src: &image::RgbaImage, out_w: u32, out_h: u32, allow_simd: bool) -> (Vec<u8>, &'static str) {
     let sw = src.width().max(1) as f64;
     let sh = src.height().max(1) as f64;
     let scale = (out_w as f64 / sw).min(out_h as f64 / sh);
     let new_w = ((sw * scale).round() as u32).clamp(1, out_w);
     let new_h = ((sh * scale).round() as u32).clamp(1, out_h);
-    let resized = image::imageops::resize(src, new_w, new_h, image::imageops::FilterType::Triangle);
-    let resized_raw = resized.into_raw();
+    let (resized_raw, backend) = resize_rgba(src, new_w, new_h, allow_simd);
 
     let mut canvas = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
     // Opaque black background (BGRA: alpha in byte 3).
@@ -363,9 +405,10 @@ fn letterbox_into(src: &image::RgbaImage, out_w: u32, out_h: u32) -> Vec<u8> {
         let sptr = row * row_bytes;
         canvas[dst..dst + row_bytes].copy_from_slice(&resized_raw[sptr..sptr + row_bytes]);
     }
-    canvas
+    (canvas, backend)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn orient_resize_write(
     rgba: image::RgbaImage,
     rotate_arg: Option<u32>,
@@ -374,6 +417,7 @@ fn orient_resize_write(
     out_h: u32,
     ipc: &SharedMemoryIpc,
     frame_counter: u64,
+    allow_simd: bool,
 ) -> StageTimings {
     let src_w = rgba.width();
     let src_h = rgba.height();
@@ -417,9 +461,9 @@ fn orient_resize_write(
     //   image; letterboxing rotates correctly without cropping.
     let oriented_landscape = oriented.width() >= oriented.height();
     let box_landscape = out_w >= out_h;
-    let final_frame = if oriented_landscape == box_landscape {
+    let (final_frame, resize_backend) = if oriented_landscape == box_landscape {
         if oriented.width() != out_w || oriented.height() != out_h {
-            image::imageops::resize(&oriented, out_w, out_h, image::imageops::FilterType::Triangle).into_raw()
+            resize_rgba(&oriented, out_w, out_h, allow_simd)
         } else {
             // FAST PATH (the stable MJPEG/OBS case): the oriented frame already
             // matches the output box exactly, so there is nothing to scale. This
@@ -428,10 +472,10 @@ fn orient_resize_write(
             // out_w x out_h. In that situation we take a plain copy of the pixel
             // buffer: NO resample, NO letterbox canvas allocation, NO black bars.
             // Output is bit-for-bit the decoded (BGRA-swapped) frame.
-            oriented.into_raw()
+            (oriented.into_raw(), "skipped")
         }
     } else {
-        letterbox_into(&oriented, out_w, out_h)
+        letterbox_into(&oriented, out_w, out_h, allow_simd)
     };
     let resize_ms = resize_start.elapsed().as_millis() as u32;
 
@@ -439,7 +483,7 @@ fn orient_resize_write(
     ipc.write_frame(frame_counter, &final_frame, out_w, out_h);
     let write_ms = write_start.elapsed().as_millis() as u32;
 
-    StageTimings { rotate_ms, resize_ms, write_ms }
+    StageTimings { rotate_ms, resize_ms, write_ms, resize_backend, rotation }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -828,7 +872,7 @@ fn start_h264_decoder(
 /// end-to-end latency does not include waiting for the next pacing tick.
 /// Writes are still paced to the target FPS; every NAL is decoded regardless
 /// (the reference chain must stay intact even when frames are not written).
-fn run_h264(args: &Args, ipc: &SharedMemoryIpc, width: u32, height: u32, fps: u32) {
+fn run_h264(args: &Args, ipc: &SharedMemoryIpc, width: u32, height: u32, fps: u32, allow_simd: bool) {
     eprintln!("NOTE: --source h264 is experimental. Decoding uses the bundled openh264; MJPEG remains the stable path.");
 
     let url = args.url.clone().expect("URL is required for h264 source");
@@ -857,6 +901,8 @@ fn run_h264(args: &Args, ipc: &SharedMemoryIpc, width: u32, height: u32, fps: u3
     let mut sum_write_ms: u32 = 0;
     let mut source_w: u32 = 0;
     let mut source_h: u32 = 0;
+    let mut last_backend: &str = "skipped";
+    let mut last_rotation: u32 = 0;
 
     loop {
         let next_print = last_print + Duration::from_secs(1);
@@ -890,10 +936,12 @@ fn run_h264(args: &Args, ipc: &SharedMemoryIpc, width: u32, height: u32, fps: u3
             if let Some(rgba) = frame_opt {
                 source_w = rgba.width();
                 source_h = rgba.height();
-                let timings = orient_resize_write(rgba, args.rotate, args.mirror, width, height, ipc, frame_counter);
+                let timings = orient_resize_write(rgba, args.rotate, args.mirror, width, height, ipc, frame_counter, allow_simd);
                 sum_rotate_ms += timings.rotate_ms;
                 sum_resize_ms += timings.resize_ms;
                 sum_write_ms += timings.write_ms;
+                last_backend = timings.resize_backend;
+                last_rotation = timings.rotation;
                 frame_counter += 1;
                 written_counter += 1;
                 last_write = Instant::now();
@@ -934,11 +982,11 @@ fn run_h264(args: &Args, ipc: &SharedMemoryIpc, width: u32, height: u32, fps: u3
                 None => "null".to_string(),
             };
 
-            println!(r#"{{"source":"h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"dropped_jpegs":0,"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"BGRA32","last_error":{}}}"#,
+            println!(r#"{{"source":"h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"dropped_jpegs":0,"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"BGRA32","resize_backend":"{}","rotation":{},"last_error":{}}}"#,
                 json_escape(&args.profile), source_w, source_h, width, height, fps,
                 decoded_fps, written_fps, queue_len,
                 decode_ms_avg, avg_rotate, avg_resize, avg_write, avg_total,
-                source_bytes, mbps, last_error_json
+                source_bytes, mbps, last_backend, last_rotation, last_error_json
             );
 
             last_print = Instant::now();
@@ -996,9 +1044,15 @@ fn main() {
     let ipc = SharedMemoryIpc::new().expect("Failed to initialize IPC");
     eprintln!("Framebuffer backend: {}", ipc.backend_name);
 
+    // SIMD resize is on by default (with an automatic fallback to the standard
+    // resize on any error). Set OCB_DISABLE_SIMD_RESIZE=1 to force the standard
+    // path — the kill switch if a SIMD build ever produces bad output.
+    let allow_simd = std::env::var("OCB_DISABLE_SIMD_RESIZE").is_err();
+    eprintln!("Resize backend preference: {}", if allow_simd { "simd (fallback: standard)" } else { "standard (simd disabled)" });
+
     if args.source == "h264" {
         // Event-driven loop, fully separate from the MJPEG/test-pattern path.
-        run_h264(&args, &ipc, width, height, fps);
+        run_h264(&args, &ipc, width, height, fps, allow_simd);
         return;
     }
 
@@ -1037,6 +1091,8 @@ fn main() {
     let mut decoded_fps_counter = 0;
     let mut source_w = 0;
     let mut source_h = 0;
+    let mut last_backend: &str = "skipped";
+    let mut last_rotation: u32 = 0;
 
     loop {
         let start_time = Instant::now();
@@ -1088,10 +1144,12 @@ fn main() {
                         }
                         sum_decode_ms += decode_start.elapsed().as_millis() as u32;
 
-                        let timings = orient_resize_write(rgba, args.rotate, args.mirror, width, height, &ipc, frame_counter);
+                        let timings = orient_resize_write(rgba, args.rotate, args.mirror, width, height, &ipc, frame_counter, allow_simd);
                         sum_rotate_ms += timings.rotate_ms;
                         sum_resize_ms += timings.resize_ms;
                         sum_write_ms += timings.write_ms;
+                        last_backend = timings.resize_backend;
+                        last_rotation = timings.rotation;
 
                         frame_counter += 1;
                         output_fps_counter += 1;
@@ -1147,11 +1205,11 @@ fn main() {
                 None => "null".to_string(),
             };
 
-            println!(r#"{{"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"dropped_jpegs":{},"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"BGRA32","last_error":{}}}"#,
+            println!(r#"{{"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"dropped_jpegs":{},"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"BGRA32","resize_backend":"{}","rotation":{},"last_error":{}}}"#,
                 args.source, json_escape(&args.profile), source_w, source_h, width, height, fps,
                 http_fps, decoded_fps_normalized, written_fps_normalized, dropped_jpegs, queue_len,
                 avg_decode, avg_rotate, avg_resize, avg_write, avg_total,
-                source_bytes, mbps, last_error_json
+                source_bytes, mbps, last_backend, last_rotation, last_error_json
             );
 
             last_print = Instant::now();

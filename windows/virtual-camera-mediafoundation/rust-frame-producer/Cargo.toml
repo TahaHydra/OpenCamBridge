@@ -6,6 +6,11 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
 image = "0.24"
+# SIMD-accelerated resize for the 1080p portrait->landscape letterbox path
+# (the measured producer bottleneck). Pure Rust + SIMD, no C toolchain. Used
+# with a runtime fallback to image::imageops::resize, and can be disabled at
+# runtime with OCB_DISABLE_SIMD_RESIZE.
+fast_image_resize = "5"
 reqwest = { version = "0.11", features = ["blocking"] }
 # H.264 decoding for --source h264. Builds Cisco openh264 from source (needs a
 # C/C++ compiler; nasm is optional and only enables faster assembly routines).
