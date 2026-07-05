@@ -60,7 +60,10 @@ class CameraRepository(private val context: Context) {
      */
     private fun classifyLenses(cameras: List<CameraInfoDto>): List<CameraInfoDto> {
         fun focalOf(c: CameraInfoDto) = c.focalLengths.minOrNull() ?: 0f
-        val backs = cameras.filter { it.facing == "back" && focalOf(it) > 0f }.sortedBy { focalOf(it) }
+        // Monochrome sensors are excluded from the color-lens pool: their focal
+        // must not skew the "main" detection, and they must not be labeled
+        // ultrawide/telephoto.
+        val backs = cameras.filter { it.facing == "back" && !it.isMonochrome && focalOf(it) > 0f }.sortedBy { focalOf(it) }
 
         // Establish the main (1x) focal length.
         val mainFocal: Float = when {
@@ -76,8 +79,10 @@ class CameraRepository(private val context: Context) {
         }
 
         return cameras.map { cam ->
-            when (cam.facing) {
-                "back" -> {
+            when {
+                cam.facing == "back" && cam.isMonochrome ->
+                    cam.copy(label = "Back monochrome", lensType = "mono")
+                cam.facing == "back" -> {
                     val fl = focalOf(cam)
                     val (type, name) = when {
                         fl <= 0f || mainFocal <= 0f -> "" to "Back camera ${cam.id}"
@@ -88,7 +93,7 @@ class CameraRepository(private val context: Context) {
                     }
                     cam.copy(label = name, lensType = type)
                 }
-                "front" -> cam.copy(label = "Front camera ${cam.id}", lensType = "")
+                cam.facing == "front" -> cam.copy(label = "Front camera ${cam.id}", lensType = "")
                 else -> cam.copy(label = "${cam.facing.replaceFirstChar { it.uppercase() }} camera ${cam.id}", lensType = "")
             }
         }
@@ -136,6 +141,17 @@ class CameraRepository(private val context: Context) {
         // ultrawide, front) have no flash even when the main lens does. Report it
         // honestly so the UI only offers torch where it exists.
         val hasTorch = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+
+        // Monochrome / near-IR sensors (color filter arrangement MONO=5 or
+        // NIR=6, or the MONOCHROME capability) produce a grayscale image. The
+        // OnePlus 9 has one; without flagging it, the relative lens classifier
+        // can label it "ultrawide" and selecting it shows black & white.
+        val cfa = chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: -1
+        val monoByCfa = cfa == CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_MONO ||
+            cfa == CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_NIR
+        val monoByCap = (chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0))
+            .contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MONOCHROME)
+        val isMonochrome = monoByCfa || monoByCap
 
         // Honest per-resolution max FPS. The AE target-fps ranges advertise what
         // the sensor *can* do in principle, but the achievable rate at a given
@@ -207,6 +223,7 @@ class CameraRepository(private val context: Context) {
             zoomRatioMax = zoomMax,
             hasTorch = hasTorch,
             lensType = "",
+            isMonochrome = isMonochrome,
             fpsByResolution = fpsByResolution,
             supportsHighSpeed = supportsHighSpeed,
             highSpeedSizes = highSpeedSizes,

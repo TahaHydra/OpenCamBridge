@@ -15,6 +15,8 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
   const imgRef = useRef<HTMLImageElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
   const [boxSize, setBoxSize] = useState({ w: 0, h: 0 });
+  // Whether a frame has decoded since the last (re)load. Used by the watchdog.
+  const loadedRef = useRef(false);
 
   const mjpegUrl = buildUrl(baseUrl, '/stream.mjpeg', token, { ts: String(timestamp) });
 
@@ -32,10 +34,12 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
   };
 
   const handleLoad = () => {
+    loadedRef.current = true;
     setIsError(false);
   };
 
   const reloadPreview = () => {
+    loadedRef.current = false;
     setIsError(false);
     setTimestamp(Date.now());
   };
@@ -49,6 +53,19 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
       return () => clearTimeout(timer);
     }
   }, [isError]);
+
+  // Watchdog: /stream.mjpeg is multipart. When a (re)connect lands during a
+  // camera rebind, the stream is open but sends no frame yet, so the <img>
+  // fires NEITHER onload NOR onerror and the preview would sit blank forever.
+  // If no frame decodes within the timeout, force an error so the auto-retry
+  // above reconnects. Re-armed on every reload (timestamp change).
+  useEffect(() => {
+    loadedRef.current = false;
+    const t = setTimeout(() => {
+      if (!loadedRef.current) setIsError(true);
+    }, 6000);
+    return () => clearTimeout(t);
+  }, [timestamp]);
 
   useEffect(() => {
     const handleReload = () => reloadPreview();

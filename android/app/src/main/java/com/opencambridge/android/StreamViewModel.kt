@@ -281,8 +281,12 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 if (token.isNotEmpty()) {
                     conn.setRequestProperty("X-OpenCamBridge-Token", token)
                 }
-                conn.connectTimeout = 1000
-                conn.readTimeout = 1000
+                // Generous timeouts: the loopback server can be briefly busy
+                // during a camera (re)bind, especially on slower devices
+                // (e.g. LineageOS on the OnePlus 9). 1s was too short and made
+                // every button surface a spurious IOException/timeout.
+                conn.connectTimeout = 5000
+                conn.readTimeout = 5000
                 conn.outputStream.write(jsonPayload.toByteArray())
                 val code = conn.responseCode // Wait for completion
                 // Surface failed control calls instead of silently dropping them:

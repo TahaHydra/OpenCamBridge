@@ -18,9 +18,13 @@ data class CameraInfoDto(
     /** Whether this specific lens/camera has a flash unit (torch). Reported per
      *  camera so the UI can hide torch on lenses that do not support it. */
     val hasTorch: Boolean = false,
-    /** Lens kind: "wide", "ultrawide", "telephoto", or "" when unknown. Lets the
-     *  desktop prefer main/back-wide as the default (not telephoto). */
+    /** Lens kind: "wide", "ultrawide", "telephoto", "mono", or "" when unknown.
+     *  Lets the desktop prefer main/back-wide as the default (not telephoto). */
     val lensType: String = "",
+    /** True for monochrome/near-IR sensors (e.g. the OnePlus 9's mono camera),
+     *  which produce a grayscale image. Kept out of the ultrawide/main/telephoto
+     *  classification so users don't pick it thinking it's the ultrawide. */
+    val isMonochrome: Boolean = false,
     /** Honest max FPS achievable at each standard resolution for this lens,
      *  derived from the sensor's minimum frame duration. maxFps == 0 means the
      *  size is not supported (or the duration is unknown). Used to enable/disable

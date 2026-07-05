@@ -556,10 +556,13 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       if (streamImpacting && streamWasRunning) {
         await restartFullPipelineWithSettings(nextSettings);
       } else {
+        // Non-stream-impacting change (quality/mirror/rotation/bandwidth): the
+        // running MJPEG stream already reflects it live (rotation + quality are
+        // applied on the phone; mirror is a preview CSS transform driven by
+        // status). Do NOT reload the preview — a needless reconnect can land
+        // mid-frame and stall, which is what made "changing anything" break the
+        // preview.
         await postSettingsToAndroid(nextSettings);
-        if (!previewOff) {
-          window.dispatchEvent(new CustomEvent('reload-preview'));
-        }
       }
     } catch (err: any) {
       console.error('[Tauri UI] applySettingsAndRefreshPreview failed:', err);
