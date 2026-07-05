@@ -113,6 +113,14 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private val _rotationDegrees = MutableStateFlow(0)
     val rotationDegrees: StateFlow<Int> = _rotationDegrees.asStateFlow()
 
+    // Live measured FPS (frames encoded in the last 1s window).
+    private val _actualFps = MutableStateFlow(0)
+    val actualFps: StateFlow<Int> = _actualFps.asStateFlow()
+
+    // Developer mode gates noisy diagnostics in the Logs tab.
+    private val _developerMode = MutableStateFlow(false)
+    val developerMode: StateFlow<Boolean> = _developerMode.asStateFlow()
+
     init {
         viewModelScope.launch {
             _cameras.value = cameraRepo.listCameras()
@@ -143,6 +151,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 _hasTorch.value = StreamState.hasTorch.get()
                 _linearZoom.value = StreamState.linearZoom.get()
                 _rotationDegrees.value = StreamState.rotationDegrees.get()
+                _actualFps.value = StreamState.actualFps.get()
+                _developerMode.value = StreamState.developerMode.get()
                 _accessMode.value = StreamState.accessMode.get()
                 _port.value = StreamState.port.get()
                 _accessToken.value = StreamState.accessToken.get()
@@ -221,6 +231,15 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     fun regenerateToken() {
         val newToken = java.util.UUID.randomUUID().toString().replace("-", "")
         viewModelScope.launch { postLocalApiSuspend("/api/settings", """{"accessToken": "$newToken", "clientType": "phone"}""") }
+    }
+
+    fun setDeveloperMode(enabled: Boolean) {
+        // Minimal, device-local toggle: no /api/settings roundtrip needed since
+        // this only affects what the phone UI shows. Persist so it survives
+        // restarts, and reflect immediately in the StateFlow.
+        StreamState.developerMode.set(enabled)
+        _developerMode.value = enabled
+        settingsManager.save()
     }
 
     fun clearLogs() {

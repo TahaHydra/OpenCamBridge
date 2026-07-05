@@ -354,7 +354,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       const parts = [
         `${s.streamMode} ${s.width}x${s.height}@${s.fps} q${s.jpegQuality}`,
         `androidFps=${am?.actualFps ?? '?'}`,
+        // Android per-stage profiling (ms): YUV->NV21, rotate, JPEG encode, total.
+        am ? `android[yuv=${(am.yuvMsAvg ?? 0).toFixed?.(1) ?? am.yuvMsAvg} rot=${(am.rotateMsAvg ?? 0).toFixed?.(1) ?? am.rotateMsAvg} jpeg=${(am.jpegMsAvg ?? 0).toFixed?.(1) ?? am.jpegMsAvg} enc=${(am.androidEncodeMsAvg ?? 0).toFixed?.(1) ?? am.androidEncodeMsAvg}]` : '',
         m ? `prodIn=${m.decoded_fps} prodOut=${m.written_fps}` : 'prod=off',
+        // Producer per-stage profiling (ms): decode, rotate, resize, write.
+        m ? `prod[decode=${m.decode_ms_avg} rot=${m.rotate_ms_avg} resize=${m.resize_ms_avg} write=${m.write_ms_avg}]` : '',
         m ? `mbps=${m.estimated_mbps} lat=${m.total_pipeline_ms}ms drop=${m.dropped_jpegs} q=${m.jpeg_queue_len}` : '',
         (vcamStateRef.current?.last_error || m?.last_error) ? `err=${vcamStateRef.current?.last_error || m?.last_error}` : '',
       ].filter(Boolean);

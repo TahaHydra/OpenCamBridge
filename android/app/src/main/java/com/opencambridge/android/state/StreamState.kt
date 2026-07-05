@@ -23,6 +23,10 @@ object StreamState {
     val lifecycleState = AtomicReference(LifecycleState.STOPPED)
     val lastError = AtomicReference("")
 
+    // When true, noisy diagnostics (all log levels) are shown; when false,
+    // only WARN/ERROR are surfaced in the phone Logs tab.
+    val developerMode = AtomicBoolean(false)
+
 
     // Security & Network
     val accessMode = AtomicReference("usbOnly") // usbOnly, lanOpen, lanToken
@@ -46,6 +50,12 @@ object StreamState {
     val framesThisSecond = AtomicInteger(0)
     val fpsWindowStartMs = AtomicLong(System.currentTimeMillis())
     val androidEncodeMsAvg = AtomicReference(0.0)
+    // Split capture-pipeline timing (EWMA ms), so the total androidEncodeMsAvg
+    // can be attributed to its stages: YUV_420_888 -> NV21 conversion, NV21
+    // rotation (0 when no rotation), and YuvImage.compressToJpeg.
+    val yuvMsAvg = AtomicReference(0.0)
+    val jpegMsAvg = AtomicReference(0.0)
+    val rotateMsAvg = AtomicReference(0.0)
     val previewFitMode = AtomicReference("fill")
     val aspectRatio = AtomicReference("auto") // auto, 16:9, 4:3
     val zoomSpeed = AtomicReference("normal") // slow, normal, fast
@@ -178,7 +188,10 @@ object StreamState {
         resolutionPolicy = resolutionPolicy.get(),
         fallbackUsed = fallbackUsed.get(),
         mjpegClients = mjpegClientCount.get(),
-        h264Clients = h264ClientCount.get()
+        h264Clients = h264ClientCount.get(),
+        yuvMsAvg = yuvMsAvg.get(),
+        jpegMsAvg = jpegMsAvg.get(),
+        rotateMsAvg = rotateMsAvg.get()
     )
 }
 
@@ -239,5 +252,8 @@ data class StreamStatusDto(
     val resolutionPolicy: String = "unknown",
     val fallbackUsed: Boolean = false,
     val mjpegClients: Int = 0,
-    val h264Clients: Int = 0
+    val h264Clients: Int = 0,
+    val yuvMsAvg: Double = 0.0,
+    val jpegMsAvg: Double = 0.0,
+    val rotateMsAvg: Double = 0.0
 )

@@ -325,10 +325,30 @@ fun MainScreen(
                     }
                 }
                 NavTab.Security -> {
-                    SecurityTabContent(accessMode, port, accessToken, onAccessModeSelect, onPortSelect, onRegenerateToken)
+                    val developerMode by viewModel.developerMode.collectAsState()
+                    SecurityTabContent(
+                        accessMode, port, accessToken, onAccessModeSelect, onPortSelect, onRegenerateToken,
+                        developerMode = developerMode,
+                        onDeveloperModeChange = { viewModel.setDeveloperMode(it) }
+                    )
                 }
                 NavTab.Logs -> {
-                    LogsTabContent(logs, onClearLogs)
+                    val actualFps by viewModel.actualFps.collectAsState()
+                    val developerMode by viewModel.developerMode.collectAsState()
+                    LogsTabContent(
+                        logs = logs,
+                        onClearLogs = onClearLogs,
+                        cameras = cameras,
+                        selectedCameraId = selectedCameraId,
+                        width = width,
+                        height = height,
+                        fps = fps,
+                        actualFps = actualFps,
+                        jpegQuality = jpegQuality,
+                        hasTorch = hasTorch,
+                        isStreaming = isStreaming,
+                        developerMode = developerMode
+                    )
                 }
             }
         }
@@ -988,7 +1008,9 @@ fun SecurityTabContent(
     accessToken: String,
     onAccessModeSelect: (String) -> Unit,
     onPortSelect: (Int) -> Unit,
-    onRegenerateToken: () -> Unit
+    onRegenerateToken: () -> Unit,
+    developerMode: Boolean,
+    onDeveloperModeChange: (Boolean) -> Unit
 ) {
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
@@ -1069,11 +1091,55 @@ fun SecurityTabContent(
                 }
             }
         }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Developer Mode", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                        Text(
+                            "Show all log levels in the Logs tab. When off, only warnings and errors are shown.",
+                            color = Color.Gray,
+                            fontSize = 12.sp
+                        )
+                    }
+                    Switch(checked = developerMode, onCheckedChange = onDeveloperModeChange)
+                }
+            }
+        }
     }
 }
 
 @Composable
-fun LogsTabContent(logs: List<LogEntry>, onClearLogs: () -> Unit) {
+fun LogsTabContent(
+    logs: List<LogEntry>,
+    onClearLogs: () -> Unit,
+    cameras: List<CameraInfoDto>,
+    selectedCameraId: String,
+    width: Int,
+    height: Int,
+    fps: Int,
+    actualFps: Int,
+    jpegQuality: Int,
+    hasTorch: Boolean,
+    isStreaming: Boolean,
+    developerMode: Boolean
+) {
+    // Count errors/warnings across the full (unfiltered) log for the header badge.
+    val errorCount = logs.count { it.level == "ERROR" }
+    val warnCount = logs.count { it.level == "WARN" }
+
+    // In non-developer mode, only surface WARN/ERROR; developer mode shows all.
+    val visibleLogs = if (developerMode) logs else logs.filter { it.level == "ERROR" || it.level == "WARN" }
+
+    val selectedCam = cameras.find { it.id == selectedCameraId }
+    val lensLabel = selectedCam?.label ?: "Camera"
+
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             Text("System Logs", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
@@ -1082,15 +1148,65 @@ fun LogsTabContent(logs: List<LogEntry>, onClearLogs: () -> Unit) {
                 Text("Clear")
             }
         }
-        Spacer(modifier = Modifier.height(16.dp))
-        
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Compact status header so the operator can eyeball the live pipeline
+        // state without hunting through log lines.
+        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        text = if (isStreaming) "Streaming" else "Stopped",
+                        color = if (isStreaming) MaterialTheme.colorScheme.tertiary else Color.Gray,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    if (errorCount > 0 || warnCount > 0) {
+                        Text(
+                            text = buildString {
+                                if (errorCount > 0) append("$errorCount err")
+                                if (errorCount > 0 && warnCount > 0) append("  ")
+                                if (warnCount > 0) append("$warnCount warn")
+                            },
+                            color = if (errorCount > 0) MaterialTheme.colorScheme.error else Color(0xFFFBC02D),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "Lens: $lensLabel (id $selectedCameraId)",
+                    color = Color(0xFFB0B0B0),
+                    fontSize = 12.sp
+                )
+                Text(
+                    text = "Res: ${width}x${height}   FPS: $actualFps / $fps   JPEG: $jpegQuality%",
+                    color = Color(0xFFB0B0B0),
+                    fontSize = 12.sp
+                )
+                Text(
+                    text = "Torch: ${if (hasTorch) "yes" else "no"}   Dev mode: ${if (developerMode) "on" else "off"}",
+                    color = Color(0xFFB0B0B0),
+                    fontSize = 12.sp
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
         Card(modifier = Modifier.fillMaxSize(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
             val scrollState = rememberScrollState()
             Column(modifier = Modifier.fillMaxSize().padding(12.dp).verticalScroll(scrollState)) {
-                if (logs.isEmpty()) {
-                    Text("No logs.", color = Color.Gray)
+                if (visibleLogs.isEmpty()) {
+                    Text(
+                        if (developerMode) "No logs." else "No warnings or errors. Enable Developer Mode (Security tab) to see all logs.",
+                        color = Color.Gray
+                    )
                 } else {
-                    logs.forEach { log ->
+                    visibleLogs.forEach { log ->
+                        val isProblem = log.level == "ERROR" || log.level == "WARN"
                         val color = when (log.level) {
                             "ERROR" -> MaterialTheme.colorScheme.error
                             "WARN" -> Color(0xFFFBC02D)
@@ -1100,6 +1216,7 @@ fun LogsTabContent(logs: List<LogEntry>, onClearLogs: () -> Unit) {
                         Text(
                             text = "[$timeStr] ${log.level} [${log.source}]: ${log.message}",
                             color = color,
+                            fontWeight = if (isProblem) FontWeight.Bold else FontWeight.Normal,
                             fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                             fontSize = 12.sp
                         )

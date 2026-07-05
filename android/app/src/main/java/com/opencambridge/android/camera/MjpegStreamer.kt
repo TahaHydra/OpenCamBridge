@@ -272,6 +272,10 @@ class MjpegStreamer(
 
     // ---- Frame Processing ----
 
+    /** Exponential moving average (same weighting as the total encode timing). */
+    private fun ewma(prev: Double, v: Double): Double =
+        if (prev <= 0.0) v else prev * 0.85 + v * 0.15
+
     private fun processFrame(imageProxy: ImageProxy) {
         // Drop frames if we are in the middle of a rebind to prevent native crashes
         if (StreamState.rebindInProgress.get()) {
@@ -324,9 +328,13 @@ class MjpegStreamer(
             if (nv21Buffer?.size != frameSize) nv21Buffer = ByteArray(frameSize)
             val nv21 = nv21Buffer!!
 
-            yuvToNv21(imageProxy, nv21)
-
             val encodeStartNs = System.nanoTime()
+
+            // Stage A: YUV_420_888 -> NV21 conversion.
+            val yuvStartNs = System.nanoTime()
+            yuvToNv21(imageProxy, nv21)
+            val yuvMs = (System.nanoTime() - yuvStartNs) / 1_000_000.0
+            StreamState.yuvMsAvg.set(ewma(StreamState.yuvMsAvg.get(), yuvMs))
 
             // Rotate the ACTUAL streamed pixels so the video output of the phone
             // is upright no matter how the phone is physically held.
@@ -355,10 +363,16 @@ class MjpegStreamer(
             if (totalRot != 0) {
                 if (nv21RotatedBuffer?.size != frameSize) nv21RotatedBuffer = ByteArray(frameSize)
                 val dst = nv21RotatedBuffer!!
+                // Stage B: NV21 rotation (only when a rotation is applied).
+                val rotStartNs = System.nanoTime()
                 rotateNv21(nv21, dst, width, height, totalRot)
+                val rotMs = (System.nanoTime() - rotStartNs) / 1_000_000.0
+                StreamState.rotateMsAvg.set(ewma(StreamState.rotateMsAvg.get(), rotMs))
                 outBuf = dst
                 if (totalRot % 180 != 0) { outW = height; outH = width } else { outW = width; outH = height }
             } else {
+                // No rotation this frame: record 0 so the average decays toward it.
+                StreamState.rotateMsAvg.set(ewma(StreamState.rotateMsAvg.get(), 0.0))
                 outBuf = nv21
                 outW = width
                 outH = height
@@ -369,14 +383,16 @@ class MjpegStreamer(
             StreamState.resizeNeeded.set(outW != StreamState.width.get() || outH != StreamState.height.get())
 
             val quality = StreamState.jpegQuality.get()
+            // Stage C: YuvImage build + compressToJpeg.
+            val jpegStartNs = System.nanoTime()
             val yuvImage = YuvImage(outBuf, ImageFormat.NV21, outW, outH, null)
             jpegStream.reset()
             yuvImage.compressToJpeg(Rect(0, 0, outW, outH), quality, jpegStream)
+            val jpegMs = (System.nanoTime() - jpegStartNs) / 1_000_000.0
+            StreamState.jpegMsAvg.set(ewma(StreamState.jpegMsAvg.get(), jpegMs))
 
             val encodeMs = (System.nanoTime() - encodeStartNs) / 1_000_000.0
-            val prevAvg = StreamState.androidEncodeMsAvg.get()
-            val nextAvg = if (prevAvg <= 0.0) encodeMs else (prevAvg * 0.85 + encodeMs * 0.15)
-            StreamState.androidEncodeMsAvg.set(nextAvg)
+            StreamState.androidEncodeMsAvg.set(ewma(StreamState.androidEncodeMsAvg.get(), encodeMs))
 
             StreamState.latestFrame.set(jpegStream.toByteArray())
             StreamState.latestFrameRevision.incrementAndGet()

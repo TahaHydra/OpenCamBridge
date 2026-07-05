@@ -51,6 +51,7 @@ class SettingsManager(context: Context) {
 
         StreamState.mirror.set(prefs.getBoolean("mirror", false))
         StreamState.localPreviewEnabled.set(prefs.getBoolean("localPreviewEnabled", false))
+        StreamState.developerMode.set(prefs.getBoolean("developerMode", false))
     }
 
     fun save() {
@@ -75,6 +76,7 @@ class SettingsManager(context: Context) {
             putString("displayRotation", StreamState.displayRotation.get())
             putBoolean("mirror", StreamState.mirror.get())
             putBoolean("localPreviewEnabled", StreamState.localPreviewEnabled.get())
+            putBoolean("developerMode", StreamState.developerMode.get())
             apply()
         }
     }

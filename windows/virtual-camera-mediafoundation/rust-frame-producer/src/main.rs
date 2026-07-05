@@ -421,6 +421,13 @@ fn orient_resize_write(
         if oriented.width() != out_w || oriented.height() != out_h {
             image::imageops::resize(&oriented, out_w, out_h, image::imageops::FilterType::Triangle).into_raw()
         } else {
+            // FAST PATH (the stable MJPEG/OBS case): the oriented frame already
+            // matches the output box exactly, so there is nothing to scale. This
+            // is reached when rotation was 0/360 (identity, so `oriented` is the
+            // untouched decoded frame) AND the decoded dimensions already equal
+            // out_w x out_h. In that situation we take a plain copy of the pixel
+            // buffer: NO resample, NO letterbox canvas allocation, NO black bars.
+            // Output is bit-for-bit the decoded (BGRA-swapped) frame.
             oriented.into_raw()
         }
     } else {
@@ -496,6 +503,13 @@ fn start_mjpeg_reader(
 
                                             {
                                                 let mut lock = latest_jpeg.lock().unwrap();
+                                                // dropped_jpegs counts STALE frames: a fully
+                                                // received JPEG that the writer never consumed
+                                                // because a newer one arrived first (latest-only
+                                                // overwrite). This is the network/decode-can't-
+                                                // keep-up signal surfaced in the metrics line; it
+                                                // is normal when the phone sends faster than the
+                                                // PC writes, and is NOT a decode error.
                                                 if lock.is_some() {
                                                     let mut drops = dropped_jpeg_counter.lock().unwrap();
                                                     *drops += 1;
@@ -1037,6 +1051,15 @@ fn main() {
             output_fps_counter += 1;
             loop_total_ms = start_time.elapsed().as_millis() as u32;
         } else if args.source == "mjpeg" {
+            // HONEST FPS: this is latest-only. We `take()` the newest decoded
+            // JPEG and leave None behind. If no new JPEG has arrived since the
+            // last tick, `jpeg_opt` is None and we DO NOT write anything this
+            // iteration -- the previously written shared-memory frame simply
+            // stays in place (the MF virtual camera re-serves it), but we never
+            // re-copy or re-count it. Consequently written_fps / output_fps
+            // counts only DISTINCT decoded frames actually written, so it
+            // reflects real throughput and is never inflated by duplicating a
+            // frame to hit the target FPS.
             let jpeg_opt = {
                 let mut lock = latest_jpeg.lock().unwrap();
                 lock.take() // Takes the newest JPEG, leaving None (latest-only)
@@ -1044,6 +1067,13 @@ fn main() {
 
             if let Some(jpeg_data) = jpeg_opt {
                 let decode_start = Instant::now();
+                // TODO (perf, not a V1 blocker): the `image` crate's pure-Rust
+                // JPEG decoder is the likely PC-side bottleneck at 1080p60 (watch
+                // decode_ms_avg in the metrics line). A future optional path could
+                // decode via the `turbojpeg` crate / libjpeg-turbo (SIMD), gated
+                // behind a cargo feature so default builds and CI checks stay
+                // clean and dependency-free. Do NOT migrate now; MJPEG via `image`
+                // is the stable, portable path.
                 match image::load_from_memory(&jpeg_data) {
                     Ok(img) => {
                         let mut rgba = img.to_rgba8();
@@ -1134,6 +1164,10 @@ fn main() {
             sum_total_ms = 0;
         }
 
+        // WRITE PACING: this only rate-limits how often we look for and write a
+        // NEW frame; it never manufactures output. If the slot was empty above,
+        // this iteration wrote nothing, so pacing here cannot fake FPS -- it just
+        // controls the cadence at which distinct decoded frames are emitted.
         next_frame_deadline += target_duration;
 
         let now = Instant::now();
