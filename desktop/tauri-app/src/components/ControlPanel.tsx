@@ -564,17 +564,29 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       // the whole pipeline on every quality-slider step was the source of the
       // repeated producer restarts.
       const streamImpacting = ['profile', 'width', 'height', 'fps', 'cameraId', 'streamMode', 'h264KeyframeInterval'].some(k => keysChanged.includes(k));
-      const streamWasRunning = vcamState?.running || androidMetrics?.encodedWidth > 0;
 
-      if (streamImpacting && streamWasRunning) {
+      // Android streaming and the producer/virtual-camera are SEPARATE things.
+      // The producer must never be started just because Android has frames.
+      const producerRunning = !!vcamState?.running;
+      const androidStreaming =
+        androidStreamStatus === 'running' &&
+        (Number(androidMetrics?.encodedWidth || 0) > 0 ||
+          Number(androidMetrics?.fps || 0) > 0 ||
+          Number(androidMetrics?.latestFrameRevision || 0) > 0);
+
+      if (streamImpacting && producerRunning) {
+        // Producer is feeding OBS: a resolution/fps/lens/codec change needs both
+        // the Android stream AND the producer restarted.
         await restartFullPipelineWithSettings(nextSettings);
+      } else if (streamImpacting && androidStreaming) {
+        // Only the phone stream/preview is live (producer OFF). Rebind Android
+        // alone — do NOT start the producer. Preview reconnects itself when
+        // frames resume (metrics-based recovery in Preview).
+        await restartAndroidStreamWithSettings(nextSettings);
       } else {
-        // Non-stream-impacting change (quality/mirror/rotation/bandwidth): the
-        // running MJPEG stream already reflects it live (rotation + quality are
-        // applied on the phone; mirror is a preview CSS transform driven by
-        // status). Do NOT reload the preview — a needless reconnect can land
-        // mid-frame and stall, which is what made "changing anything" break the
-        // preview.
+        // Non-stream-impacting change (quality/mirror/rotation/bandwidth), or
+        // nothing is live. The running MJPEG already reflects quality/rotation
+        // live and mirror is a preview transform, so do NOT reload the preview.
         await postSettingsToAndroid(nextSettings);
       }
     } catch (err: any) {

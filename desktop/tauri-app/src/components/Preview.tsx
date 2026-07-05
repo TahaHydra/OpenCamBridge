@@ -44,34 +44,57 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
     setTimestamp(Date.now());
   };
 
-  // Auto-retry every 3 seconds if error
-  useEffect(() => {
-    if (isError) {
-      const timer = setTimeout(() => {
-        reloadPreview();
-      }, 3000);
-      return () => clearTimeout(timer);
-    }
-  }, [isError]);
+  const lifecycle: string = serverStatus?.lifecycleState || 'UNKNOWN';
+  const frameRev: number = Number(serverStatus?.latestFrameRevision || 0);
+  const lastRevRef = useRef(0);
+  const staleSinceRef = useRef(0);
+  const lastReloadRef = useRef(0);
 
-  // Watchdog: /stream.mjpeg is multipart. When a (re)connect lands during a
-  // camera rebind, the stream is open but sends no frame yet, so the <img>
-  // fires NEITHER onload NOR onerror and the preview would sit blank forever.
-  // If no frame decodes within the timeout, force an error so the auto-retry
-  // above reconnects. Re-armed on every reload (timestamp change).
+  // Metrics-based recovery. /stream.mjpeg is multipart, so onLoad/onError are
+  // unreliable during a rebind (the socket opens but no complete frame arrives).
+  // Drive recovery from the phone's frame counter + lifecycle instead:
+  //  - frame counter advanced while we were blank -> reconnect once,
+  //  - lifecycle STREAMING but no fresh frame for a while -> reconnect (backoff),
+  //  - lifecycle stopped/error/offline -> show a message, do NOT spam reconnect.
   useEffect(() => {
-    loadedRef.current = false;
-    const t = setTimeout(() => {
-      if (!loadedRef.current) setIsError(true);
-    }, 6000);
-    return () => clearTimeout(t);
-  }, [timestamp]);
+    const now = Date.now();
+    if (frameRev > lastRevRef.current) {
+      lastRevRef.current = frameRev;
+      staleSinceRef.current = 0;
+      if (isError) reloadPreview(); // frames resumed after a blank/rebind
+      return;
+    }
+    if (lifecycle === 'STREAMING') {
+      if (staleSinceRef.current === 0) staleSinceRef.current = now;
+      // No new frame for >5s while "streaming" -> reconnect, at most once per
+      // 5s so we never spam.
+      if (now - staleSinceRef.current > 5000 && now - lastReloadRef.current > 5000) {
+        lastReloadRef.current = now;
+        reloadPreview();
+      }
+    } else {
+      staleSinceRef.current = 0; // not streaming; nothing to wait for
+    }
+  }, [frameRev, lifecycle, isError]);
 
   useEffect(() => {
     const handleReload = () => reloadPreview();
     window.addEventListener('reload-preview', handleReload);
     return () => window.removeEventListener('reload-preview', handleReload);
   }, []);
+
+  // Human-readable state for the overlay.
+  const rebinding = lifecycle === 'STARTING' || lifecycle === 'REBINDING';
+  const stopped = lifecycle === 'STOPPED' || lifecycle === 'STOPPING';
+  const offline = lifecycle === 'OFFLINE' || lifecycle === 'UNKNOWN';
+  const cameraError = lifecycle === 'ERROR';
+  const statusMsg = offline ? 'Android server unreachable'
+    : cameraError ? 'Camera error — check the phone Logs tab'
+    : stopped ? 'Camera stopped'
+    : rebinding ? 'Rebinding… waiting for camera'
+    : 'Waiting for camera frames…';
+  // Overlay only when we are NOT showing live frames.
+  const showOverlay = isError || rebinding || stopped || offline || cameraError;
 
   const layout = serverStatus?.aspectRatio || 'auto';
   const mirror = serverStatus?.mirror || false;
@@ -121,17 +144,19 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
           />
         </div>
 
-        {isError && (
+        {showOverlay && (
           <div className="preview-overlay">
-            <CameraOff size={48} opacity={0.5} />
-            <div>Stream Offline</div>
-            <button className="btn btn-secondary" onClick={reloadPreview}>
-              <RefreshCw size={16} /> Retry Now
-            </button>
+            {rebinding ? <RefreshCw size={48} opacity={0.6} className="animate-spin" /> : <CameraOff size={48} opacity={0.5} />}
+            <div>{statusMsg}</div>
+            {!rebinding && (
+              <button className="btn btn-secondary" onClick={reloadPreview}>
+                <RefreshCw size={16} /> Retry Now
+              </button>
+            )}
           </div>
         )}
 
-        {!isError && (
+        {!showOverlay && (
           <button
             className="btn btn-secondary"
             style={{ position: 'absolute', top: 16, right: 16, padding: '6px 12px', fontSize: '0.8rem', background: 'rgba(0,0,0,0.5)' }}
