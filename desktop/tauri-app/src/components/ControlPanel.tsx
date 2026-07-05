@@ -724,14 +724,30 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   };
 
   const restartFullPipelineWithSettings = async (s: any) => {
-    console.log('[Tauri UI] Restarting full pipeline:', s);
+    // This path is only taken when the producer was actually running (see
+    // applySettingsAndRefreshPreview using vcamState.running), so it MUST end
+    // with the producer running again. Verify it and surface a real error if not
+    // — a settings change must never silently leave OBS with prod=off.
+    addDiag('pipeline', 'full restart: producerWasRunning=true');
+    try { await invoke('stop_virtual_camera_feeder'); addDiag('pipeline', 'stopProducer ok'); }
+    catch (e: any) { addDiag('pipeline', `stopProducer fail: ${e}`); }
 
-    await invoke('stop_virtual_camera_feeder');
-    await restartAndroidStreamWithSettings(s);
+    try { await restartAndroidStreamWithSettings(s); addDiag('pipeline', 'androidRebind ok'); }
+    catch (e: any) { addDiag('pipeline', `androidRebind fail: ${e}`); }
+
     await handleStartProducer(s);
-
-    const state = await invoke<VirtualCamState>('get_virtual_camera_status');
+    let state = await invoke<VirtualCamState>('get_virtual_camera_status');
+    if (!state.running) {
+      addDiag('pipeline', 'producer not running after start — retrying once');
+      await sleep(600);
+      await handleStartProducer(s);
+      state = await invoke<VirtualCamState>('get_virtual_camera_status');
+    }
     setVcamState(state);
+    addDiag('pipeline', `finalProducerRunning=${!!state.running}`);
+    if (!state.running) {
+      setVcamMessage('Producer failed to restart — OBS is not receiving frames. See Logs.');
+    }
 
     fetchStatus();
 

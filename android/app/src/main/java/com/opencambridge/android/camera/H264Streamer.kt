@@ -873,5 +873,6 @@ class H264Streamer(
         // is slow or does not emit OFF on some devices.
         StreamState.torchEnabled.set(enabled)
         currentCamera?.cameraControl?.enableTorch(enabled)
+        com.opencambridge.android.state.AppLogger.i("Torch", "set torchEnabled=$enabled")
     }
 }

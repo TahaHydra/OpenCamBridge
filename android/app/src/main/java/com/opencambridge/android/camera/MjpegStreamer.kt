@@ -280,6 +280,7 @@ class MjpegStreamer(
         // it fires, confirms the same value.
         StreamState.torchEnabled.set(enabled)
         currentCamera?.cameraControl?.enableTorch(enabled)
+        com.opencambridge.android.state.AppLogger.i("Torch", "set torchEnabled=$enabled (torchState now reported to /api/camera/status)")
     }
 
     // ---- Frame Processing ----
