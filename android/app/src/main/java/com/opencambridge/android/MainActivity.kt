@@ -145,6 +145,11 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+
+        // Development and cable-reconnect launches must bring the foreground
+        // service back without requiring a tap on the phone. If permissions
+        // are not granted yet this uses the normal permission launcher.
+        requestPermissionsAndStart()
     }
 
     private fun requestPermissionsAndStart() {

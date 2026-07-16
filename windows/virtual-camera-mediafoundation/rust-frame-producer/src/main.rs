@@ -1,22 +1,31 @@
 use clap::Parser;
-use std::ffi::c_void;
-use std::ptr::{null_mut, copy_nonoverlapping};
-use std::time::{Instant, Duration};
-use std::thread::{sleep, spawn};
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{sync_channel, SyncSender};
-use std::io::Read;
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
-mod ocb2;
+use std::ffi::c_void;
+use std::io::Read;
+use std::ptr::{copy_nonoverlapping, null_mut};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread::{sleep, spawn};
+use std::time::{Duration, Instant};
 mod mf_decoder;
+mod ocb2;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows::Win32::Security::{SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION};
-use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
-use windows::Win32::System::Memory::{CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{
+    SetKernelObjectSecurity, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, WRITE_DAC,
+};
+use windows::Win32::System::Memory::{
+    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
+};
 use windows::Win32::System::Performance::QueryPerformanceCounter;
-use windows::Win32::Storage::FileSystem::{CreateFileW, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC};
 
 const OCBR_MAGIC: u32 = 0x5242434F; // "OCBR"
 const RING_VERSION: u16 = 2;
@@ -118,9 +127,9 @@ struct SharedMemoryIpc {
 /// scope the framebuffer ACL to the current user instead of broad groups.
 fn current_user_sid() -> Option<String> {
     use windows::core::PWSTR;
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
-    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     unsafe {
@@ -133,7 +142,13 @@ fn current_user_sid() -> Option<String> {
             return None;
         }
         let mut buf = vec![0u8; len as usize];
-        let info = GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr() as *mut c_void), len, &mut len);
+        let info = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            len,
+            &mut len,
+        );
         let _ = CloseHandle(token);
         info.ok()?;
         let user = &*(buf.as_ptr() as *const TOKEN_USER);
@@ -162,9 +177,19 @@ impl SharedMemoryIpc {
                 }
             };
             eprintln!("Framebuffer SDDL: {}", sddl_string);
-            let sddl: Vec<u16> = sddl_string.encode_utf16().chain(std::iter::once(0)).collect();
+            let sddl: Vec<u16> = sddl_string
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
 
-            if ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), SDDL_REVISION_1, &mut p_sd, None).is_err() {
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut p_sd,
+                None,
+            )
+            .is_err()
+            {
                 return Err("Failed to create preferred security descriptor".into());
             }
 
@@ -176,11 +201,15 @@ impl SharedMemoryIpc {
 
             let _ = std::fs::create_dir_all("C:\\ProgramData\\OpenCamBridge");
 
-            let path: Vec<u16> = "C:\\ProgramData\\OpenCamBridge\\framebuffer.bin\0".encode_utf16().collect();
+            let path: Vec<u16> = "C:\\ProgramData\\OpenCamBridge\\framebuffer.bin\0"
+                .encode_utf16()
+                .collect();
             let h_file = CreateFileW(
                 PCWSTR(path.as_ptr()),
-                (windows::Win32::Storage::FileSystem::FILE_GENERIC_READ |
-                    windows::Win32::Storage::FileSystem::FILE_GENERIC_WRITE | WRITE_DAC).0,
+                (windows::Win32::Storage::FileSystem::FILE_GENERIC_READ
+                    | windows::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
+                    | WRITE_DAC)
+                    .0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 Some(&sa),
                 OPEN_ALWAYS,
@@ -190,7 +219,13 @@ impl SharedMemoryIpc {
 
             if let Ok(h_file) = h_file {
                 if !h_file.is_invalid() {
-                    if SetKernelObjectSecurity(h_file, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, p_sd).is_err() {
+                    if SetKernelObjectSecurity(
+                        h_file,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        p_sd,
+                    )
+                    .is_err()
+                    {
                         let _ = CloseHandle(h_file);
                         return Err("Could not restrict the existing frame-ring file ACL".into());
                     }
@@ -208,9 +243,11 @@ impl SharedMemoryIpc {
                             let p_map = MapViewOfFile(h_map_val, FILE_MAP_ALL_ACCESS, 0, 0, 0);
                             if !p_map.Value.is_null() {
                                 return Ok(Self {
-                                    h_file, h_map: h_map_val,
+                                    h_file,
+                                    h_map: h_map_val,
                                     p_map: p_map.Value,
-                                    backend_name: "C:\\ProgramData\\OpenCamBridge\\framebuffer.bin".to_string(),
+                                    backend_name: "C:\\ProgramData\\OpenCamBridge\\framebuffer.bin"
+                                        .to_string(),
                                 });
                             }
                             let _ = CloseHandle(h_map_val);
@@ -224,14 +261,31 @@ impl SharedMemoryIpc {
             // but cannot be opened/resecured/mapped, using a different named
             // ring would leave the consumer reading stale data.
             if std::path::Path::new("C:\\ProgramData\\OpenCamBridge\\framebuffer.bin").exists() {
-                return Err("The existing frame-ring file could not be opened and secured for this user".into());
+                return Err(
+                    "The existing frame-ring file could not be opened and secured for this user"
+                        .into(),
+                );
             }
 
-            let name_buffer: Vec<u16> = "Global\\OpenCamBridgeFrameBuffer\0".encode_utf16().collect();
+            let name_buffer: Vec<u16> = "Global\\OpenCamBridgeFrameBuffer\0"
+                .encode_utf16()
+                .collect();
             let h_map = CreateFileMappingW(
-                INVALID_HANDLE_VALUE, Some(&sa), PAGE_READWRITE, 0, MAX_SHM_SIZE, PCWSTR(name_buffer.as_ptr()),
-            ).map_err(|e| format!("CreateFileMappingW failed: {}", e))?;
-            if SetKernelObjectSecurity(h_map, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, p_sd).is_err() {
+                INVALID_HANDLE_VALUE,
+                Some(&sa),
+                PAGE_READWRITE,
+                0,
+                MAX_SHM_SIZE,
+                PCWSTR(name_buffer.as_ptr()),
+            )
+            .map_err(|e| format!("CreateFileMappingW failed: {}", e))?;
+            if SetKernelObjectSecurity(
+                h_map,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                p_sd,
+            )
+            .is_err()
+            {
                 let _ = CloseHandle(h_map);
                 return Err("Could not restrict the named frame-ring ACL".into());
             }
@@ -244,15 +298,23 @@ impl SharedMemoryIpc {
 
             std::ptr::write_bytes(p_map.Value as *mut u8, 0, MAX_SHM_SIZE as usize);
 
-            Ok(Self { h_file: HANDLE(0), h_map, p_map: p_map.Value, backend_name: "Global\\OpenCamBridgeFrameBuffer".to_string() })
+            Ok(Self {
+                h_file: HANDLE(0),
+                h_map,
+                p_map: p_map.Value,
+                backend_name: "Global\\OpenCamBridgeFrameBuffer".to_string(),
+            })
         }
     }
 
     fn initialize_ring_if_needed(&self) {
         unsafe {
             let header = self.p_map as *mut OpenCamBridgeRingHeader;
-            if (*header).magic == OCBR_MAGIC && (*header).version == RING_VERSION &&
-                (*header).header_size as usize == RING_HEADER_SIZE && (*header).slot_size as usize == SLOT_SIZE {
+            if (*header).magic == OCBR_MAGIC
+                && (*header).version == RING_VERSION
+                && (*header).header_size as usize == RING_HEADER_SIZE
+                && (*header).slot_size as usize == SLOT_SIZE
+            {
                 return;
             }
             std::ptr::write_bytes(self.p_map as *mut u8, 0, MAX_SHM_SIZE as usize);
@@ -263,10 +325,18 @@ impl SharedMemoryIpc {
             (*header).slot_size = SLOT_SIZE as u32;
             (*header).max_width = 1920;
             (*header).max_height = 1080;
-            (*header).consumer_width.store(1920, std::sync::atomic::Ordering::Relaxed);
-            (*header).consumer_height.store(1080, std::sync::atomic::Ordering::Relaxed);
-            (*header).consumer_fps_num.store(60, std::sync::atomic::Ordering::Relaxed);
-            (*header).consumer_fps_den.store(1, std::sync::atomic::Ordering::Relaxed);
+            (*header)
+                .consumer_width
+                .store(1920, std::sync::atomic::Ordering::Relaxed);
+            (*header)
+                .consumer_height
+                .store(1080, std::sync::atomic::Ordering::Relaxed);
+            (*header)
+                .consumer_fps_num
+                .store(60, std::sync::atomic::Ordering::Relaxed);
+            (*header)
+                .consumer_fps_den
+                .store(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -284,15 +354,26 @@ impl SharedMemoryIpc {
         flags: u32,
         data: &[u8],
     ) -> bool {
-        let Some(payload_size) = validate_nv12_metadata(width, height, y_stride, uv_stride, data.len()) else {
-            eprintln!("NV12 ring write rejected: invalid {}x{} strides {}/{} size {}", width, height, y_stride, uv_stride, data.len());
+        let Some(payload_size) =
+            validate_nv12_metadata(width, height, y_stride, uv_stride, data.len())
+        else {
+            eprintln!(
+                "NV12 ring write rejected: invalid {}x{} strides {}/{} size {}",
+                width,
+                height,
+                y_stride,
+                uv_stride,
+                data.len()
+            );
             return false;
         };
         self.initialize_ring_if_needed();
 
         unsafe {
             let ring = &*(self.p_map as *const OpenCamBridgeRingHeader);
-            let current = ring.published_slot.load(std::sync::atomic::Ordering::Acquire) as usize;
+            let current = ring
+                .published_slot
+                .load(std::sync::atomic::Ordering::Acquire) as usize;
             let slot_index = (current + 1) % SLOT_COUNT;
             let slot_base = (self.p_map as *mut u8).add(RING_HEADER_SIZE + slot_index * SLOT_SIZE);
             let slot = slot_base as *mut OpenCamBridgeSlotHeader;
@@ -310,16 +391,20 @@ impl SharedMemoryIpc {
             (*slot).pixel_format = FORMAT_NV12;
             (*slot).payload_size = payload_size as u32;
             (*slot).flags = flags;
-            (*slot).data_offset = (RING_HEADER_SIZE + slot_index * SLOT_SIZE + SLOT_HEADER_SIZE) as u32;
+            (*slot).data_offset =
+                (RING_HEADER_SIZE + slot_index * SLOT_SIZE + SLOT_HEADER_SIZE) as u32;
             copy_nonoverlapping(data.as_ptr(), slot_base.add(SLOT_HEADER_SIZE), payload_size);
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             std::ptr::write_volatile(&mut (*slot).committed_epoch, epoch);
 
             let mut qpc = 0i64;
             let _ = QueryPerformanceCounter(&mut qpc);
-            ring.producer_heartbeat_qpc.store(qpc as u64, std::sync::atomic::Ordering::Release);
-            ring.published_slot.store(slot_index as u32, std::sync::atomic::Ordering::Release);
-            ring.published_sequence.store(sequence, std::sync::atomic::Ordering::Release);
+            ring.producer_heartbeat_qpc
+                .store(qpc as u64, std::sync::atomic::Ordering::Release);
+            ring.published_slot
+                .store(slot_index as u32, std::sync::atomic::Ordering::Release);
+            ring.published_sequence
+                .store(sequence, std::sync::atomic::Ordering::Release);
         }
         true
     }
@@ -328,7 +413,9 @@ impl SharedMemoryIpc {
     /// same NV12 ring consumed by the virtual camera. H.264 never calls this.
     fn write_frame(&self, frame_counter: u64, bgra: &[u8], width: u32, height: u32) {
         let needed = width as usize * height as usize * 4;
-        if bgra.len() < needed || width % 2 != 0 || height % 2 != 0 { return; }
+        if bgra.len() < needed || width % 2 != 0 || height % 2 != 0 {
+            return;
+        }
         thread_local! { static NV12_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) }; }
         NV12_SCRATCH.with(|scratch| {
             let mut nv12 = scratch.borrow_mut();
@@ -336,7 +423,18 @@ impl SharedMemoryIpc {
             nv12.resize(nv12_len, 0);
             bgra_to_nv12(bgra, width, height, &mut nv12);
             let now = monotonic_ns();
-            let _ = self.write_nv12_frame(frame_counter, now, now, now, width, height, width, width, 0, &nv12);
+            let _ = self.write_nv12_frame(
+                frame_counter,
+                now,
+                now,
+                now,
+                width,
+                height,
+                width,
+                width,
+                0,
+                &nv12,
+            );
         });
     }
 
@@ -345,8 +443,10 @@ impl SharedMemoryIpc {
         unsafe {
             let ring = &*(self.p_map as *const OpenCamBridgeRingHeader);
             (
-                ring.virtual_camera_unique_frames.load(std::sync::atomic::Ordering::Acquire),
-                ring.repeated_virtual_camera_samples.load(std::sync::atomic::Ordering::Acquire),
+                ring.virtual_camera_unique_frames
+                    .load(std::sync::atomic::Ordering::Acquire),
+                ring.repeated_virtual_camera_samples
+                    .load(std::sync::atomic::Ordering::Acquire),
             )
         }
     }
@@ -355,30 +455,65 @@ impl SharedMemoryIpc {
         self.initialize_ring_if_needed();
         unsafe {
             let ring = &*(self.p_map as *const OpenCamBridgeRingHeader);
-            let width = ring.consumer_width.load(std::sync::atomic::Ordering::Acquire);
-            let height = ring.consumer_height.load(std::sync::atomic::Ordering::Acquire);
-            let numerator = ring.consumer_fps_num.load(std::sync::atomic::Ordering::Acquire);
-            let denominator = ring.consumer_fps_den.load(std::sync::atomic::Ordering::Acquire).max(1);
+            let width = ring
+                .consumer_width
+                .load(std::sync::atomic::Ordering::Acquire);
+            let height = ring
+                .consumer_height
+                .load(std::sync::atomic::Ordering::Acquire);
+            let numerator = ring
+                .consumer_fps_num
+                .load(std::sync::atomic::Ordering::Acquire);
+            let denominator = ring
+                .consumer_fps_den
+                .load(std::sync::atomic::Ordering::Acquire)
+                .max(1);
             (width, height, numerator / denominator)
         }
     }
 }
 
-fn validate_nv12_metadata(width: u32, height: u32, y_stride: u32, uv_stride: u32, available: usize) -> Option<usize> {
-    if width == 0 || height == 0 || width > 1920 || height > 1080 || width % 2 != 0 || height % 2 != 0 { return None; }
-    if y_stride < width || uv_stride < width || y_stride > 8192 || uv_stride > 8192 { return None; }
+fn validate_nv12_metadata(
+    width: u32,
+    height: u32,
+    y_stride: u32,
+    uv_stride: u32,
+    available: usize,
+) -> Option<usize> {
+    if width == 0
+        || height == 0
+        || width > 1920
+        || height > 1080
+        || width % 2 != 0
+        || height % 2 != 0
+    {
+        return None;
+    }
+    if y_stride < width || uv_stride < width || y_stride > 8192 || uv_stride > 8192 {
+        return None;
+    }
     let y = (y_stride as usize).checked_mul(height as usize)?;
     let uv = (uv_stride as usize).checked_mul((height / 2) as usize)?;
     let total = y.checked_add(uv)?;
-    if total > MAX_NV12_SIZE || total > available { None } else { Some(total) }
+    if total > MAX_NV12_SIZE || total > available {
+        None
+    } else {
+        Some(total)
+    }
 }
 
 fn monotonic_ns() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_nanos().min(u64::MAX as u128) as u64
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
 }
 
-fn clamp_u8(value: i32) -> u8 { value.clamp(0, 255) as u8 }
+fn clamp_u8(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
 
 fn bgra_to_nv12(src: &[u8], width: u32, height: u32, dst: &mut [u8]) {
     let w = width as usize;
@@ -386,19 +521,29 @@ fn bgra_to_nv12(src: &[u8], width: u32, height: u32, dst: &mut [u8]) {
     for y in 0..h {
         for x in 0..w {
             let p = (y * w + x) * 4;
-            let b = src[p] as i32; let g = src[p + 1] as i32; let r = src[p + 2] as i32;
+            let b = src[p] as i32;
+            let g = src[p + 1] as i32;
+            let r = src[p + 2] as i32;
             dst[y * w + x] = clamp_u8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
         }
     }
     let uv_base = w * h;
     for y in (0..h).step_by(2) {
         for x in (0..w).step_by(2) {
-            let mut r = 0i32; let mut g = 0i32; let mut b = 0i32;
-            for dy in 0..2 { for dx in 0..2 {
-                let p = ((y + dy) * w + x + dx) * 4;
-                b += src[p] as i32; g += src[p + 1] as i32; r += src[p + 2] as i32;
-            }}
-            r /= 4; g /= 4; b /= 4;
+            let mut r = 0i32;
+            let mut g = 0i32;
+            let mut b = 0i32;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let p = ((y + dy) * w + x + dx) * 4;
+                    b += src[p] as i32;
+                    g += src[p + 1] as i32;
+                    r += src[p + 2] as i32;
+                }
+            }
+            r /= 4;
+            g /= 4;
+            b /= 4;
             let uv = uv_base + (y / 2) * w + x;
             dst[uv] = clamp_u8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
             dst[uv + 1] = clamp_u8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
@@ -412,38 +557,72 @@ mod ring_tests {
 
     #[test]
     fn ring_struct_sizes_are_stable_for_cpp_consumer() {
-        assert_eq!(std::mem::size_of::<OpenCamBridgeRingHeader>(), RING_HEADER_SIZE);
-        assert_eq!(std::mem::size_of::<OpenCamBridgeSlotHeader>(), SLOT_HEADER_SIZE);
+        assert_eq!(
+            std::mem::size_of::<OpenCamBridgeRingHeader>(),
+            RING_HEADER_SIZE
+        );
+        assert_eq!(
+            std::mem::size_of::<OpenCamBridgeSlotHeader>(),
+            SLOT_HEADER_SIZE
+        );
     }
 
     #[test]
     fn ring_buffer_bounds_and_invalid_metadata() {
-        assert_eq!(validate_nv12_metadata(1920, 1080, 1920, 1920, MAX_NV12_SIZE), Some(MAX_NV12_SIZE));
-        assert_eq!(validate_nv12_metadata(1921, 1080, 1921, 1921, usize::MAX), None);
-        assert_eq!(validate_nv12_metadata(1280, 720, 1279, 1280, usize::MAX), None);
-        assert_eq!(validate_nv12_metadata(1280, 721, 1280, 1280, usize::MAX), None);
+        assert_eq!(
+            validate_nv12_metadata(1920, 1080, 1920, 1920, MAX_NV12_SIZE),
+            Some(MAX_NV12_SIZE)
+        );
+        assert_eq!(
+            validate_nv12_metadata(1921, 1080, 1921, 1921, usize::MAX),
+            None
+        );
+        assert_eq!(
+            validate_nv12_metadata(1280, 720, 1279, 1280, usize::MAX),
+            None
+        );
+        assert_eq!(
+            validate_nv12_metadata(1280, 721, 1280, 1280, usize::MAX),
+            None
+        );
         assert_eq!(validate_nv12_metadata(1280, 720, 1280, 1280, 16), None);
-        assert_eq!(validate_nv12_metadata(u32::MAX, u32::MAX, u32::MAX, u32::MAX, usize::MAX), None);
+        assert_eq!(
+            validate_nv12_metadata(u32::MAX, u32::MAX, u32::MAX, u32::MAX, usize::MAX),
+            None
+        );
     }
 
     #[derive(Default)]
-    struct UniqueRepeatCounter { last: Option<u64>, unique: u64, repeated: u64 }
+    struct UniqueRepeatCounter {
+        last: Option<u64>,
+        unique: u64,
+        repeated: u64,
+    }
     impl UniqueRepeatCounter {
         fn observe(&mut self, sequence: u64) {
-            if self.last == Some(sequence) { self.repeated += 1; } else { self.unique += 1; self.last = Some(sequence); }
+            if self.last == Some(sequence) {
+                self.repeated += 1;
+            } else {
+                self.unique += 1;
+                self.last = Some(sequence);
+            }
         }
     }
 
     #[test]
     fn unique_frames_are_not_inflated_by_repeated_samples() {
         let mut counter = UniqueRepeatCounter::default();
-        for sequence in [1, 1, 1, 2, 2, 3] { counter.observe(sequence); }
+        for sequence in [1, 1, 1, 2, 2, 3] {
+            counter.observe(sequence);
+        }
         assert_eq!((counter.unique, counter.repeated), (3, 3));
     }
 
     #[test]
     fn media_foundation_pacing_is_exact_at_30_and_60_fps() {
-        fn duration_100ns(fps: u32) -> i64 { 10_000_000 / fps as i64 }
+        fn duration_100ns(fps: u32) -> i64 {
+            10_000_000 / fps as i64
+        }
         assert_eq!(duration_100ns(30), 333_333);
         assert_eq!(duration_100ns(60), 166_666);
         assert!(duration_100ns(30) > duration_100ns(60));
@@ -456,7 +635,10 @@ impl Drop for SharedMemoryIpc {
     fn drop(&mut self) {
         unsafe {
             if !self.p_map.is_null() {
-                let _ = UnmapViewOfFile(windows::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: self.p_map });
+                let _ =
+                    UnmapViewOfFile(windows::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: self.p_map,
+                    });
             }
             if !self.h_map.is_invalid() && self.h_map.0 != 0 {
                 let _ = CloseHandle(self.h_map);
@@ -487,20 +669,28 @@ fn generate_test_pattern(frame_counter: u64, width: u32, height: u32) -> Vec<u8>
     for y in 0..height {
         // BGRA channel values for this row's base colour.
         let (mut b, mut g, mut r) = if y < band {
-            (0u8, 0u8, 220u8)          // top: RED
+            (0u8, 0u8, 220u8) // top: RED
         } else if y >= height - band {
-            (220u8, 0u8, 0u8)          // bottom: BLUE
+            (220u8, 0u8, 0u8) // bottom: BLUE
         } else {
-            (40u8, 40u8, 40u8)         // middle: dark gray
+            (40u8, 40u8, 40u8) // middle: dark gray
         };
-        if y == scan { b = 255; g = 255; r = 255; } // white scanline
+        if y == scan {
+            b = 255;
+            g = 255;
+            r = 255;
+        } // white scanline
 
         for x in 0..width {
             let index = ((y * width * 4) + (x * 4)) as usize;
             if y < marker && x < marker {
-                buf[index] = 0; buf[index + 1] = 220; buf[index + 2] = 0; // GREEN top-left
+                buf[index] = 0;
+                buf[index + 1] = 220;
+                buf[index + 2] = 0; // GREEN top-left
             } else {
-                buf[index] = b; buf[index + 1] = g; buf[index + 2] = r;
+                buf[index] = b;
+                buf[index + 1] = g;
+                buf[index + 2] = r;
             }
             buf[index + 3] = 255;
         }
@@ -576,13 +766,9 @@ fn simd_resize(src: &image::RgbaImage, new_w: u32, new_h: u32) -> Option<Vec<u8>
         return None;
     }
     // Borrow the source pixels directly (avoids a full-frame copy per frame).
-    let src_img = fr::images::ImageRef::new(
-        src.width(),
-        src.height(),
-        src.as_raw(),
-        fr::PixelType::U8x4,
-    )
-    .ok()?;
+    let src_img =
+        fr::images::ImageRef::new(src.width(), src.height(), src.as_raw(), fr::PixelType::U8x4)
+            .ok()?;
     let mut dst_img = fr::images::Image::new(new_w, new_h, fr::PixelType::U8x4);
     // A Resizer caches internal conversion buffers, so keep one per thread
     // instead of rebuilding it every frame.
@@ -590,7 +776,9 @@ fn simd_resize(src: &image::RgbaImage, new_w: u32, new_h: u32) -> Option<Vec<u8>
         static RESIZER: std::cell::RefCell<fast_image_resize::Resizer> =
             std::cell::RefCell::new(fast_image_resize::Resizer::new());
     }
-    RESIZER.with(|r| r.borrow_mut().resize(&src_img, &mut dst_img, None)).ok()?;
+    RESIZER
+        .with(|r| r.borrow_mut().resize(&src_img, &mut dst_img, None))
+        .ok()?;
     Some(dst_img.into_vec())
 }
 
@@ -598,7 +786,12 @@ fn simd_resize(src: &image::RgbaImage, new_w: u32, new_h: u32) -> Option<Vec<u8>
 /// standard `image` resize if SIMD is disabled, errors, or returns an
 /// unexpected buffer size (defensive: a wrong-size SIMD result must never reach
 /// the framebuffer). Returns the BGRA bytes and the backend that produced them.
-fn resize_rgba(src: &image::RgbaImage, new_w: u32, new_h: u32, allow_simd: bool) -> (Vec<u8>, &'static str) {
+fn resize_rgba(
+    src: &image::RgbaImage,
+    new_w: u32,
+    new_h: u32,
+    allow_simd: bool,
+) -> (Vec<u8>, &'static str) {
     if allow_simd {
         if let Some(out) = simd_resize(src, new_w, new_h) {
             if out.len() == (new_w as usize) * (new_h as usize) * 4 {
@@ -607,7 +800,8 @@ fn resize_rgba(src: &image::RgbaImage, new_w: u32, new_h: u32, allow_simd: bool)
         }
     }
     (
-        image::imageops::resize(src, new_w, new_h, image::imageops::FilterType::Triangle).into_raw(),
+        image::imageops::resize(src, new_w, new_h, image::imageops::FilterType::Triangle)
+            .into_raw(),
         "standard",
     )
 }
@@ -616,7 +810,12 @@ fn resize_rgba(src: &image::RgbaImage, new_w: u32, new_h: u32, allow_simd: bool)
 /// ratio, centered on an opaque black canvas (BGRA). Used when a 90/270
 /// rotation leaves portrait content that would otherwise be stretched into a
 /// landscape output. No pixels are cropped; unused space becomes black bars.
-fn letterbox_into(src: &image::RgbaImage, out_w: u32, out_h: u32, allow_simd: bool) -> (Vec<u8>, &'static str) {
+fn letterbox_into(
+    src: &image::RgbaImage,
+    out_w: u32,
+    out_h: u32,
+    allow_simd: bool,
+) -> (Vec<u8>, &'static str) {
     let sw = src.width().max(1) as f64;
     let sh = src.height().max(1) as f64;
     let scale = (out_w as f64 / sw).min(out_h as f64 / sh);
@@ -683,7 +882,11 @@ fn orient_resize_write(
     let rotation = match rotate_arg {
         Some(r) => r % 360,
         None => {
-            if src_w < src_h && out_w >= out_h { 90 } else { 0 }
+            if src_w < src_h && out_w >= out_h {
+                90
+            } else {
+                0
+            }
         }
     };
     let rotated = match rotation {
@@ -738,7 +941,13 @@ fn orient_resize_write(
     ipc.write_frame(frame_counter, &final_frame, out_w, out_h);
     let write_ms = write_start.elapsed().as_millis() as u32;
 
-    StageTimings { rotate_ms, resize_ms, write_ms, resize_backend, rotation }
+    StageTimings {
+        rotate_ms,
+        resize_ms,
+        write_ms,
+        resize_backend,
+        rotation,
+    }
 }
 
 /// Case-insensitive `Content-Length:` lookup in a multipart part-header block.
@@ -830,7 +1039,10 @@ fn start_mjpeg_reader(
                         } else {
                             ""
                         };
-                        set_error(&last_error, format!("MJPEG stream returned HTTP {}{}", res.status(), hint));
+                        set_error(
+                            &last_error,
+                            format!("MJPEG stream returned HTTP {}{}", res.status(), hint),
+                        );
                         failures = failures.saturating_add(1);
                     } else {
                         failures = 0;
@@ -874,14 +1086,18 @@ fn start_mjpeg_reader(
                                         // The JPEG payload begins at the next SOI marker;
                                         // anything before it is the (short) multipart
                                         // boundary + part headers.
-                                        let Some(start) = frame_buffer.windows(2).position(|w| w == [0xFF, 0xD8]) else {
+                                        let Some(start) =
+                                            frame_buffer.windows(2).position(|w| w == [0xFF, 0xD8])
+                                        else {
                                             break;
                                         };
 
                                         // Prefer the Content-Length announced in the part
                                         // headers (exact read); fall back to the EOI
                                         // marker scan when absent or implausible.
-                                        if let Some(len) = parse_content_length(&frame_buffer[..start]) {
+                                        if let Some(len) =
+                                            parse_content_length(&frame_buffer[..start])
+                                        {
                                             if len >= 2 && len <= 10_000_000 {
                                                 exact = Some((start, len));
                                                 continue;
@@ -889,7 +1105,10 @@ fn start_mjpeg_reader(
                                         }
 
                                         let from = eoi_scan_from.max(start + 2);
-                                        if let Some(end_offset) = frame_buffer[from..].windows(2).position(|w| w == [0xFF, 0xD9]) {
+                                        if let Some(end_offset) = frame_buffer[from..]
+                                            .windows(2)
+                                            .position(|w| w == [0xFF, 0xD9])
+                                        {
                                             let end = from + end_offset + 2;
                                             publish_jpeg(&frame_buffer[start..end]);
                                             frame_buffer.drain(..end);
@@ -907,7 +1126,10 @@ fn start_mjpeg_reader(
                                     }
                                 }
                                 Err(e) => {
-                                    set_error(&last_error, format!("MJPEG stream read error: {}; reconnecting", e));
+                                    set_error(
+                                        &last_error,
+                                        format!("MJPEG stream read error: {}; reconnecting", e),
+                                    );
                                     break;
                                 }
                             }
@@ -915,7 +1137,10 @@ fn start_mjpeg_reader(
                     }
                 }
                 Err(e) => {
-                    set_error(&last_error, format!("MJPEG connect failed: {}; retrying", e));
+                    set_error(
+                        &last_error,
+                        format!("MJPEG connect failed: {}; retrying", e),
+                    );
                     failures = failures.saturating_add(1);
                 }
             }
@@ -939,15 +1164,24 @@ fn request_phone_mjpeg_fallback(args: &Args) -> Result<(), String> {
     let stream_url = args.url.as_ref().ok_or("missing stream URL")?;
     let settings_url = stream_url.replace("/stream.ocb2", "/api/settings");
     let client = build_http_client()?;
-    let mut request = client.post(settings_url)
+    let mut request = client
+        .post(settings_url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(r#"{"streamMode":"mjpeg","clientType":"producer"}"#);
     if let Some(token) = &args.token {
         request = request.header("X-OpenCamBridge-Token", token);
     }
-    let response = request.send().map_err(|e| format!("could not request phone MJPEG fallback: {e}"))?;
-    if response.status().is_success() { Ok(()) }
-    else { Err(format!("phone rejected MJPEG fallback with HTTP {}", response.status())) }
+    let response = request
+        .send()
+        .map_err(|e| format!("could not request phone MJPEG fallback: {e}"))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "phone rejected MJPEG fallback with HTTP {}",
+            response.status()
+        ))
+    }
 }
 
 impl V2Decoder {
@@ -962,15 +1196,29 @@ impl V2Decoder {
     }
 }
 
-fn create_v2_decoder(info: &ocb2::StreamInfo, config: &[u8], force_software: bool) -> Result<V2Decoder, String> {
+fn create_v2_decoder(
+    info: &ocb2::StreamInfo,
+    config: &[u8],
+    force_software: bool,
+) -> Result<V2Decoder, String> {
     if !force_software {
-        match mf_decoder::MfH264Decoder::new(info.width, info.height, info.fps_numerator / info.fps_denominator.max(1), config) {
+        match mf_decoder::MfH264Decoder::new(
+            info.width,
+            info.height,
+            info.fps_numerator / info.fps_denominator.max(1),
+            config,
+        ) {
             Ok(decoder) => return Ok(V2Decoder::MediaFoundation(decoder)),
-            Err(e) => eprintln!("Media Foundation decoder unavailable ({e}); using software fallback"),
+            Err(e) => {
+                eprintln!("Media Foundation decoder unavailable ({e}); using software fallback")
+            }
         }
     }
-    let mut decoder = Decoder::new().map_err(|e| format!("OpenH264 fallback initialization failed: {e}"))?;
-    if !config.is_empty() { let _ = decoder.decode(config); }
+    let mut decoder =
+        Decoder::new().map_err(|e| format!("OpenH264 fallback initialization failed: {e}"))?;
+    if !config.is_empty() {
+        let _ = decoder.decode(config);
+    }
     Ok(V2Decoder::Software {
         decoder,
         scratch: vec![0; info.width as usize * info.height as usize * 3 / 2],
@@ -979,13 +1227,21 @@ fn create_v2_decoder(info: &ocb2::StreamInfo, config: &[u8], force_software: boo
 
 fn copy_i420_to_nv12(yuv: &impl YUVSource, scratch: &mut Vec<u8>) -> Result<(u32, u32), String> {
     let (width, height) = yuv.dimensions();
-    if width == 0 || height == 0 || width > 1920 || height > 1080 || width % 2 != 0 || height % 2 != 0 {
+    if width == 0
+        || height == 0
+        || width > 1920
+        || height > 1080
+        || width % 2 != 0
+        || height % 2 != 0
+    {
         return Err(format!("invalid software decoder frame {width}x{height}"));
     }
     let needed = width * height * 3 / 2;
     scratch.resize(needed, 0);
     let (sy, su, sv) = yuv.strides();
-    let y = yuv.y(); let u = yuv.u(); let v = yuv.v();
+    let y = yuv.y();
+    let u = yuv.u();
+    let v = yuv.v();
     if y.len() < sy * height || u.len() < su * (height / 2) || v.len() < sv * (height / 2) {
         return Err("software decoder returned invalid plane bounds".to_string());
     }
@@ -1031,14 +1287,21 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
         parser.reset();
         waiting_for_keyframe = true;
         phone_encoder_error = false;
-        if let Some(V2Decoder::MediaFoundation(d)) = decoder.as_mut() { let _ = d.flush(); }
+        if let Some(V2Decoder::MediaFoundation(d)) = decoder.as_mut() {
+            let _ = d.flush();
+        }
 
         let client = build_http_client()?;
         let mut request = client.get(&url);
-        if let Some(token) = &args.token { request = request.header("X-OpenCamBridge-Token", token); }
+        if let Some(token) = &args.token {
+            request = request.header("X-OpenCamBridge-Token", token);
+        }
         let response = request.send();
         let mut response = match response {
-            Ok(r) if r.status().is_success() => { failures = 0; r }
+            Ok(r) if r.status().is_success() => {
+                failures = 0;
+                r
+            }
             Ok(r) => {
                 failures += 1;
                 last_error = Some(format!("OCB2 endpoint returned HTTP {}", r.status()));
@@ -1056,8 +1319,14 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
         let mut network_buffer = [0u8; 64 * 1024];
         'connection: loop {
             match response.read(&mut network_buffer) {
-                Ok(0) => { last_error = Some("OCB2 connection ended; reconnecting at a keyframe".into()); break; }
-                Err(e) => { last_error = Some(format!("OCB2 read failed: {e}")); break; }
+                Ok(0) => {
+                    last_error = Some("OCB2 connection ended; reconnecting at a keyframe".into());
+                    break;
+                }
+                Err(e) => {
+                    last_error = Some(format!("OCB2 read failed: {e}"));
+                    break;
+                }
                 Ok(count) => {
                     bytes_received += count as u64;
                     parser.push(&network_buffer[..count]);
@@ -1065,27 +1334,60 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                         let record = match parser.next() {
                             Ok(Some(r)) => r,
                             Ok(None) => break,
-                            Err(e) => { last_error = Some(format!("Malformed OCB2 record: {e:?}")); break 'connection; }
+                            Err(e) => {
+                                last_error = Some(format!("Malformed OCB2 record: {e:?}"));
+                                break 'connection;
+                            }
                         };
                         let receive_ns = monotonic_ns();
                         match record.record_type {
                             ocb2::TYPE_STREAM_INFO => {
                                 match serde_json::from_slice::<ocb2::StreamInfo>(&record.payload) {
-                                    Ok(info) if info.codec == "H264" && info.framing == "annex-b-access-units" && info.bitrate <= 100_000_000 &&
-                                        info.pixel_format == "NV12" && validate_nv12_metadata(
-                                            info.width, info.height, info.width, info.width,
-                                            info.width as usize * info.height as usize * 3 / 2).is_some() => {
-                                        let changed = stream_info.as_ref().map(|old| old.width != info.width || old.height != info.height ||
-                                            old.fps_numerator != info.fps_numerator || old.fps_denominator != info.fps_denominator).unwrap_or(true);
+                                    Ok(info)
+                                        if info.codec == "H264"
+                                            && info.framing == "annex-b-access-units"
+                                            && info.bitrate <= 100_000_000
+                                            && info.pixel_format == "NV12"
+                                            && validate_nv12_metadata(
+                                                info.width,
+                                                info.height,
+                                                info.width,
+                                                info.width,
+                                                info.width as usize * info.height as usize * 3 / 2,
+                                            )
+                                            .is_some() =>
+                                    {
+                                        let changed = stream_info
+                                            .as_ref()
+                                            .map(|old| {
+                                                old.width != info.width
+                                                    || old.height != info.height
+                                                    || old.fps_numerator != info.fps_numerator
+                                                    || old.fps_denominator != info.fps_denominator
+                                            })
+                                            .unwrap_or(true);
                                         stream_info = Some(info);
-                                        if changed { decoder = None; codec_config.clear(); }
+                                        if changed {
+                                            decoder = None;
+                                            codec_config.clear();
+                                        }
                                         waiting_for_keyframe = true;
                                     }
-                                    Ok(_) => { last_error = Some("Unsupported OCB2 stream information".into()); break 'connection; }
-                                    Err(e) => { last_error = Some(format!("Invalid OCB2 stream information: {e}")); break 'connection; }
+                                    Ok(_) => {
+                                        last_error =
+                                            Some("Unsupported OCB2 stream information".into());
+                                        break 'connection;
+                                    }
+                                    Err(e) => {
+                                        last_error =
+                                            Some(format!("Invalid OCB2 stream information: {e}"));
+                                        break 'connection;
+                                    }
                                 }
                             }
-                            ocb2::TYPE_CODEC_CONFIG if record.flags & ocb2::FLAG_CODEC_CONFIG != 0 => {
+                            ocb2::TYPE_CODEC_CONFIG
+                                if record.flags & ocb2::FLAG_CODEC_CONFIG != 0 =>
+                            {
                                 codec_config.clear();
                                 codec_config.extend_from_slice(&record.payload);
                                 decoder = None;
@@ -1094,15 +1396,32 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                             ocb2::TYPE_VIDEO_ACCESS_UNIT => {
                                 received_frames += 1;
                                 if record.is_discontinuity() {
-                                    if let Some(V2Decoder::MediaFoundation(d)) = decoder.as_mut() { let _ = d.flush(); }
+                                    if let Some(V2Decoder::MediaFoundation(d)) = decoder.as_mut() {
+                                        let _ = d.flush();
+                                    }
                                     waiting_for_keyframe = true;
                                 }
-                                if waiting_for_keyframe && !record.is_keyframe() { continue; }
-                                let Some(info) = stream_info.as_ref() else { continue; };
-                                if codec_config.is_empty() { continue; }
+                                if waiting_for_keyframe && !record.is_keyframe() {
+                                    continue;
+                                }
+                                let Some(info) = stream_info.as_ref() else {
+                                    continue;
+                                };
+                                // AVC permits SPS/PPS to be prepended in-band
+                                // to an IDR. Some Qualcomm MediaCodec encoders
+                                // do this without a separate config buffer, so
+                                // allow the keyframe to bootstrap the decoder.
                                 if decoder.is_none() {
-                                    decoder = Some(create_v2_decoder(info, &codec_config, force_software)?);
-                                    eprintln!("Decoder: {} (hardware={})", decoder.as_ref().unwrap().name(), decoder.as_ref().unwrap().hardware_active());
+                                    decoder = Some(create_v2_decoder(
+                                        info,
+                                        &codec_config,
+                                        force_software,
+                                    )?);
+                                    eprintln!(
+                                        "Decoder: {} (hardware={})",
+                                        decoder.as_ref().unwrap().name(),
+                                        decoder.as_ref().unwrap().hardware_active()
+                                    );
                                 }
                                 waiting_for_keyframe = false;
                                 let start = Instant::now();
@@ -1110,49 +1429,91 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                 let was_hardware = decoder.as_ref().unwrap().hardware_active();
                                 let decode_result = match decoder.as_mut().unwrap() {
                                     V2Decoder::MediaFoundation(d) => d.decode(
-                                        &record.payload, record.encoder_timestamp_us, record.is_keyframe(), |frame| {
+                                        &record.payload,
+                                        record.encoder_timestamp_us,
+                                        record.is_keyframe(),
+                                        |frame| {
                                             let decode_ns = monotonic_ns();
                                             let sequence = record.sequence;
-                                            if last_published_sequence != 0 && sequence > last_published_sequence + 1 {
-                                                replaced_frames += sequence - last_published_sequence - 1;
+                                            if last_published_sequence != 0
+                                                && sequence > last_published_sequence + 1
+                                            {
+                                                replaced_frames +=
+                                                    sequence - last_published_sequence - 1;
                                             }
-                                            if ipc.write_nv12_frame(sequence, record.capture_timestamp_ns, receive_ns, decode_ns,
-                                                frame.width, frame.height, frame.y_stride, frame.uv_stride, record.flags, frame.bytes) {
+                                            if ipc.write_nv12_frame(
+                                                sequence,
+                                                record.capture_timestamp_ns,
+                                                receive_ns,
+                                                decode_ns,
+                                                frame.width,
+                                                frame.height,
+                                                frame.y_stride,
+                                                frame.uv_stride,
+                                                record.flags,
+                                                frame.bytes,
+                                            ) {
                                                 last_published_sequence = sequence;
                                                 decoded_unique += 1;
                                                 decoded_this_au += 1;
-                                                let offset = *capture_clock_offset.get_or_insert(receive_ns as i128 - record.capture_timestamp_ns as i128);
-                                                let aligned_capture = record.capture_timestamp_ns as i128 + offset;
-                                                latency_ms_sum += ((decode_ns as i128 - aligned_capture).max(0) as u64) / 1_000_000;
+                                                let offset = *capture_clock_offset.get_or_insert(
+                                                    receive_ns as i128
+                                                        - record.capture_timestamp_ns as i128,
+                                                );
+                                                let aligned_capture =
+                                                    record.capture_timestamp_ns as i128 + offset;
+                                                latency_ms_sum +=
+                                                    ((decode_ns as i128 - aligned_capture).max(0)
+                                                        as u64)
+                                                        / 1_000_000;
                                                 latency_samples += 1;
                                             }
-                                        }
+                                        },
                                     ),
-                                    V2Decoder::Software { decoder, scratch } => match decoder.decode(&record.payload) {
-                                        Ok(Some(yuv)) => {
-                                            let (w, h) = copy_i420_to_nv12(&yuv, scratch)?;
-                                            let decode_ns = monotonic_ns();
-                                            if ipc.write_nv12_frame(record.sequence, record.capture_timestamp_ns, receive_ns, decode_ns,
-                                                w, h, w, w, record.flags, scratch) {
-                                                last_published_sequence = record.sequence;
-                                                decoded_unique += 1;
-                                                decoded_this_au = 1;
+                                    V2Decoder::Software { decoder, scratch } => {
+                                        match decoder.decode(&record.payload) {
+                                            Ok(Some(yuv)) => {
+                                                let (w, h) = copy_i420_to_nv12(&yuv, scratch)?;
+                                                let decode_ns = monotonic_ns();
+                                                if ipc.write_nv12_frame(
+                                                    record.sequence,
+                                                    record.capture_timestamp_ns,
+                                                    receive_ns,
+                                                    decode_ns,
+                                                    w,
+                                                    h,
+                                                    w,
+                                                    w,
+                                                    record.flags,
+                                                    scratch,
+                                                ) {
+                                                    last_published_sequence = record.sequence;
+                                                    decoded_unique += 1;
+                                                    decoded_this_au = 1;
+                                                }
+                                                Ok(1)
                                             }
-                                            Ok(1)
+                                            Ok(None) => Ok(0),
+                                            Err(e) => Err(format!("OpenH264 decode: {e}")),
                                         }
-                                        Ok(None) => Ok(0),
-                                        Err(e) => Err(format!("OpenH264 decode: {e}")),
                                     }
                                 };
                                 decode_ms_sum += start.elapsed().as_millis() as u64;
                                 match decode_result {
-                                    Ok(_) => { consecutive_decode_errors = 0; if decoded_this_au > 0 { last_error = None; } }
+                                    Ok(_) => {
+                                        consecutive_decode_errors = 0;
+                                        if decoded_this_au > 0 {
+                                            last_error = None;
+                                        }
+                                    }
                                     Err(e) => {
                                         consecutive_decode_errors += 1;
                                         last_error = Some(e);
                                         waiting_for_keyframe = true;
                                         if !was_hardware && consecutive_decode_errors >= 3 {
-                                            return Err(last_error.take().unwrap_or_else(|| "software H.264 decoder failed".into()));
+                                            return Err(last_error.take().unwrap_or_else(|| {
+                                                "software H.264 decoder failed".into()
+                                            }));
                                         } else if was_hardware && consecutive_decode_errors >= 3 {
                                             force_software = true;
                                             decoder = None;
@@ -1167,18 +1528,31 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                             }
                             ocb2::TYPE_HEARTBEAT => {}
                             ocb2::TYPE_END_OF_STREAM => {
-                                if phone_encoder_error { return Err("phone H.264 encoder ended after an error".into()); }
-                                last_error = Some("Phone restarted the OCB2 stream; reconnecting at a keyframe".into());
+                                if phone_encoder_error {
+                                    return Err("phone H.264 encoder ended after an error".into());
+                                }
+                                last_error = Some(
+                                    "Phone restarted the OCB2 stream; reconnecting at a keyframe"
+                                        .into(),
+                                );
                                 break 'connection;
                             }
                             ocb2::TYPE_ERROR => {
                                 phone_encoder_error = true;
-                                last_error = Some(format!("Phone encoder error: {}", String::from_utf8_lossy(&record.payload)));
+                                last_error = Some(format!(
+                                    "Phone encoder error: {}",
+                                    String::from_utf8_lossy(&record.payload)
+                                ));
                             }
                             _ => {}
                         }
                         if record.flags & ocb2::FLAG_END_OF_STREAM != 0 {
-                            if phone_encoder_error { return Err("phone marked the OCB2 stream ended after an encoder error".into()); }
+                            if phone_encoder_error {
+                                return Err(
+                                    "phone marked the OCB2 stream ended after an encoder error"
+                                        .into(),
+                                );
+                            }
                             break 'connection;
                         }
                         parser.recycle_payload(record.payload);
@@ -1187,38 +1561,98 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                             let seconds = last_print.elapsed().as_secs_f64().max(0.001);
                             let transport_fps = (received_frames as f64 / seconds).round() as u32;
                             let decoded_fps = (decoded_unique as f64 / seconds).round() as u32;
-                            let decode_avg = if decoded_unique > 0 { decode_ms_sum / decoded_unique as u64 } else { 0 };
-                            let latency = if latency_samples > 0 { latency_ms_sum / latency_samples } else { 0 };
-                            let (decoder_name, hardware) = decoder.as_ref().map(|d| (d.name(), d.hardware_active())).unwrap_or(("initializing", false));
+                            let decode_avg = if decoded_unique > 0 {
+                                decode_ms_sum / decoded_unique as u64
+                            } else {
+                                0
+                            };
+                            let latency = if latency_samples > 0 {
+                                latency_ms_sum / latency_samples
+                            } else {
+                                0
+                            };
+                            let (decoder_name, hardware) = decoder
+                                .as_ref()
+                                .map(|d| (d.name(), d.hardware_active()))
+                                .unwrap_or(("initializing", false));
                             let info = stream_info.as_ref();
                             let (consumer_width, consumer_height, _) = ipc.consumer_format();
-                            let (vcam_unique_total, vcam_repeated_total) = ipc.virtual_camera_counters();
-                            let vcam_unique_fps = ((vcam_unique_total.saturating_sub(last_vcam_unique)) as f64 / seconds).round() as u32;
-                            let repeated_samples = vcam_repeated_total.saturating_sub(last_vcam_repeated);
+                            let (vcam_unique_total, vcam_repeated_total) =
+                                ipc.virtual_camera_counters();
+                            let vcam_unique_fps =
+                                ((vcam_unique_total.saturating_sub(last_vcam_unique)) as f64
+                                    / seconds)
+                                    .round() as u32;
+                            let repeated_samples =
+                                vcam_repeated_total.saturating_sub(last_vcam_repeated);
                             last_vcam_unique = vcam_unique_total;
                             last_vcam_repeated = vcam_repeated_total;
-                            let err_json = last_error.as_ref().map(|e| format!("\"{}\"", json_escape(e))).unwrap_or_else(|| "null".into());
-                            println!(r#"{{"source":"ocb2-h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":0,"replaced_frames":{},"jpeg_queue_len":0,"decode_ms_avg":{},"rotate_ms_avg":0,"resize_ms_avg":0,"write_ms_avg":0,"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"{}","hardware_decoder":{},"encoder_name":"{}","hardware_encoder":{},"camera_id":"{}","fallback_reason":"{}","resize_backend":"gpu-or-exact","rotation":0,"last_error":{}}}"#,
-                                json_escape(&args.profile), info.map(|i| i.width).unwrap_or(0), info.map(|i| i.height).unwrap_or(0),
-                                consumer_width, consumer_height, info.map(|i| i.fps_numerator / i.fps_denominator.max(1)).unwrap_or(0),
-                                decoded_fps, decoded_fps, transport_fps, decoded_fps, vcam_unique_fps, repeated_samples, replaced_frames, decode_avg, decode_avg, latency,
-                                (bytes_received as f64 / seconds) as u64, (bytes_received as f64 * 8.0 / seconds) / 1_000_000.0,
-                                if hardware { "media-foundation-d3d11" } else { "software-fallback" }, json_escape(decoder_name), hardware,
-                                info.map(|i| json_escape(&i.encoder_name)).unwrap_or_default(), info.map(|i| i.hardware_encoder).unwrap_or(false),
-                                info.map(|i| json_escape(&i.camera_id)).unwrap_or_default(), if hardware { "" } else { "hardware decoder unavailable" }, err_json);
+                            let err_json = last_error
+                                .as_ref()
+                                .map(|e| format!("\"{}\"", json_escape(e)))
+                                .unwrap_or_else(|| "null".into());
+                            println!(
+                                r#"{{"source":"ocb2-h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":0,"replaced_frames":{},"jpeg_queue_len":0,"decode_ms_avg":{},"rotate_ms_avg":0,"resize_ms_avg":0,"write_ms_avg":0,"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"{}","hardware_decoder":{},"encoder_name":"{}","hardware_encoder":{},"camera_id":"{}","fallback_reason":"{}","resize_backend":"gpu-or-exact","rotation":0,"last_error":{}}}"#,
+                                json_escape(&args.profile),
+                                info.map(|i| i.width).unwrap_or(0),
+                                info.map(|i| i.height).unwrap_or(0),
+                                consumer_width,
+                                consumer_height,
+                                info.map(|i| i.fps_numerator / i.fps_denominator.max(1))
+                                    .unwrap_or(0),
+                                decoded_fps,
+                                decoded_fps,
+                                transport_fps,
+                                decoded_fps,
+                                vcam_unique_fps,
+                                repeated_samples,
+                                replaced_frames,
+                                decode_avg,
+                                decode_avg,
+                                latency,
+                                (bytes_received as f64 / seconds) as u64,
+                                (bytes_received as f64 * 8.0 / seconds) / 1_000_000.0,
+                                if hardware {
+                                    "media-foundation-d3d11"
+                                } else {
+                                    "software-fallback"
+                                },
+                                json_escape(decoder_name),
+                                hardware,
+                                info.map(|i| json_escape(&i.encoder_name))
+                                    .unwrap_or_default(),
+                                info.map(|i| i.hardware_encoder).unwrap_or(false),
+                                info.map(|i| json_escape(&i.camera_id)).unwrap_or_default(),
+                                if hardware {
+                                    ""
+                                } else {
+                                    "hardware decoder unavailable"
+                                },
+                                err_json
+                            );
                             if matches!(&decoder, Some(V2Decoder::Software { .. })) {
-                                let target = info.map(|i| i.fps_numerator / i.fps_denominator.max(1)).unwrap_or(0);
-                                low_software_windows = if target > 0 && decoded_fps * 100 < target * 80 {
-                                    low_software_windows + 1
-                                } else { 0 };
+                                let target = info
+                                    .map(|i| i.fps_numerator / i.fps_denominator.max(1))
+                                    .unwrap_or(0);
+                                low_software_windows =
+                                    if target > 0 && decoded_fps * 100 < target * 80 {
+                                        low_software_windows + 1
+                                    } else {
+                                        0
+                                    };
                                 if low_software_windows >= 3 {
                                     return Err(format!("software H.264 decode sustained only {decoded_fps}/{target} FPS"));
                                 }
                             } else {
                                 low_software_windows = 0;
                             }
-                            received_frames = 0; decoded_unique = 0; bytes_received = 0; decode_ms_sum = 0;
-                            latency_ms_sum = 0; latency_samples = 0; last_print = Instant::now();
+                            received_frames = 0;
+                            decoded_unique = 0;
+                            bytes_received = 0;
+                            decode_ms_sum = 0;
+                            latency_ms_sum = 0;
+                            latency_samples = 0;
+                            last_print = Instant::now();
                         }
                     }
                 }
@@ -1246,7 +1680,10 @@ fn main() {
     match args.source.as_str() {
         "mjpeg" | "test-pattern" | "h264" => {}
         other => {
-            eprintln!("Unknown --source '{}'. Expected mjpeg, test-pattern, or h264.", other);
+            eprintln!(
+                "Unknown --source '{}'. Expected mjpeg, test-pattern, or h264.",
+                other
+            );
             std::process::exit(2);
         }
     }
@@ -1266,7 +1703,14 @@ fn main() {
 
     // Every V2 slot is sized for one 1920x1080 NV12 frame.
     let needed = (width as u64) * (height as u64) * 3 / 2;
-    if width == 0 || height == 0 || width > 1920 || height > 1080 || width % 2 != 0 || height % 2 != 0 || needed > MAX_NV12_SIZE as u64 {
+    if width == 0
+        || height == 0
+        || width > 1920
+        || height > 1080
+        || width % 2 != 0
+        || height % 2 != 0
+        || needed > MAX_NV12_SIZE as u64
+    {
         eprintln!(
             "Requested output {}x{} needs {} bytes but the shared framebuffer holds {} bytes (max 1920x1080).",
             width, height, needed, MAX_NV12_SIZE
@@ -1285,21 +1729,39 @@ fn main() {
     eprintln!("Framebuffer backend: {}", ipc.backend_name);
     let mut active_fallback_reason = if args.source == "mjpeg" {
         "MJPEG compatibility mode selected".to_string()
-    } else { String::new() };
+    } else {
+        String::new()
+    };
 
     // SIMD resize is on by default (with an automatic fallback to the standard
     // resize on any error). Set OCB_DISABLE_SIMD_RESIZE=1 to force the standard
     // path — the kill switch if a SIMD build ever produces bad output.
     let allow_simd = std::env::var("OCB_DISABLE_SIMD_RESIZE").is_err();
-    eprintln!("Resize backend preference: {}", if allow_simd { "simd (fallback: standard)" } else { "standard (simd disabled)" });
+    eprintln!(
+        "Resize backend preference: {}",
+        if allow_simd {
+            "simd (fallback: standard)"
+        } else {
+            "standard (simd disabled)"
+        }
+    );
     // Faster pure-Rust JPEG decode (fallback: image crate). Disable with
     // OCB_DISABLE_FASTJPEG if it ever misdecodes.
     let allow_fastjpeg = std::env::var("OCB_DISABLE_FASTJPEG").is_err();
-    eprintln!("JPEG decode preference: {}", if allow_fastjpeg { "zune (fallback: image)" } else { "image (fastjpeg disabled)" });
+    eprintln!(
+        "JPEG decode preference: {}",
+        if allow_fastjpeg {
+            "zune (fallback: image)"
+        } else {
+            "image (fastjpeg disabled)"
+        }
+    );
 
     if args.source == "h264" {
         if let Err(e) = run_h264_v2(&args, &ipc) {
-            eprintln!("OCB2 H.264 pipeline unavailable ({e}); switching to MJPEG compatibility mode");
+            eprintln!(
+                "OCB2 H.264 pipeline unavailable ({e}); switching to MJPEG compatibility mode"
+            );
             active_fallback_reason = format!("H.264 pipeline failed: {e}");
             if let Err(fallback_error) = request_phone_mjpeg_fallback(&args) {
                 eprintln!("{fallback_error}");
@@ -1307,7 +1769,10 @@ fn main() {
             }
             sleep(Duration::from_millis(500));
             args.source = "mjpeg".to_string();
-            args.url = args.url.take().map(|url| url.replace("/stream.ocb2", "/stream.mjpeg"));
+            args.url = args
+                .url
+                .take()
+                .map(|url| url.replace("/stream.ocb2", "/stream.mjpeg"));
         } else {
             return;
         }
@@ -1373,7 +1838,11 @@ fn main() {
             // written at that deadline even if no later frame arrives.
             let pending = latest_jpeg.lock().unwrap().is_some();
             let pacing_deadline = last_write + pace_threshold;
-            let wake_at = if pending { next_print.min(pacing_deadline) } else { next_print };
+            let wake_at = if pending {
+                next_print.min(pacing_deadline)
+            } else {
+                next_print
+            };
             let timeout = wake_at.saturating_duration_since(Instant::now());
             let _ = wake_rx.recv_timeout(timeout);
         } else {
@@ -1400,7 +1869,9 @@ fn main() {
                 // If we are too far behind, reset the clock instead of
                 // accumulating lag.
                 let now = Instant::now();
-                if now > next_frame_deadline && now.duration_since(next_frame_deadline) > target_duration {
+                if now > next_frame_deadline
+                    && now.duration_since(next_frame_deadline) > target_duration
+                {
                     next_frame_deadline = now;
                 }
                 loop_total_ms = start_time.elapsed().as_millis() as u32;
@@ -1432,8 +1903,11 @@ fn main() {
                 // format). Prefer the faster pure-Rust zune-jpeg decoder; fall
                 // back to the image crate on any failure (or when disabled).
                 let mut decode_backend = "zune";
-                let mut rgba_opt: Option<image::RgbaImage> =
-                    if allow_fastjpeg { fast_jpeg_decode_bgra(&jpeg_data) } else { None };
+                let mut rgba_opt: Option<image::RgbaImage> = if allow_fastjpeg {
+                    fast_jpeg_decode_bgra(&jpeg_data)
+                } else {
+                    None
+                };
                 if rgba_opt.is_none() {
                     decode_backend = "standard";
                     match image::load_from_memory(&jpeg_data) {
@@ -1457,7 +1931,16 @@ fn main() {
                     sum_decode_ms += decode_start.elapsed().as_millis() as u32;
                     last_decode_backend = decode_backend;
 
-                    let timings = orient_resize_write(rgba, args.rotate, args.mirror, width, height, &ipc, frame_counter, allow_simd);
+                    let timings = orient_resize_write(
+                        rgba,
+                        args.rotate,
+                        args.mirror,
+                        width,
+                        height,
+                        &ipc,
+                        frame_counter,
+                        allow_simd,
+                    );
                     sum_rotate_ms += timings.rotate_ms;
                     sum_resize_ms += timings.resize_ms;
                     sum_write_ms += timings.write_ms;
@@ -1491,14 +1974,20 @@ fn main() {
                 *drop_lock = 0;
 
                 let jpeg_lock = latest_jpeg.lock().unwrap();
-                if jpeg_lock.is_some() { queue_len = 1; }
+                if jpeg_lock.is_some() {
+                    queue_len = 1;
+                }
 
                 let mut bytes_lock = mjpeg_bytes_counter.lock().unwrap();
                 source_bytes = *bytes_lock;
                 *bytes_lock = 0;
             }
 
-            let denom = if output_fps_counter > 0 { output_fps_counter } else { 1 };
+            let denom = if output_fps_counter > 0 {
+                output_fps_counter
+            } else {
+                1
+            };
             let avg_decode = sum_decode_ms / denom;
             let avg_rotate = sum_rotate_ms / denom;
             let avg_resize = sum_resize_ms / denom;
@@ -1506,11 +1995,15 @@ fn main() {
             let avg_total = sum_total_ms / denom;
 
             let mbps = (source_bytes as f64 * 8.0) / 1_000_000.0;
-            let decoded_fps_normalized = ((decoded_fps_counter as f64) / interval_secs).round() as u32;
-            let written_fps_normalized = ((output_fps_counter as f64) / interval_secs).round() as u32;
+            let decoded_fps_normalized =
+                ((decoded_fps_counter as f64) / interval_secs).round() as u32;
+            let written_fps_normalized =
+                ((output_fps_counter as f64) / interval_secs).round() as u32;
             let (consumer_width, consumer_height, _) = ipc.consumer_format();
             let (vcam_unique_total, vcam_repeated_total) = ipc.virtual_camera_counters();
-            let vcam_unique_fps = ((vcam_unique_total.saturating_sub(last_vcam_unique)) as f64 / interval_secs).round() as u32;
+            let vcam_unique_fps = ((vcam_unique_total.saturating_sub(last_vcam_unique)) as f64
+                / interval_secs)
+                .round() as u32;
             let repeated_samples = vcam_repeated_total.saturating_sub(last_vcam_repeated);
             last_vcam_unique = vcam_unique_total;
             last_vcam_repeated = vcam_repeated_total;
@@ -1521,12 +2014,38 @@ fn main() {
                 None => "null".to_string(),
             };
 
-            println!(r#"{{"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":{},"replaced_frames":{},"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"JPEG software compatibility","hardware_decoder":false,"encoder_name":"Android JPEG","hardware_encoder":false,"camera_id":"","fallback_reason":"{}","resize_backend":"{}","rotation":{},"last_error":{}}}"#,
-                args.source, json_escape(&args.profile), source_w, source_h, consumer_width, consumer_height, fps,
-                http_fps, decoded_fps_normalized, written_fps_normalized, http_fps, decoded_fps_normalized,
-                vcam_unique_fps, repeated_samples, dropped_jpegs, dropped_jpegs, queue_len,
-                avg_decode, avg_rotate, avg_resize, avg_write, avg_total, avg_total,
-                source_bytes, mbps, last_decode_backend, json_escape(&active_fallback_reason), last_backend, last_rotation, last_error_json
+            println!(
+                r#"{{"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":{},"replaced_frames":{},"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"JPEG software compatibility","hardware_decoder":false,"encoder_name":"Android JPEG","hardware_encoder":false,"camera_id":"","fallback_reason":"{}","resize_backend":"{}","rotation":{},"last_error":{}}}"#,
+                args.source,
+                json_escape(&args.profile),
+                source_w,
+                source_h,
+                consumer_width,
+                consumer_height,
+                fps,
+                http_fps,
+                decoded_fps_normalized,
+                written_fps_normalized,
+                http_fps,
+                decoded_fps_normalized,
+                vcam_unique_fps,
+                repeated_samples,
+                dropped_jpegs,
+                dropped_jpegs,
+                queue_len,
+                avg_decode,
+                avg_rotate,
+                avg_resize,
+                avg_write,
+                avg_total,
+                avg_total,
+                source_bytes,
+                mbps,
+                last_decode_backend,
+                json_escape(&active_fallback_reason),
+                last_backend,
+                last_rotation,
+                last_error_json
             );
 
             last_print = Instant::now();

@@ -173,7 +173,10 @@ class StreamService : LifecycleService() {
                     val target = StreamState.selectedFps.get()
                     val actual = minOf(StreamState.captureFps.get(), StreamState.encodedFps.get())
                     lowH264Windows = if (target > 0 && actual > 0 && actual * 100 < target * 80) lowH264Windows + 1 else 0
-                    if (lowH264Windows >= 2) {
+                    // Ignore transient camera/codec warm-up jitter. A profile
+                    // is downgraded only after four consecutive two-second
+                    // windows below 80% of its actual selected target.
+                    if (lowH264Windows >= 4) {
                         lowH264Windows = 0
                         val next = h264Streamer.prepareAdaptiveDowngrade()
                         if (next != null) {

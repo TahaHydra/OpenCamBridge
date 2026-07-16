@@ -72,7 +72,7 @@ class H264Streamer(
     private var camera: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var requestBuilder: CaptureRequest.Builder? = null
-    private var codec: MediaCodec? = null
+    @Volatile private var codec: MediaCodec? = null
     private var encoderSurface: Surface? = null
     private var selection: H264EncoderSelection? = null
     private var adaptiveMode: H264ModeDto? = null
@@ -108,6 +108,8 @@ class H264Streamer(
 
             configureCodec(chosen)
             publishSelection(chosen)
+            captureWindowStartNs = 0L
+            captureWindowFrames = 0
             val device = openCamera(cameraId)
             camera = device
             createSession(device, chosen)
@@ -143,10 +145,14 @@ class H264Streamer(
         session?.close(); session = null
         camera?.close(); camera = null
         requestBuilder = null
-        try { codec?.signalEndOfInputStream() } catch (_: Exception) {}
-        try { codec?.stop() } catch (_: Exception) {}
-        try { codec?.release() } catch (_: Exception) {}
+        // Invalidate this generation before stopping it. Qualcomm can deliver
+        // callbacks queued by stop/release after the replacement codec starts;
+        // callback identity checks below keep those events isolated.
+        val oldCodec = codec
         codec = null
+        try { oldCodec?.signalEndOfInputStream() } catch (_: Exception) {}
+        try { oldCodec?.stop() } catch (_: Exception) {}
+        try { oldCodec?.release() } catch (_: Exception) {}
         try { encoderSurface?.release() } catch (_: Exception) {}
         encoderSurface = null
         codecConfig = null
@@ -220,9 +226,19 @@ class H264Streamer(
         c.setCallback(codecCallback, codecHandler)
         c.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         encoderSurface = c.createInputSurface()
-        c.start()
+        // Publish the generation before start(), because asynchronous format
+        // and error callbacks are allowed as soon as the codec starts.
         codec = c
+        try {
+            c.start()
+        } catch (e: Exception) {
+            if (codec === c) codec = null
+            try { c.release() } catch (_: Exception) {}
+            throw e
+        }
         StreamState.actualBitrate.set(bitrate)
+        encodedWindowFrames = 0
+        encodedWindowBytes = 0L
         encodedWindowStartNs = SystemClock.elapsedRealtimeNanos()
     }
 
@@ -232,6 +248,10 @@ class H264Streamer(
         }
 
         override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
+            if (codec !== this@H264Streamer.codec) {
+                try { codec.releaseOutputBuffer(index, false) } catch (_: Exception) {}
+                return
+            }
             try {
                 val buffer = codec.getOutputBuffer(index) ?: return
                 if (info.size <= 0) return
@@ -275,6 +295,7 @@ class H264Streamer(
         }
 
         override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
+            if (codec !== this@H264Streamer.codec) return
             val pieces = listOf("csd-0", "csd-1").mapNotNull { key ->
                 if (!format.containsKey(key)) null else format.getByteBuffer(key)?.toByteArray()
             }
@@ -288,6 +309,10 @@ class H264Streamer(
         }
 
         override fun onError(codec: MediaCodec, error: MediaCodec.CodecException) {
+            // Ignore errors queued by a codec generation that has already been
+            // stopped. A real startup error still belongs to the current codec
+            // even before running becomes true and must be reported.
+            if (codec !== this@H264Streamer.codec) return
             publishError("Hardware encoder ${error.diagnosticInfo}")
             StreamState.fallbackReason.set("Hardware encoder failed: ${error.diagnosticInfo}")
             StreamState.h264Failed.set(true)
@@ -295,6 +320,17 @@ class H264Streamer(
     }
 
     private fun publishAccessUnit(data: ByteArray, presentationTimeUs: Long, keyframe: Boolean) {
+        // Several Qualcomm encoders honor PREPEND_HEADER_TO_SYNC_FRAMES but do
+        // not emit BUFFER_FLAG_CODEC_CONFIG or expose csd-* in a format-change
+        // callback. Derive SPS/PPS from that first IDR so every current and
+        // future OCB2 client still receives an explicit type-2 config record.
+        if (keyframe && (codecConfig == null || codecConfig?.isEmpty() == true)) {
+            extractAnnexBCodecConfig(data)?.let { config ->
+                codecConfig = config
+                broadcast(Ocb2.record(Ocb2.TYPE_CODEC_CONFIG, Ocb2.FLAG_CODEC_CONFIG,
+                    currentSequence(), presentationTimeUs * 1000L, presentationTimeUs, config))
+            }
+        }
         val flags = if (keyframe) Ocb2.FLAG_KEYFRAME else 0
         val captureNs = max(0L, presentationTimeUs * 1000L)
         broadcast(Ocb2.record(Ocb2.TYPE_VIDEO_ACCESS_UNIT, flags, nextFrameSequence(), captureNs, presentationTimeUs, data))
@@ -552,6 +588,39 @@ class H264Streamer(
             out.write(byteArrayOf(0, 0, 0, 1)); out.write(input, offset, len); offset += len
         }
         return if (offset == input.size && out.size() > 0) out.toByteArray() else input
+    }
+
+    private fun extractAnnexBCodecConfig(accessUnit: ByteArray): ByteArray? {
+        data class Nal(val start: Int, val payload: Int, val end: Int)
+        val starts = ArrayList<Pair<Int, Int>>(8)
+        var i = 0
+        while (i + 3 < accessUnit.size) {
+            val prefix = when {
+                accessUnit[i] == 0.toByte() && accessUnit[i + 1] == 0.toByte() && accessUnit[i + 2] == 1.toByte() -> 3
+                i + 4 <= accessUnit.size && accessUnit[i] == 0.toByte() && accessUnit[i + 1] == 0.toByte() &&
+                    accessUnit[i + 2] == 0.toByte() && accessUnit[i + 3] == 1.toByte() -> 4
+                else -> 0
+            }
+            if (prefix > 0) {
+                starts.add(i to prefix)
+                i += prefix
+            } else i++
+        }
+        if (starts.isEmpty()) return null
+        val nals = starts.mapIndexedNotNull { index, (start, prefix) ->
+            val payload = start + prefix
+            val end = if (index + 1 < starts.size) starts[index + 1].first else accessUnit.size
+            if (payload < end) Nal(start, payload, end) else null
+        }
+        val configNals = nals.filter { nal ->
+            val type = accessUnit[nal.payload].toInt() and 0x1f
+            type == 7 || type == 8
+        }
+        if (configNals.none { (accessUnit[it.payload].toInt() and 0x1f) == 7 } ||
+            configNals.none { (accessUnit[it.payload].toInt() and 0x1f) == 8 }) return null
+        val out = ByteArrayOutputStream(configNals.sumOf { it.end - it.start })
+        configNals.forEach { out.write(accessUnit, it.start, it.end - it.start) }
+        return out.toByteArray()
     }
 
     private fun ByteBuffer.toByteArray(): ByteArray {

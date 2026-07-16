@@ -28,8 +28,12 @@ pub struct Record {
 }
 
 impl Record {
-    pub fn is_keyframe(&self) -> bool { self.flags & FLAG_KEYFRAME != 0 }
-    pub fn is_discontinuity(&self) -> bool { self.flags & FLAG_DISCONTINUITY != 0 }
+    pub fn is_keyframe(&self) -> bool {
+        self.flags & FLAG_KEYFRAME != 0
+    }
+    pub fn is_discontinuity(&self) -> bool {
+        self.flags & FLAG_DISCONTINUITY != 0
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -67,7 +71,11 @@ pub struct Parser {
 
 impl Parser {
     pub fn new() -> Self {
-        Self { buffer: Vec::with_capacity(128 * 1024), consumed: 0, spare_payload: Vec::with_capacity(256 * 1024) }
+        Self {
+            buffer: Vec::with_capacity(128 * 1024),
+            consumed: 0,
+            spare_payload: Vec::with_capacity(256 * 1024),
+        }
     }
 
     pub fn reset(&mut self) {
@@ -75,7 +83,9 @@ impl Parser {
         self.consumed = 0;
     }
 
-    pub fn push(&mut self, bytes: &[u8]) { self.buffer.extend_from_slice(bytes); }
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
 
     /// Return a processed payload allocation to the parser. The streaming loop
     /// calls this after synchronous decode so steady-state AUs reuse storage.
@@ -88,12 +98,20 @@ impl Parser {
 
     pub fn next(&mut self) -> Result<Option<Record>, ParseError> {
         let available = &self.buffer[self.consumed..];
-        if available.len() < HEADER_SIZE { return Ok(None); }
-        if available[..4] != MAGIC { return Err(ParseError::BadMagic); }
+        if available.len() < HEADER_SIZE {
+            return Ok(None);
+        }
+        if available[..4] != MAGIC {
+            return Err(ParseError::BadMagic);
+        }
         let version = u16::from_le_bytes([available[4], available[5]]);
-        if version != VERSION { return Err(ParseError::UnsupportedVersion(version)); }
+        if version != VERSION {
+            return Err(ParseError::UnsupportedVersion(version));
+        }
         let header_size = u16::from_le_bytes([available[6], available[7]]);
-        if header_size as usize != HEADER_SIZE { return Err(ParseError::InvalidHeaderSize(header_size)); }
+        if header_size as usize != HEADER_SIZE {
+            return Err(ParseError::InvalidHeaderSize(header_size));
+        }
         let record_type = u16::from_le_bytes([available[8], available[9]]);
         if !(TYPE_STREAM_INFO..=TYPE_ERROR).contains(&record_type) {
             return Err(ParseError::InvalidRecordType(record_type));
@@ -103,9 +121,13 @@ impl Parser {
         let capture_timestamp_ns = u64::from_le_bytes(available[24..32].try_into().unwrap());
         let encoder_timestamp_us = i64::from_le_bytes(available[32..40].try_into().unwrap());
         let payload_len = u32::from_le_bytes(available[40..44].try_into().unwrap()) as usize;
-        if payload_len > MAX_PAYLOAD { return Err(ParseError::PayloadTooLarge(payload_len)); }
+        if payload_len > MAX_PAYLOAD {
+            return Err(ParseError::PayloadTooLarge(payload_len));
+        }
         let total = HEADER_SIZE + payload_len;
-        if available.len() < total { return Ok(None); }
+        if available.len() < total {
+            return Ok(None);
+        }
         let mut payload = std::mem::take(&mut self.spare_payload);
         payload.clear();
         payload.extend_from_slice(&available[HEADER_SIZE..total]);
@@ -116,7 +138,14 @@ impl Parser {
             self.buffer.drain(..self.consumed);
             self.consumed = 0;
         }
-        Ok(Some(Record { record_type, flags, sequence, capture_timestamp_ns, encoder_timestamp_us, payload }))
+        Ok(Some(Record {
+            record_type,
+            flags,
+            sequence,
+            capture_timestamp_ns,
+            encoder_timestamp_us,
+            payload,
+        }))
     }
 }
 
@@ -160,9 +189,13 @@ mod tests {
     fn multiple_records_in_one_read() {
         let mut bytes = encoded(TYPE_CODEC_CONFIG, FLAG_CODEC_CONFIG, 1, b"cfg");
         bytes.extend(encoded(TYPE_VIDEO_ACCESS_UNIT, 0, 2, b"au"));
-        let mut p = Parser::new(); p.push(&bytes);
+        let mut p = Parser::new();
+        p.push(&bytes);
         assert_eq!(p.next().unwrap().unwrap().record_type, TYPE_CODEC_CONFIG);
-        assert_eq!(p.next().unwrap().unwrap().record_type, TYPE_VIDEO_ACCESS_UNIT);
+        assert_eq!(
+            p.next().unwrap().unwrap().record_type,
+            TYPE_VIDEO_ACCESS_UNIT
+        );
         assert!(p.next().unwrap().is_none());
     }
 
@@ -170,7 +203,8 @@ mod tests {
     fn malformed_length_is_rejected_before_allocation() {
         let mut bytes = encoded(TYPE_VIDEO_ACCESS_UNIT, 0, 1, b"");
         bytes[40..44].copy_from_slice(&((MAX_PAYLOAD as u32) + 1).to_le_bytes());
-        let mut p = Parser::new(); p.push(&bytes);
+        let mut p = Parser::new();
+        p.push(&bytes);
         assert_eq!(p.next(), Err(ParseError::PayloadTooLarge(MAX_PAYLOAD + 1)));
     }
 
@@ -187,9 +221,15 @@ mod tests {
 
     #[test]
     fn codec_configuration_and_keyframe_restart_flags_survive() {
-        let mut bytes = encoded(TYPE_CODEC_CONFIG, FLAG_CODEC_CONFIG | FLAG_DISCONTINUITY, 1, b"spspps");
+        let mut bytes = encoded(
+            TYPE_CODEC_CONFIG,
+            FLAG_CODEC_CONFIG | FLAG_DISCONTINUITY,
+            1,
+            b"spspps",
+        );
         bytes.extend(encoded(TYPE_VIDEO_ACCESS_UNIT, FLAG_KEYFRAME, 2, b"idr"));
-        let mut p = Parser::new(); p.push(&bytes);
+        let mut p = Parser::new();
+        p.push(&bytes);
         let config = p.next().unwrap().unwrap();
         let idr = p.next().unwrap().unwrap();
         assert_eq!(config.flags & FLAG_CODEC_CONFIG, FLAG_CODEC_CONFIG);

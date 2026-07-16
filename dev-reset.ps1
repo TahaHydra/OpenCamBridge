@@ -8,18 +8,18 @@ $framebuffer = "C:\ProgramData\OpenCamBridge\framebuffer.bin"
 $producerLog = "C:\ProgramData\OpenCamBridge\producer.log"
 $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 
-Write-Host "Closing OBS / desktop / producer / node..." -ForegroundColor Yellow
+Write-Host "Closing OBS / desktop / producer..." -ForegroundColor Yellow
 Stop-Process -Name obs64 -Force
 Stop-Process -Name tauri-app -Force
-Stop-Process -Name node -Force
 Stop-Process -Name rust-frame-producer -Force
 Stop-Process -Name VirtualCamera_Installer -Force
 Stop-Process -Name WindowsCamera -Force
 
 Write-Host "Killing any producer by executable path..." -ForegroundColor Yellow
 Get-CimInstance Win32_Process | Where-Object {
-    $_.CommandLine -like "*rust-frame-producer.exe*" -or
-    $_.CommandLine -like "*OpenCamBridge*"
+    # Do not match the workspace name here: this script itself is launched
+    # from an OpenCamBridge path and would terminate its own PowerShell host.
+    $_.ProcessId -ne $PID -and $_.CommandLine -like "*rust-frame-producer.exe*"
 } | ForEach-Object {
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
 }
