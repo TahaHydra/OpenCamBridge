@@ -39,7 +39,9 @@ data class CameraInfoDto(
      *  fps slow-motion modes the standard capture path cannot use. */
     val supportsHighSpeed: Boolean = false,
     val highSpeedSizes: List<SizeDto> = emptyList(),
-    val highSpeedFpsRanges: List<FpsRangeDto> = emptyList()
+    val highSpeedFpsRanges: List<FpsRangeDto> = emptyList(),
+    /** Modes supported by both this Camera2 surface path and a hardware AVC encoder. */
+    val h264Modes: List<H264ModeDto> = emptyList()
 )
 
 @Serializable

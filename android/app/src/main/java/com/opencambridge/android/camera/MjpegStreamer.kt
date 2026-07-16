@@ -52,6 +52,7 @@ class MjpegStreamer(
     private var lastEncodeNs = 0L
 
     suspend fun start() {
+        StreamState.activeStreamMode.set("mjpeg")
         val provider = suspendCoroutine<ProcessCameraProvider> { cont ->
             val future = ProcessCameraProvider.getInstance(context)
             future.addListener({
@@ -89,9 +90,7 @@ class MjpegStreamer(
                 val resSelector = ResolutionPolicy.buildSelector(
                     profile = StreamState.profile.get(),
                     requestedWidth = StreamState.width.get(),
-                    requestedHeight = StreamState.height.get(),
-                    allowNative = StreamState.profile.get() == "native",
-                    allowAspectFallback = false
+                    requestedHeight = StreamState.height.get()
                 )
 
                 val targetFps = StreamState.fps.get()

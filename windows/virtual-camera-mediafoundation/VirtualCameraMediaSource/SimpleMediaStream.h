@@ -72,6 +72,7 @@ namespace winrt::WindowsSample::implementation
         DWORD m_dwStreamId = 0;
         MFSampleAllocatorUsage m_allocatorUsage;
         SharedMemoryClient m_shmClient;
+        LONGLONG m_nextSampleTime = 0;
     };
 }
 

@@ -155,7 +155,10 @@ class ControlServer(
                 post("/api/logs/clear")            { serveClearLogs(call) }
 
                 get("/stream.mjpeg")               { serveMjpeg(call) }
-                get("/stream.h264")                { serveH264(call) }
+                get("/stream.ocb2")                { serveOcb2(call) }
+                get("/stream.h264")                {
+                    call.respondText("Raw H.264 was replaced by the framed /stream.ocb2 endpoint", status = HttpStatusCode.Gone)
+                }
                 get("/api/stream/info")            { serveStreamInfo(call) }
                 get("/obs")                        { serveObs(call) }
             }
@@ -458,7 +461,7 @@ class ControlServer(
                       <div class="preview-stage">
                         <div id="preview-box" class="preview-box layout-landscape">
                             <div id="offline-overlay" class="offline-overlay">
-                                <p>Camera is Offline</p>
+                                <p id="preview-overlay-text">Camera is Offline</p>
                                 <button class="refresh-btn" onclick="fetchStatus()">Refresh Stream</button>
                             </div>
                             <span id="preview-rebind-warning" style="display:none; position:absolute; top:16px; left:16px; background:rgba(255,165,0,0.8); color:#000; padding:4px 8px; border-radius:4px; font-size:0.8rem; z-index:20; font-weight:bold;">REBINDING...</span>
@@ -524,13 +527,13 @@ class ControlServer(
                       <div class="control-group">
                         <label>Stream Mode</label>
                         <select id="sm-select" onchange="patchSetting({streamMode: this.value})">
-                           <option value="mjpeg">MJPEG</option>
-                           <option value="h264">H.264 Experimental</option>
+                           <option value="h264">Hardware H.264 / OCB2</option>
+                           <option value="mjpeg">MJPEG Compatibility</option>
                         </select>
                       </div>
                       <div id="h264-info" style="display:none; font-size: 0.85rem; color: #aaa; margin-top: 8px;">
-                          H.264 stream active at: <a href="#" id="h264-link" style="color:var(--primary)" target="_blank">/stream.h264</a><br>
-                          Test with: <code style="background:#000;padding:2px 4px;border-radius:4px;color:#fff;">ffplay http://[IP]/stream.h264</code>
+                          Framed H.264 stream active at: <span id="h264-link" style="color:var(--primary)">/stream.ocb2</span><br>
+                          OCB2 carries complete access units and is consumed by the OpenCamBridge Windows producer.
                       </div>
                       <div class="control-group">
                         <label>JPEG Quality: <span id="quality-val">85</span>%</label>
@@ -679,10 +682,43 @@ class ControlServer(
 
                 let currentRevision = 0;
                 let currentLifecycleState = '';
+                let currentStreamMode = 'h264';
                 let isDraggingQuality = false;
                 let isDraggingZoom = false;
+                let cameraCapabilities = [];
+
+                function updateModeOptions(status) {
+                    const resSelect = document.getElementById('res-select');
+                    const fpsSelect = document.getElementById('fps-select');
+                    let resolutions = [[1920,1080], [1280,720], [640,480]];
+                    let rates = [15,30,60];
+                    if (status.streamMode === 'h264') {
+                        const camera = cameraCapabilities.find(c => c.id === status.cameraId);
+                        const modes = camera && Array.isArray(camera.h264Modes) ? camera.h264Modes : [];
+                        const seen = new Set();
+                        resolutions = modes.filter(m => {
+                            const key = m.width + 'x' + m.height;
+                            if (seen.has(key)) return false;
+                            seen.add(key); return true;
+                        }).map(m => [m.width, m.height]);
+                        rates = modes.filter(m => m.width === status.width && m.height === status.height).map(m => m.fps);
+                    }
+                    resSelect.innerHTML = '';
+                    resolutions.forEach(r => {
+                        const option = document.createElement('option');
+                        option.value = r[0] + 'x' + r[1]; option.textContent = r[0] + ' x ' + r[1];
+                        resSelect.appendChild(option);
+                    });
+                    fpsSelect.innerHTML = '';
+                    rates.forEach(rate => {
+                        const option = document.createElement('option');
+                        option.value = String(rate); option.textContent = rate + ' fps';
+                        fpsSelect.appendChild(option);
+                    });
+                }
 
                 function reloadPreviewImage() {
+                    if (currentStreamMode === 'h264') return;
                     const img = document.getElementById('stream-img');
                     const imgUrl = new URL('/stream.mjpeg', window.location.origin);
                     if (isTokenRequired && TOKEN) imgUrl.searchParams.set('token', TOKEN);
@@ -698,11 +734,12 @@ class ControlServer(
 
                         const previousLifecycle = currentLifecycleState;
                         currentLifecycleState = status.lifecycleState;
+                        currentStreamMode = status.activeStreamMode || status.streamMode || 'h264';
                         currentRevision = status.revision;
 
                         // Auto-reconnect preview if rebind finished successfully
                         if (previousLifecycle !== 'STREAMING' && currentLifecycleState === 'STREAMING') {
-                            if (status.streamMode === 'mjpeg') {
+                            if (currentStreamMode === 'mjpeg') {
                                 reloadPreviewImage();
                             }
                         }
@@ -711,11 +748,12 @@ class ControlServer(
                         document.getElementById('sec-mode').innerText = status.accessMode;
                         document.getElementById('sec-port').innerText = status.port;
 
+                        updateModeOptions(status);
                         document.getElementById('res-select').value = status.width + 'x' + status.height;
                         document.getElementById('fps-select').value = status.fps;
                         document.getElementById('fit-select').value = status.previewFitMode;
                         document.getElementById('zs-select').value = status.zoomSpeed || 'normal';
-                        document.getElementById('sm-select').value = status.streamMode || 'mjpeg';
+                        document.getElementById('sm-select').value = status.streamMode || 'h264';
 
                         const orientSel = document.getElementById('orient-select');
                         if (orientSel) {
@@ -725,11 +763,11 @@ class ControlServer(
                         document.getElementById('mirror-check').checked = !!status.mirror;
                         document.getElementById('preview-check').checked = !!status.localPreviewEnabled;
 
-                        if (status.streamMode === 'h264') {
+                        if (currentStreamMode === 'h264') {
                             document.getElementById('h264-info').style.display = 'block';
-                            let h264Url = new URL('/stream.h264', window.location.origin);
+                            let h264Url = new URL('/stream.ocb2', window.location.origin);
                             if (isTokenRequired && TOKEN) h264Url.searchParams.set('token', TOKEN);
-                            document.getElementById('h264-link').href = h264Url.toString();
+                            document.getElementById('h264-link').textContent = h264Url.toString();
                         } else {
                             document.getElementById('h264-info').style.display = 'none';
                         }
@@ -759,11 +797,16 @@ class ControlServer(
                         }
 
                         if (currentLifecycleState !== 'STREAMING' && currentLifecycleState !== 'REBINDING') {
+                            document.getElementById('preview-overlay-text').textContent = 'Camera is Offline';
                             document.getElementById('offline-overlay').style.display = 'flex';
                             document.getElementById('stream-img').style.opacity = '0.3';
-                        } else {
+                        } else if (currentStreamMode === 'mjpeg') {
                             document.getElementById('offline-overlay').style.display = 'none';
                             document.getElementById('stream-img').style.opacity = '1';
+                        } else {
+                            document.getElementById('preview-overlay-text').textContent = 'H.264 / OCB2 is feeding the Windows virtual camera';
+                            document.getElementById('offline-overlay').style.display = 'flex';
+                            document.getElementById('stream-img').style.opacity = '0.15';
                         }
 
                         const camSelect = document.getElementById('camera-select');
@@ -777,6 +820,7 @@ class ControlServer(
                     try {
                         const res = await fetchWithAuth('/api/camera/list');
                         const cameras = await res.json();
+                        cameraCapabilities = cameras;
                         const select = document.getElementById('camera-select');
                         select.innerHTML = '';
                         cameras.forEach(c => {
@@ -869,7 +913,7 @@ class ControlServer(
                     const img = document.getElementById('stream-img');
                     img.onerror = () => {
                         // If stream is supposed to be running but image broke, retry after 1s
-                        if (currentLifecycleState === 'STREAMING') {
+                        if (currentLifecycleState === 'STREAMING' && currentStreamMode === 'mjpeg') {
                             setTimeout(reloadPreviewImage, 1000);
                         }
                     };
@@ -890,7 +934,8 @@ class ControlServer(
         }
     }
     private suspend fun serveDeviceInfo(call: RoutingCall) {
-        call.respond(DeviceInfoDto(app = "OpenCamBridge", version = "0.1.0", platform = "android", serverPort = StreamState.port.get()))
+        call.respond(DeviceInfoDto(app = "OpenCamBridge", version = "2.0.0", platform = "android", serverPort = StreamState.port.get(),
+            manufacturer = android.os.Build.MANUFACTURER, model = android.os.Build.MODEL))
     }
 
     private suspend fun serveCameraList(call: RoutingCall) {
@@ -1150,11 +1195,11 @@ class ControlServer(
         }
     }
 
-    private suspend fun serveH264(call: RoutingCall) {
+    private suspend fun serveOcb2(call: RoutingCall) {
         call.response.headers.append("Cache-Control", "no-cache")
         call.response.headers.append("Connection", "close")
         call.respondBytesWriter(
-            contentType = ContentType.parse("video/h264")
+            contentType = ContentType.parse("application/vnd.opencambridge.ocb2")
         ) {
             val channel = h264Streamer.subscribe()
             try {
@@ -1184,11 +1229,11 @@ class ControlServer(
                 fps = StreamState.fps.get(),
                 h264Bitrate = StreamState.h264Bitrate.get(),
                 // Honest transport metadata so consumers do not have to guess.
-                codec = if (mode == "h264") "h264-annexb" else "mjpeg",
-                container = if (mode == "h264") "raw Annex B byte stream (no container)" else "multipart/x-mixed-replace",
-                experimental = mode == "h264",
+                codec = if (mode == "h264") "h264-annexb-access-units" else "mjpeg",
+                container = if (mode == "h264") "OCB2 framed records" else "multipart/x-mixed-replace",
+                experimental = false,
                 notes = if (mode == "h264")
-                    "SPS/PPS are sent as the first bytes to each new /stream.h264 subscriber when available, and the encoder is asked to repeat them before IDR frames. The Windows producer can decode this stream (--source h264, experimental)."
+                    "Each /stream.ocb2 video record contains one complete H.264 access unit with sequence and monotonic capture/encoder timestamps."
                 else
                     "Stable path. Each part is a complete JPEG image."
             )
@@ -1222,7 +1267,15 @@ class ControlServer(
                 selectedEffectiveHeight = StreamState.selectedEffectiveHeight.get(),
                 normalizedForPolicy = StreamState.normalizedForPolicy.get(),
                 resolutionPolicy = StreamState.resolutionPolicy.get(),
-                fallbackUsed = StreamState.fallbackUsed.get()
+                fallbackUsed = StreamState.fallbackUsed.get(),
+                captureFps = StreamState.captureFps.get(),
+                encodedFps = StreamState.encodedFps.get(),
+                selectedFps = StreamState.selectedFps.get(),
+                encodedBitrate = StreamState.encodedBitrate.get(),
+                encoderName = StreamState.encoderName.get(),
+                hardwareEncoder = StreamState.hardwareEncoder.get(),
+                activeStreamMode = StreamState.activeStreamMode.get(),
+                fallbackReason = StreamState.fallbackReason.get()
             )
         )
     }
@@ -1231,7 +1284,14 @@ class ControlServer(
 // ---- DTOs ----
 
 @Serializable
-private data class DeviceInfoDto(val app: String, val version: String, val platform: String, val serverPort: Int)
+private data class DeviceInfoDto(
+    val app: String,
+    val version: String,
+    val platform: String,
+    val serverPort: Int,
+    val manufacturer: String,
+    val model: String
+)
 
 @Serializable
 data class SimpleResult(val success: Boolean, val message: String)
@@ -1351,5 +1411,13 @@ private data class StreamMetricsDto(
     val selectedEffectiveHeight: Int = 0,
     val normalizedForPolicy: Boolean = false,
     val resolutionPolicy: String = "unknown",
-    val fallbackUsed: Boolean = false
+    val fallbackUsed: Boolean = false,
+    val captureFps: Int = 0,
+    val encodedFps: Int = 0,
+    val selectedFps: Int = 0,
+    val encodedBitrate: Int = 0,
+    val encoderName: String = "",
+    val hardwareEncoder: Boolean = false,
+    val activeStreamMode: String = "mjpeg",
+    val fallbackReason: String = ""
 )

@@ -39,20 +39,30 @@ object StreamState {
     val port = AtomicInteger(8080)
     val accessToken = AtomicReference("")
 
-    val streamMode = AtomicReference("mjpeg") // mjpeg, h264
+    val streamMode = AtomicReference("h264") // h264 preferred; mjpeg compatibility
     val h264Bitrate = AtomicInteger(4000000)
-    val h264KeyframeInterval = AtomicInteger(2)
+    val h264KeyframeInterval = AtomicInteger(1)
+    val activeStreamMode = AtomicReference("mjpeg")
+    val fallbackReason = AtomicReference("")
+    val h264Failed = AtomicBoolean(false)
 
     val cameraId = AtomicReference("0")
-    val width = AtomicInteger(1280) // requested capture width
-    val height = AtomicInteger(720) // requested capture height
-    val outputWidth = AtomicInteger(1280) // requested output width
-    val outputHeight = AtomicInteger(720) // requested output height
-    val profile = AtomicReference("balanced")
+    val width = AtomicInteger(1920) // requested capture width
+    val height = AtomicInteger(1080) // requested capture height
+    val outputWidth = AtomicInteger(1920) // requested output width
+    val outputHeight = AtomicInteger(1080) // requested output height
+    val profile = AtomicReference("adaptive")
 
     val jpegQuality = AtomicInteger(85)
-    val fps = AtomicInteger(30)
+    val fps = AtomicInteger(60)
     val actualFps = AtomicInteger(0)
+    val captureFps = AtomicInteger(0)
+    val encodedFps = AtomicInteger(0)
+    val selectedFps = AtomicInteger(0)
+    val encodedBitrate = AtomicInteger(0)
+    val actualBitrate = AtomicInteger(0)
+    val encoderName = AtomicReference("")
+    val hardwareEncoder = AtomicBoolean(false)
     val framesThisSecond = AtomicInteger(0)
     val fpsWindowStartMs = AtomicLong(System.currentTimeMillis())
     val androidEncodeMsAvg = AtomicReference(0.0)
@@ -126,6 +136,9 @@ object StreamState {
     /** SurfaceProvider for CameraX Preview use case */
     var surfaceProvider: androidx.camera.core.Preview.SurfaceProvider? = null
 
+    /** Native preview surface used only by the Camera2/MediaCodec H.264 path. */
+    val camera2PreviewSurface = AtomicReference<android.view.Surface?>(null)
+
     /** The active Preview UseCase (if any). Enables dynamic surface rebinding without tearing down CameraX. */
     var previewUseCase: androidx.camera.core.Preview? = null
 
@@ -152,6 +165,8 @@ object StreamState {
         tokenRequired = accessMode.get() == "lanToken",
         allowLan = accessMode.get() != "usbOnly",
         streamMode = streamMode.get(),
+        activeStreamMode = activeStreamMode.get(),
+        fallbackReason = fallbackReason.get(),
         h264Bitrate = h264Bitrate.get(),
         h264KeyframeInterval = h264KeyframeInterval.get(),
         cameraId = cameraId.get(),
@@ -199,7 +214,12 @@ object StreamState {
         h264Clients = h264ClientCount.get(),
         yuvMsAvg = yuvMsAvg.get(),
         jpegMsAvg = jpegMsAvg.get(),
-        rotateMsAvg = rotateMsAvg.get()
+        rotateMsAvg = rotateMsAvg.get(),
+        captureFps = captureFps.get(),
+        encodedFps = encodedFps.get(),
+        encodedBitrate = encodedBitrate.get(),
+        encoderName = encoderName.get(),
+        hardwareEncoder = hardwareEncoder.get()
     )
 }
 
@@ -218,6 +238,8 @@ data class StreamStatusDto(
     val tokenRequired: Boolean,
     val allowLan: Boolean,
     val streamMode: String,
+    val activeStreamMode: String = "mjpeg",
+    val fallbackReason: String = "",
     val h264Bitrate: Int,
     val h264KeyframeInterval: Int,
     val cameraId: String,
@@ -265,5 +287,10 @@ data class StreamStatusDto(
     val h264Clients: Int = 0,
     val yuvMsAvg: Double = 0.0,
     val jpegMsAvg: Double = 0.0,
-    val rotateMsAvg: Double = 0.0
+    val rotateMsAvg: Double = 0.0,
+    val captureFps: Int = 0,
+    val encodedFps: Int = 0,
+    val encodedBitrate: Int = 0,
+    val encoderName: String = "",
+    val hardwareEncoder: Boolean = false
 )

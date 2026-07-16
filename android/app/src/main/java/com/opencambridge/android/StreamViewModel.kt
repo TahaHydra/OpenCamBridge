@@ -75,7 +75,7 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private val _mirror = MutableStateFlow(false)
     val mirror: StateFlow<Boolean> = _mirror.asStateFlow()
 
-    private val _streamMode = MutableStateFlow("mjpeg")
+    private val _streamMode = MutableStateFlow("h264")
     val streamMode: StateFlow<String> = _streamMode.asStateFlow()
 
     // Security
@@ -170,6 +170,10 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         // Dynamically attach or detach the surface to the active Preview UseCase
         // This avoids tearing down the entire CameraX session when switching tabs.
         StreamState.previewUseCase?.setSurfaceProvider(provider)
+    }
+
+    fun setCamera2PreviewSurface(surface: android.view.Surface?) {
+        StreamState.camera2PreviewSurface.set(surface)
     }
 
     fun toggleLocalPreview(enabled: Boolean) {

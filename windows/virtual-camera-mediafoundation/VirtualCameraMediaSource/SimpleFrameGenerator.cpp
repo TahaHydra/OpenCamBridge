@@ -41,13 +41,19 @@ HRESULT SimpleFrameGenerator::CreateFrame(
     else if(m_subType == MFVideoFormat_NV12)
     {
         DEBUG_MSG(L"NV12 frames %s \n", winrt::to_hstring(MFVideoFormat_NV12).data());
-
-        DWORD frameBuffLen = m_width * m_height * 4;
-        wil::unique_cotaskmem_ptr<BYTE[]> spBuff = wil::make_unique_cotaskmem_nothrow<BYTE[]>(frameBuffLen);
-        RETURN_IF_NULL_ALLOC(spBuff.get());
-
-        RETURN_IF_FAILED(_CreateRGB32Frame(spBuff.get(), frameBuffLen, m_width * 4, m_width, m_height, rgbMask));
-        RETURN_IF_FAILED(RGB32ToNV12Frame(spBuff.get(), frameBuffLen, m_width * 4, m_width, m_height, pBuf, len, pitch));
+        RETURN_HR_IF(E_INVALIDARG, pitch <= 0 || static_cast<DWORD>(pitch) < m_width);
+        RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+            static_cast<uint64_t>(pitch) * (m_height + m_height / 2) > len);
+        const BYTE offset = static_cast<BYTE>((MFGetSystemTime() / 1000000) & 0xff);
+        for (DWORD row = 0; row < m_height; ++row) {
+            BYTE* y = pBuf + static_cast<size_t>(row) * pitch;
+            for (DWORD col = 0; col < m_width; ++col) y[col] = static_cast<BYTE>(16 + ((row + col + offset) % 220));
+        }
+        BYTE* uv = pBuf + static_cast<size_t>(pitch) * m_height;
+        for (DWORD row = 0; row < m_height / 2; ++row) {
+            BYTE* line = uv + static_cast<size_t>(row) * pitch;
+            for (DWORD col = 0; col < m_width; col += 2) { line[col] = 128; line[col + 1] = 128; }
+        }
     }
     else
     {

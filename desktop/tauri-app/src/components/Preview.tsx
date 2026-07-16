@@ -128,11 +128,12 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
   // - Auto: box always matches the frame, so the user's fit mode applies as-is.
   const effectiveFit =
     layout === '16:9' && framePortrait ? 'fit' : fitMode;
+  const h264Primary = (serverStatus?.activeStreamMode || serverStatus?.streamMode) === 'h264';
 
   return (
     <div className="preview-wrapper animate-fade">
       <div className={`preview-stage ${boxClass}`} ref={boxRef}>
-        <div className="stream-rotator" style={rotatorStyle}>
+        {!h264Primary && <div className="stream-rotator" style={rotatorStyle}>
           <img
             ref={imgRef}
             src={mjpegUrl}
@@ -142,9 +143,15 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
             alt="Live Stream"
             style={{ opacity: isError ? 0 : 1 }}
           />
-        </div>
+        </div>}
 
-        {showOverlay && (
+        {h264Primary ? (
+          <div className="preview-overlay">
+            <VideoMessage />
+            <div>Hardware H.264 is feeding the Windows virtual camera.</div>
+            <div style={{ fontSize: '0.75rem', opacity: 0.7 }}>Enable preview on the phone for a zero-copy Camera2 preview surface.</div>
+          </div>
+        ) : showOverlay && (
           <div className="preview-overlay">
             {rebinding ? <RefreshCw size={48} opacity={0.6} className="animate-spin" /> : <CameraOff size={48} opacity={0.5} />}
             <div>{statusMsg}</div>
@@ -156,7 +163,7 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
           </div>
         )}
 
-        {!showOverlay && (
+        {!h264Primary && !showOverlay && (
           <button
             className="btn btn-secondary"
             style={{ position: 'absolute', top: 16, right: 16, padding: '6px 12px', fontSize: '0.8rem', background: 'rgba(0,0,0,0.5)' }}
@@ -166,12 +173,11 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
           </button>
         )}
 
-        {!isError && serverStatus?.streamMode === 'h264' && (
-          <div style={{ position: 'absolute', bottom: 16, left: 16, padding: '4px 10px', fontSize: '0.7rem', color: '#ffb300', background: 'rgba(0,0,0,0.6)', border: '1px solid rgba(255,179,0,0.4)', borderRadius: 4 }}>
-            H.264 active — this preview is a ~5 fps snapshot; the virtual camera runs at full rate
-          </div>
-        )}
       </div>
     </div>
   );
+}
+
+function VideoMessage() {
+  return <CameraOff size={48} opacity={0.5} />;
 }

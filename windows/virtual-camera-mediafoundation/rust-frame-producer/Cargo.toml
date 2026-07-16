@@ -18,8 +18,10 @@ fast_image_resize = "5"
 # switch.
 zune-jpeg = "0.4"
 reqwest = { version = "0.11", features = ["blocking"] }
-# H.264 decoding for --source h264. Builds Cisco openh264 from source (needs a
-# C/C++ compiler; nasm is optional and only enables faster assembly routines).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Software fallback for systems where the Media Foundation/D3D11 decoder cannot
+# run. The primary H.264 decoder is implemented in mf_decoder.rs.
 openh264 = "0.6"
 windows = { version = "0.52", features = [
     "Win32_Foundation",
@@ -29,5 +31,11 @@ windows = { version = "0.52", features = [
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
-    "Win32_System_Performance"
+    "Win32_System_Performance",
+    "Win32_Media_MediaFoundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Com"
 ] }

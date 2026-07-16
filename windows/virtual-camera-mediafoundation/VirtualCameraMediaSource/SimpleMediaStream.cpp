@@ -26,39 +26,36 @@ namespace winrt::WindowsSample::implementation
         const uint32_t NUM_MEDIATYPES = 5;
         wil::unique_cotaskmem_array_ptr<wil::com_ptr_nothrow<IMFMediaType>> mediaTypeList = wilEx::make_unique_cotaskmem_array<wil::com_ptr_nothrow<IMFMediaType>>(NUM_MEDIATYPES);
 
-        auto createMediaType = [](uint32_t width, uint32_t height, uint32_t fps, wil::com_ptr_nothrow<IMFMediaType>& spMediaType) -> HRESULT {
+        auto createMediaType = [](GUID subtype, uint32_t width, uint32_t height, uint32_t fps, wil::com_ptr_nothrow<IMFMediaType>& spMediaType) -> HRESULT {
             RETURN_IF_FAILED(MFCreateMediaType(&spMediaType));
             spMediaType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-            spMediaType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+            spMediaType->SetGUID(MF_MT_SUBTYPE, subtype);
             spMediaType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
             spMediaType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
             MFSetAttributeSize(spMediaType.get(), MF_MT_FRAME_SIZE, width, height);
             MFSetAttributeRatio(spMediaType.get(), MF_MT_FRAME_RATE, fps, 1);
-            uint32_t bitrate = (uint32_t)(width * height * 4 * 8 * fps);
+            uint64_t bytesPerFrame = subtype == MFVideoFormat_NV12
+                ? static_cast<uint64_t>(width) * height * 3 / 2
+                : static_cast<uint64_t>(width) * height * 4;
+            uint32_t bitrate = static_cast<uint32_t>(min<uint64_t>(UINT32_MAX, bytesPerFrame * 8 * fps));
             spMediaType->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
             MFSetAttributeRatio(spMediaType.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-            // Declare the surface TOP-DOWN. The shared framebuffer is top-down
-            // BGRA, but RGB32 in Media Foundation defaults to bottom-up (the
-            // derived MFGetStrideForBitmapInfoHeader stride is negative for RGB),
-            // so consumers such as OBS render the image upside down. A POSITIVE
-            // default stride (width*4) signals top-down. This is metadata only —
-            // ReadFrame's straight copy is left exactly as the known-good build,
-            // so this cannot reintroduce the out-of-bounds write / black screen
-            // that physically flipping rows in the copy loop caused.
-            spMediaType->SetUINT32(MF_MT_DEFAULT_STRIDE, (uint32_t)(width * 4));
+            spMediaType->SetUINT32(MF_MT_DEFAULT_STRIDE, subtype == MFVideoFormat_NV12 ? width : width * 4);
             return S_OK;
         };
 
         wil::com_ptr_nothrow<IMFMediaType> spMediaType0, spMediaType1, spMediaType2, spMediaType3, spMediaType4;
-        RETURN_IF_FAILED(createMediaType(1920, 1080, 60, spMediaType0));
+        RETURN_IF_FAILED(createMediaType(MFVideoFormat_NV12, 1920, 1080, 60, spMediaType0));
         mediaTypeList[0] = spMediaType0.detach();
-        RETURN_IF_FAILED(createMediaType(1920, 1080, 30, spMediaType1));
+        RETURN_IF_FAILED(createMediaType(MFVideoFormat_NV12, 1920, 1080, 30, spMediaType1));
         mediaTypeList[1] = spMediaType1.detach();
-        RETURN_IF_FAILED(createMediaType(1280, 720, 60, spMediaType2));
+        RETURN_IF_FAILED(createMediaType(MFVideoFormat_NV12, 1280, 720, 60, spMediaType2));
         mediaTypeList[2] = spMediaType2.detach();
-        RETURN_IF_FAILED(createMediaType(1280, 720, 30, spMediaType3));
+        RETURN_IF_FAILED(createMediaType(MFVideoFormat_NV12, 1280, 720, 30, spMediaType3));
         mediaTypeList[3] = spMediaType3.detach();
-        RETURN_IF_FAILED(createMediaType(960, 540, 30, spMediaType4));
+        // RGB32 is intentionally last and exists only for consumers that cannot
+        // negotiate NV12. The normal path never converts decoded frames to RGB.
+        RETURN_IF_FAILED(createMediaType(MFVideoFormat_RGB32, 1280, 720, 30, spMediaType4));
         mediaTypeList[4] = spMediaType4.detach();
 
         RETURN_IF_FAILED(MFCreateAttributes(&m_spAttributes, 10));
@@ -212,33 +209,37 @@ namespace winrt::WindowsSample::implementation
         
 
         UINT32 width = 1280, height = 720;
+        GUID subtype = MFVideoFormat_NV12;
         if (m_spMediaType) {
             MFGetAttributeSize(m_spMediaType.get(), MF_MT_FRAME_SIZE, &width, &height);
+            m_spMediaType->GetGUID(MF_MT_SUBTYPE, &subtype);
         }
 
-        HRESULT hrFrame = m_shmClient.ReadFrame(pbuf, bufferLength, pitch, width, height);
+        UINT32 fpsNum = 30;
+        UINT32 fpsDen = 1;
+        if (m_spMediaType) MFGetAttributeRatio(m_spMediaType.get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen);
+        (void)m_shmClient.SetConsumerFormat(width, height, fpsNum, fpsDen);
+
+        OpenCamBridgeFrameMetadata metadata = {};
+        HRESULT hrFrame = m_shmClient.ReadFrame(pbuf, bufferLength, pitch, width, height, subtype, &metadata);
         if (FAILED(hrFrame)) {
-            // Log fallback if desired
+            // Test pattern is used only until the first valid producer frame.
             RETURN_IF_FAILED(m_spFrameGenerator->CreateFrame(pbuf, bufferLength, pitch, m_rgbMask));
         }
         //RETURN_IF_FAILED(WriteSampleData(pbuf, bufferLength, pitch, width, height));
         RETURN_IF_FAILED(buffer2D->Unlock2D());
 
-        RETURN_IF_FAILED(sample->SetSampleTime(MFGetSystemTime()));
-        
-        UINT32 fpsNum = 30;
-        UINT32 fpsDen = 1;
-
-        if (m_spMediaType) {
-            MFGetAttributeRatio(m_spMediaType.get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen);
-        }
-
         LONGLONG duration = 333333;
         if (fpsNum > 0) {
             duration = (10'000'000LL * fpsDen) / fpsNum;
         }
+        if (m_nextSampleTime == 0) m_nextSampleTime = MFGetSystemTime();
+        RETURN_IF_FAILED(sample->SetSampleTime(m_nextSampleTime));
+        m_nextSampleTime += duration;
 
         RETURN_IF_FAILED(sample->SetSampleDuration(duration));
+        if (metadata.flags & (1u << 2)) sample->SetUINT32(MFSampleExtension_Discontinuity, TRUE);
+        sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
         if (pToken != nullptr)
         {
             RETURN_IF_FAILED(sample->SetUnknown(MFSampleExtension_Token, pToken));
@@ -312,10 +313,7 @@ namespace winrt::WindowsSample::implementation
         winrt::slim_lock_guard lock(m_Lock);
 
         RETURN_HR_IF_NULL(E_INVALIDARG, pMediaType);
-        if (m_spMediaType == nullptr)
-        {
-            m_spMediaType = pMediaType;
-        }
+        m_spMediaType = pMediaType;
         m_bSelected = true;
 
         // Change Stream state to running.
@@ -453,7 +451,7 @@ namespace winrt::WindowsSample::implementation
             MFGetAttributeSize(m_spMediaType.get(), MF_MT_FRAME_SIZE, &width, &height);
 
             DEBUG_MSG(L"Initialize sample allocator for mediatype: %s, %dx%d ", winrt::to_hstring(subType).data(), width, height);
-            RETURN_IF_FAILED(m_spSampleAllocator->InitializeSampleAllocator(10, m_spMediaType.get()));
+            RETURN_IF_FAILED(m_spSampleAllocator->InitializeSampleAllocator(3, m_spMediaType.get()));
             if (m_spFrameGenerator == nullptr)
             {
                 m_spFrameGenerator = wil::make_unique_nothrow<SimpleFrameGenerator>();
@@ -470,6 +468,7 @@ namespace winrt::WindowsSample::implementation
 
         // Set stream state
         m_streamState = MF_STREAM_STATE_RUNNING;
+        m_nextSampleTime = MFGetSystemTime();
 
         return S_OK;
     }
@@ -479,6 +478,7 @@ namespace winrt::WindowsSample::implementation
     {
         // Set stream state
         m_streamState = MF_STREAM_STATE_STOPPED;
+        m_nextSampleTime = 0;
 
         // NOTE: if implementation has sampleRequestQueue or sampleQueue, it must flush the queue on stopped.
         if (bSendEvent)

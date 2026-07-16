@@ -227,7 +227,8 @@ class CameraRepository(private val context: Context) {
             fpsByResolution = fpsByResolution,
             supportsHighSpeed = supportsHighSpeed,
             highSpeedSizes = highSpeedSizes,
-            highSpeedFpsRanges = highSpeedFpsRanges
+            highSpeedFpsRanges = highSpeedFpsRanges,
+            h264Modes = H264Capabilities.supportedModes(context, id)
         )
     }
 }

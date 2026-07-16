@@ -1,3 +1,5 @@
+param([string]$DeviceSerial)
+
 Write-Host "=== OpenCamBridge HARD DEV RESET ===" -ForegroundColor Cyan
 $ErrorActionPreference = "SilentlyContinue"
 
@@ -33,9 +35,18 @@ Get-NetTCPConnection -LocalPort 1420 -ErrorAction SilentlyContinue | ForEach-Obj
     Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "Removing ADB forwards..." -ForegroundColor Yellow
+Write-Host "Removing ADB forward tcp:8080..." -ForegroundColor Yellow
 if (Test-Path $adb) {
-    & $adb forward --remove-all
+    # Only remove our own forward; --remove-all would kill forwards owned by other tools.
+    $connected = @(& $adb devices | Select-Object -Skip 1 | ForEach-Object {
+        if ($_ -match '^([^\s]+)\s+device$') { $Matches[1] }
+    } | Where-Object { $_ })
+    if ([string]::IsNullOrWhiteSpace($DeviceSerial) -and $connected.Count -eq 1) { $DeviceSerial = $connected[0] }
+    if ($connected.Count -gt 1 -and [string]::IsNullOrWhiteSpace($DeviceSerial)) {
+        Write-Host "Several phones are connected; pass -DeviceSerial to remove that phone's forward." -ForegroundColor Yellow
+    } elseif (![string]::IsNullOrWhiteSpace($DeviceSerial)) {
+        & $adb -s $DeviceSerial forward --remove tcp:8080 2>$null
+    }
 }
 
 Write-Host "Keeping framebuffer.bin to avoid stale Media Foundation mappings..." -ForegroundColor Yellow

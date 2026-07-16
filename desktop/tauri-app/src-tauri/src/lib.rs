@@ -1,12 +1,6 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod adb;
 mod logger;
 mod virtualcam;
-
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -17,7 +11,6 @@ pub fn run() {
         .manage(virtualcam::VirtualCamManager::new())
         .manage(logger::SessionLog::new())
         .invoke_handler(tauri::generate_handler![
-            greet,
             adb::get_adb_status,
             adb::list_devices,
             adb::forward_port,

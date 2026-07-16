@@ -23,6 +23,7 @@ import com.opencambridge.android.state.SettingsManager
 import com.opencambridge.android.state.StreamState
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -37,6 +38,8 @@ class StreamService : LifecycleService() {
     private lateinit var h264Streamer: H264Streamer
     private lateinit var settingsManager: SettingsManager
     private var orientationListener: android.view.OrientationEventListener? = null
+    private var monitorJob: Job? = null
+    private var lowH264Windows = 0
 
     private val cameraMutex = Mutex()
 
@@ -68,13 +71,13 @@ class StreamService : LifecycleService() {
             onStopCamera = { stopCamera() },
             onApplySettingsPatch = { req, source -> applySettingsPatch(req, source) },
             onSetZoomRatio = { ratio ->
-                if (StreamState.streamMode.get() == "h264") h264Streamer.setZoomRatio(ratio) else mjpegStreamer.setZoomRatio(ratio)
+                if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setZoomRatio(ratio) else mjpegStreamer.setZoomRatio(ratio)
             },
             onSetLinearZoom = { linear ->
-                if (StreamState.streamMode.get() == "h264") h264Streamer.setLinearZoom(linear) else mjpegStreamer.setLinearZoom(linear)
+                if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setLinearZoom(linear) else mjpegStreamer.setLinearZoom(linear)
             },
             onSetTorch = { enabled ->
-                if (StreamState.streamMode.get() == "h264") h264Streamer.setTorch(enabled) else mjpegStreamer.setTorch(enabled)
+                if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setTorch(enabled) else mjpegStreamer.setTorch(enabled)
             },
             onRecoverCamera = { recoverCamera() }
         )
@@ -83,13 +86,13 @@ class StreamService : LifecycleService() {
         // them directly instead of POSTing to its own loopback server.
         ServiceBridge.applyPatch = { req, source -> applySettingsPatch(req, source) }
         ServiceBridge.setTorch = { enabled ->
-            if (StreamState.streamMode.get() == "h264") h264Streamer.setTorch(enabled) else mjpegStreamer.setTorch(enabled)
+            if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setTorch(enabled) else mjpegStreamer.setTorch(enabled)
         }
         ServiceBridge.setLinearZoom = { linear ->
-            if (StreamState.streamMode.get() == "h264") h264Streamer.setLinearZoom(linear) else mjpegStreamer.setLinearZoom(linear)
+            if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setLinearZoom(linear) else mjpegStreamer.setLinearZoom(linear)
         }
         ServiceBridge.setZoomRatio = { ratio ->
-            if (StreamState.streamMode.get() == "h264") h264Streamer.setZoomRatio(ratio) else mjpegStreamer.setZoomRatio(ratio)
+            if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setZoomRatio(ratio) else mjpegStreamer.setZoomRatio(ratio)
         }
         ServiceBridge.startCamera = { startCamera() }
         ServiceBridge.stopCamera = { stopCamera() }
@@ -148,9 +151,52 @@ class StreamService : LifecycleService() {
         startCamera()
 
         // Start bandwidth monitoring
-        lifecycleScope.launch {
+        if (monitorJob?.isActive != true) monitorJob = lifecycleScope.launch {
             while (isActive) {
                 kotlinx.coroutines.delay(2000)
+
+                if (StreamState.h264Failed.getAndSet(false) && StreamState.activeStreamMode.get() == "h264") {
+                    cameraMutex.withLock {
+                        AppLogger.w("H264", "Encoder failed at runtime; switching to MJPEG compatibility mode")
+                        StreamState.lifecycleState.set(LifecycleState.REBINDING)
+                        h264Streamer.stop()
+                        kotlinx.coroutines.delay(150)
+                        mjpegStreamer.start()
+                        StreamState.activeStreamMode.set("mjpeg")
+                        StreamState.fallbackUsed.set(true)
+                        StreamState.lifecycleState.set(LifecycleState.STREAMING)
+                        StreamState.streaming.set(true)
+                    }
+                }
+
+                if (StreamState.activeStreamMode.get() == "h264") {
+                    val target = StreamState.selectedFps.get()
+                    val actual = minOf(StreamState.captureFps.get(), StreamState.encodedFps.get())
+                    lowH264Windows = if (target > 0 && actual > 0 && actual * 100 < target * 80) lowH264Windows + 1 else 0
+                    if (lowH264Windows >= 2) {
+                        lowH264Windows = 0
+                        val next = h264Streamer.prepareAdaptiveDowngrade()
+                        if (next != null) {
+                            cameraMutex.withLock {
+                                val reason = "${StreamState.encodedWidth.get()}x${StreamState.encodedHeight.get()}@${target} could not sustain $target FPS; adapting to ${next.width}x${next.height}@${next.fps}"
+                                AppLogger.w("H264", reason)
+                                StreamState.fallbackReason.set(reason)
+                                StreamState.fallbackUsed.set(true)
+                                StreamState.lifecycleState.set(LifecycleState.REBINDING)
+                                h264Streamer.stop()
+                                kotlinx.coroutines.delay(150)
+                                h264Streamer.start()
+                                StreamState.lifecycleState.set(LifecycleState.STREAMING)
+                                StreamState.streaming.set(true)
+                            }
+                        } else {
+                            StreamState.fallbackReason.set("Lowest H.264 profile could not sustain its target FPS")
+                            StreamState.h264Failed.set(true)
+                        }
+                    }
+                } else {
+                    lowH264Windows = 0
+                }
 
                 val sent = StreamState.bytesSentThisSecond.getAndSet(0L)
                 val bps = sent / 2.0 // average over 2 seconds
@@ -203,11 +249,7 @@ class StreamService : LifecycleService() {
                 AppLogger.i("Camera", "Camera starting")
 
                 try {
-                    if (StreamState.streamMode.get() == "h264") {
-                        h264Streamer.start()
-                    } else {
-                        mjpegStreamer.start()
-                    }
+                    startSelectedPipeline()
                     StreamState.lifecycleState.set(LifecycleState.STREAMING)
                     Log.d(TAG, "Camera STREAMING")
                     AppLogger.i("Camera", "Camera streaming successfully")
@@ -258,11 +300,7 @@ class StreamService : LifecycleService() {
                     // Wait briefly for camera hardware to release properly
                     kotlinx.coroutines.delay(200)
 
-                    if (StreamState.streamMode.get() == "h264") {
-                        h264Streamer.start()
-                    } else {
-                        mjpegStreamer.start()
-                    }
+                    startSelectedPipeline()
                     StreamState.lifecycleState.set(LifecycleState.STREAMING)
                     StreamState.streaming.set(true)
                     Log.d(TAG, "Camera REBOUND to STREAMING")
@@ -294,11 +332,7 @@ class StreamService : LifecycleService() {
                 StreamState.lastError.set("")
                 StreamState.streaming.set(true)
                 try {
-                    if (StreamState.streamMode.get() == "h264") {
-                        h264Streamer.start()
-                    } else {
-                        mjpegStreamer.start()
-                    }
+                    startSelectedPipeline()
                     StreamState.lifecycleState.set(LifecycleState.STREAMING)
                 } catch (e: Exception) {
                     handleCameraError("Failed to start camera during recovery", e)
@@ -316,6 +350,30 @@ class StreamService : LifecycleService() {
         StreamState.streaming.set(false)
     }
 
+    /** Starts the requested path and transparently falls back when AVC surface
+     * capture cannot be created. The requested setting is retained so a later
+     * reconnect/rebind can retry hardware H.264. */
+    private suspend fun startSelectedPipeline() {
+        if (StreamState.streamMode.get() != "h264") {
+            StreamState.fallbackReason.set("")
+            StreamState.fallbackUsed.set(false)
+            mjpegStreamer.start()
+            StreamState.activeStreamMode.set("mjpeg")
+            return
+        }
+        try {
+            h264Streamer.start()
+            StreamState.activeStreamMode.set("h264")
+        } catch (h264Error: Exception) {
+            val reason = "H.264 unavailable: ${h264Error.message}; using MJPEG"
+            AppLogger.w("H264", reason)
+            StreamState.fallbackReason.set(reason)
+            StreamState.fallbackUsed.set(true)
+            mjpegStreamer.start()
+            StreamState.activeStreamMode.set("mjpeg")
+        }
+    }
+
     private fun applySettingsPatch(req: UpdateSettingsRequest, source: String?) {
         var requiresRebind = false
         var requiresSettingsSave = false
@@ -327,6 +385,11 @@ class StreamService : LifecycleService() {
 
         AppLogger.i("System", "Settings patch received from ${source ?: "unknown"}")
 
+        if (req.cameraId != null || req.streamMode != null || req.width != null || req.height != null || req.fps != null) {
+            h264Streamer.resetAdaptiveProfile()
+            lowH264Windows = 0
+        }
+
         // --- Camera-Affecting Settings (Rebind) ---
         req.cameraId?.let { StreamState.cameraId.set(it); requiresRebind = true; requiresSettingsSave = true }
         req.streamMode?.let { StreamState.streamMode.set(it); requiresRebind = true; requiresSettingsSave = true }
@@ -337,7 +400,7 @@ class StreamService : LifecycleService() {
             // interruption). Only rebind when H.264 is actually streaming and
             // the dynamic update failed; in MJPEG mode the value simply takes
             // effect at the next H.264 start.
-            if (StreamState.streamMode.get() == "h264" &&
+            if (StreamState.activeStreamMode.get() == "h264" &&
                 StreamState.lifecycleState.get() == LifecycleState.STREAMING &&
                 !h264Streamer.updateBitrate(it)
             ) {

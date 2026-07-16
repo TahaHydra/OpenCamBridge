@@ -3,9 +3,7 @@ package com.opencambridge.android.camera
 import android.util.Size
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionFilter
-import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import com.opencambridge.android.state.StreamState
-import kotlin.math.abs
 
 object ResolutionPolicy {
 
@@ -21,9 +19,7 @@ object ResolutionPolicy {
     fun buildSelector(
         profile: String,
         requestedWidth: Int,
-        requestedHeight: Int,
-        allowNative: Boolean,
-        allowAspectFallback: Boolean
+        requestedHeight: Int
     ): ResolutionSelector {
         val filter = ResolutionFilter { supportedSizes, _ ->
             val validSizes = mutableListOf<Size>()

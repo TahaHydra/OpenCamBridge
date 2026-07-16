@@ -6,6 +6,8 @@ import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.ViewGroup
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -20,7 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.*
@@ -293,7 +295,7 @@ fun MainScreen(
                     onClick = { currentTab = NavTab.Security }
                 )
                 NavigationBarItem(
-                    icon = { Icon(Icons.Default.List, contentDescription = null) },
+                    icon = { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null) },
                     label = { Text("Logs") },
                     selected = currentTab == NavTab.Logs,
                     onClick = { currentTab = NavTab.Logs }
@@ -519,7 +521,11 @@ fun MainControls(
         // lens reports which frame rates it can actually deliver at this
         // resolution. Unknown (0) means do not restrict.
         val activeCam = cameras.find { it.id == selectedCameraId }
-        val maxFpsHere = activeCam?.fpsByResolution
+        val h264ResolutionOptions = activeCam?.h264Modes?.map { Pair(it.width, it.height) }?.distinct().orEmpty()
+        val resolutionOptions = if (streamMode == "h264") h264ResolutionOptions else listOf(Pair(1920, 1080), Pair(1280, 720), Pair(640, 480))
+        val h264FpsOptions = activeCam?.h264Modes?.filter { it.width == width && it.height == height }?.map { it.fps }?.distinct().orEmpty()
+        val fpsOptions = if (streamMode == "h264") h264FpsOptions else listOf(15, 30, 60)
+        val maxFpsHere = if (streamMode == "h264") h264FpsOptions.maxOrNull() ?: 0 else activeCam?.fpsByResolution
             ?.firstOrNull { it.width == width && it.height == height }?.maxFps ?: 0
 
         if (rebindInProgress) {
@@ -540,9 +546,9 @@ fun MainControls(
                 Spacer(modifier = Modifier.height(16.dp))
                 CameraSelector(cameras, selectedCameraId, !rebindInProgress, onCameraSelect)
                 Spacer(modifier = Modifier.height(16.dp))
-                ResolutionSelector(width, height, !rebindInProgress, onResolutionSelect)
+                ResolutionSelector(width, height, resolutionOptions, !rebindInProgress, onResolutionSelect)
                 Spacer(modifier = Modifier.height(16.dp))
-                FpsSelector(fps, maxFpsHere, !rebindInProgress, onFpsSelect)
+                FpsSelector(fps, maxFpsHere, fpsOptions, streamMode == "h264", !rebindInProgress, onFpsSelect)
             }
         }
         Spacer(modifier = Modifier.height(16.dp))
@@ -609,13 +615,28 @@ fun MainControls(
 
 @Composable
 fun LocalPreviewBox(fitMode: String, viewModel: StreamViewModel) {
+    val streamMode by viewModel.streamMode.collectAsState()
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .aspectRatio(16f / 9f)
             .background(Color.Black, RoundedCornerShape(8.dp))
     ) {
-        AndroidView(
+        if (streamMode == "h264") AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx ->
+                SurfaceView(ctx).apply {
+                    layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                    holder.addCallback(object : SurfaceHolder.Callback {
+                        override fun surfaceCreated(holder: SurfaceHolder) = viewModel.setCamera2PreviewSurface(holder.surface)
+                        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) =
+                            viewModel.setCamera2PreviewSurface(holder.surface)
+                        override fun surfaceDestroyed(holder: SurfaceHolder) = viewModel.setCamera2PreviewSurface(null)
+                    })
+                }
+            },
+            onRelease = { viewModel.setCamera2PreviewSurface(null) }
+        ) else AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
                 PreviewView(ctx).apply {
@@ -730,13 +751,8 @@ fun CameraSelector(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ResolutionSelector(width: Int, height: Int, enabled: Boolean, onSelect: (Int, Int) -> Unit) {
+fun ResolutionSelector(width: Int, height: Int, options: List<Pair<Int, Int>>, enabled: Boolean, onSelect: (Int, Int) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
-    val options = listOf(
-        Pair(1920, 1080),
-        Pair(1280, 720),
-        Pair(640, 480)
-    )
 
     ExposedDropdownMenuBox(
         expanded = expanded,
@@ -775,9 +791,8 @@ fun ResolutionSelector(width: Int, height: Int, enabled: Boolean, onSelect: (Int
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun FpsSelector(fps: Int, maxFps: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
+fun FpsSelector(fps: Int, maxFps: Int, options: List<Int>, h264: Boolean, enabled: Boolean, onSelect: (Int) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
-    val options = listOf(15, 30, 60)
     // maxFps == 0 means "unknown" (capability not reported) → do not restrict.
     fun supported(opt: Int) = maxFps == 0 || opt <= maxFps + 2
 
@@ -818,8 +833,8 @@ fun FpsSelector(fps: Int, maxFps: Int, enabled: Boolean, onSelect: (Int) -> Unit
         }
         if (maxFps > 0) {
             Text(
-                "This lens reports up to $maxFps fps at this resolution via the normal camera API. " +
-                    "High-speed (slow-motion) modes, if any, are not used by the MJPEG webcam path.",
+                if (h264) "This is a complete Camera2 surface + hardware AVC encoder mode."
+                else "This lens reports up to $maxFps fps at this resolution via the normal camera API.",
                 color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)
             )
         }
@@ -1237,8 +1252,8 @@ fun LogsTabContent(
 fun StreamModeSelector(mode: String, enabled: Boolean, onSelect: (String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     val options = listOf(
-        Pair("mjpeg", "MJPEG"),
-        Pair("h264", "H.264 Experimental")
+        Pair("h264", "Hardware H.264 / OCB2"),
+        Pair("mjpeg", "MJPEG Compatibility")
     )
     val displayMode = options.find { it.first == mode }?.second ?: mode
 

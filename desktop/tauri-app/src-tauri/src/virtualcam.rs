@@ -16,7 +16,17 @@ pub struct VirtualCamMetrics {
     pub http_jpeg_fps: u32,
     pub decoded_fps: u32,
     pub written_fps: u32,
+    #[serde(default)]
+    pub transport_fps: u32,
+    #[serde(default)]
+    pub decoded_unique_fps: u32,
+    #[serde(default)]
+    pub virtual_camera_unique_fps: u32,
+    #[serde(default)]
+    pub repeated_samples: u64,
     pub dropped_jpegs: u32,
+    #[serde(default)]
+    pub replaced_frames: u64,
     pub jpeg_queue_len: u32,
     pub decode_ms_avg: u32,
     // default so metrics from older producer builds still parse
@@ -25,6 +35,8 @@ pub struct VirtualCamMetrics {
     pub resize_ms_avg: u32,
     pub write_ms_avg: u32,
     pub total_pipeline_ms: u32,
+    #[serde(default)]
+    pub latency_ms: u32,
     pub bytes_per_sec: usize,
     // Producer emits this; the desktop "Est. Bandwidth" readout stayed blank
     // without the field. Default keeps older producer builds parseable.
@@ -37,6 +49,18 @@ pub struct VirtualCamMetrics {
     pub decode_backend: String,
     #[serde(default)]
     pub resize_backend: String,
+    #[serde(default)]
+    pub decoder_name: String,
+    #[serde(default)]
+    pub hardware_decoder: bool,
+    #[serde(default)]
+    pub encoder_name: String,
+    #[serde(default)]
+    pub hardware_encoder: bool,
+    #[serde(default)]
+    pub camera_id: String,
+    #[serde(default)]
+    pub fallback_reason: String,
     #[serde(default)]
     pub rotation: u32,
     pub last_error: Option<String>,
@@ -156,7 +180,6 @@ pub fn start_virtual_camera_feeder(
     width: u32,
     height: u32,
     fps: f64,
-    quality: Option<u32>,
     profile: Option<String>,
     rotate: Option<u32>,
     mirror: Option<bool>,
@@ -202,17 +225,14 @@ pub fn start_virtual_camera_feeder(
     let exe_path = std::fs::canonicalize(&exe_path).unwrap_or(exe_path);
     let path_string = exe_path.to_string_lossy().to_string();
 
+    // Note: the producer no longer accepts --latest-only (always on) or
+    // --quality (JPEG quality is applied on the Android side).
     let mut cmd = Command::new(exe_path);
     cmd.arg("--source").arg(source)
        .arg("--url").arg(&url)
        .arg("--width").arg(width.to_string())
        .arg("--height").arg(height.to_string())
-       .arg("--fps").arg(fps.to_string())
-       .arg("--latest-only");
-
-    if let Some(q) = quality {
-        cmd.arg("--quality").arg(q.to_string());
-    }
+       .arg("--fps").arg(fps.to_string());
 
     if let Some(p) = profile {
         cmd.arg("--profile").arg(p);
@@ -226,11 +246,18 @@ pub fn start_virtual_camera_feeder(
         cmd.arg("--mirror");
     }
 
+    // Pass the LAN token via environment variable so it never appears in the
+    // child's command line (visible to any local process).
     if let Some(t) = token.filter(|t| !t.is_empty()) {
-        cmd.arg("--token").arg(t);
+        cmd.env("OPENCAMBRIDGE_TOKEN", t);
     }
 
-    println!(">>> [Tauri] Executing exactly: {:?}", cmd);
+    // Print program + args only (never the env, which holds the token).
+    println!(
+        ">>> [Tauri] Executing exactly: {:?} {:?}",
+        cmd.get_program(),
+        cmd.get_args().collect::<Vec<_>>()
+    );
 
     let mut child = match cmd
         .stdout(Stdio::piped())
@@ -279,8 +306,8 @@ pub fn start_virtual_camera_feeder(
             if let Ok(line) = line {
                 println!(">>> [Producer STDERR] {}", line);
                 // The producer prints benign informational lines to stderr at
-                // startup ("Framebuffer backend: ...", the experimental H.264
-                // NOTE). Treating those as last_error made every metrics line and
+                // startup ("Framebuffer backend: ...", decoder selection notes).
+                // Treating those as last_error made every metrics line and
                 // the session log show a fake "err=..." forever. Real errors are
                 // already carried in the per-second metrics JSON (last_error) on
                 // stdout; only promote genuinely error-ish stderr lines here.

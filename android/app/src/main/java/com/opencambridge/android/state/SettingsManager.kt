@@ -21,17 +21,17 @@ class SettingsManager(context: Context) {
         }
         StreamState.accessToken.set(token)
 
-        StreamState.streamMode.set(prefs.getString("streamMode", "mjpeg") ?: "mjpeg")
+        StreamState.streamMode.set(prefs.getString("streamMode", "h264") ?: "h264")
         StreamState.h264Bitrate.set(prefs.getInt("h264Bitrate", 4000000))
-        StreamState.h264KeyframeInterval.set(prefs.getInt("h264KeyframeInterval", 2))
+        StreamState.h264KeyframeInterval.set(prefs.getInt("h264KeyframeInterval", 1))
 
         StreamState.cameraId.set(prefs.getString("cameraId", "0") ?: "0")
-        StreamState.width.set(prefs.getInt("width", 1280))
-        StreamState.height.set(prefs.getInt("height", 720))
-        StreamState.outputWidth.set(prefs.getInt("outputWidth", 1280))
-        StreamState.outputHeight.set(prefs.getInt("outputHeight", 720))
-        StreamState.profile.set(prefs.getString("profile", "balanced") ?: "balanced")
-        StreamState.fps.set(prefs.getInt("fps", 30))
+        StreamState.width.set(prefs.getInt("width", 1920))
+        StreamState.height.set(prefs.getInt("height", 1080))
+        StreamState.outputWidth.set(prefs.getInt("outputWidth", 1920))
+        StreamState.outputHeight.set(prefs.getInt("outputHeight", 1080))
+        StreamState.profile.set(prefs.getString("profile", "adaptive") ?: "adaptive")
+        StreamState.fps.set(prefs.getInt("fps", 60))
         StreamState.jpegQuality.set(prefs.getInt("jpegQuality", 85))
         StreamState.previewFitMode.set(prefs.getString("previewFitMode", "fill") ?: "fill")
         // Orientation mode: "auto" (view follows how the phone is held),

@@ -9,10 +9,16 @@ import { startSession, logEvent } from './services/logging';
 import './App.css';
 
 interface ConnectionScreenProps {
-  onConnect: (url: string, token: string) => void;
+  onConnect: (url: string, token: string, connection: ConnectionInfo) => void;
 }
 
 type ConnectMode = 'usb' | 'lan';
+type AdbDevice = { serial: string; state: string; model?: string };
+type ConnectionInfo = {
+  mode: ConnectMode;
+  port?: number;
+  serial?: string;
+};
 
 function ConnectionScreen({ onConnect }: ConnectionScreenProps) {
   const [mode, setMode] = useState<ConnectMode>('usb');
@@ -22,8 +28,25 @@ function ConnectionScreen({ onConnect }: ConnectionScreenProps) {
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
+  const [adbDevices, setAdbDevices] = useState<AdbDevice[]>([]);
+  const [selectedSerial, setSelectedSerial] = useState('');
 
-  const verifyAndConnect = async (url: string, token: string) => {
+  const refreshAdbDevices = async () => {
+    try {
+      const devices = await invoke<AdbDevice[]>('list_devices');
+      setAdbDevices(devices);
+      setSelectedSerial(current => devices.some(d => d.serial === current)
+        ? current
+        : devices.length === 1 ? devices[0].serial : '');
+    } catch {
+      setAdbDevices([]);
+      setSelectedSerial('');
+    }
+  };
+
+  useEffect(() => { if (mode === 'usb') void refreshAdbDevices(); }, [mode]);
+
+  const verifyAndConnect = async (url: string, token: string, connection: ConnectionInfo) => {
     const formattedUrl = url.endsWith('/') ? url.slice(0, -1) : url;
 
     // 1. Reachability (no token needed for /health by design)
@@ -41,7 +64,7 @@ function ConnectionScreen({ onConnect }: ConnectionScreenProps) {
     }
     if (!statusRes.ok) throw new Error('Status check failed');
 
-    onConnect(formattedUrl, token);
+    onConnect(formattedUrl, token, connection);
   };
 
   const handleUsbConnect = async (e: React.FormEvent) => {
@@ -51,16 +74,33 @@ function ConnectionScreen({ onConnect }: ConnectionScreenProps) {
     setInfo('');
     const p = parseInt(port, 10) || 8080;
     try {
+      const liveDevices = await invoke<AdbDevice[]>('list_devices').catch(() => adbDevices);
+      setAdbDevices(liveDevices);
+      const selectedIsLive = liveDevices.some(device => device.serial === selectedSerial);
+      if (liveDevices.length > 1 && !selectedIsLive) {
+        setError('Several ADB devices are connected. Select the phone to use.');
+        return;
+      }
+      const effectiveSerial = liveDevices.length === 1 ? liveDevices[0].serial : selectedSerial;
       // Best-effort adb forward. If adb is missing we still try to connect:
       // the user may have set the forward up manually.
       try {
         setInfo('Setting up adb port forwarding...');
-        await invoke<string>('forward_port', { port: p });
+        await invoke<string>('forward_port', { port: p, serial: effectiveSerial || undefined });
         setInfo('adb forward active. Connecting...');
       } catch (adbErr: any) {
-        setInfo(`adb not available (${String(adbErr).slice(0, 120)}). Trying direct connection...`);
+        const adbMessage = String(adbErr);
+        if (/Several ADB devices|Selected ADB device/.test(adbMessage)) {
+          setError(adbMessage);
+          return;
+        }
+        setInfo(`adb not available (${adbMessage.slice(0, 120)}). Trying direct connection...`);
       }
-      await verifyAndConnect(`http://127.0.0.1:${p}`, '');
+      await verifyAndConnect(`http://127.0.0.1:${p}`, '', {
+        mode: 'usb',
+        port: p,
+        serial: effectiveSerial || undefined,
+      });
     } catch (err: any) {
       if (String(err?.message) === 'UNAUTHORIZED') {
         setError('The phone rejected the request (401). Is the phone set to LAN mode? For USB, set Access Mode to "USB Only" on the phone.');
@@ -78,7 +118,7 @@ function ConnectionScreen({ onConnect }: ConnectionScreenProps) {
     setError('');
     setInfo('');
     try {
-      await verifyAndConnect(lanUrl, lanToken.trim());
+      await verifyAndConnect(lanUrl, lanToken.trim(), { mode: 'lan' });
     } catch (err: any) {
       if (String(err?.message) === 'UNAUTHORIZED') {
         setError('Invalid or missing token. Copy the access token from the phone: OpenCamBridge app > Security tab.');
@@ -146,6 +186,19 @@ function ConnectionScreen({ onConnect }: ConnectionScreenProps) {
               />
             </div>
 
+            {adbDevices.length > 0 && (
+              <div style={{ textAlign: 'left' }}>
+                <label style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                  <span>Android device{adbDevices.length > 1 ? ' (required)' : ''}</span>
+                  <button type="button" onClick={refreshAdbDevices} style={{ border: 0, background: 'transparent', color: '#4dabf7', cursor: 'pointer' }}>Refresh</button>
+                </label>
+                <select className="input-control" value={selectedSerial} onChange={e => setSelectedSerial(e.target.value)} required={adbDevices.length > 1}>
+                  {adbDevices.length > 1 && <option value="">Select a phone…</option>}
+                  {adbDevices.map(device => <option key={device.serial} value={device.serial}>{device.model || 'Android device'} — {device.serial}</option>)}
+                </select>
+              </div>
+            )}
+
             <button type="submit" className="btn btn-primary" style={{ width: '100%', padding: '14px', marginTop: 8 }} disabled={isConnecting}>
               {isConnecting ? <Zap size={18} /> : <Usb size={18} />}
               {isConnecting ? 'Connecting...' : 'Set up USB & Connect'}
@@ -201,6 +254,7 @@ export default function App() {
   const [baseUrl, setBaseUrl] = useState('');
   const [token, setToken] = useState('');
   const [isConnected, setIsConnected] = useState(false);
+  const [connectionInfo, setConnectionInfo] = useState<ConnectionInfo | null>(null);
   const [serverStatus, setServerStatus] = useState<any>(null);
   const [fitMode, setFitMode] = useState('fill');
   const [obsMode, setObsMode] = useState(false);
@@ -226,6 +280,41 @@ export default function App() {
       } catch { /* capabilities best-effort */ }
     })();
   }, [isConnected, baseUrl, token]);
+
+  // An ADB forward is removed when a USB device disappears. Re-apply the
+  // exact selected-device forward while connected so the existing producer
+  // HTTP retry loop can resume after a cable cycle without restarting either
+  // desktop process.
+  useEffect(() => {
+    if (!isConnected || connectionInfo?.mode !== 'usb' || !connectionInfo.serial || !connectionInfo.port) return;
+
+    let active = true;
+    let inFlight = false;
+    let forwardHealthy = true;
+    const repairForward = async () => {
+      if (!active || inFlight) return;
+      inFlight = true;
+      try {
+        await invoke<string>('forward_port', {
+          port: connectionInfo.port,
+          serial: connectionInfo.serial,
+        });
+        if (!forwardHealthy) logEvent('usb', `ADB forward restored for ${connectionInfo.serial}`);
+        forwardHealthy = true;
+      } catch (error) {
+        if (forwardHealthy) logEvent('usb', `ADB device unavailable; waiting to restore forward: ${String(error)}`);
+        forwardHealthy = false;
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const timer = window.setInterval(() => { void repairForward(); }, 3000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [isConnected, connectionInfo]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -259,7 +348,12 @@ export default function App() {
   }, [isConnected, baseUrl, token]);
 
   if (!isConnected) {
-    return <ConnectionScreen onConnect={(url, tok) => { setBaseUrl(url); setToken(tok); setIsConnected(true); }} />;
+    return <ConnectionScreen onConnect={(url, tok, connection) => {
+      setBaseUrl(url);
+      setToken(tok);
+      setConnectionInfo(connection);
+      setIsConnected(true);
+    }} />;
   }
 
   const stateClass = serverStatus?.lifecycleState?.toLowerCase() || 'stopped';
@@ -300,7 +394,7 @@ export default function App() {
           <button className="btn btn-secondary" onClick={() => setShowLogs(true)} style={{ padding: '6px 12px', fontSize: '0.8rem' }} title="Session logs">
             <FileText size={14} /> Logs
           </button>
-          <button className="btn btn-secondary" onClick={() => { setIsConnected(false); setToken(''); }} style={{ padding: '6px 12px', fontSize: '0.8rem' }}>
+          <button className="btn btn-secondary" onClick={() => { setIsConnected(false); setToken(''); setConnectionInfo(null); }} style={{ padding: '6px 12px', fontSize: '0.8rem' }}>
             <Unplug size={14} /> Disconnect
           </button>
         </div>

@@ -16,18 +16,30 @@ interface VirtualCamMetrics {
   http_jpeg_fps: number;
   decoded_fps: number;
   written_fps: number;
+  transport_fps?: number;
+  decoded_unique_fps?: number;
+  virtual_camera_unique_fps?: number;
+  repeated_samples?: number;
   dropped_jpegs: number;
+  replaced_frames?: number;
   jpeg_queue_len: number;
   decode_ms_avg: number;
   rotate_ms_avg: number;
   resize_ms_avg: number;
   write_ms_avg: number;
   total_pipeline_ms: number;
+  latency_ms?: number;
   bytes_per_sec: number;
   estimated_mbps: string;
   pixel_format: string;
   decode_backend?: string;
   resize_backend?: string;
+  decoder_name?: string;
+  hardware_decoder?: boolean;
+  encoder_name?: string;
+  hardware_encoder?: boolean;
+  camera_id?: string;
+  fallback_reason?: string;
   rotation?: number;
   last_error: string | null;
 }
@@ -58,22 +70,22 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   const [cameras, setCameras] = useState<any[]>([]);
   const [settings, setSettings] = useState({
     cameraId: '0',
-    profile: 'balanced',
-    width: 1280,
-    height: 720,
-    outputWidth: 1280,
-    outputHeight: 720,
-    fps: 30,
+    profile: 'adaptive',
+    width: 1920,
+    height: 1080,
+    outputWidth: 1920,
+    outputHeight: 1080,
+    fps: 60,
     jpegQuality: 85,
     displayRotation: '0',
     aspectRatio: '16:9',
     mirror: false,
     torchEnabled: false,
     linearZoom: 0.0,
-    streamMode: 'mjpeg',
+    streamMode: 'h264',
     targetBandwidthMbps: 0,
     h264Bitrate: 4000000,
-    h264KeyframeInterval: 2
+    h264KeyframeInterval: 1
   });
 
   const PROFILE_PRESETS: Record<string, any> = {
@@ -164,11 +176,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   const [vcamMessage, setVcamMessage] = useState('');
   const [androidStreamStatus, setAndroidStreamStatus] = useState('unknown');
   const [androidMetrics, setAndroidMetrics] = useState<any>(null);
+  const [phoneInfo, setPhoneInfo] = useState<any>(null);
   const [now, setNow] = useState(Date.now() / 1000);
 
-  // Developer / Experimental mode. Off by default: V1 is a stable MJPEG product.
-  // When off, H.264 codec selection, capture profiles, and the verbose producer
-  // metrics are hidden — normal users just pick resolution/fps/quality.
+  // Developer mode only controls verbose diagnostics and presets. Codec choice
+  // is a normal product setting because hardware H.264 is the V2 primary path.
   const [devMode, setDevMode] = useState<boolean>(() => localStorage.getItem('ocb.devMode') === '1');
   useEffect(() => { localStorage.setItem('ocb.devMode', devMode ? '1' : '0'); }, [devMode]);
 
@@ -199,13 +211,27 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   // field is absent (older phone build / capability unknown) keep it visible so
   // version skew never hides a working torch.
   const torchSupported = activeCam ? activeCam.hasTorch !== false : false;
+  const h264Modes: any[] = Array.isArray(activeCam?.h264Modes) ? activeCam.h264Modes : [];
+  const h264ModeFor = (w: number, h: number, fps: number) =>
+    h264Modes.some((m: any) => m.width === w && m.height === h && m.fps === fps);
   const fpsCapFor = (w: number, h: number): number => {
+    if (settings.streamMode === 'h264') {
+      return Math.max(0, ...h264Modes.filter((m: any) => m.width === w && m.height === h).map((m: any) => m.fps));
+    }
     const e = activeCam?.fpsByResolution?.find((r: any) => r.width === w && r.height === h);
     return e ? e.maxFps : 0; // 0 = unknown (do not restrict)
   };
   const maxFpsHere = fpsCapFor(settings.width, settings.height);
-  const supports60 = maxFpsHere === 0 || maxFpsHere >= 50;
-  const supports30 = maxFpsHere === 0 || maxFpsHere >= 25;
+  const supports60 = settings.streamMode === 'h264' ? h264ModeFor(settings.width, settings.height, 60) : maxFpsHere === 0 || maxFpsHere >= 50;
+  const supports30 = settings.streamMode === 'h264' ? h264ModeFor(settings.width, settings.height, 30) : maxFpsHere === 0 || maxFpsHere >= 25;
+  const resolutionChoices = settings.streamMode === 'h264'
+    ? Array.from(new Map(h264Modes.map((m: any) => [`${m.width}x${m.height}`, { width: m.width, height: m.height }])).values()) as any[]
+    : [
+        { width: 640, height: 480 },
+        { width: 960, height: 540 },
+        { width: 1280, height: 720 },
+        { width: 1920, height: 1080 }
+      ];
 
   const handleStartObs = async () => {
     if (obsMode === 'window' && onEnterObsMode) {
@@ -279,6 +305,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   }, [baseUrl, token]);
 
   useEffect(() => {
+    apiFetch(baseUrl, '/api/device/info', token)
+      .then(res => res.json())
+      .then(setPhoneInfo)
+      .catch(() => setPhoneInfo(null));
+
     apiFetch(baseUrl, '/api/camera/list', token)
       .then(res => res.json())
       .then(data => {
@@ -443,17 +474,18 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   const startStream = () => apiFetch(baseUrl, '/api/stream/start', token, { method: 'POST' });
   const stopStream = () => apiFetch(baseUrl, '/api/stream/stop', token, { method: 'POST' });
 
-  const handleStartProducer = async (s: any) => {
+  const handleStartProducer = async (s: any, actual?: any) => {
     const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
-    const source = s.streamMode === 'h264' ? 'h264' : 'mjpeg';
-    const targetUrl = source === 'h264' ? `${base}/stream.h264` : `${base}/stream.mjpeg`;
+    const source = (actual?.activeStreamMode || s.streamMode) === 'h264' ? 'h264' : 'mjpeg';
+    const targetUrl = source === 'h264' ? `${base}/stream.ocb2` : `${base}/stream.mjpeg`;
     // Rotation is applied on the phone now (the /stream.mjpeg frames are already
     // rotated), so the producer must NOT rotate again — pass 0 explicitly, which
     // also disables its portrait auto-rotate. The producer still letterboxes a
     // portrait frame into the fixed landscape output.
     const rotate = 0;
+    // jpegQuality is applied on the Android side; the producer no longer takes it.
     console.log('[Tauri UI] Calling start_virtual_camera_feeder with', {
-      url: targetUrl, source, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, quality: s.jpegQuality, profile: s.profile, rotate, mirror: s.mirror
+      url: targetUrl, source, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, profile: s.profile, rotate, mirror: s.mirror
     });
     try {
       await invoke('start_virtual_camera_feeder', {
@@ -462,7 +494,6 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         width: s.outputWidth || s.width,
         height: s.outputHeight || s.height,
         fps: s.fps,
-        quality: s.jpegQuality,
         profile: s.profile,
         rotate,
         mirror: !!s.mirror,
@@ -511,8 +542,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
     setVcamMessage('Starting feed...');
     try {
-      await restartAndroidStreamWithSettings(s);
-      await handleStartProducer(s);
+      const actual = await restartAndroidStreamWithSettings(s);
+      await handleStartProducer(s, actual);
 
       setVcamMessage('');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
@@ -676,7 +707,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
             Number(m.fps || 0) > 0 ||
             Number(m.encodedWidth || 0) > 0;
 
-          if (encodedOk && hasFrame) {
+          if (hasFrame && (encodedOk || m.fallbackUsed || m.activeStreamMode !== s.streamMode)) {
             return m;
           }
         }
@@ -732,15 +763,16 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     try { await invoke('stop_virtual_camera_feeder'); addDiag('pipeline', 'stopProducer ok'); }
     catch (e: any) { addDiag('pipeline', `stopProducer fail: ${e}`); }
 
-    try { await restartAndroidStreamWithSettings(s); addDiag('pipeline', 'androidRebind ok'); }
-    catch (e: any) { addDiag('pipeline', `androidRebind fail: ${e}`); }
+    let actual: any = null;
+    try { actual = await restartAndroidStreamWithSettings(s); addDiag('pipeline', `androidRebind ok (${actual?.activeStreamMode || s.streamMode})`); }
+    catch (e: any) { addDiag('pipeline', `androidRebind fail: ${e}`); throw e; }
 
-    await handleStartProducer(s);
+    await handleStartProducer(s, actual);
     let state = await invoke<VirtualCamState>('get_virtual_camera_status');
     if (!state.running) {
       addDiag('pipeline', 'producer not running after start — retrying once');
       await sleep(600);
-      await handleStartProducer(s);
+      await handleStartProducer(s, actual);
       state = await invoke<VirtualCamState>('get_virtual_camera_status');
     }
     setVcamState(state);
@@ -814,18 +846,6 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     await applySettingsAndRefreshPreview(next, ['displayRotation']);
   };
 
-  // V1 is MJPEG-only for normal users: leaving Developer mode forces the codec
-  // back to the stable MJPEG path so H.264 can never be left running by accident.
-  useEffect(() => {
-    if (!devMode && settingsRef.current.streamMode !== 'mjpeg') {
-      const next = { ...settingsRef.current, streamMode: 'mjpeg' };
-      setSettings(next);
-      settingsRef.current = next;
-      addDiag('codec', 'Developer mode off — codec reset to MJPEG');
-      postSettingsToAndroid(next).catch(() => {});
-    }
-  }, [devMode, addDiag]);
-
   return (
     <div className="control-panel glass-panel animate-fade" style={{ display: 'flex', flexDirection: 'column', gap: 24, padding: 24 }}>
 
@@ -852,6 +872,14 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
             <span style={{ color: 'var(--text-secondary)' }}>Profile:</span>
             <span style={{ color: '#fff', textTransform: 'capitalize' }}>{settings.profile}</span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-secondary)' }}>Phone:</span>
+            <span style={{ color: '#fff' }}>{phoneInfo ? `${phoneInfo.manufacturer || ''} ${phoneInfo.model || ''}`.trim() : 'Unknown'}</span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-secondary)' }}>Camera:</span>
+            <span style={{ color: '#fff' }}>{activeCam?.label || settings.cameraId}</span>
           </div>
         </div>
 
@@ -927,10 +955,9 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
               <span style={{ color: vcamState.running ? '#51cf66' : '#888' }}>{vcamState.running ? 'Streaming' : 'Idle'}</span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-              <span style={{ color: '#888' }}>FPS (out / target)</span>
-              <span style={{ color: (vcamState.metrics && vcamState.metrics.written_fps >= settings.fps - 5) ? '#51cf66' : '#ffb300' }}>
-                {vcamState.metrics ? `${vcamState.metrics.written_fps} / ${settings.fps}` : '— / ' + settings.fps}
-                {androidMetrics?.actualFps != null ? ` (phone ${androidMetrics.actualFps})` : ''}
+              <span style={{ color: '#888' }}>Unique FPS (camera / encode / decode / camera)</span>
+              <span style={{ color: (vcamState.metrics && (vcamState.metrics.virtual_camera_unique_fps ?? vcamState.metrics.written_fps) >= settings.fps - 5) ? '#51cf66' : '#ffb300' }}>
+                {androidMetrics?.captureFps ?? androidMetrics?.actualFps ?? '—'} / {androidMetrics?.encodedFps ?? '—'} / {vcamState.metrics?.decoded_unique_fps ?? vcamState.metrics?.decoded_fps ?? '—'} / {vcamState.metrics?.virtual_camera_unique_fps ?? vcamState.metrics?.written_fps ?? '—'}
               </span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -961,8 +988,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           </div>
         </div>
 
-        {/* Verbose producer metrics (developer mode) */}
-        {devMode && vcamState && (
+        {/* Pipeline truth metrics are product diagnostics, not synthetic FPS. */}
+        {vcamState && (
           <div style={{ background: '#0a0a0a', padding: 12, borderRadius: 8, border: '1px solid #222', fontFamily: 'monospace', fontSize: '0.75rem', color: '#51cf66' }}>
 
             {/* Extended Status */}
@@ -1006,21 +1033,35 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                   <span style={{ color: androidMetrics.aspectRatioMatch ? '#51cf66' : '#ffb300' }}>{androidMetrics.selectedAspectRatio}</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Native Encode Dim:</span>
-                  <span>{androidMetrics.encodedWidth}x{androidMetrics.encodedHeight}</span>
+                  <span>Resolution requested / actual:</span>
+                  <span>{settings.width}x{settings.height} / {androidMetrics.encodedWidth}x{androidMetrics.encodedHeight}</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
                   <span>Rotation Resizing:</span>
                   <span style={{ color: androidMetrics.resizeNeeded ? '#ffb300' : '#51cf66' }}>{androidMetrics.resizeNeeded ? 'Required' : 'Native Match'}</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Android FPS:</span>
-                  <span style={{ color: (androidMetrics.actualFps || androidMetrics.fps) >= settings.fps - 5 ? '#51cf66' : '#ffb300' }}>
-                    {androidMetrics.actualFps ?? androidMetrics.fps} / {settings.fps}
+                  <span>Capture FPS requested / actual:</span>
+                  <span style={{ color: (androidMetrics.captureFps || androidMetrics.actualFps || androidMetrics.fps) >= settings.fps - 5 ? '#51cf66' : '#ffb300' }}>
+                    {settings.fps} / {androidMetrics.captureFps ?? androidMetrics.actualFps ?? androidMetrics.fps}
                   </span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Android JPEG Encode:</span>
+                  <span>Encoder:</span>
+                  <span>{androidMetrics.encoderName || 'MJPEG'} ({androidMetrics.hardwareEncoder ? 'hardware' : 'compatibility'})</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                  <span>Encoded FPS / bitrate:</span>
+                  <span>{androidMetrics.encodedFps || 0} / {((androidMetrics.encodedBitrate || 0) / 1_000_000).toFixed(2)} Mbps</span>
+                </div>
+                {(androidMetrics.fallbackReason || vcamState.metrics?.fallback_reason) && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', color: '#ffb300', marginTop: 4 }}>
+                    <span>Active fallback:</span>
+                    <span>{androidMetrics.fallbackReason || vcamState.metrics?.fallback_reason}</span>
+                  </div>
+                )}
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                  <span>Android encode time:</span>
                   <span>{Number(androidMetrics.androidEncodeMsAvg || 0).toFixed(1)} ms</span>
                 </div>
 
@@ -1085,36 +1126,36 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
               <>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>FPS (In/Out):</span>
-                    <span>{vcamState.metrics.decoded_fps} / {vcamState.metrics.written_fps}</span>
+                    <span style={{ color: '#888' }}>Transport FPS:</span>
+                    <span>{vcamState.metrics.transport_fps ?? vcamState.metrics.http_jpeg_fps}</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Latency Est:</span>
-                    <span>{vcamState.metrics.total_pipeline_ms} ms</span>
+                    <span style={{ color: '#888' }}>Decoded unique FPS:</span>
+                    <span>{vcamState.metrics.decoded_unique_fps ?? vcamState.metrics.decoded_fps}</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Est. Bandwidth:</span>
+                    <span style={{ color: '#888' }}>Virtual-camera unique FPS:</span>
+                    <span>{vcamState.metrics.virtual_camera_unique_fps ?? vcamState.metrics.written_fps}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#888' }}>Repeated samples:</span>
+                    <span>{vcamState.metrics.repeated_samples ?? 0}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#888' }}>End-to-end latency:</span>
+                    <span>{vcamState.metrics.latency_ms ?? vcamState.metrics.total_pipeline_ms} ms</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#888' }}>Bandwidth:</span>
                     <span style={{ color: '#4dabf7' }}>{vcamState.metrics.estimated_mbps} Mbps</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Decode Time:</span>
-                    <span>{vcamState.metrics.decode_ms_avg} ms</span>
+                    <span style={{ color: '#888' }}>Decoder:</span>
+                    <span>{vcamState.metrics.decoder_name || vcamState.metrics.decode_backend || 'MJPEG'} ({vcamState.metrics.hardware_decoder ? 'hardware' : 'fallback'})</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Rotate Time:</span>
-                    <span>{vcamState.metrics.rotate_ms_avg} ms</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Resize Time:</span>
-                    <span>{vcamState.metrics.resize_ms_avg} ms</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Dropped JPEGs:</span>
-                    <span style={{ color: vcamState.metrics.dropped_jpegs > 0 ? '#ff6b6b' : 'inherit' }}>{vcamState.metrics.dropped_jpegs}</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Queue Len:</span>
-                    <span>{vcamState.metrics.jpeg_queue_len}</span>
+                    <span style={{ color: '#888' }}>Replaced / dropped:</span>
+                    <span>{vcamState.metrics.replaced_frames ?? 0} / {vcamState.metrics.dropped_jpegs}</span>
                   </div>
                 </div>
                 {vcamState.metrics.source_width !== vcamState.metrics.output_width && (
@@ -1151,10 +1192,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
               updateResolution(w, h);
             }}
           >
-            <option value="640x480">480p (640x480)</option>
-            <option value="960x540">540p (960x540)</option>
-            <option value="1280x720">720p (1280x720)</option>
-            <option value="1920x1080">1080p (1920x1080)</option>
+            {resolutionChoices.length === 0 && <option value="" disabled>No hardware H.264 modes on this lens</option>}
+            {resolutionChoices.map((r: any) => (
+              <option key={`${r.width}x${r.height}`} value={`${r.width}x${r.height}`}>
+                {r.height === 1080 ? '1080p' : r.height === 720 ? '720p' : `${r.height}p`} ({r.width}x{r.height})
+              </option>
+            ))}
           </select>
         </div>
 
@@ -1165,15 +1208,15 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
             value={settings.fps}
             onChange={(e) => updateFps(parseInt(e.target.value, 10))}
           >
-            <option value={15}>15 fps</option>
+            {settings.streamMode === 'mjpeg' && <option value={15}>15 fps</option>}
             <option value={30} disabled={!supports30}>30 fps{!supports30 ? ' (unsupported here)' : ''}</option>
             <option value={60} disabled={!supports60}>60 fps{!supports60 ? ' (unsupported here)' : ''}</option>
           </select>
           <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-            Resolution and frame rate are independent.
+            Resolution and frame rate are validated as one complete camera/encoder mode.
             {maxFpsHere > 0
-              ? ` This lens reports up to ${maxFpsHere} fps at ${settings.width}x${settings.height} via the normal camera API.`
-              : ' Actual rate depends on the phone camera and lighting.'}
+              ? ` This lens supports up to ${maxFpsHere} fps at ${settings.width}x${settings.height} on the selected path.`
+              : settings.streamMode === 'h264' ? ' No hardware H.264 mode is available for this combination.' : ' Actual rate depends on the phone camera and lighting.'}
             {androidMetrics?.actualFps != null &&
               ` Delivering ${androidMetrics.actualFps}/${settings.fps} fps now.`}
           </p>
@@ -1200,7 +1243,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
               <option value="balanced">Balanced (1280x720, Q85)</option>
               <option value="balanced-720p60">Balanced 60 (1280x720 @ 60fps, Q80)</option>
               <option value="quality">Quality (1920x1080, Q90)</option>
-              <option value="experimental-1080p60">Experimental (1080p @ 60fps)</option>
+              <option value="experimental-1080p60">1080p @ 60fps</option>
             </select>
             <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
               Developer preset: sets resolution + quality (+fps for "60" presets)
@@ -1258,26 +1301,22 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           )}
         </div>
 
-        {devMode && (
-          <div className="control-item">
-            <label>Stream Codec (Developer)</label>
+        <div className="control-item">
+            <label>Stream Codec</label>
             <select
               className="input-control"
               value={settings.streamMode}
               onChange={(e) => updateSetting('streamMode', e.target.value)}
             >
-              <option value="mjpeg">MJPEG (Stable)</option>
-              <option value="h264">H.264 (Experimental / unstable)</option>
+              <option value="h264">Hardware H.264 / OCB2 (Recommended)</option>
+              <option value="mjpeg">MJPEG (Compatibility)</option>
             </select>
-            <p style={{ fontSize: '0.7rem', color: '#ffb300', marginTop: 4 }}>
-              ⚠️ H.264 is experimental and may fail on some devices (the bundled
-              openh264 decoder errors on certain phone encoder output). MJPEG is
-              the stable V1 path. Use H.264 only for testing.
+            <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
+              H.264 uses Camera2 surface encoding, OCB2 framing and Windows hardware decoding. The app falls back to MJPEG when that complete path is unavailable.
             </p>
           </div>
-        )}
 
-        {(settings.streamMode === 'mjpeg' || !devMode) ? (
+        {settings.streamMode === 'mjpeg' ? (
           <>
             <div className="control-item" style={{ marginTop: 12 }}>
               <label style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -1310,9 +1349,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           </>
         ) : (
           <div style={{ marginTop: 12, padding: 12, background: 'rgba(255, 179, 0, 0.06)', borderRadius: 6, border: '1px solid rgba(255, 179, 0, 0.25)' }}>
-            <p style={{ fontSize: '0.75rem', color: '#ffb300', marginBottom: 12 }}>
-              H.264 is experimental. The desktop preview falls back to ~5 fps JPEG
-              snapshots; the virtual camera itself runs at full rate.
+            <p style={{ fontSize: '0.75rem', color: '#4dabf7', marginBottom: 12 }}>
+              Hardware H.264 is the low-latency V2 path. Disable the desktop preview if the phone cannot run a simultaneous preview surface at the selected rate.
             </p>
             <div className="control-item">
               <label style={{ display: 'flex', justifyContent: 'space-between' }}>
