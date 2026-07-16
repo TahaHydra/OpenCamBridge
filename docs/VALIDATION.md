@@ -1,6 +1,6 @@
 # Manual Validation Checklist
 
-None of the changes on `fable/full-product-hardening` have been run on a
+None of the changes on `main` have been run on a
 device, in OBS, or through adb. Everything below must be validated by hand
 before merging or releasing.
 

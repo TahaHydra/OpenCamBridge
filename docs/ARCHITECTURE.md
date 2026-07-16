@@ -1,6 +1,6 @@
 # OpenCamBridge Architecture
 
-Last updated for branch `fable/full-product-hardening`.
+Last updated for branch `main`.
 
 ## Pipeline overview
 
