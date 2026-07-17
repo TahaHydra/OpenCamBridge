@@ -867,6 +867,8 @@ fn bgra_to_nv12(src: &[u8], width: u32, height: u32, dst: &mut [u8]) {
 #[cfg(test)]
 mod ring_tests {
     use super::*;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
 
     #[test]
     fn h264_1080p60_fallback_selects_canonical_mjpeg_1080p30() {
@@ -911,6 +913,197 @@ mod ring_tests {
             })
         );
         assert_eq!(parse_mjpeg_alternative("not a mode"), None);
+    }
+
+    #[test]
+    fn fallback_http_retries_conflict_uses_422_alternatives_and_returns_accepted_tuple() {
+        let status = |revision| {
+            format!(
+                r#"{{"revision":{revision},"snapshot":{{"desired":{{"cameraId":"0","streamMode":"h264","width":1920,"height":1080,"fps":60}}}}}}"#
+            )
+        };
+        let capabilities = r#"{"cameras":[{"id":"0","mjpegModes":[{"width":1920,"height":1080,"fps":30},{"width":1280,"height":720,"fps":30}]}]}"#;
+        let exchanges = vec![
+            MockExchange::get("/api/camera/status", status(20)),
+            MockExchange::get("/api/pipeline/capabilities", capabilities),
+            MockExchange::post(
+                409,
+                r#"{"message":"revision conflict","authoritativeState":{"revision":21}}"#,
+            ),
+            MockExchange::get("/api/camera/status", status(21)),
+            MockExchange::get("/api/pipeline/capabilities", capabilities),
+            MockExchange::post(
+                422,
+                r#"{"message":"unsupported","alternatives":["MJPEG 1280x720@30"],"authoritativeState":{"revision":22}}"#,
+            ),
+            MockExchange::get("/api/camera/status", status(22)),
+            MockExchange::get("/api/pipeline/capabilities", capabilities),
+            MockExchange::post(
+                200,
+                r#"{"success":true,"authoritativeState":{"snapshot":{"selected":{"streamMode":"mjpeg","width":1280,"height":720,"fps":30}}}}"#,
+            ),
+        ];
+        let (base_url, server, captured) = spawn_mock_phone(exchanges);
+        let args = Args {
+            source: "h264".into(),
+            test_pattern: None,
+            url: Some(format!("{base_url}/stream.ocb2")),
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(60),
+            source_width: Some(1920),
+            source_height: Some(1080),
+            source_fps: Some(60),
+            profile: "adaptive".into(),
+            token: Some("secret-token".into()),
+        };
+
+        assert_eq!(
+            request_phone_mjpeg_fallback(&args).unwrap(),
+            MjpegMode {
+                width: 1280,
+                height: 720,
+                fps: 30
+            }
+        );
+        server.join().unwrap();
+        let requests = captured.lock().unwrap();
+        let posts: Vec<&CapturedRequest> = requests
+            .iter()
+            .filter(|request| request.method == "POST")
+            .collect();
+        assert_eq!(posts.len(), 3);
+        let first: serde_json::Value = serde_json::from_str(&posts[0].body).unwrap();
+        let retry: serde_json::Value = serde_json::from_str(&posts[1].body).unwrap();
+        let alternative: serde_json::Value = serde_json::from_str(&posts[2].body).unwrap();
+        assert_eq!(
+            (
+                first["width"].as_u64(),
+                first["height"].as_u64(),
+                first["fps"].as_u64()
+            ),
+            (Some(1920), Some(1080), Some(30))
+        );
+        assert_eq!(first["baseRevision"], 20);
+        assert_eq!(retry["baseRevision"], 21);
+        assert_eq!(
+            (
+                alternative["width"].as_u64(),
+                alternative["height"].as_u64(),
+                alternative["fps"].as_u64()
+            ),
+            (Some(1280), Some(720), Some(30))
+        );
+        assert_eq!(alternative["baseRevision"], 22);
+        assert!(requests.iter().all(|request| request
+            .headers
+            .to_ascii_lowercase()
+            .contains("x-opencambridge-token: secret-token")));
+    }
+
+    struct MockExchange {
+        method: &'static str,
+        path: &'static str,
+        status: u16,
+        body: String,
+    }
+
+    impl MockExchange {
+        fn get(path: &'static str, body: impl Into<String>) -> Self {
+            Self {
+                method: "GET",
+                path,
+                status: 200,
+                body: body.into(),
+            }
+        }
+        fn post(status: u16, body: impl Into<String>) -> Self {
+            Self {
+                method: "POST",
+                path: "/api/settings",
+                status,
+                body: body.into(),
+            }
+        }
+    }
+
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        headers: String,
+        body: String,
+    }
+
+    fn spawn_mock_phone(
+        exchanges: Vec<MockExchange>,
+    ) -> (
+        String,
+        std::thread::JoinHandle<()>,
+        Arc<Mutex<Vec<CapturedRequest>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let thread_capture = captured.clone();
+        let server = std::thread::spawn(move || {
+            for expected in exchanges {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_mock_request(&mut stream);
+                assert_eq!(request.method, expected.method);
+                assert_eq!(request.path, expected.path);
+                thread_capture.lock().unwrap().push(request);
+                let reason = match expected.status {
+                    200 => "OK",
+                    409 => "Conflict",
+                    422 => "Unprocessable Entity",
+                    _ => "Error",
+                };
+                write!(stream, "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", expected.status, reason, expected.body.len(), expected.body).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        (format!("http://{address}"), server, captured)
+    }
+
+    fn read_mock_request(stream: &mut TcpStream) -> CapturedRequest {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            let count = stream.read(&mut chunk).unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let count = stream.read(&mut chunk).unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        let first = headers.lines().next().unwrap();
+        let mut parts = first.split_whitespace();
+        CapturedRequest {
+            method: parts.next().unwrap().to_owned(),
+            path: parts.next().unwrap().to_owned(),
+            headers,
+            body: String::from_utf8(bytes[header_end..header_end + content_length].to_vec())
+                .unwrap(),
+        }
     }
 
     fn readiness_ring(pid: u32, value: u64) -> RingDiagnostics {
