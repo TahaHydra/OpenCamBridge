@@ -21,9 +21,9 @@ import com.opencambridge.android.server.UpdateSettingsRequest
  */
 object ServiceBridge {
     @Volatile var applyPatch: (suspend (UpdateSettingsRequest, String?) -> PipelineResult)? = null
-    @Volatile var setTorch: ((Boolean) -> Unit)? = null
-    @Volatile var setLinearZoom: ((Float) -> Unit)? = null
-    @Volatile var setZoomRatio: ((Float) -> Unit)? = null
+    @Volatile var setTorch: (suspend (Boolean, Long, String, String) -> PipelineResult)? = null
+    @Volatile var setLinearZoom: (suspend (Float, Long, String, String) -> PipelineResult)? = null
+    @Volatile var setZoomRatio: (suspend (Float, Long, String, String) -> PipelineResult)? = null
     @Volatile var startCamera: (suspend () -> PipelineResult)? = null
     @Volatile var stopCamera: (suspend () -> PipelineResult)? = null
     @Volatile var recoverCamera: (suspend () -> PipelineResult)? = null

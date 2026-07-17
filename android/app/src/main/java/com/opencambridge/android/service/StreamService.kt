@@ -78,14 +78,14 @@ class StreamService : LifecycleService() {
             onStartCamera = { pipelineController.submit(PipelineCommand.Start()) },
             onStopCamera = { pipelineController.submit(PipelineCommand.Stop()) },
             onApplySettingsPatch = { req, source -> pipelineController.submit(PipelineCommand.ApplySettings(req, source)) },
-            onSetZoomRatio = { ratio ->
-                if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setZoomRatio(ratio) else mjpegStreamer.setZoomRatio(ratio)
+            onSetZoomRatio = { ratio, revision, requestId, source ->
+                pipelineController.submit(PipelineCommand.SetZoomRatio(ratio, revision, requestId, source))
             },
-            onSetLinearZoom = { linear ->
-                if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setLinearZoom(linear) else mjpegStreamer.setLinearZoom(linear)
+            onSetLinearZoom = { linear, revision, requestId, source ->
+                pipelineController.submit(PipelineCommand.SetLinearZoom(linear, revision, requestId, source))
             },
-            onSetTorch = { enabled ->
-                if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setTorch(enabled) else mjpegStreamer.setTorch(enabled)
+            onSetTorch = { enabled, revision, requestId, source ->
+                pipelineController.submit(PipelineCommand.SetTorch(enabled, revision, requestId, source))
             },
             onRecoverCamera = { pipelineController.submit(PipelineCommand.Recover()) }
         )
@@ -95,14 +95,14 @@ class StreamService : LifecycleService() {
         ServiceBridge.applyPatch = { req, source ->
             pipelineController.submit(PipelineCommand.ApplySettings(req, source))
         }
-        ServiceBridge.setTorch = { enabled ->
-            if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setTorch(enabled) else mjpegStreamer.setTorch(enabled)
+        ServiceBridge.setTorch = { enabled, revision, requestId, source ->
+            pipelineController.submit(PipelineCommand.SetTorch(enabled, revision, requestId, source))
         }
-        ServiceBridge.setLinearZoom = { linear ->
-            if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setLinearZoom(linear) else mjpegStreamer.setLinearZoom(linear)
+        ServiceBridge.setLinearZoom = { linear, revision, requestId, source ->
+            pipelineController.submit(PipelineCommand.SetLinearZoom(linear, revision, requestId, source))
         }
-        ServiceBridge.setZoomRatio = { ratio ->
-            if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setZoomRatio(ratio) else mjpegStreamer.setZoomRatio(ratio)
+        ServiceBridge.setZoomRatio = { ratio, revision, requestId, source ->
+            pipelineController.submit(PipelineCommand.SetZoomRatio(ratio, revision, requestId, source))
         }
         ServiceBridge.startCamera = { pipelineController.submit(PipelineCommand.Start()) }
         ServiceBridge.stopCamera = { pipelineController.submit(PipelineCommand.Stop()) }
@@ -130,6 +130,9 @@ class StreamService : LifecycleService() {
                 if (StreamState.deviceSurfaceRotation.getAndSet(surfaceRotation) != surfaceRotation) {
                     StreamState.imageAnalysisUseCase?.targetRotation = surfaceRotation
                     AppLogger.i("Rotation", "Device orientation changed -> targetRotation=$surfaceRotation")
+                    if (StreamState.activeStreamMode.get() == "h264" &&
+                        StreamState.lifecycleState.get() == LifecycleState.STREAMING
+                    ) pipelineController.enqueue(PipelineCommand.Recover())
                 }
             }
         }
@@ -168,7 +171,7 @@ class StreamService : LifecycleService() {
         AppLogger.i("System", "StreamService started on port $port")
 
         // Auto-start stream
-        pipelineController.enqueue(lifecycleScope, PipelineCommand.Start())
+        pipelineController.enqueue(PipelineCommand.Start())
 
         // Start bandwidth monitoring
         if (monitorJob?.isActive != true) monitorJob = lifecycleScope.launch {
@@ -208,19 +211,23 @@ class StreamService : LifecycleService() {
                 if (targetBandwidth > 0 && StreamState.streamMode.get() == "mjpeg" && StreamState.lifecycleState.get() == LifecycleState.STREAMING) {
                     val currentQ = StreamState.jpegQuality.get()
                     if (mbps > targetBandwidth * 1.15 && currentQ > 40) {
-                        StreamState.publishConfigRevision(
-                            StreamState.currentConfig().copy(jpegQuality = (currentQ - 3).coerceAtLeast(40)),
-                            "auto-bandwidth",
-                            null
-                        )
-                        settingsManager.save()
+                        pipelineController.submit(PipelineCommand.ApplySettings(
+                            UpdateSettingsRequest(
+                                baseRevision = StreamState.revision.get(),
+                                requestId = java.util.UUID.randomUUID().toString(),
+                                clientType = "auto-bandwidth",
+                                jpegQuality = (currentQ - 3).coerceAtLeast(40)
+                            ), "auto-bandwidth"
+                        ))
                     } else if (mbps < targetBandwidth * 0.75 && currentQ < 95) {
-                        StreamState.publishConfigRevision(
-                            StreamState.currentConfig().copy(jpegQuality = (currentQ + 2).coerceAtMost(95)),
-                            "auto-bandwidth",
-                            null
-                        )
-                        settingsManager.save()
+                        pipelineController.submit(PipelineCommand.ApplySettings(
+                            UpdateSettingsRequest(
+                                baseRevision = StreamState.revision.get(),
+                                requestId = java.util.UUID.randomUUID().toString(),
+                                clientType = "auto-bandwidth",
+                                jpegQuality = (currentQ + 2).coerceAtMost(95)
+                            ), "auto-bandwidth"
+                        ))
                     }
                 }
             }
@@ -256,6 +263,32 @@ class StreamService : LifecycleService() {
         is PipelineCommand.RuntimeH264Failure -> switchToMjpegNow(command.reason)
         is PipelineCommand.AdaptiveDowngrade -> adaptiveDowngradeNow(command.reason)
         is PipelineCommand.PreviewSurfaceChanged -> previewSurfaceChangedNow(command.attached)
+        is PipelineCommand.SetTorch -> applyRuntimeControl(command.baseRevision, command.requestId, command.source) {
+            if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setTorch(command.enabled) else mjpegStreamer.setTorch(command.enabled)
+        }
+        is PipelineCommand.SetLinearZoom -> applyRuntimeControl(command.baseRevision, command.requestId, command.source) {
+            if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setLinearZoom(command.linear) else mjpegStreamer.setLinearZoom(command.linear)
+        }
+        is PipelineCommand.SetZoomRatio -> applyRuntimeControl(command.baseRevision, command.requestId, command.source) {
+            if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setZoomRatio(command.ratio) else mjpegStreamer.setZoomRatio(command.ratio)
+        }
+    }
+
+    private fun applyRuntimeControl(
+        baseRevision: Long,
+        requestId: String,
+        source: String,
+        action: () -> Unit
+    ): PipelineResult {
+        if (requestId.isBlank()) return pipelineResult("Runtime control requires requestId", PipelineResultCode.UNPROCESSABLE)
+        val current = StreamState.revision.get()
+        if (baseRevision != current) return pipelineResult(
+            "Revision conflict: client base=$baseRevision, authoritative=$current",
+            PipelineResultCode.CONFLICT
+        )
+        action()
+        StreamState.publishRuntimeRevision(source, requestId)
+        return pipelineResult("Runtime control applied")
     }
 
     private suspend fun startCameraNow(): PipelineResult {
@@ -347,13 +380,13 @@ class StreamService : LifecycleService() {
         StreamState.streaming.set(false)
         beginPipelineGeneration()
         val fallback = "H.264 failed: $reason; using MJPEG compatibility"
+        StreamState.publishRuntimeRevision("runtime-h264-fallback", java.util.UUID.randomUUID().toString())
         AppLogger.w("H264", fallback)
         return try {
             h264Streamer.stop()
             mjpegStreamer.start()
             StreamState.activeStreamMode.set("mjpeg")
-            StreamState.fallbackReason.set(fallback)
-            StreamState.fallbackUsed.set(true)
+            StreamState.publishFallback(true, fallback)
             StreamState.lifecycleState.set(LifecycleState.STREAMING)
             StreamState.streaming.set(true)
             pipelineResult(fallback)
@@ -365,8 +398,8 @@ class StreamService : LifecycleService() {
     private suspend fun adaptiveDowngradeNow(reason: String): PipelineResult {
         val next = h264Streamer.prepareAdaptiveDowngrade()
             ?: return switchToMjpegNow("$reason; no lower sustainable H.264 profile")
-        StreamState.fallbackReason.set("$reason; adapting to ${next.width}x${next.height}@${next.fps}")
-        StreamState.fallbackUsed.set(true)
+        StreamState.publishRuntimeRevision("adaptive-watchdog", java.util.UUID.randomUUID().toString())
+        StreamState.publishFallback(true, "$reason; adapting to ${next.width}x${next.height}@${next.fps}")
         return rebindCameraNow(StreamState.fallbackReason.get())
     }
 
@@ -448,8 +481,7 @@ class StreamService : LifecycleService() {
     private suspend fun startSelectedPipeline() {
         val config = StreamState.currentConfig()
         if (config.streamMode != "h264") {
-            StreamState.fallbackReason.set("")
-            StreamState.fallbackUsed.set(false)
+            StreamState.publishFallback(false, "")
             mjpegStreamer.start()
             StreamState.activeStreamMode.set("mjpeg")
             return
@@ -460,18 +492,29 @@ class StreamService : LifecycleService() {
         } catch (h264Error: Exception) {
             val reason = "H.264 unavailable: ${h264Error.message}; using MJPEG"
             AppLogger.w("H264", reason)
-            StreamState.fallbackReason.set(reason)
-            StreamState.fallbackUsed.set(true)
+            StreamState.publishFallback(true, reason)
             mjpegStreamer.start()
             StreamState.activeStreamMode.set("mjpeg")
         }
     }
 
     private suspend fun applySettingsPatch(req: UpdateSettingsRequest, source: String?): PipelineResult {
+        if (req.requestId.isNullOrBlank()) return pipelineResult(
+            "Every settings mutation requires requestId",
+            PipelineResultCode.UNPROCESSABLE
+        )
+        if (req.baseRevision == null) return rememberRequest(req.requestId, pipelineResult(
+            "Every settings mutation requires baseRevision",
+            PipelineResultCode.CONFLICT
+        ))
+        if (source.isNullOrBlank() && req.clientType.isNullOrBlank()) return rememberRequest(req.requestId, pipelineResult(
+            "Every settings mutation requires client/source identity",
+            PipelineResultCode.UNPROCESSABLE
+        ))
         req.requestId?.let { appliedRequestResults[it] }?.let { return it }
-        val expectedRevision = req.baseRevision ?: req.clientRevision
+        val expectedRevision = req.baseRevision
         val currentRevision = StreamState.revision.get()
-        if (expectedRevision != null && expectedRevision != currentRevision) {
+        if (expectedRevision != currentRevision) {
             return rememberRequest(req.requestId, pipelineResult(
                 "Revision conflict: client base=$expectedRevision, authoritative=$currentRevision",
                 PipelineResultCode.CONFLICT
@@ -521,14 +564,9 @@ class StreamService : LifecycleService() {
         val captureChanged = previous.cameraId != next.cameraId || previous.streamMode != next.streamMode ||
             previous.width != next.width || previous.height != next.height || previous.fps != next.fps ||
             previous.profile != next.profile || previous.h264KeyframeInterval != next.h264KeyframeInterval ||
-            previous.outputWidth != next.outputWidth || previous.outputHeight != next.outputHeight ||
-            previous.localPreviewEnabled != next.localPreviewEnabled
+            previous.localPreviewEnabled != next.localPreviewEnabled ||
+            previous.displayRotation != next.displayRotation || previous.mirror != next.mirror
         var requiresRebind = captureChanged
-
-        // Record the desktop apply id (if any) so status.appliedVersion reflects
-        // that this change has been applied — the desktop uses it to know when it
-        // is safe to trust incoming status for stream-shaping fields.
-        req.applyId?.let { StreamState.appliedSettingsVersion.set(it) }
 
         AppLogger.i("System", "Settings patch received from ${source ?: "unknown"}")
 
@@ -614,10 +652,10 @@ class StreamService : LifecycleService() {
         if (fps !in setOf(15, 30, 60)) return "Unsupported MJPEG FPS $fps; selectable values are 15, 30, or 60"
         val camera = cameraRepository.listCameras().firstOrNull { it.id == cameraId }
             ?: return "Unknown camera '$cameraId'"
-        val capability = camera.fpsByResolution.firstOrNull { it.width == width && it.height == height }
-            ?: return "MJPEG ${width}x$height is unavailable on camera $cameraId"
-        if (capability.maxFps < fps) {
-            return "MJPEG ${width}x$height@$fps is unavailable on camera $cameraId; regular Camera2/ImageAnalysis max is ${capability.maxFps} FPS"
+        if (camera.mjpegModes.none { it.width == width && it.height == height && it.fps == fps }) {
+            val max = camera.fpsByResolution.firstOrNull { it.width == width && it.height == height }?.maxFps
+            return "MJPEG ${width}x$height@$fps is unavailable on camera $cameraId" +
+                (max?.let { "; regular Camera2/ImageAnalysis max is $it FPS" } ?: "")
         }
         return null
     }
@@ -632,11 +670,7 @@ class StreamService : LifecycleService() {
                 .sortedBy { preference[it] ?: Int.MAX_VALUE }
                 .map { "H264 ${it.width}x${it.height}@${it.fps}" }
         } else {
-            camera.fpsByResolution.flatMap { resolution ->
-                listOf(15, 30, 60)
-                    .filter { it <= resolution.maxFps }
-                    .map { "MJPEG ${resolution.width}x${resolution.height}@$it" }
-            }.distinct()
+            camera.mjpegModes.map { "MJPEG ${it.width}x${it.height}@${it.fps}" }.distinct()
         }.take(12)
     }
 

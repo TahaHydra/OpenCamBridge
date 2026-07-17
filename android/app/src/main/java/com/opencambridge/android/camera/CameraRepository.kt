@@ -174,6 +174,11 @@ class CameraRepository(private val context: Context) {
             val maxFps = minOf(durFps, maxAeFps).coerceAtLeast(1)
             ResolutionFpsDto(w, h, maxFps)
         }
+        val mjpegModes = fpsByResolution.flatMap { resolution ->
+            listOf(15, 30, 60)
+                .filter { it <= resolution.maxFps }
+                .map { H264ModeDto(resolution.width, resolution.height, it) }
+        }
 
         // Zoom ratio range (API 30+); older devices only report max digital zoom.
         var zoomMin = 1.0f
@@ -228,6 +233,7 @@ class CameraRepository(private val context: Context) {
             lensType = "",
             isMonochrome = isMonochrome,
             fpsByResolution = fpsByResolution,
+            mjpegModes = mjpegModes,
             supportsHighSpeed = supportsHighSpeed,
             highSpeedSizes = highSpeedSizes,
             highSpeedFpsRanges = highSpeedFpsRanges,

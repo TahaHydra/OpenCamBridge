@@ -1,8 +1,10 @@
 package com.opencambridge.android.service
 
 import com.opencambridge.android.server.UpdateSettingsRequest
+import com.opencambridge.android.state.StreamState
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 
@@ -10,6 +12,7 @@ enum class PipelineResultCode {
     OK,
     CONFLICT,
     UNPROCESSABLE,
+    CANCELLED,
     FAILED
 }
 
@@ -34,46 +37,183 @@ sealed class PipelineCommand(val label: String) {
     class RuntimeH264Failure(val reason: String) : PipelineCommand("H264_FAILURE")
     class AdaptiveDowngrade(val reason: String) : PipelineCommand("ADAPTIVE_DOWNGRADE")
     class PreviewSurfaceChanged(val attached: Boolean) : PipelineCommand("PREVIEW_SURFACE_CHANGED")
+    class SetTorch(val enabled: Boolean, val baseRevision: Long, val requestId: String, val source: String) : PipelineCommand("SET_TORCH")
+    class SetLinearZoom(val linear: Float, val baseRevision: Long, val requestId: String, val source: String) : PipelineCommand("SET_LINEAR_ZOOM")
+    class SetZoomRatio(val ratio: Float, val baseRevision: Long, val requestId: String, val source: String) : PipelineCommand("SET_ZOOM_RATIO")
     class ApplySettings(
-        val request: UpdateSettingsRequest,
+        var request: UpdateSettingsRequest,
         val source: String?
     ) : PipelineCommand("APPLY_SETTINGS")
 }
 
 /**
- * A single-consumer actor for every capture-pipeline mutation. API handlers,
- * the phone UI, and watchdogs enqueue commands and await the same completion;
- * none of them may independently stop/start Camera2 or MediaCodec.
+ * Single owner for capture-pipeline mutations. The pending queue is bounded by
+ * coalescing settings and preview commands before they reach the actor. Stop
+ * and recovery are inserted ahead of ordinary reconfiguration work. No caller
+ * coroutine is left suspended merely trying to send to a rendezvous channel.
  */
 class PipelineController(
     scope: CoroutineScope,
     private val handle: suspend (PipelineCommand) -> PipelineResult
 ) {
-    // Rendezvous keeps lifecycle/control queue depth at zero: each producer
-    // hands one command directly to the sole owner and then awaits completion.
-    // This prevents a burst of stale reconfiguration commands accumulating.
-    private val commands = Channel<PipelineCommand>(Channel.RENDEZVOUS)
-    private val actor = scope.launch {
-        for (command in commands) {
-            try {
-                command.completion.complete(handle(command))
-            } catch (e: Exception) {
-                command.completion.completeExceptionally(e)
+    private val lock = Any()
+    private val pending = ArrayDeque<PipelineCommand>()
+    private val wake = Channel<Unit>(Channel.CONFLATED)
+    private var closed = false
+    private var active: PipelineCommand? = null
+    private val actor: Job = scope.launch {
+        try {
+            for (ignored in wake) {
+                while (true) {
+                    val command = synchronized(lock) {
+                        pending.removeFirstOrNull()?.also { active = it }
+                    } ?: break
+                    try {
+                        command.completion.complete(handle(command))
+                    } catch (e: Exception) {
+                        command.completion.completeExceptionally(e)
+                    } finally {
+                        synchronized(lock) { if (active === command) active = null }
+                    }
+                }
             }
+        } finally {
+            val cancelled = synchronized(lock) {
+                val all = pending.toList() + listOfNotNull(active)
+                pending.clear()
+                active = null
+                all
+            }
+            cancelled.forEach { cancel(it, "Pipeline controller closed") }
         }
     }
 
     suspend fun submit(command: PipelineCommand): PipelineResult {
-        commands.send(command)
+        enqueue(command)
         return command.completion.await()
     }
 
-    fun enqueue(scope: CoroutineScope, command: PipelineCommand) {
-        scope.launch { submit(command) }
+    fun enqueue(command: PipelineCommand): CompletableDeferred<PipelineResult> {
+        val cancelled = mutableListOf<PipelineCommand>()
+        synchronized(lock) {
+            if (closed) {
+                cancel(command, "Pipeline controller is closed")
+                return command.completion
+            }
+            when (command) {
+                is PipelineCommand.ApplySettings -> {
+                    val older = pending.filterIsInstance<PipelineCommand.ApplySettings>()
+                    older.forEach {
+                        pending.remove(it)
+                        cancelled += it
+                    }
+                    val merged = older.fold(command.request) { newest, old ->
+                        mergePatches(old.request, newest)
+                    }
+                    command.request = merged
+                    pending.addLast(command)
+                }
+                is PipelineCommand.PreviewSurfaceChanged -> {
+                    pending.filterIsInstance<PipelineCommand.PreviewSurfaceChanged>().forEach {
+                        pending.remove(it)
+                        cancelled += it
+                    }
+                    pending.addLast(command)
+                }
+                is PipelineCommand.SetLinearZoom,
+                is PipelineCommand.SetZoomRatio -> {
+                    pending.filter { it is PipelineCommand.SetLinearZoom || it is PipelineCommand.SetZoomRatio }
+                        .forEach { pending.remove(it); cancelled += it }
+                    pending.addLast(command)
+                }
+                is PipelineCommand.SetTorch -> {
+                    pending.filterIsInstance<PipelineCommand.SetTorch>().forEach {
+                        pending.remove(it); cancelled += it
+                    }
+                    pending.addLast(command)
+                }
+                is PipelineCommand.Stop -> {
+                    pending.filter {
+                        it is PipelineCommand.ApplySettings || it is PipelineCommand.PreviewSurfaceChanged ||
+                            it is PipelineCommand.SetTorch || it is PipelineCommand.SetLinearZoom ||
+                            it is PipelineCommand.SetZoomRatio
+                    }
+                        .forEach { pending.remove(it); cancelled += it }
+                    pending.addFirst(command)
+                }
+                is PipelineCommand.Recover -> {
+                    pending.filterIsInstance<PipelineCommand.Recover>().forEach {
+                        pending.remove(it); cancelled += it
+                    }
+                    pending.addFirst(command)
+                }
+                is PipelineCommand.RuntimeH264Failure -> {
+                    pending.filterIsInstance<PipelineCommand.RuntimeH264Failure>().forEach {
+                        pending.remove(it); cancelled += it
+                    }
+                    pending.addFirst(command)
+                }
+                else -> pending.addLast(command)
+            }
+        }
+        cancelled.forEach { cancel(it, "Superseded by a newer complete pipeline command") }
+        wake.trySend(Unit)
+        return command.completion
     }
 
     fun close() {
-        commands.close()
+        val cancelled: List<PipelineCommand>
+        synchronized(lock) {
+            if (closed) return
+            closed = true
+            cancelled = pending.toList()
+            pending.clear()
+        }
+        cancelled.forEach { cancel(it, "Pipeline controller closed") }
+        wake.close()
         actor.cancel()
     }
+
+    private fun cancel(command: PipelineCommand, reason: String) {
+        command.completion.complete(
+            PipelineResult(
+                PipelineResultCode.CANCELLED,
+                reason,
+                StreamState.revision.get(),
+                StreamState.pipelineGeneration.get(),
+                StreamState.lifecycleState.get().name
+            )
+        )
+    }
+
+    /** Newer non-null values win while older pending fields are retained, so a
+     * burst of partial slider/dropdown patches becomes one complete desired
+     * state rather than a replay of obsolete intermediate configurations. */
+    private fun mergePatches(older: UpdateSettingsRequest, newer: UpdateSettingsRequest) = newer.copy(
+        baseRevision = newer.baseRevision ?: older.baseRevision,
+        requestId = newer.requestId ?: older.requestId,
+        clientType = newer.clientType ?: older.clientType,
+        cameraId = newer.cameraId ?: older.cameraId,
+        width = newer.width ?: older.width,
+        height = newer.height ?: older.height,
+        outputWidth = newer.outputWidth ?: older.outputWidth,
+        outputHeight = newer.outputHeight ?: older.outputHeight,
+        profile = newer.profile ?: older.profile,
+        fps = newer.fps ?: older.fps,
+        jpegQuality = newer.jpegQuality ?: older.jpegQuality,
+        previewFitMode = newer.previewFitMode ?: older.previewFitMode,
+        aspectRatio = newer.aspectRatio ?: older.aspectRatio,
+        zoomSpeed = newer.zoomSpeed ?: older.zoomSpeed,
+        displayRotation = newer.displayRotation ?: older.displayRotation,
+        mirror = newer.mirror ?: older.mirror,
+        localPreviewEnabled = newer.localPreviewEnabled ?: older.localPreviewEnabled,
+        phonePreviewEnabled = newer.phonePreviewEnabled ?: older.phonePreviewEnabled,
+        accessMode = newer.accessMode ?: older.accessMode,
+        port = newer.port ?: older.port,
+        accessToken = newer.accessToken ?: older.accessToken,
+        streamMode = newer.streamMode ?: older.streamMode,
+        h264Bitrate = newer.h264Bitrate ?: older.h264Bitrate,
+        h264KeyframeInterval = newer.h264KeyframeInterval ?: older.h264KeyframeInterval,
+        targetBandwidthMbps = newer.targetBandwidthMbps ?: older.targetBandwidthMbps
+    )
 }

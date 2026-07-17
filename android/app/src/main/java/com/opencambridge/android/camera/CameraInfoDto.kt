@@ -31,6 +31,9 @@ data class CameraInfoDto(
      *  60 fps in the UI per lens+resolution instead of pretending every phone
      *  can do it. */
     val fpsByResolution: List<ResolutionFpsDto> = emptyList(),
+    /** Canonical selectable MJPEG tuples. UIs must not synthesize their own
+     * resolution/FPS Cartesian product. */
+    val mjpegModes: List<H264ModeDto> = emptyList(),
 
     /** Diagnostics only (NOT used by the MJPEG webcam path). Whether the camera
      *  advertises CONSTRAINED_HIGH_SPEED_VIDEO and the slow-motion sizes/ranges

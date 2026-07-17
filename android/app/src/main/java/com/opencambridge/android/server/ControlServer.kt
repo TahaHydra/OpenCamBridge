@@ -60,9 +60,9 @@ class ControlServer(
     private val onStartCamera: suspend () -> PipelineResult,
     private val onStopCamera: suspend () -> PipelineResult,
     private val onApplySettingsPatch: suspend (UpdateSettingsRequest, String?) -> PipelineResult,
-    private val onSetZoomRatio: (Float) -> Unit,
-    private val onSetLinearZoom: (Float) -> Unit,
-    private val onSetTorch: (Boolean) -> Unit,
+    private val onSetZoomRatio: suspend (Float, Long, String, String) -> PipelineResult,
+    private val onSetLinearZoom: suspend (Float, Long, String, String) -> PipelineResult,
+    private val onSetTorch: suspend (Boolean, Long, String, String) -> PipelineResult,
     private val onRecoverCamera: suspend () -> PipelineResult
 ) {
     private var engine: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
@@ -201,13 +201,35 @@ class ControlServer(
     }
 
     private suspend fun serveObs(call: RoutingCall) {
-        val fit = call.request.queryParameters["fit"] ?: "cover"
+        val fit = call.request.queryParameters["fit"].takeIf { it == "contain" || it == "cover" } ?: "cover"
         val mirror = call.request.queryParameters["mirror"] == "true"
-        val rotate = call.request.queryParameters["rotate"]?.toIntOrNull() ?: 0
+        val rotate = call.request.queryParameters["rotate"]?.toIntOrNull()?.takeIf { it in setOf(0, 90, 180, 270) } ?: 0
 
         val scaleX = if (mirror) -1 else 1
         val accessMode = StreamState.accessMode.get()
         val token = StreamState.accessToken.get()
+
+        if (StreamState.activeStreamMode.get() == "h264") {
+            call.respondText(ContentType.Text.Html) {
+                """
+                <!doctype html><html><head><meta charset="utf-8"><style>
+                html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000}
+                canvas{width:100%;height:100%;object-fit:$fit;display:block}
+                #error{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;background:#000;font:18px system-ui;text-align:center;padding:24px}
+                </style></head><body><canvas id="stream"></canvas><div id="error">Connecting H.264 preview…</div><script>
+                const token = "$token", tokenRequired = "$accessMode" === "lanToken";
+                const canvas = document.getElementById('stream'), errorBox = document.getElementById('error');
+                let info={effectiveRotation:0,mirror:false}, configBytes=new Uint8Array(0), decoder=null, lastTs=-1;
+                const fail = message => { errorBox.textContent=message; errorBox.style.display='flex'; };
+                function codec(bytes){for(let i=0;i+7<bytes.length;i++){let s=0;if(bytes[i]===0&&bytes[i+1]===0&&bytes[i+2]===1)s=i+3;else if(bytes[i]===0&&bytes[i+1]===0&&bytes[i+2]===0&&bytes[i+3]===1)s=i+4;if(s&&(bytes[s]&31)===7)return'avc1.'+[bytes[s+1],bytes[s+2],bytes[s+3]].map(v=>v.toString(16).padStart(2,'0')).join('').toUpperCase()}return'avc1.42E01E'}
+                function draw(frame){const r=Number(info.effectiveRotation||0),swap=r===90||r===270,w=frame.displayWidth||frame.codedWidth,h=frame.displayHeight||frame.codedHeight;canvas.width=swap?h:w;canvas.height=swap?w:h;const c=canvas.getContext('2d',{alpha:false,desynchronized:true});c.save();c.fillStyle='#000';c.fillRect(0,0,canvas.width,canvas.height);c.translate(canvas.width/2,canvas.height/2);c.rotate(r*Math.PI/180);c.scale(info.mirror?-1:1,1);c.drawImage(frame,-w/2,-h/2,w,h);c.restore();frame.close();errorBox.style.display='none'}
+                async function configure(){if(decoder||!configBytes.length)return;const c={codec:codec(configBytes),codedWidth:Number(info.width||1280),codedHeight:Number(info.height||720),optimizeForLatency:true,hardwareAcceleration:'prefer-hardware'};const support=await VideoDecoder.isConfigSupported(c);if(!support.supported)throw new Error('Browser cannot decode '+c.codec);decoder=new VideoDecoder({output:draw,error:e=>fail('H.264 decoder failed: '+e.message)});decoder.configure(c)}
+                async function run(){if(!('VideoDecoder'in window)||!('EncodedVideoChunk'in window)){fail('H.264 OBS preview unavailable: this browser lacks WebCodecs. Select MJPEG compatibility mode.');return}try{const u=new URL('/stream.ocb2',location.origin);if(tokenRequired&&token)u.searchParams.set('token',token);const response=await fetch(u);if(!response.ok||!response.body)throw new Error('OCB2 HTTP '+response.status);const reader=response.body.getReader();let b=new Uint8Array(0);while(true){const n=await reader.read();if(n.done)throw new Error('stream ended');const j=new Uint8Array(b.length+n.value.length);j.set(b);j.set(n.value,b.length);b=j;let o=0;while(b.length-o>=48){const v=new DataView(b.buffer,b.byteOffset+o,b.length-o);if(v.getUint32(0,false)!==0x4f434232||v.getUint16(4,true)!==2||v.getUint16(6,true)!==48)throw new Error('malformed OCB2');const l=v.getUint32(40,true);if(l>16777216)throw new Error('OCB2 payload too large');if(b.length-o<48+l)break;const t=v.getUint16(8,true),f=v.getUint32(12,true),ts=Number(v.getBigInt64(32,true)),p=b.slice(o+48,o+48+l);if(t===1){info=JSON.parse(new TextDecoder().decode(p));if(decoder){decoder.close();decoder=null}configBytes=new Uint8Array(0);lastTs=-1}else if(t===2&&(f&1)){configBytes=p;await configure()}else if(t===3){await configure();if(decoder){const key=!!(f&2);let d=p;if(key&&configBytes.length){d=new Uint8Array(configBytes.length+p.length);d.set(configBytes);d.set(p,configBytes.length)}const stamp=Math.max(lastTs+1,ts);lastTs=stamp;decoder.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:stamp,data:d}))}}else if(t===5||(f&8))throw new Error('stream ended');else if(t===6)throw new Error(new TextDecoder().decode(p));o+=48+l}if(o)b=b.slice(o)}}catch(e){fail('H.264 OBS preview unavailable: '+(e.message||String(e)))}}
+                run();</script></body></html>
+                """.trimIndent()
+            }
+            return
+        }
 
         call.respondText(ContentType.Text.Html) {
             """
@@ -402,15 +424,15 @@ class ControlServer(
                     align-items: center;
                     justify-content: center;
                 }
-                .stream-img {
+                .stream-img, .stream-canvas {
                     width: 100%;
                     height: 100%;
                     display: block;
                 }
-                .stream-img.fit-contain {
+                .stream-img.fit-contain, .stream-canvas.fit-contain {
                     object-fit: contain;
                 }
-                .stream-img.fit-cover {
+                .stream-img.fit-cover, .stream-canvas.fit-cover {
                     object-fit: cover;
                 }
 
@@ -477,6 +499,7 @@ class ControlServer(
                             <button class="manual-refresh-btn" onclick="reloadPreviewImage()">Reload Image</button>
                             <div id="stream-rotator" class="stream-rotator">
                                 <img id="stream-img" class="stream-img fit-contain" src="" alt="Live Stream">
+                                <canvas id="h264-canvas" class="stream-canvas fit-contain" style="display:none"></canvas>
                             </div>
                         </div>
                       </div>
@@ -510,24 +533,16 @@ class ControlServer(
                       <h3>Camera Config</h3>
                       <div class="control-group">
                         <label>Camera</label>
-                        <select id="camera-select" onchange="patchSetting({cameraId: this.value})"></select>
+                        <select id="camera-select" onchange="selectCameraMode(this.value)"></select>
                       </div>
                       <div class="control-group">
                         <label>Resolution</label>
-                        <select id="res-select" onchange="patchSetting({width: parseInt(this.value.split('x')[0]), height: parseInt(this.value.split('x')[1])})">
-                           <option value="1920x1080">1920 x 1080</option>
-                           <option value="1280x720">1280 x 720</option>
-                           <option value="640x480">640 x 480</option>
-                        </select>
+                        <select id="res-select" onchange="selectResolutionMode(this.value)"></select>
                       </div>
 
                       <div class="control-group">
                         <label>FPS Limit</label>
-                        <select id="fps-select" onchange="patchSetting({fps: parseInt(this.value)})">
-                           <option value="15">15 fps</option>
-                           <option value="30">30 fps</option>
-                           <option value="60">60 fps</option>
-                        </select>
+                        <select id="fps-select" onchange="patchSetting({fps: parseInt(this.value)})"></select>
                       </div>
                     </div>
 
@@ -535,7 +550,7 @@ class ControlServer(
                       <h3>Image Controls</h3>
                       <div class="control-group">
                         <label>Stream Mode</label>
-                        <select id="sm-select" onchange="patchSetting({streamMode: this.value})">
+                        <select id="sm-select" onchange="selectStreamMode(this.value)">
                            <option value="h264">Hardware H.264 / OCB2</option>
                            <option value="mjpeg">MJPEG Compatibility</option>
                         </select>
@@ -658,6 +673,7 @@ class ControlServer(
                     const box = document.getElementById('preview-box');
                     const rotator = document.getElementById('stream-rotator');
                     const img = document.getElementById('stream-img');
+                    const canvas = document.getElementById('h264-canvas');
 
                     box.classList.remove('layout-landscape', 'layout-portrait', 'layout-square');
                     if (lastLayout === '9:16') box.classList.add('layout-portrait');
@@ -666,6 +682,8 @@ class ControlServer(
 
                     img.classList.remove('fit-contain', 'fit-cover');
                     img.classList.add(lastMode === 'fill' ? 'fit-cover' : 'fit-contain');
+                    canvas.classList.remove('fit-contain', 'fit-cover');
+                    canvas.classList.add(lastMode === 'fill' ? 'fit-cover' : 'fit-contain');
 
                     // The /stream.mjpeg frames are already rotated on the phone
                     // (auto-upright + manual offset), so this view must NOT
@@ -676,7 +694,7 @@ class ControlServer(
                     rotator.style.width = boxW + 'px';
                     rotator.style.height = boxH + 'px';
 
-                    const scaleX = lastMirror ? -1 : 1;
+                    const scaleX = currentStreamMode === 'mjpeg' && lastMirror ? -1 : 1;
                     rotator.style.transform = `translate(-50%, -50%) scaleX(${'$'}{scaleX})`;
                 }
 
@@ -699,19 +717,18 @@ class ControlServer(
                 function updateModeOptions(status) {
                     const resSelect = document.getElementById('res-select');
                     const fpsSelect = document.getElementById('fps-select');
-                    let resolutions = [[1920,1080], [1280,720], [640,480]];
-                    let rates = [15,30,60];
-                    if (status.streamMode === 'h264') {
-                        const camera = cameraCapabilities.find(c => c.id === status.cameraId);
-                        const modes = camera && Array.isArray(camera.h264Modes) ? camera.h264Modes : [];
-                        const seen = new Set();
-                        resolutions = modes.filter(m => {
-                            const key = m.width + 'x' + m.height;
-                            if (seen.has(key)) return false;
-                            seen.add(key); return true;
-                        }).map(m => [m.width, m.height]);
-                        rates = modes.filter(m => m.width === status.width && m.height === status.height).map(m => m.fps);
-                    }
+                    const camera = cameraCapabilities.find(c => c.id === status.cameraId);
+                    const canonical = status.streamMode === 'h264' ? camera?.h264Modes : camera?.mjpegModes;
+                    const modes = Array.isArray(canonical) ? canonical : [];
+                    const seen = new Set();
+                    const resolutions = modes.filter(m => {
+                        const key = m.width + 'x' + m.height;
+                        if (seen.has(key)) return false;
+                        seen.add(key); return true;
+                    }).map(m => [m.width, m.height]);
+                    const rates = [...new Set(modes
+                        .filter(m => m.width === status.width && m.height === status.height)
+                        .map(m => m.fps))];
                     resSelect.innerHTML = '';
                     resolutions.forEach(r => {
                         const option = document.createElement('option');
@@ -726,9 +743,192 @@ class ControlServer(
                     });
                 }
 
-                function reloadPreviewImage() {
-                    if (currentStreamMode === 'h264') return;
+                function canonicalModes(cameraId, streamMode) {
+                    const camera = cameraCapabilities.find(c => c.id === cameraId);
+                    const modes = streamMode === 'h264' ? camera?.h264Modes : camera?.mjpegModes;
+                    return Array.isArray(modes) ? modes : [];
+                }
+
+                function selectCameraMode(cameraId) {
+                    const mode = document.getElementById('sm-select').value || lastStatus.streamMode;
+                    const modes = canonicalModes(cameraId, mode);
+                    const selected = modes.find(m => m.width === lastStatus.width && m.height === lastStatus.height && m.fps === lastStatus.fps) || modes[0];
+                    if (!selected) { showPreviewError('No supported ' + mode.toUpperCase() + ' modes on this camera'); return; }
+                    patchSetting({ cameraId, width: selected.width, height: selected.height, fps: selected.fps });
+                }
+
+                function selectStreamMode(streamMode) {
+                    const cameraId = document.getElementById('camera-select').value || lastStatus.cameraId;
+                    const modes = canonicalModes(cameraId, streamMode);
+                    const selected = modes.find(m => m.width === lastStatus.width && m.height === lastStatus.height && m.fps === lastStatus.fps) || modes[0];
+                    if (!selected) { showPreviewError('No supported ' + streamMode.toUpperCase() + ' modes on this camera'); return; }
+                    patchSetting({ streamMode, width: selected.width, height: selected.height, fps: selected.fps });
+                }
+
+                function selectResolutionMode(value) {
+                    const parts = value.split('x').map(Number), width = parts[0], height = parts[1];
+                    const cameraId = document.getElementById('camera-select').value || lastStatus.cameraId;
+                    const streamMode = document.getElementById('sm-select').value || lastStatus.streamMode;
+                    const modes = canonicalModes(cameraId, streamMode).filter(m => m.width === width && m.height === height);
+                    const selected = modes.find(m => m.fps === lastStatus.fps) || modes[0];
+                    if (!selected) return;
+                    patchSetting({ width, height, fps: selected.fps });
+                }
+
+                let h264Abort = null;
+                let h264Decoder = null;
+                let h264PreviewRunning = false;
+                let h264Info = { effectiveRotation: 0, mirror: false };
+                let h264Config = new Uint8Array(0);
+                let h264LastTimestamp = -1;
+
+                function stopH264Preview() {
+                    if (h264Abort) h264Abort.abort();
+                    h264Abort = null;
+                    h264PreviewRunning = false;
+                    if (h264Decoder) { try { h264Decoder.close(); } catch (_) {} }
+                    h264Decoder = null;
+                    h264Config = new Uint8Array(0);
+                    h264LastTimestamp = -1;
+                }
+
+                function showPreviewError(message) {
+                    document.getElementById('preview-overlay-text').textContent = message;
+                    document.getElementById('offline-overlay').style.display = 'flex';
+                }
+
+                function codecFromAnnexB(bytes) {
+                    for (let i = 0; i + 7 < bytes.length; i++) {
+                        let start = 0;
+                        if (bytes[i] === 0 && bytes[i+1] === 0 && bytes[i+2] === 1) start = i + 3;
+                        else if (bytes[i] === 0 && bytes[i+1] === 0 && bytes[i+2] === 0 && bytes[i+3] === 1) start = i + 4;
+                        if (start && (bytes[start] & 31) === 7 && start + 3 < bytes.length) {
+                            return 'avc1.' + [bytes[start+1], bytes[start+2], bytes[start+3]]
+                                .map(v => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+                        }
+                    }
+                    return 'avc1.42E01E';
+                }
+
+                function renderH264Frame(frame) {
+                    const canvas = document.getElementById('h264-canvas');
                     const img = document.getElementById('stream-img');
+                    const rotation = Number(h264Info.effectiveRotation || 0);
+                    const swap = rotation === 90 || rotation === 270;
+                    const width = frame.displayWidth || frame.codedWidth;
+                    const height = frame.displayHeight || frame.codedHeight;
+                    canvas.width = swap ? height : width;
+                    canvas.height = swap ? width : height;
+                    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+                    ctx.save();
+                    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    ctx.translate(canvas.width / 2, canvas.height / 2);
+                    ctx.rotate(rotation * Math.PI / 180);
+                    ctx.scale(h264Info.mirror ? -1 : 1, 1);
+                    ctx.drawImage(frame, -width / 2, -height / 2, width, height);
+                    ctx.restore();
+                    frame.close();
+                    img.style.display = 'none';
+                    canvas.style.display = 'block';
+                    document.getElementById('offline-overlay').style.display = 'none';
+                }
+
+                async function configureH264Decoder() {
+                    if (!h264Config.length || h264Decoder) return;
+                    const config = {
+                        codec: codecFromAnnexB(h264Config),
+                        codedWidth: Number(h264Info.width || 1280),
+                        codedHeight: Number(h264Info.height || 720),
+                        optimizeForLatency: true,
+                        hardwareAcceleration: 'prefer-hardware'
+                    };
+                    const support = await VideoDecoder.isConfigSupported(config);
+                    if (!support.supported) throw new Error('Browser WebCodecs cannot decode ' + config.codec);
+                    h264Decoder = new VideoDecoder({
+                        output: renderH264Frame,
+                        error: error => showPreviewError('H.264 preview decoder failed: ' + error.message)
+                    });
+                    h264Decoder.configure(config);
+                }
+
+                async function startH264Preview(force) {
+                    if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
+                        showPreviewError('H.264 preview unavailable: this browser does not support WebCodecs. Use Edge/Chrome or MJPEG compatibility mode.');
+                        return;
+                    }
+                    if (h264PreviewRunning && !force) return;
+                    stopH264Preview();
+                    h264PreviewRunning = true;
+                    h264Abort = new AbortController();
+                    document.getElementById('stream-img').style.display = 'none';
+                    document.getElementById('h264-canvas').style.display = 'block';
+                    showPreviewError('Connecting H.264 WebCodecs preview…');
+                    try {
+                        const response = await fetchWithAuth('/stream.ocb2', { signal: h264Abort.signal });
+                        if (!response.ok || !response.body) throw new Error('OCB2 HTTP ' + response.status);
+                        const reader = response.body.getReader();
+                        let buffered = new Uint8Array(0);
+                        while (h264PreviewRunning) {
+                            const result = await reader.read();
+                            if (result.done) throw new Error('OCB2 preview stream ended');
+                            const joined = new Uint8Array(buffered.length + result.value.length);
+                            joined.set(buffered); joined.set(result.value, buffered.length); buffered = joined;
+                            let offset = 0;
+                            while (buffered.length - offset >= 48) {
+                                const view = new DataView(buffered.buffer, buffered.byteOffset + offset, buffered.length - offset);
+                                if (view.getUint32(0, false) !== 0x4f434232 || view.getUint16(4, true) !== 2 || view.getUint16(6, true) !== 48) {
+                                    throw new Error('Malformed OCB2 preview header');
+                                }
+                                const payloadLength = view.getUint32(40, true);
+                                if (payloadLength > 16 * 1024 * 1024) throw new Error('OCB2 preview payload exceeds limit');
+                                if (buffered.length - offset < 48 + payloadLength) break;
+                                const type = view.getUint16(8, true);
+                                const flags = view.getUint32(12, true);
+                                const encoderTimestamp = Number(view.getBigInt64(32, true));
+                                const payload = buffered.slice(offset + 48, offset + 48 + payloadLength);
+                                if (type === 1) {
+                                    h264Info = JSON.parse(new TextDecoder().decode(payload));
+                                    if (h264Decoder) { h264Decoder.close(); h264Decoder = null; }
+                                    h264Config = new Uint8Array(0); h264LastTimestamp = -1;
+                                } else if (type === 2 && (flags & 1)) {
+                                    h264Config = payload;
+                                    await configureH264Decoder();
+                                } else if (type === 3) {
+                                    await configureH264Decoder();
+                                    if (h264Decoder) {
+                                        const key = (flags & 2) !== 0;
+                                        let data = payload;
+                                        if (key && h264Config.length) {
+                                            data = new Uint8Array(h264Config.length + payload.length);
+                                            data.set(h264Config); data.set(payload, h264Config.length);
+                                        }
+                                        const timestamp = Math.max(h264LastTimestamp + 1, encoderTimestamp);
+                                        h264LastTimestamp = timestamp;
+                                        h264Decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp, data }));
+                                    }
+                                } else if (type === 5 || (flags & 8)) {
+                                    throw new Error('Phone ended the H.264 preview stream');
+                                } else if (type === 6) {
+                                    throw new Error(new TextDecoder().decode(payload));
+                                }
+                                offset += 48 + payloadLength;
+                            }
+                            if (offset) buffered = buffered.slice(offset);
+                        }
+                    } catch (error) {
+                        if (error.name !== 'AbortError') {
+                            showPreviewError('H.264 preview unavailable: ' + (error.message || String(error)));
+                            h264PreviewRunning = false;
+                        }
+                    }
+                }
+
+                function reloadPreviewImage() {
+                    if (currentStreamMode === 'h264') { startH264Preview(true); return; }
+                    stopH264Preview();
+                    document.getElementById('h264-canvas').style.display = 'none';
+                    const img = document.getElementById('stream-img');
+                    img.style.display = 'block';
                     const imgUrl = new URL('/stream.mjpeg', window.location.origin);
                     if (isTokenRequired && TOKEN) imgUrl.searchParams.set('token', TOKEN);
                     imgUrl.searchParams.set('ts', new Date().getTime());
@@ -750,6 +950,8 @@ class ControlServer(
                         if (previousLifecycle !== 'STREAMING' && currentLifecycleState === 'STREAMING') {
                             if (currentStreamMode === 'mjpeg') {
                                 reloadPreviewImage();
+                            } else {
+                                startH264Preview(false);
                             }
                         }
 
@@ -810,12 +1012,16 @@ class ControlServer(
                             document.getElementById('offline-overlay').style.display = 'flex';
                             document.getElementById('stream-img').style.opacity = '0.3';
                         } else if (currentStreamMode === 'mjpeg') {
+                            stopH264Preview();
+                            document.getElementById('h264-canvas').style.display = 'none';
+                            document.getElementById('stream-img').style.display = 'block';
                             document.getElementById('offline-overlay').style.display = 'none';
                             document.getElementById('stream-img').style.opacity = '1';
                         } else {
-                            document.getElementById('preview-overlay-text').textContent = 'H.264 / OCB2 is feeding the Windows virtual camera';
-                            document.getElementById('offline-overlay').style.display = 'flex';
-                            document.getElementById('stream-img').style.opacity = '0.15';
+                            startH264Preview(false);
+                            if (!document.getElementById('h264-canvas').width) {
+                                showPreviewError('Connecting H.264 WebCodecs preview…');
+                            }
                         }
 
                         const camSelect = document.getElementById('camera-select');
@@ -867,27 +1073,43 @@ class ControlServer(
                         });
                         if (!response.ok) {
                             const result = await response.json().catch(() => ({}));
+                            if (result.authoritativeState) {
+                                currentRevision = Number(result.authoritativeState.revision || currentRevision);
+                                lastStatus = result.authoritativeState;
+                                updateModeOptions(result.authoritativeState);
+                            }
+                            fetchStatus();
                             throw new Error(result.message || ('HTTP ' + response.status));
                         }
+                        const result = await response.json().catch(() => ({}));
+                        currentRevision = Number(result.revision || currentRevision);
                         fetchStatus();
                     } catch (e) { console.error('Update err', e); }
                 }
 
                 async function updateZoom() {
                     const val = parseInt(document.getElementById('zoom-slider').value) / 100.0;
-                    await fetchWithAuth('/api/camera/zoom', {
+                    const response = await fetchWithAuth('/api/camera/zoom', {
                         method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ linearZoom: val })
+                        body: JSON.stringify({ linearZoom: val, baseRevision: currentRevision,
+                            requestId: (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString()), clientType: 'web' })
                     });
+                    const result = await response.json().catch(() => ({}));
+                    currentRevision = Number(result.revision ?? result.authoritativeState?.revision ?? currentRevision);
+                    if (!response.ok) throw new Error(result.message || ('HTTP ' + response.status));
                     fetchControls();
                 }
 
                 async function updateTorch() {
                     const enabled = document.getElementById('torch-check').checked;
-                    await fetchWithAuth('/api/camera/torch', {
+                    const response = await fetchWithAuth('/api/camera/torch', {
                         method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ enabled })
+                        body: JSON.stringify({ enabled, baseRevision: currentRevision,
+                            requestId: (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString()), clientType: 'web' })
                     });
+                    const result = await response.json().catch(() => ({}));
+                    currentRevision = Number(result.revision ?? result.authoritativeState?.revision ?? currentRevision);
+                    if (!response.ok) throw new Error(result.message || ('HTTP ' + response.status));
                     fetchControls();
                 }
 
@@ -1071,7 +1293,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON: ${e.message}"))
             return
         }
-        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(cameraId = req.cameraId), "api"))
+        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(baseRevision = req.baseRevision, requestId = req.requestId, clientType = req.clientType, cameraId = req.cameraId), req.clientType))
     }
 
     private suspend fun serveSetResolution(call: RoutingCall) {
@@ -1079,7 +1301,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(width = req.width, height = req.height), "api"))
+        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(baseRevision = req.baseRevision, requestId = req.requestId, clientType = req.clientType, width = req.width, height = req.height), req.clientType))
     }
 
     private suspend fun serveSetFps(call: RoutingCall) {
@@ -1087,7 +1309,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(fps = req.fps), "api"))
+        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(baseRevision = req.baseRevision, requestId = req.requestId, clientType = req.clientType, fps = req.fps), req.clientType))
     }
 
     private suspend fun serveSetJpegQuality(call: RoutingCall) {
@@ -1096,7 +1318,7 @@ class ControlServer(
             return
         }
         val quality = req.quality.coerceIn(1, 100)
-        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(jpegQuality = quality), "api"))
+        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(baseRevision = req.baseRevision, requestId = req.requestId, clientType = req.clientType, jpegQuality = quality), req.clientType))
     }
 
     private suspend fun serveSetPreviewFitMode(call: RoutingCall) {
@@ -1104,7 +1326,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(previewFitMode = req.previewFitMode), "api"))
+        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(baseRevision = req.baseRevision, requestId = req.requestId, clientType = req.clientType, previewFitMode = req.previewFitMode), req.clientType))
     }
 
     private suspend fun serveSetAspectRatio(call: RoutingCall) {
@@ -1112,7 +1334,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(aspectRatio = req.aspectRatio), "api"))
+        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(baseRevision = req.baseRevision, requestId = req.requestId, clientType = req.clientType, aspectRatio = req.aspectRatio), req.clientType))
     }
 
     private suspend fun serveUpdateSettings(call: RoutingCall) {
@@ -1162,6 +1384,7 @@ class ControlServer(
             PipelineResultCode.OK -> HttpStatusCode.OK
             PipelineResultCode.CONFLICT -> HttpStatusCode.Conflict
             PipelineResultCode.UNPROCESSABLE -> HttpStatusCode.UnprocessableEntity
+            PipelineResultCode.CANCELLED -> HttpStatusCode.Conflict
             PipelineResultCode.FAILED -> HttpStatusCode.InternalServerError
         }
         call.respond(
@@ -1177,6 +1400,7 @@ class ControlServer(
                     PipelineResultCode.OK -> null
                     PipelineResultCode.CONFLICT -> "Revision conflict"
                     PipelineResultCode.UNPROCESSABLE -> "Unsupported mode"
+                    PipelineResultCode.CANCELLED -> "Command superseded"
                     PipelineResultCode.FAILED -> "Pipeline failure"
                 },
                 requested = result.requested,
@@ -1193,12 +1417,14 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
+        if (req.baseRevision == null || req.requestId.isNullOrBlank() || req.clientType.isNullOrBlank()) {
+            call.respond(HttpStatusCode.Conflict, SimpleResult(false, "baseRevision, requestId and clientType are required"))
+            return
+        }
         if (req.linearZoom != null) {
-            onSetLinearZoom(req.linearZoom.coerceIn(0f, 1f))
-            call.respond(SimpleResult(true, "Linear zoom set to ${req.linearZoom}"))
+            respondPipelineResult(call, onSetLinearZoom(req.linearZoom.coerceIn(0f, 1f), req.baseRevision, req.requestId, req.clientType))
         } else if (req.zoomRatio != null) {
-            onSetZoomRatio(req.zoomRatio)
-            call.respond(SimpleResult(true, "Zoom ratio set to ${req.zoomRatio}"))
+            respondPipelineResult(call, onSetZoomRatio(req.zoomRatio, req.baseRevision, req.requestId, req.clientType))
         } else {
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Require zoomRatio or linearZoom"))
         }
@@ -1209,8 +1435,11 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        onSetTorch(req.enabled)
-        call.respond(SimpleResult(true, "Torch set to ${req.enabled}"))
+        if (req.baseRevision == null || req.requestId.isNullOrBlank() || req.clientType.isNullOrBlank()) {
+            call.respond(HttpStatusCode.Conflict, SimpleResult(false, "baseRevision, requestId and clientType are required"))
+            return
+        }
+        respondPipelineResult(call, onSetTorch(req.enabled, req.baseRevision, req.requestId, req.clientType))
     }
 
     private suspend fun serveSetAutofocus(call: RoutingCall) {
@@ -1336,36 +1565,39 @@ class ControlServer(
     }
 
     private suspend fun serveStreamMetrics(call: RoutingCall) {
-        val active = StreamState.lifecycleState.get().name == "STREAMING"
-        val mode = StreamState.activeStreamMode.get()
+        val status = StreamState.toStatusDto()
+        val active = status.lifecycleState == "STREAMING"
+        val selected = status.snapshot.selected
+        val actual = status.snapshot.actual
+        val mode = selected?.streamMode ?: status.activeStreamMode
         val config = StreamState.currentConfig()
         call.respond(
             PipelineMetricsDto(
-                generation = StreamState.pipelineGeneration.get(),
+                generation = status.snapshot.generation,
                 activeStreamMode = mode,
-                capture = if (!active) null else CaptureMetricsDto(
-                    engine = if (mode == "h264") StreamState.captureEngine.get() else "CAMERAX_IMAGE_ANALYSIS",
-                    cameraId = config.cameraId,
+                capture = if (!active || selected == null || actual == null) null else CaptureMetricsDto(
+                    engine = selected.captureEngine,
+                    cameraId = selected.cameraId,
                     requestedWidth = config.width,
                     requestedHeight = config.height,
-                    actualWidth = StreamState.encodedWidth.get(),
-                    actualHeight = StreamState.encodedHeight.get(),
+                    actualWidth = actual.width,
+                    actualHeight = actual.height,
                     requestedFps = config.fps,
-                    selectedFps = StreamState.selectedFps.get(),
-                    cameraSessionFps = if (mode == "h264") StreamState.cameraSessionFps.get() else StreamState.selectedFps.get(),
-                    actualFps = StreamState.captureFps.get(),
-                    gpuBridgeFps = StreamState.gpuBridgeFps.get().takeIf { mode == "h264" && StreamState.captureEngine.get() == "HIGH_SPEED_GPU_BRIDGE" }
+                    selectedFps = selected.fps,
+                    cameraSessionFps = selected.fps,
+                    actualFps = actual.captureFps,
+                    gpuBridgeFps = StreamState.gpuBridgeFps.get().takeIf { mode == "h264" && selected.captureEngine == "HIGH_SPEED_GPU_BRIDGE" }
                 ),
                 h264 = if (!active || mode != "h264") null else H264MetricsDto(
-                    encoderName = StreamState.encoderName.get(),
-                    hardwareEncoder = StreamState.hardwareEncoder.get(),
-                    encodedFps = StreamState.encodedFps.get(),
-                    bitrate = StreamState.encodedBitrate.get(),
+                    encoderName = selected?.encoderName.orEmpty(),
+                    hardwareEncoder = selected?.hardwareEncoder == true,
+                    encodedFps = actual?.encodedFps ?: 0,
+                    bitrate = actual?.encodedBitrate ?: 0,
                     clientCount = StreamState.h264ClientCount.get(),
                     rejectedCapturePaths = StreamState.capturePathError.get().ifBlank { null }
                 ),
                 mjpeg = if (!active || mode != "mjpeg") null else MjpegMetricsDto(
-                    encodedFps = StreamState.actualFps.get(),
+                    encodedFps = actual?.encodedFps ?: 0,
                     encodeMs = StreamState.androidEncodeMsAvg.get(),
                     yuvMs = StreamState.yuvMsAvg.get(),
                     jpegMs = StreamState.jpegMsAvg.get(),
@@ -1382,15 +1614,13 @@ class ControlServer(
                     selectedAspectRatio = StreamState.selectedAspectRatio.get(),
                     aspectRatioMatch = StreamState.aspectRatioMatch.get(),
                     resizeNeeded = StreamState.resizeNeeded.get(),
-                    selectedRawWidth = StreamState.selectedRawWidth.get(),
-                    selectedRawHeight = StreamState.selectedRawHeight.get(),
-                    selectedEffectiveWidth = StreamState.selectedEffectiveWidth.get(),
-                    selectedEffectiveHeight = StreamState.selectedEffectiveHeight.get(),
+                    selectedRawWidth = selected?.width ?: 0,
+                    selectedRawHeight = selected?.height ?: 0,
+                    selectedEffectiveWidth = selected?.width ?: 0,
+                    selectedEffectiveHeight = selected?.height ?: 0,
                     resolutionPolicy = StreamState.resolutionPolicy.get()
                 ),
-                fallback = StreamState.fallbackReason.get().takeIf { it.isNotBlank() }?.let {
-                    FallbackMetricsDto(StreamState.fallbackUsed.get(), it)
-                }
+                fallback = status.snapshot.fallback?.let { FallbackMetricsDto(it.active, it.reason) }
             )
         )
     }
@@ -1458,32 +1688,28 @@ data class CameraControlsDto(
 )
 
 @Serializable
-private data class CameraSwitchRequest(val cameraId: String)
+private data class CameraSwitchRequest(val cameraId: String, val baseRevision: Long? = null, val requestId: String? = null, val clientType: String? = null)
 
 @Serializable
-private data class ResolutionRequest(val width: Int, val height: Int)
+private data class ResolutionRequest(val width: Int, val height: Int, val baseRevision: Long? = null, val requestId: String? = null, val clientType: String? = null)
 
 @Serializable
-private data class FpsRequest(val fps: Int)
+private data class FpsRequest(val fps: Int, val baseRevision: Long? = null, val requestId: String? = null, val clientType: String? = null)
 
 @Serializable
-private data class JpegQualityRequest(val quality: Int)
+private data class JpegQualityRequest(val quality: Int, val baseRevision: Long? = null, val requestId: String? = null, val clientType: String? = null)
 
 @Serializable
-private data class PreviewFitModeRequest(val previewFitMode: String)
+private data class PreviewFitModeRequest(val previewFitMode: String, val baseRevision: Long? = null, val requestId: String? = null, val clientType: String? = null)
 
 @Serializable
-private data class AspectRatioRequest(val aspectRatio: String)
+private data class AspectRatioRequest(val aspectRatio: String, val baseRevision: Long? = null, val requestId: String? = null, val clientType: String? = null)
 
 @Serializable
 data class UpdateSettingsRequest(
     val baseRevision: Long? = null,
     val requestId: String? = null,
-    val clientRevision: Long? = null,
     val clientType: String? = null,
-    /** Monotonic desktop apply id; echoed back in status.appliedVersion so the
-     *  desktop knows when its change has been applied (anti status-snapback). */
-    val applyId: Long? = null,
     val cameraId: String? = null,
     val width: Int? = null,
     val height: Int? = null,
@@ -1521,10 +1747,21 @@ private data class StreamInfoDto(
 )
 
 @Serializable
-private data class ZoomRequest(val zoomRatio: Float? = null, val linearZoom: Float? = null)
+private data class ZoomRequest(
+    val zoomRatio: Float? = null,
+    val linearZoom: Float? = null,
+    val baseRevision: Long? = null,
+    val requestId: String? = null,
+    val clientType: String? = null
+)
 
 @Serializable
-private data class TorchRequest(val enabled: Boolean)
+private data class TorchRequest(
+    val enabled: Boolean,
+    val baseRevision: Long? = null,
+    val requestId: String? = null,
+    val clientType: String? = null
+)
 
 @Serializable
 private data class AutofocusRequest(val enabled: Boolean)

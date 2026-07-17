@@ -43,6 +43,7 @@ class MjpegStreamer(
     private var cameraProvider: ProcessCameraProvider? = null
     private var currentCamera: Camera? = null
     @Volatile private var activeConfig: StreamConfig? = null
+    @Volatile private var activePipelineGeneration: Long = -1
 
     // Reusable buffers to avoid GC churn at 30-60 fps
     private var nv21Buffer: ByteArray? = null
@@ -57,6 +58,7 @@ class MjpegStreamer(
 
     suspend fun start() {
         activeConfig = StreamState.currentConfig()
+        activePipelineGeneration = StreamState.pipelineGeneration.get()
         captureWindowStartNs = 0L
         captureWindowFrames = 0
         lastEncodeNs = 0L
@@ -198,6 +200,17 @@ class MjpegStreamer(
                             StreamState.selectedEffectiveWidth.set(effW)
                             StreamState.selectedEffectiveHeight.set(effH)
                             StreamState.normalizedForPolicy.set(true)
+                            StreamState.publishSelectedPipeline(
+                                activePipelineGeneration, config.cameraId, "mjpeg", "CAMERAX_IMAGE_ANALYSIS",
+                                effW, effH, targetFps, null, false
+                            )
+                            if (config.streamMode == "mjpeg") {
+                                val fallback = effW != config.width || effH != config.height
+                                StreamState.publishFallback(
+                                    fallback,
+                                    if (fallback) "CameraX selected ${effW}x${effH} instead of requested ${config.width}x${config.height}" else ""
+                                )
+                            }
 
                             android.util.Log.i("MjpegStreamer", "Selected Resolution: ${resolution.width}x${resolution.height} (Effective: ${effW}x${effH})")
                         }
@@ -220,6 +233,7 @@ class MjpegStreamer(
             cameraProvider?.unbindAll()
             currentCamera = null
             activeConfig = null
+            activePipelineGeneration = -1
             StreamState.streaming.set(false)
             StreamState.latestFrame.set(null)
         }
@@ -312,6 +326,10 @@ class MjpegStreamer(
             captureWindowFrames++
             if (captureNowNs - captureWindowStartNs >= 1_000_000_000L) {
                 StreamState.captureFps.set(captureWindowFrames)
+                StreamState.publishActualPipeline(
+                    activePipelineGeneration, StreamState.selectedEffectiveWidth.get(), StreamState.selectedEffectiveHeight.get(),
+                    captureWindowFrames, StreamState.actualFps.get(), 0
+                )
                 captureWindowFrames = 0
                 captureWindowStartNs = captureNowNs
             }
@@ -437,6 +455,10 @@ class MjpegStreamer(
                 if (StreamState.fpsWindowStartMs.compareAndSet(windowStart, now)) {
                     val count = StreamState.framesThisSecond.getAndSet(0)
                     StreamState.actualFps.set(count)
+                    StreamState.publishActualPipeline(
+                        activePipelineGeneration, StreamState.selectedEffectiveWidth.get(), StreamState.selectedEffectiveHeight.get(),
+                        StreamState.captureFps.get(), count, 0
+                    )
                 }
             }
         } catch (e: Exception) {

@@ -83,6 +83,7 @@ class H264Streamer(
     private var gpuBridge: HighSpeedGpuBridge? = null
     private var selection: H264EncoderSelection? = null
     private var activeConfig: StreamConfig? = null
+    @Volatile private var activePipelineGeneration: Long = -1
     private var adaptiveMode: H264ModeDto? = null
     private var codecConfig: ByteArray? = null
     private var streamInfo: ByteArray? = null
@@ -106,6 +107,7 @@ class H264Streamer(
         try {
             val config = StreamState.currentConfig()
             activeConfig = config
+            activePipelineGeneration = StreamState.pipelineGeneration.get()
             val cameraId = config.cameraId
             val requested = adaptiveMode
             val candidates = H264Capabilities.selectCandidates(
@@ -192,6 +194,7 @@ class H264Streamer(
         )
         selection = null
         activeConfig = null
+        activePipelineGeneration = -1
         releaseCaptureAttempt()
         codecConfig = null
         streamInfo = null
@@ -421,6 +424,12 @@ class H264Streamer(
         if (now - encodedWindowStartNs >= 1_000_000_000L) {
             StreamState.encodedFps.set(encodedWindowFrames)
             StreamState.encodedBitrate.set((encodedWindowBytes * 8L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+            selection?.mode?.let { mode ->
+                StreamState.publishActualPipeline(
+                    activePipelineGeneration, mode.width, mode.height, StreamState.captureFps.get(),
+                    encodedWindowFrames, StreamState.encodedBitrate.get()
+                )
+            }
             encodedWindowFrames = 0
             encodedWindowBytes = 0
             encodedWindowStartNs = now
@@ -661,6 +670,12 @@ class H264Streamer(
             if (timestamp - captureWindowStartNs >= 1_000_000_000L) {
                 StreamState.actualFps.set(captureWindowFrames)
                 StreamState.captureFps.set(captureWindowFrames)
+                selection?.mode?.let { mode ->
+                    StreamState.publishActualPipeline(
+                        activePipelineGeneration, mode.width, mode.height, captureWindowFrames,
+                        StreamState.encodedFps.get(), StreamState.encodedBitrate.get()
+                    )
+                }
                 captureWindowFrames = 0
                 captureWindowStartNs = timestamp
             }
@@ -746,14 +761,29 @@ class H264Streamer(
         StreamState.selectedFps.set(m.fps)
         StreamState.selectedRawWidth.set(m.width); StreamState.selectedRawHeight.set(m.height)
         StreamState.selectedEffectiveWidth.set(m.width); StreamState.selectedEffectiveHeight.set(m.height)
-        StreamState.fallbackUsed.set(m.width != config.width || m.height != config.height || m.fps != config.fps)
-        StreamState.fallbackReason.set(
-            when {
-                StreamState.fallbackUsed.get() -> "Requested profile unsupported or rejected; selected ${m.width}x${m.height}@${m.fps} using ${chosen.captureEngine}"
-                rejectedPaths.isNotEmpty() -> "Earlier capture paths rejected; using ${chosen.captureEngine}: ${rejectedPaths.joinToString(" | ")}"
-                else -> ""
-            }
+        val usedFallback = m.width != config.width || m.height != config.height || m.fps != config.fps
+        val fallback = when {
+            usedFallback -> "Requested profile unsupported or rejected; selected ${m.width}x${m.height}@${m.fps} using ${chosen.captureEngine}"
+            rejectedPaths.isNotEmpty() -> "Earlier capture paths rejected; using ${chosen.captureEngine}: ${rejectedPaths.joinToString(" | ")}"
+            else -> ""
+        }
+        StreamState.publishFallback(usedFallback || rejectedPaths.isNotEmpty(), fallback)
+        StreamState.publishSelectedPipeline(
+            activePipelineGeneration, config.cameraId, "h264", chosen.captureEngine.name, m.width, m.height,
+            m.fps, chosen.codecName, chosen.hardware
         )
+        val chars = manager.getCameraCharacteristics(config.cameraId)
+        val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val deviceRotation = FrameTransformPolicy.surfaceRotationDegrees(StreamState.deviceSurfaceRotation.get())
+        val transform = FrameTransformPolicy.calculate(
+            sensorOrientation,
+            deviceRotation,
+            chars.get(CameraCharacteristics.LENS_FACING),
+            config.displayRotation,
+            config.mirror
+        )
+        StreamState.sensorOrientation.set(transform.sensorOrientation)
+        StreamState.rotationDegrees.set(transform.effectiveRotation)
         val payload = JSONObject().apply {
             put("codec", "H264")
             put("framing", "annex-b-access-units")
@@ -765,6 +795,10 @@ class H264Streamer(
             put("hardwareEncoder", chosen.hardware)
             put("captureEngine", chosen.captureEngine.name)
             put("cameraCaptureFps", chosen.cameraCaptureFps)
+            put("effectiveRotation", transform.effectiveRotation)
+            put("mirror", transform.mirror)
+            put("sensorOrientation", transform.sensorOrientation)
+            put("deviceRotation", transform.deviceRotation)
             put("rejectedCapturePaths", rejectedPaths.joinToString(" | "))
             put("pixelFormat", "NV12")
         }.toString().toByteArray(Charsets.UTF_8)

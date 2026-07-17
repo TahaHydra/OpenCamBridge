@@ -528,18 +528,17 @@ fun MainControls(
         // resolution. Unknown (0) means do not restrict.
         val activeCam = cameras.find { it.id == selectedCameraId }
         val h264ResolutionOptions = activeCam?.h264Modes?.map { Pair(it.width, it.height) }?.distinct().orEmpty()
-        val mjpegResolutionOptions = activeCam?.fpsByResolution
-            ?.filter { it.maxFps >= 15 }
+        val mjpegResolutionOptions = activeCam?.mjpegModes
             ?.map { Pair(it.width, it.height) }
             ?.distinct()
             .orEmpty()
         val resolutionOptions = if (streamMode == "h264") h264ResolutionOptions else mjpegResolutionOptions
         val h264FpsOptions = activeCam?.h264Modes?.filter { it.width == width && it.height == height }?.map { it.fps }?.distinct().orEmpty()
-        val maxMjpegFps = activeCam?.fpsByResolution
-            ?.firstOrNull { it.width == width && it.height == height }?.maxFps ?: 0
-        val mjpegFpsOptions = CapturePathPolicy.selectableMjpegFps(maxMjpegFps)
+        val mjpegFpsOptions = activeCam?.mjpegModes
+            ?.filter { it.width == width && it.height == height }
+            ?.map { it.fps }?.distinct().orEmpty()
         val fpsOptions = if (streamMode == "h264") h264FpsOptions else mjpegFpsOptions
-        val maxFpsHere = if (streamMode == "h264") h264FpsOptions.maxOrNull() ?: 0 else maxMjpegFps
+        val maxFpsHere = fpsOptions.maxOrNull() ?: 0
 
         if (rebindInProgress) {
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF33270A)), modifier = Modifier.fillMaxWidth()) {

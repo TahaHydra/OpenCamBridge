@@ -229,20 +229,26 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     fun updateTorch(enabled: Boolean) {
         val h = ServiceBridge.setTorch
         if (h != null) {
-            try { h(enabled) } catch (e: Exception) {
-                AppLogger.e("Control", "Torch failed: ${e.message}")
-                _controlError.value = "Torch failed: ${e.javaClass.simpleName}"
+            viewModelScope.launch {
+                try {
+                    val result = h(enabled, StreamState.revision.get(), java.util.UUID.randomUUID().toString(), "phone")
+                    if (!result.success) _controlError.value = result.message
+                } catch (e: Exception) {
+                    AppLogger.e("Control", "Torch failed: ${e.message}")
+                    _controlError.value = "Torch failed: ${e.javaClass.simpleName}"
+                }
             }
         } else {
-            // No camera running: reflect intent so the switch is consistent.
-            StreamState.torchRequested.set(enabled)
-            StreamState.torchEnabled.set(enabled)
+            _controlError.value = "Streaming service is starting; try again"
         }
     }
 
     fun updateZoom(linearZoom: Float) {
         val h = ServiceBridge.setLinearZoom
-        if (h != null) h(linearZoom) else StreamState.linearZoom.set(linearZoom)
+        if (h != null) viewModelScope.launch {
+            val result = h(linearZoom, StreamState.revision.get(), java.util.UUID.randomUUID().toString(), "phone")
+            if (!result.success) _controlError.value = result.message
+        } else _controlError.value = "Streaming service is starting; try again"
     }
 
     fun stopStream() {
@@ -269,7 +275,12 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         }
         viewModelScope.launch {
             try {
-                val result = handler(req, "phone")
+                val authoritative = req.copy(
+                    baseRevision = StreamState.revision.get(),
+                    requestId = java.util.UUID.randomUUID().toString(),
+                    clientType = "phone"
+                )
+                val result = handler(authoritative, "phone")
                 if (!result.success) {
                     AppLogger.w("Control", "Settings rejected: ${result.message}")
                     _controlError.value = result.message

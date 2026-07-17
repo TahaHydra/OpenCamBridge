@@ -62,11 +62,41 @@ class SnapshotCounter internal constructor(
     fun incrementAndGet(): Long = increment()
 }
 
+private data class SelectedPipeline(
+    val generation: Long,
+    val cameraId: String,
+    val streamMode: String,
+    val captureEngine: String,
+    val width: Int,
+    val height: Int,
+    val fps: Int,
+    val encoderName: String?,
+    val hardwareEncoder: Boolean
+)
+
+private data class ActualPipeline(
+    val generation: Long,
+    val width: Int,
+    val height: Int,
+    val captureFps: Int,
+    val encodedFps: Int,
+    val encodedBitrate: Int
+)
+
+private data class FallbackState(
+    val generation: Long,
+    val active: Boolean,
+    val reason: String
+)
+
 private data class PipelineSnapshot(
     val revision: Long = 0,
     val generation: Long = 0,
     val lifecycle: LifecycleState = LifecycleState.STOPPED,
     val desired: StreamConfig = StreamConfig(),
+    val selected: SelectedPipeline? = null,
+    val actual: ActualPipeline? = null,
+    val fallback: FallbackState? = null,
     val lastRequestId: String? = null,
     val updatedAtMillis: Long = System.currentTimeMillis(),
     val lastUpdatedBy: String = "system"
@@ -86,16 +116,19 @@ object StreamState {
     val revision = SnapshotReadValue { pipelineSnapshot.get().revision }
     val pipelineGeneration = SnapshotCounter(
         read = { pipelineSnapshot.get().generation },
-        increment = { updatePipelineSnapshot { it.copy(generation = it.generation + 1) }.generation }
+        increment = {
+            updatePipelineSnapshot {
+                it.copy(
+                    generation = it.generation + 1,
+                    selected = null,
+                    actual = null,
+                    fallback = null
+                )
+            }.generation
+        }
     )
     val updatedAtMillis = SnapshotReadValue { pipelineSnapshot.get().updatedAtMillis }
     val lastUpdatedBy = SnapshotReadValue { pipelineSnapshot.get().lastUpdatedBy }
-
-    /** Highest desktop apply id that has been applied here. The desktop sends a
-     *  monotonically increasing applyId with each settings change and refuses to
-     *  merge stream-shaping status fields until it sees this catch up — so a slow
-     *  CameraX rebind can't let a stale status snap the desktop dropdowns back. */
-    val appliedSettingsVersion = AtomicLong(0L)
 
     val streaming = AtomicBoolean(false) // Deprecated, use lifecycleState
     val lifecycleState = SnapshotValue({ pipelineSnapshot.get().lifecycle }) { value ->
@@ -238,9 +271,19 @@ object StreamState {
      * Readers never see a new desired configuration under an old revision. */
     fun publishConfigRevision(config: StreamConfig, source: String, requestId: String?): Long {
         val snapshot = updatePipelineSnapshot {
+            val shapeChanged = it.desired.cameraId != config.cameraId ||
+                it.desired.streamMode != config.streamMode ||
+                it.desired.width != config.width || it.desired.height != config.height ||
+                it.desired.fps != config.fps || it.desired.profile != config.profile ||
+                it.desired.displayRotation != config.displayRotation ||
+                it.desired.mirror != config.mirror ||
+                it.desired.h264KeyframeInterval != config.h264KeyframeInterval
             it.copy(
                 desired = config,
                 revision = it.revision + 1,
+                selected = if (shapeChanged) null else it.selected,
+                actual = if (shapeChanged) null else it.actual,
+                fallback = if (shapeChanged) null else it.fallback,
                 lastRequestId = requestId,
                 updatedAtMillis = System.currentTimeMillis(),
                 lastUpdatedBy = source
@@ -248,6 +291,73 @@ object StreamState {
         }
         mirrorLegacyConfig(config)
         return snapshot.revision
+    }
+
+    fun publishRuntimeRevision(source: String, requestId: String): Long = updatePipelineSnapshot {
+        it.copy(
+            revision = it.revision + 1,
+            lastRequestId = requestId,
+            updatedAtMillis = System.currentTimeMillis(),
+            lastUpdatedBy = source
+        )
+    }.revision
+
+    /** Publish runtime selection as part of the same immutable generation as
+     * lifecycle and desired state. Legacy atomics remain compatibility
+     * projections only; status is built exclusively from this snapshot. */
+    fun publishSelectedPipeline(
+        generation: Long,
+        cameraId: String,
+        streamMode: String,
+        captureEngine: String,
+        width: Int,
+        height: Int,
+        fps: Int,
+        encoderName: String?,
+        hardwareEncoder: Boolean
+    ) {
+        updatePipelineSnapshot { current ->
+            if (current.generation != generation) return@updatePipelineSnapshot current
+            current.copy(
+                selected = SelectedPipeline(
+                    generation, cameraId, streamMode, captureEngine,
+                    width, height, fps, encoderName, hardwareEncoder
+                ),
+                actual = current.actual?.takeIf { it.generation == current.generation }
+            )
+        }
+    }
+
+    fun publishActualPipeline(
+        generation: Long,
+        width: Int,
+        height: Int,
+        captureFps: Int,
+        encodedFps: Int,
+        encodedBitrate: Int
+    ) {
+        updatePipelineSnapshot { current ->
+            if (current.generation != generation || current.selected?.generation != generation) {
+                return@updatePipelineSnapshot current
+            }
+            current.copy(
+                actual = ActualPipeline(
+                    generation, width, height, captureFps, encodedFps, encodedBitrate
+                )
+            )
+        }
+    }
+
+    fun publishFallback(active: Boolean, reason: String) {
+        updatePipelineSnapshot { current ->
+            current.copy(
+                fallback = if (active || reason.isNotBlank()) {
+                    FallbackState(current.generation, active, reason)
+                } else null
+            )
+        }
+        fallbackUsed.set(active)
+        fallbackReason.set(reason)
     }
 
     private fun mirrorLegacyConfig(config: StreamConfig) {
@@ -303,31 +413,32 @@ object StreamState {
     fun toStatusDto(): StreamStatusDto {
         val snapshot = pipelineSnapshot.get()
         val config = snapshot.desired
-        val selectedWidth = selectedEffectiveWidth.get().takeIf { it > 0 }
-            ?: encodedWidth.get().takeIf { it > 0 }
-        val selectedHeight = selectedEffectiveHeight.get().takeIf { it > 0 }
-            ?: encodedHeight.get().takeIf { it > 0 }
-        val selected = if (selectedWidth != null && selectedHeight != null) {
+        val selectedState = snapshot.selected?.takeIf { it.generation == snapshot.generation }
+        val actualState = snapshot.actual?.takeIf { it.generation == snapshot.generation }
+        val fallbackState = snapshot.fallback?.takeIf { it.generation == snapshot.generation }
+        val selected = selectedState?.let {
             SelectedPipelineDto(
-                cameraId = config.cameraId,
-                streamMode = activeStreamMode.get(),
-                captureEngine = captureEngine.get(),
-                width = selectedWidth,
-                height = selectedHeight,
-                fps = selectedFps.get(),
-                encoderName = encoderName.get().ifBlank { null },
-                hardwareEncoder = hardwareEncoder.get()
+                generation = it.generation,
+                cameraId = it.cameraId,
+                streamMode = it.streamMode,
+                captureEngine = it.captureEngine,
+                width = it.width,
+                height = it.height,
+                fps = it.fps,
+                encoderName = it.encoderName,
+                hardwareEncoder = it.hardwareEncoder
             )
-        } else null
-        val actual = if (snapshot.lifecycle == LifecycleState.STREAMING) {
+        }
+        val actual = actualState?.let {
             ActualPipelineDto(
-                width = encodedWidth.get(),
-                height = encodedHeight.get(),
-                captureFps = captureFps.get(),
-                encodedFps = encodedFps.get(),
-                encodedBitrate = encodedBitrate.get()
+                generation = it.generation,
+                width = it.width,
+                height = it.height,
+                captureFps = it.captureFps,
+                encodedFps = it.encodedFps,
+                encodedBitrate = it.encodedBitrate
             )
-        } else null
+        }
         val publicSnapshot = PipelineSnapshotDto(
             revision = snapshot.revision,
             generation = snapshot.generation,
@@ -343,6 +454,7 @@ object StreamState {
             ),
             selected = selected,
             actual = actual,
+            fallback = fallbackState?.let { FallbackStateDto(it.generation, it.active, it.reason) },
             lastRequestId = snapshot.lastRequestId,
             lastUpdatedBy = snapshot.lastUpdatedBy
         )
@@ -356,15 +468,14 @@ object StreamState {
         streaming = snapshot.lifecycle == LifecycleState.STREAMING,
         lifecycleState = snapshot.lifecycle.name,
         latestFrameRevision = latestFrameRevision.get(),
-        appliedVersion = appliedSettingsVersion.get(),
         lastError = lastError.get(),
         accessMode = config.accessMode,
         port = config.port,
         tokenRequired = config.accessMode == "lanToken",
         allowLan = config.accessMode != "usbOnly",
         streamMode = config.streamMode,
-        activeStreamMode = activeStreamMode.get(),
-        fallbackReason = fallbackReason.get(),
+        activeStreamMode = selectedState?.streamMode ?: config.streamMode,
+        fallbackReason = fallbackState?.reason.orEmpty(),
         h264Bitrate = config.h264Bitrate,
         h264KeyframeInterval = config.h264KeyframeInterval,
         cameraId = config.cameraId,
@@ -385,13 +496,13 @@ object StreamState {
         torchEnabled = torchEnabled.get(),
         linearZoom = linearZoom.get(),
         zoomRatio = zoomRatio.get(),
-        rotationDegrees = rotationDegrees.get(),
-        sensorOrientation = sensorOrientation.get(),
-        frameWidth = frameWidth.get(),
-        frameHeight = frameHeight.get(),
-        encodedWidth = encodedWidth.get(),
-        encodedHeight = encodedHeight.get(),
-        rotationApplied = rotationApplied.get(),
+        rotationDegrees = if (selectedState != null) rotationDegrees.get() else 0,
+        sensorOrientation = if (selectedState != null) sensorOrientation.get() else 0,
+        frameWidth = actualState?.width ?: selectedState?.width ?: 0,
+        frameHeight = actualState?.height ?: selectedState?.height ?: 0,
+        encodedWidth = actualState?.width ?: selectedState?.width ?: 0,
+        encodedHeight = actualState?.height ?: selectedState?.height ?: 0,
+        rotationApplied = selectedState != null && rotationApplied.get(),
         targetBandwidthMbps = config.targetBandwidthMbps,
         estimatedMbps = estimatedMbps.get(),
         isFramePortrait = frameHeight.get() > frameWidth.get(),
@@ -402,24 +513,24 @@ object StreamState {
         selectedAspectRatio = selectedAspectRatio.get(),
         aspectRatioMatch = aspectRatioMatch.get(),
         resizeNeeded = resizeNeeded.get(),
-        selectedRawWidth = selectedRawWidth.get(),
-        selectedRawHeight = selectedRawHeight.get(),
-        selectedEffectiveWidth = selectedEffectiveWidth.get(),
-        selectedEffectiveHeight = selectedEffectiveHeight.get(),
+        selectedRawWidth = selectedState?.width ?: 0,
+        selectedRawHeight = selectedState?.height ?: 0,
+        selectedEffectiveWidth = selectedState?.width ?: 0,
+        selectedEffectiveHeight = selectedState?.height ?: 0,
         normalizedForPolicy = normalizedForPolicy.get(),
         resolutionPolicy = resolutionPolicy.get(),
-        fallbackUsed = fallbackUsed.get(),
+        fallbackUsed = fallbackState?.active == true,
         mjpegClients = mjpegClientCount.get(),
         h264Clients = h264ClientCount.get(),
         yuvMsAvg = yuvMsAvg.get(),
         jpegMsAvg = jpegMsAvg.get(),
         rotateMsAvg = rotateMsAvg.get(),
-        captureFps = captureFps.get(),
-        encodedFps = encodedFps.get(),
-        encodedBitrate = encodedBitrate.get(),
-        encoderName = encoderName.get(),
-        hardwareEncoder = hardwareEncoder.get(),
-        captureEngine = captureEngine.get(),
+        captureFps = actualState?.captureFps ?: 0,
+        encodedFps = actualState?.encodedFps ?: 0,
+        encodedBitrate = actualState?.encodedBitrate ?: 0,
+        encoderName = selectedState?.encoderName.orEmpty(),
+        hardwareEncoder = selectedState?.hardwareEncoder == true,
+        captureEngine = selectedState?.captureEngine.orEmpty(),
         cameraSessionFps = cameraSessionFps.get(),
         gpuBridgeFps = gpuBridgeFps.get(),
         capturePathError = capturePathError.get()
@@ -438,7 +549,6 @@ data class StreamStatusDto(
     val streaming: Boolean,
     val lifecycleState: String,
     val latestFrameRevision: Long = 0L,
-    val appliedVersion: Long = 0L,
     val lastError: String,
     val accessMode: String,
     val port: Int,
@@ -515,6 +625,7 @@ data class PipelineSnapshotDto(
     val desired: DesiredPipelineDto,
     val selected: SelectedPipelineDto?,
     val actual: ActualPipelineDto?,
+    val fallback: FallbackStateDto?,
     val lastRequestId: String?,
     val lastUpdatedBy: String
 )
@@ -532,6 +643,7 @@ data class DesiredPipelineDto(
 
 @Serializable
 data class SelectedPipelineDto(
+    val generation: Long,
     val cameraId: String,
     val streamMode: String,
     val captureEngine: String,
@@ -544,9 +656,17 @@ data class SelectedPipelineDto(
 
 @Serializable
 data class ActualPipelineDto(
+    val generation: Long,
     val width: Int,
     val height: Int,
     val captureFps: Int,
     val encodedFps: Int,
     val encodedBitrate: Int
+)
+
+@Serializable
+data class FallbackStateDto(
+    val generation: Long,
+    val active: Boolean,
+    val reason: String
 )
