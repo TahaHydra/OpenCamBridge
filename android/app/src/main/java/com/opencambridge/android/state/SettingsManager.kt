@@ -51,7 +51,9 @@ class SettingsManager(context: Context) {
 
         StreamState.mirror.set(prefs.getBoolean("mirror", false))
         StreamState.localPreviewEnabled.set(prefs.getBoolean("localPreviewEnabled", false))
+        StreamState.targetBandwidthMbps.set(prefs.getInt("targetBandwidthMbps", 0))
         StreamState.developerMode.set(prefs.getBoolean("developerMode", false))
+        StreamState.refreshConfigSnapshotFromLegacy()
     }
 
     fun save() {
@@ -76,6 +78,7 @@ class SettingsManager(context: Context) {
             putString("displayRotation", StreamState.displayRotation.get())
             putBoolean("mirror", StreamState.mirror.get())
             putBoolean("localPreviewEnabled", StreamState.localPreviewEnabled.get())
+            putInt("targetBandwidthMbps", StreamState.targetBandwidthMbps.get())
             putBoolean("developerMode", StreamState.developerMode.get())
             apply()
         }

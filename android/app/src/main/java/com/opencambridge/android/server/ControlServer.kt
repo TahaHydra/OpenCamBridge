@@ -5,6 +5,10 @@ import android.hardware.camera2.CameraCharacteristics
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import com.opencambridge.android.camera.CameraRepository
 import com.opencambridge.android.camera.H264Streamer
+import com.opencambridge.android.camera.H264ModeDto
+import com.opencambridge.android.camera.CameraInfoDto
+import com.opencambridge.android.service.PipelineResult
+import com.opencambridge.android.service.PipelineResultCode
 import com.opencambridge.android.state.SettingsManager
 import com.opencambridge.android.state.StreamState
 import com.opencambridge.android.state.AppLogger
@@ -27,6 +31,7 @@ import io.ktor.server.request.accept
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytesWriter
 import io.ktor.server.response.respondText
+import io.ktor.server.response.respondTextWriter
 import io.ktor.server.routing.RoutingCall
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
@@ -38,6 +43,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 private const val MJPEG_BOUNDARY = "FRAME"
@@ -50,13 +56,13 @@ class ControlServer(
     private val context: Context,
     private val settingsManager: SettingsManager,
     private val h264Streamer: H264Streamer,
-    private val onStartCamera: () -> Unit,
-    private val onStopCamera: () -> Unit,
-    private val onApplySettingsPatch: (UpdateSettingsRequest, String?) -> Unit,
+    private val onStartCamera: suspend () -> PipelineResult,
+    private val onStopCamera: suspend () -> PipelineResult,
+    private val onApplySettingsPatch: suspend (UpdateSettingsRequest, String?) -> PipelineResult,
     private val onSetZoomRatio: (Float) -> Unit,
     private val onSetLinearZoom: (Float) -> Unit,
     private val onSetTorch: (Boolean) -> Unit,
-    private val onRecoverCamera: () -> Unit
+    private val onRecoverCamera: suspend () -> PipelineResult
 ) {
     private var engine: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
     private val cameraRepo = CameraRepository(context)
@@ -130,8 +136,10 @@ class ControlServer(
                 get("/api/camera/status")          { serveCameraStatus(call) }
                 get("/api/camera/controls")        { serveCameraControls(call) }
                 get("/api/settings")               { serveGetSettings(call) }
+                get("/api/state/events")           { serveStateEvents(call) }
                 get("/api/logs")                   { serveGetLogs(call) }
                 get("/api/camera/capabilities")    { serveCameraCapabilities(call) }
+                get("/api/pipeline/capabilities")  { servePipelineCapabilities(call) }
 
                 post("/api/stream/start")          { serveStreamStart(call) }
                 post("/api/stream/stop")           { serveStreamStop(call) }
@@ -818,8 +826,9 @@ class ControlServer(
 
                 async function fetchCameras() {
                     try {
-                        const res = await fetchWithAuth('/api/camera/list');
-                        const cameras = await res.json();
+                        const res = await fetchWithAuth('/api/pipeline/capabilities');
+                        const capability = await res.json();
+                        const cameras = capability.cameras || [];
                         cameraCapabilities = cameras;
                         const select = document.getElementById('camera-select');
                         select.innerHTML = '';
@@ -846,14 +855,19 @@ class ControlServer(
                 }
 
                 async function patchSetting(payload) {
-                    payload.clientRevision = currentRevision;
+                    payload.baseRevision = currentRevision;
+                    payload.requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString());
                     payload.clientType = 'web';
                     try {
-                        await fetchWithAuth('/api/settings', {
+                        const response = await fetchWithAuth('/api/settings', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify(payload)
                         });
+                        if (!response.ok) {
+                            const result = await response.json().catch(() => ({}));
+                            throw new Error(result.message || ('HTTP ' + response.status));
+                        }
                         fetchStatus();
                     } catch (e) { console.error('Update err', e); }
                 }
@@ -925,7 +939,19 @@ class ControlServer(
                     await fetchCameras();
                     await fetchStatus();
                     await fetchControls();
-                    setInterval(() => { fetchStatus(); fetchControls(); }, 500);
+                    const stateUrl = new URL('/api/state/events', window.location.origin);
+                    if (isTokenRequired && TOKEN) stateUrl.searchParams.set('token', TOKEN);
+                    const stateEvents = new EventSource(stateUrl);
+                    stateEvents.addEventListener('state', event => {
+                        try {
+                            const status = JSON.parse(event.data);
+                            currentRevision = status.revision || currentRevision;
+                        } catch (_) {}
+                        fetchStatus();
+                    });
+                    // Controls are hardware observations, not settings state.
+                    // Poll them slowly; authoritative settings arrive by SSE.
+                    setInterval(() => { fetchControls(); }, 2000);
                 };
               </script>
             </body>
@@ -948,6 +974,28 @@ class ControlServer(
 
     private suspend fun serveGetSettings(call: RoutingCall) {
         call.respond(StreamState.toStatusDto())
+    }
+
+    private suspend fun serveStateEvents(call: RoutingCall) {
+        call.respondTextWriter(contentType = ContentType.Text.EventStream) {
+            var lastRevision = Long.MIN_VALUE
+            var lastGeneration = Long.MIN_VALUE
+            var lastLifecycle = ""
+            while (currentCoroutineContext().isActive) {
+                val status = StreamState.toStatusDto()
+                if (status.revision != lastRevision || status.pipelineGeneration != lastGeneration ||
+                    status.lifecycleState != lastLifecycle
+                ) {
+                    write("event: state\n")
+                    write("data: ${Json.encodeToString(status)}\n\n")
+                    flush()
+                    lastRevision = status.revision
+                    lastGeneration = status.pipelineGeneration
+                    lastLifecycle = status.lifecycleState
+                }
+                delay(250)
+            }
+        }
     }
 
     private suspend fun serveCameraCapabilities(call: RoutingCall) {
@@ -980,18 +1028,39 @@ class ControlServer(
     }
 
     private suspend fun serveStreamStart(call: RoutingCall) {
-        onStartCamera()
-        call.respond(SimpleResult(true, "Stream start requested"))
+        respondPipelineResult(call, onStartCamera())
+    }
+
+    private suspend fun servePipelineCapabilities(call: RoutingCall) {
+        try {
+            val cameras = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                cameraRepo.listCameras()
+            }
+            call.respond(
+                PipelineCapabilitiesDto(
+                    revision = StreamState.revision.get(),
+                    cameras = cameras,
+                    adaptivePreference = listOf(
+                        H264ModeDto(1920, 1080, 60),
+                        H264ModeDto(1280, 720, 60),
+                        H264ModeDto(1920, 1080, 30),
+                        H264ModeDto(1280, 720, 30)
+                    ),
+                    compatibilityFallback = "mjpeg",
+                    windowsDecoderRequirement = "Media Foundation hardware AVC decoder availability is reported by the desktop producer"
+                )
+            )
+        } catch (e: Exception) {
+            call.respond(HttpStatusCode.InternalServerError, SimpleResult(false, "Capability query failed: ${e.message}"))
+        }
     }
 
     private suspend fun serveStreamStop(call: RoutingCall) {
-        onStopCamera()
-        call.respond(SimpleResult(true, "Stream stop requested"))
+        respondPipelineResult(call, onStopCamera())
     }
 
     private suspend fun serveStreamRecover(call: RoutingCall) {
-        onRecoverCamera()
-        call.respond(SimpleResult(true, "Stream recovery requested"))
+        respondPipelineResult(call, onRecoverCamera())
     }
 
     private suspend fun serveCameraSwitch(call: RoutingCall) {
@@ -999,8 +1068,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON: ${e.message}"))
             return
         }
-        onApplySettingsPatch(UpdateSettingsRequest(cameraId = req.cameraId), "api")
-        call.respond(SimpleResult(success = true, message = "Switched to camera ${req.cameraId}"))
+        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(cameraId = req.cameraId), "api"))
     }
 
     private suspend fun serveSetResolution(call: RoutingCall) {
@@ -1008,8 +1076,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        onApplySettingsPatch(UpdateSettingsRequest(width = req.width, height = req.height), "api")
-        call.respond(SimpleResult(success = true, message = "Resolution set to ${req.width}x${req.height}"))
+        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(width = req.width, height = req.height), "api"))
     }
 
     private suspend fun serveSetFps(call: RoutingCall) {
@@ -1017,8 +1084,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        onApplySettingsPatch(UpdateSettingsRequest(fps = req.fps), "api")
-        call.respond(SimpleResult(success = true, message = "FPS set to ${req.fps}"))
+        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(fps = req.fps), "api"))
     }
 
     private suspend fun serveSetJpegQuality(call: RoutingCall) {
@@ -1027,8 +1093,7 @@ class ControlServer(
             return
         }
         val quality = req.quality.coerceIn(1, 100)
-        onApplySettingsPatch(UpdateSettingsRequest(jpegQuality = quality), "api")
-        call.respond(SimpleResult(success = true, message = "JPEG quality set to $quality"))
+        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(jpegQuality = quality), "api"))
     }
 
     private suspend fun serveSetPreviewFitMode(call: RoutingCall) {
@@ -1036,8 +1101,7 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        onApplySettingsPatch(UpdateSettingsRequest(previewFitMode = req.previewFitMode), "api")
-        call.respond(SimpleResult(success = true, message = "Preview fit mode set to ${req.previewFitMode}"))
+        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(previewFitMode = req.previewFitMode), "api"))
     }
 
     private suspend fun serveSetAspectRatio(call: RoutingCall) {
@@ -1045,18 +1109,12 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        onApplySettingsPatch(UpdateSettingsRequest(aspectRatio = req.aspectRatio), "api")
-        call.respond(SimpleResult(success = true, message = "Aspect ratio set to ${req.aspectRatio}"))
+        respondPipelineResult(call, onApplySettingsPatch(UpdateSettingsRequest(aspectRatio = req.aspectRatio), "api"))
     }
 
     private suspend fun serveUpdateSettings(call: RoutingCall) {
         var req = try { call.receive<UpdateSettingsRequest>() } catch (e: Exception) {
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
-            return
-        }
-
-        if (req.clientRevision != null && req.clientRevision < StreamState.revision.get()) {
-            call.respond(HttpStatusCode.Conflict, SimpleResult(false, "Stale revision. Client sent ${req.clientRevision}, server is at ${StreamState.revision.get()}"))
             return
         }
 
@@ -1075,11 +1133,16 @@ class ControlServer(
         // Delegate patch application to the central stream controller. Guard it
         // so a failure in one setting can never turn a control action into an
         // HTTP 500 (which the UI shows as a scary "action failed").
-        try {
-            onApplySettingsPatch(req, req.clientType ?: "api")
+        val result = try {
+            onApplySettingsPatch(req, req.clientType ?: "api").also { result ->
+            if (!result.success) {
+                respondPipelineResult(call, result)
+                return
+            }
+            }
         } catch (e: Exception) {
             AppLogger.e("System", "Settings apply failed: ${e.javaClass.simpleName}: ${e.message}")
-            call.respond(HttpStatusCode.OK, SimpleResult(false, "Some settings failed to apply: ${e.message}"))
+            call.respond(HttpStatusCode.InternalServerError, SimpleResult(false, "Settings failed to apply: ${e.message}"))
             return
         }
 
@@ -1088,7 +1151,26 @@ class ControlServer(
         } else {
             "Settings updated."
         }
-        call.respond(SimpleResult(success = true, message = message))
+        respondPipelineResult(call, result.copy(message = message))
+    }
+
+    private suspend fun respondPipelineResult(call: RoutingCall, result: PipelineResult) {
+        val status = when (result.code) {
+            PipelineResultCode.OK -> HttpStatusCode.OK
+            PipelineResultCode.CONFLICT -> HttpStatusCode.Conflict
+            PipelineResultCode.UNPROCESSABLE -> HttpStatusCode.UnprocessableEntity
+            PipelineResultCode.FAILED -> HttpStatusCode.InternalServerError
+        }
+        call.respond(
+            status,
+            PipelineResultDto(
+                success = result.success,
+                message = result.message,
+                revision = result.revision,
+                generation = result.generation,
+                lifecycleState = result.lifecycleState
+            )
+        )
     }
 
     // ---- Controls ----
@@ -1241,41 +1323,61 @@ class ControlServer(
     }
 
     private suspend fun serveStreamMetrics(call: RoutingCall) {
+        val active = StreamState.lifecycleState.get().name == "STREAMING"
+        val mode = StreamState.activeStreamMode.get()
+        val config = StreamState.currentConfig()
         call.respond(
-            StreamMetricsDto(
-                fps = StreamState.actualFps.get(),
-                requestedFps = StreamState.fps.get(),
-                actualFps = StreamState.actualFps.get(),
-                androidEncodeMsAvg = StreamState.androidEncodeMsAvg.get(),
-                yuvMsAvg = StreamState.yuvMsAvg.get(),
-                jpegMsAvg = StreamState.jpegMsAvg.get(),
-                rotateMsAvg = StreamState.rotateMsAvg.get(),
-                droppedFrames = 0,
-                latestFrameRevision = StreamState.latestFrameRevision.get(),
-                estimatedMbps = StreamState.estimatedMbps.get(),
-                targetBandwidthMbps = StreamState.targetBandwidthMbps.get(),
-                encodedWidth = StreamState.encodedWidth.get(),
-                encodedHeight = StreamState.encodedHeight.get(),
-                rotationApplied = StreamState.rotationApplied.get(),
-                requestedAspectRatio = StreamState.requestedAspectRatio.get(),
-                selectedAspectRatio = StreamState.selectedAspectRatio.get(),
-                aspectRatioMatch = StreamState.aspectRatioMatch.get(),
-                resizeNeeded = StreamState.resizeNeeded.get(),
-                selectedRawWidth = StreamState.selectedRawWidth.get(),
-                selectedRawHeight = StreamState.selectedRawHeight.get(),
-                selectedEffectiveWidth = StreamState.selectedEffectiveWidth.get(),
-                selectedEffectiveHeight = StreamState.selectedEffectiveHeight.get(),
-                normalizedForPolicy = StreamState.normalizedForPolicy.get(),
-                resolutionPolicy = StreamState.resolutionPolicy.get(),
-                fallbackUsed = StreamState.fallbackUsed.get(),
-                captureFps = StreamState.captureFps.get(),
-                encodedFps = StreamState.encodedFps.get(),
-                selectedFps = StreamState.selectedFps.get(),
-                encodedBitrate = StreamState.encodedBitrate.get(),
-                encoderName = StreamState.encoderName.get(),
-                hardwareEncoder = StreamState.hardwareEncoder.get(),
-                activeStreamMode = StreamState.activeStreamMode.get(),
-                fallbackReason = StreamState.fallbackReason.get()
+            PipelineMetricsDto(
+                generation = StreamState.pipelineGeneration.get(),
+                activeStreamMode = mode,
+                capture = if (!active) null else CaptureMetricsDto(
+                    engine = if (mode == "h264") StreamState.captureEngine.get() else "CAMERAX_IMAGE_ANALYSIS",
+                    cameraId = config.cameraId,
+                    requestedWidth = config.width,
+                    requestedHeight = config.height,
+                    actualWidth = StreamState.encodedWidth.get(),
+                    actualHeight = StreamState.encodedHeight.get(),
+                    requestedFps = config.fps,
+                    selectedFps = StreamState.selectedFps.get(),
+                    cameraSessionFps = if (mode == "h264") StreamState.cameraSessionFps.get() else StreamState.selectedFps.get(),
+                    actualFps = StreamState.captureFps.get(),
+                    gpuBridgeFps = StreamState.gpuBridgeFps.get().takeIf { mode == "h264" && StreamState.captureEngine.get() == "HIGH_SPEED_GPU_BRIDGE" }
+                ),
+                h264 = if (!active || mode != "h264") null else H264MetricsDto(
+                    encoderName = StreamState.encoderName.get(),
+                    hardwareEncoder = StreamState.hardwareEncoder.get(),
+                    encodedFps = StreamState.encodedFps.get(),
+                    bitrate = StreamState.encodedBitrate.get(),
+                    clientCount = StreamState.h264ClientCount.get(),
+                    rejectedCapturePaths = StreamState.capturePathError.get().ifBlank { null }
+                ),
+                mjpeg = if (!active || mode != "mjpeg") null else MjpegMetricsDto(
+                    encodedFps = StreamState.actualFps.get(),
+                    encodeMs = StreamState.androidEncodeMsAvg.get(),
+                    yuvMs = StreamState.yuvMsAvg.get(),
+                    jpegMs = StreamState.jpegMsAvg.get(),
+                    rotateMs = StreamState.rotateMsAvg.get(),
+                    latestFrameRevision = StreamState.latestFrameRevision.get(),
+                    clientCount = StreamState.mjpegClientCount.get()
+                ),
+                transport = TransportMetricsDto(
+                    estimatedMbps = StreamState.estimatedMbps.get(),
+                    targetBandwidthMbps = config.targetBandwidthMbps
+                ),
+                selection = SelectionMetricsDto(
+                    requestedAspectRatio = StreamState.requestedAspectRatio.get(),
+                    selectedAspectRatio = StreamState.selectedAspectRatio.get(),
+                    aspectRatioMatch = StreamState.aspectRatioMatch.get(),
+                    resizeNeeded = StreamState.resizeNeeded.get(),
+                    selectedRawWidth = StreamState.selectedRawWidth.get(),
+                    selectedRawHeight = StreamState.selectedRawHeight.get(),
+                    selectedEffectiveWidth = StreamState.selectedEffectiveWidth.get(),
+                    selectedEffectiveHeight = StreamState.selectedEffectiveHeight.get(),
+                    resolutionPolicy = StreamState.resolutionPolicy.get()
+                ),
+                fallback = StreamState.fallbackReason.get().takeIf { it.isNotBlank() }?.let {
+                    FallbackMetricsDto(StreamState.fallbackUsed.get(), it)
+                }
             )
         )
     }
@@ -1294,7 +1396,25 @@ private data class DeviceInfoDto(
 )
 
 @Serializable
+private data class PipelineCapabilitiesDto(
+    val revision: Long,
+    val cameras: List<CameraInfoDto>,
+    val adaptivePreference: List<H264ModeDto>,
+    val compatibilityFallback: String,
+    val windowsDecoderRequirement: String
+)
+
+@Serializable
 data class SimpleResult(val success: Boolean, val message: String)
+
+@Serializable
+data class PipelineResultDto(
+    val success: Boolean,
+    val message: String,
+    val revision: Long,
+    val generation: Long,
+    val lifecycleState: String
+)
 
 @Serializable
 data class CameraCapabilityDto(
@@ -1336,6 +1456,8 @@ private data class AspectRatioRequest(val aspectRatio: String)
 
 @Serializable
 data class UpdateSettingsRequest(
+    val baseRevision: Long? = null,
+    val requestId: String? = null,
     val clientRevision: Long? = null,
     val clientType: String? = null,
     /** Monotonic desktop apply id; echoed back in status.appliedVersion so the
@@ -1386,38 +1508,71 @@ private data class TorchRequest(val enabled: Boolean)
 private data class AutofocusRequest(val enabled: Boolean)
 
 @Serializable
-private data class StreamMetricsDto(
-    val fps: Int,
-    val requestedFps: Int = 0,
-    val actualFps: Int = 0,
-    val androidEncodeMsAvg: Double = 0.0,
-    val yuvMsAvg: Double = 0.0,
-    val jpegMsAvg: Double = 0.0,
-    val rotateMsAvg: Double = 0.0,
-    val droppedFrames: Int,
-    val latestFrameRevision: Long,
-    val estimatedMbps: String = "0.0",
-    val targetBandwidthMbps: Int = 0,
-    val encodedWidth: Int = 0,
-    val encodedHeight: Int = 0,
-    val rotationApplied: Boolean = false,
-    val requestedAspectRatio: String = "unknown",
-    val selectedAspectRatio: String = "unknown",
-    val aspectRatioMatch: Boolean = false,
-    val resizeNeeded: Boolean = false,
-    val selectedRawWidth: Int = 0,
-    val selectedRawHeight: Int = 0,
-    val selectedEffectiveWidth: Int = 0,
-    val selectedEffectiveHeight: Int = 0,
-    val normalizedForPolicy: Boolean = false,
-    val resolutionPolicy: String = "unknown",
-    val fallbackUsed: Boolean = false,
-    val captureFps: Int = 0,
-    val encodedFps: Int = 0,
-    val selectedFps: Int = 0,
-    val encodedBitrate: Int = 0,
-    val encoderName: String = "",
-    val hardwareEncoder: Boolean = false,
-    val activeStreamMode: String = "mjpeg",
-    val fallbackReason: String = ""
+private data class PipelineMetricsDto(
+    val generation: Long,
+    val activeStreamMode: String,
+    val capture: CaptureMetricsDto?,
+    val h264: H264MetricsDto?,
+    val mjpeg: MjpegMetricsDto?,
+    val transport: TransportMetricsDto,
+    val selection: SelectionMetricsDto,
+    val fallback: FallbackMetricsDto?
 )
+
+@Serializable
+private data class CaptureMetricsDto(
+    val engine: String,
+    val cameraId: String,
+    val requestedWidth: Int,
+    val requestedHeight: Int,
+    val actualWidth: Int,
+    val actualHeight: Int,
+    val requestedFps: Int,
+    val selectedFps: Int,
+    val cameraSessionFps: Int,
+    val actualFps: Int,
+    val gpuBridgeFps: Int?
+)
+
+@Serializable
+private data class H264MetricsDto(
+    val encoderName: String,
+    val hardwareEncoder: Boolean,
+    val encodedFps: Int,
+    val bitrate: Int,
+    val clientCount: Int,
+    val rejectedCapturePaths: String?
+)
+
+@Serializable
+private data class MjpegMetricsDto(
+    val encodedFps: Int,
+    val encodeMs: Double,
+    val yuvMs: Double,
+    val jpegMs: Double,
+    val rotateMs: Double,
+    val latestFrameRevision: Long,
+    val clientCount: Int
+)
+
+@Serializable
+private data class TransportMetricsDto(
+    val estimatedMbps: String,
+    val targetBandwidthMbps: Int
+)
+
+@Serializable
+private data class SelectionMetricsDto(
+    val requestedAspectRatio: String,
+    val selectedAspectRatio: String,
+    val aspectRatioMatch: Boolean,
+    val resizeNeeded: Boolean,
+    val selectedRawWidth: Int,
+    val selectedRawHeight: Int,
+    val selectedEffectiveWidth: Int,
+    val selectedEffectiveHeight: Int,
+    val resolutionPolicy: String
+)
+
+@Serializable
+private data class FallbackMetricsDto(val active: Boolean, val reason: String)

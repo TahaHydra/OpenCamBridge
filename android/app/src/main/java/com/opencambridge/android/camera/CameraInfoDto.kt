@@ -41,7 +41,16 @@ data class CameraInfoDto(
     val highSpeedSizes: List<SizeDto> = emptyList(),
     val highSpeedFpsRanges: List<FpsRangeDto> = emptyList(),
     /** Modes supported by both this Camera2 surface path and a hardware AVC encoder. */
-    val h264Modes: List<H264ModeDto> = emptyList()
+    val h264Modes: List<H264ModeDto> = emptyList(),
+    /** Per-mode public Camera2 path evidence, including exact reasons for every
+     * regular/high-speed engine that is unavailable. */
+    val h264PathCapabilities: List<H264ModePathDto> = emptyList()
+)
+
+@Serializable
+data class H264ModePathDto(
+    val mode: H264ModeDto,
+    val paths: List<H264PathCapability>
 )
 
 @Serializable

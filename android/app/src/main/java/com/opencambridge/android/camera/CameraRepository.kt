@@ -185,9 +185,9 @@ class CameraRepository(private val context: Context) {
             }
         }
 
-        // High-speed (constrained slow-motion) capability — diagnostics only.
-        // The normal ImageAnalysis/YUV path cannot use these modes, so a device
-        // may report 30 fps max above yet expose 120/240 fps here.
+        // High-speed Camera2 evidence. MJPEG/ImageAnalysis cannot use these
+        // modes, while the H.264 engine may use a direct constrained surface or
+        // the GPU surface bridge.
         val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
         val supportsHighSpeed = caps.contains(
             CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO
@@ -208,6 +208,9 @@ class CameraRepository(private val context: Context) {
             }
         }
 
+        val h264PathCapabilities = H264Capabilities.preferredModes.map { mode ->
+            H264ModePathDto(mode, H264Capabilities.inspectPathCapabilities(context, id, mode))
+        }
         return CameraInfoDto(
             id = id,
             facing = facing,
@@ -228,7 +231,8 @@ class CameraRepository(private val context: Context) {
             supportsHighSpeed = supportsHighSpeed,
             highSpeedSizes = highSpeedSizes,
             highSpeedFpsRanges = highSpeedFpsRanges,
-            h264Modes = H264Capabilities.supportedModes(context, id)
+            h264Modes = h264PathCapabilities.filter { candidate -> candidate.paths.any { it.supported } }.map { it.mode },
+            h264PathCapabilities = h264PathCapabilities
         )
     }
 }

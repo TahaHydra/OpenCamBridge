@@ -6,6 +6,7 @@ import android.graphics.Rect
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
@@ -21,17 +22,19 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
-import android.util.Range
 import android.view.Surface
 import com.opencambridge.android.protocol.Ocb2
 import com.opencambridge.android.state.AppLogger
 import com.opencambridge.android.state.StreamState
+import com.opencambridge.android.state.StreamConfig
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -63,6 +66,7 @@ class H264Streamer(
     // configuration records reuse the latest value, so transport bookkeeping
     // cannot look like dropped camera frames on Windows.
     private val frameSequence = AtomicLong(0)
+    private val captureGeneration = AtomicLong(0)
     private val running = AtomicBoolean(false)
 
     private var cameraThread: HandlerThread? = null
@@ -71,10 +75,14 @@ class H264Streamer(
     private var codecHandler: Handler? = null
     private var camera: CameraDevice? = null
     private var session: CameraCaptureSession? = null
+    private var cameraClosedSignal: CompletableDeferred<Unit>? = null
+    private var sessionClosedSignal: CompletableDeferred<Unit>? = null
     private var requestBuilder: CaptureRequest.Builder? = null
     @Volatile private var codec: MediaCodec? = null
     private var encoderSurface: Surface? = null
+    private var gpuBridge: HighSpeedGpuBridge? = null
     private var selection: H264EncoderSelection? = null
+    private var activeConfig: StreamConfig? = null
     private var adaptiveMode: H264ModeDto? = null
     private var codecConfig: ByteArray? = null
     private var streamInfo: ByteArray? = null
@@ -89,30 +97,68 @@ class H264Streamer(
     private var encodedWindowStartNs = 0L
     private var encodedWindowFrames = 0
     private var encodedWindowBytes = 0L
+    private var bridgeWindowStartNs = 0L
+    private var bridgeWindowFrames = 0
 
     suspend fun start() = lifecycleMutex.withLock {
         stopInternal(sendEnd = false)
         StreamState.rebindInProgress.set(true)
         try {
-            val cameraId = StreamState.cameraId.get()
+            val config = StreamState.currentConfig()
+            activeConfig = config
+            val cameraId = config.cameraId
             val requested = adaptiveMode
-            val chosen = H264Capabilities.select(
-                context, cameraId, requested?.width ?: StreamState.width.get(), requested?.height ?: StreamState.height.get(), requested?.fps ?: StreamState.fps.get()
-            ) ?: throw IllegalStateException("No hardware H.264 Camera2 surface profile is available for camera $cameraId")
-            selection = chosen
+            val candidates = H264Capabilities.selectCandidates(
+                context,
+                cameraId,
+                requested?.width ?: config.width,
+                requested?.height ?: config.height,
+                requested?.fps ?: config.fps,
+                includeAdaptiveFallbacks = requested == null
+            )
+            if (candidates.isEmpty()) {
+                val requestedMode = H264ModeDto(
+                    requested?.width ?: config.width,
+                    requested?.height ?: config.height,
+                    requested?.fps ?: config.fps
+                )
+                val declared = H264Capabilities.inspectPathCapabilities(context, cameraId, requestedMode)
+                    .joinToString("; ") { "${it.engine}=${it.reason}" }
+                throw IllegalStateException("No declared hardware H.264 Camera2 path for camera $cameraId: $declared")
+            }
 
             cameraThread = HandlerThread("OCB2-Camera2").apply { start() }
             codecThread = HandlerThread("OCB2-MediaCodec").apply { start() }
             cameraHandler = Handler(cameraThread!!.looper)
             codecHandler = Handler(codecThread!!.looper)
 
-            configureCodec(chosen)
-            publishSelection(chosen)
-            captureWindowStartNs = 0L
-            captureWindowFrames = 0
-            val device = openCamera(cameraId)
-            camera = device
-            createSession(device, chosen)
+            val failures = mutableListOf<String>()
+            var chosen: H264EncoderSelection? = null
+            for (candidate in candidates) {
+                try {
+                    captureWindowStartNs = 0L
+                    captureWindowFrames = 0
+                    bridgeWindowStartNs = 0L
+                    bridgeWindowFrames = 0
+                    configureCodec(candidate)
+                    val candidateGeneration = captureGeneration.incrementAndGet()
+                    val device = openCamera(cameraId, candidateGeneration)
+                    camera = device
+                    createSession(device, candidate, candidateGeneration)
+                    chosen = candidate
+                    break
+                } catch (e: Exception) {
+                    val failure = "${candidate.mode.width}x${candidate.mode.height}@${candidate.mode.fps} ${candidate.captureEngine}: ${e.javaClass.simpleName}: ${e.message}"
+                    failures += failure
+                    AppLogger.w("H264Path", failure)
+                    releaseCaptureAttempt()
+                }
+            }
+            val active = chosen ?: throw IllegalStateException(
+                "All declared Camera2 H.264 paths were rejected: ${failures.joinToString(" | ")}"
+            )
+            selection = active
+            publishSelection(active, failures)
             running.set(true)
             StreamState.activeStreamMode.set("h264")
             StreamState.h264Failed.set(false)
@@ -123,7 +169,11 @@ class H264Streamer(
                 }
             }
             StreamState.streaming.set(true)
-            AppLogger.i("H264", "${chosen.codecName}: ${chosen.mode.width}x${chosen.mode.height}@${chosen.mode.fps}, Camera2 surface input")
+            AppLogger.i(
+                "H264",
+                "${active.codecName}: ${active.mode.width}x${active.mode.height}@${active.mode.fps}, " +
+                    "engine=${active.captureEngine}, cameraFps=${active.cameraCaptureFps}, Camera2 surface input"
+            )
         } catch (e: Exception) {
             stopInternal(sendEnd = false)
             StreamState.fallbackReason.set("H.264 startup failed: ${e.message}")
@@ -135,16 +185,60 @@ class H264Streamer(
 
     suspend fun stop() = lifecycleMutex.withLock { stopInternal(sendEnd = true) }
 
-    private fun stopInternal(sendEnd: Boolean) {
+    private suspend fun stopInternal(sendEnd: Boolean) {
         val wasRunning = running.getAndSet(false)
         if (sendEnd && wasRunning) broadcast(
             Ocb2.record(Ocb2.TYPE_END_OF_STREAM, Ocb2.FLAG_END_OF_STREAM, currentSequence(), SystemClock.elapsedRealtimeNanos(), 0)
         )
-        try { session?.stopRepeating() } catch (_: Exception) {}
-        try { session?.abortCaptures() } catch (_: Exception) {}
-        session?.close(); session = null
-        camera?.close(); camera = null
+        selection = null
+        activeConfig = null
+        releaseCaptureAttempt()
+        codecConfig = null
+        streamInfo = null
+        partialAccessUnit = null
+        partialKeyframe = false
+        partialPresentationUs = 0L
+        heartbeatJob?.cancel(); heartbeatJob = null
+        zoomJob?.cancel(); zoomJob = null
+        val oldCameraThread = cameraThread
+        val oldCodecThread = codecThread
+        oldCameraThread?.quitSafely(); cameraThread = null; cameraHandler = null
+        oldCodecThread?.quitSafely(); codecThread = null; codecHandler = null
+        if (oldCameraThread != null && oldCameraThread !== Thread.currentThread()) oldCameraThread.join(1_500)
+        if (oldCodecThread != null && oldCodecThread !== Thread.currentThread()) oldCodecThread.join(1_500)
+        StreamState.streaming.set(false)
+        clients.forEach { it.close() }
+        clients.clear()
+        StreamState.h264ClientCount.set(0)
+    }
+
+    private suspend fun releaseCaptureAttempt() {
+        captureGeneration.incrementAndGet()
+        val oldSession = session
+        val oldSessionClosed = sessionClosedSignal
+        session = null
+        sessionClosedSignal = null
+        try { oldSession?.stopRepeating() } catch (_: Exception) {}
+        try { oldSession?.abortCaptures() } catch (_: Exception) {}
+        oldSession?.close()
+        if (oldSession != null && oldSessionClosed != null) {
+            if (withTimeoutOrNull(1_500) { oldSessionClosed.await() } == null) {
+                AppLogger.w("H264", "Timed out awaiting CameraCaptureSession.onClosed")
+            }
+        }
+        val oldCamera = camera
+        val oldCameraClosed = cameraClosedSignal
+        camera = null
+        cameraClosedSignal = null
+        oldCamera?.close()
+        if (oldCamera != null && oldCameraClosed != null) {
+            if (withTimeoutOrNull(1_500) { oldCameraClosed.await() } == null) {
+                AppLogger.w("H264", "Timed out awaiting CameraDevice.onClosed")
+            }
+        }
         requestBuilder = null
+        gpuBridge?.stop()
+        gpuBridge = null
         // Invalidate this generation before stopping it. Qualcomm can deliver
         // callbacks queued by stop/release after the replacement codec starts;
         // callback identity checks below keep those events isolated.
@@ -155,19 +249,6 @@ class H264Streamer(
         try { oldCodec?.release() } catch (_: Exception) {}
         try { encoderSurface?.release() } catch (_: Exception) {}
         encoderSurface = null
-        codecConfig = null
-        streamInfo = null
-        partialAccessUnit = null
-        partialKeyframe = false
-        partialPresentationUs = 0L
-        heartbeatJob?.cancel(); heartbeatJob = null
-        zoomJob?.cancel(); zoomJob = null
-        cameraThread?.quitSafely(); cameraThread = null; cameraHandler = null
-        codecThread?.quitSafely(); codecThread = null; codecHandler = null
-        StreamState.streaming.set(false)
-        clients.forEach { it.close() }
-        clients.clear()
-        StreamState.h264ClientCount.set(0)
     }
 
     fun subscribe(): Channel<ByteArray> {
@@ -211,12 +292,12 @@ class H264Streamer(
     }
 
     private fun configureCodec(chosen: H264EncoderSelection) {
-        val bitrate = boundedBitrate(StreamState.h264Bitrate.get(), chosen)
+        val bitrate = boundedBitrate(activeConfig?.h264Bitrate ?: StreamState.h264Bitrate.get(), chosen)
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, chosen.mode.width, chosen.mode.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, chosen.mode.fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, activeConfig?.h264KeyframeInterval ?: 1)
             setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
             setInteger(MediaFormat.KEY_PRIORITY, 0)
@@ -365,16 +446,24 @@ class H264Streamer(
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun openCamera(id: String): CameraDevice = suspendCancellableCoroutine { continuation ->
+    private suspend fun openCamera(id: String, generation: Long): CameraDevice = suspendCancellableCoroutine { continuation ->
+        val closedSignal = CompletableDeferred<Unit>()
+        cameraClosedSignal = closedSignal
         try {
             manager.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
-                    if (continuation.isActive) continuation.resume(camera) else camera.close()
+                    if (generation != captureGeneration.get()) {
+                        camera.close()
+                    } else if (continuation.isActive) {
+                        continuation.resume(camera)
+                    } else {
+                        camera.close()
+                    }
                 }
                 override fun onDisconnected(camera: CameraDevice) {
                     camera.close()
                     if (continuation.isActive) continuation.resumeWithException(CameraAccessException(CameraAccessException.CAMERA_DISCONNECTED))
-                    else {
+                    else if (generation == captureGeneration.get() && camera === this@H264Streamer.camera) {
                         publishError("Camera disconnected")
                         StreamState.fallbackReason.set("Camera2 device disconnected")
                         StreamState.h264Failed.set(true)
@@ -384,80 +473,188 @@ class H264Streamer(
                     camera.close()
                     val failure = IllegalStateException("Camera2 open error $error")
                     if (continuation.isActive) continuation.resumeWithException(failure) else {
-                        publishError(failure.message!!)
-                        StreamState.fallbackReason.set(failure.message!!)
-                        StreamState.h264Failed.set(true)
+                        if (generation == captureGeneration.get() && camera === this@H264Streamer.camera) {
+                            publishError(failure.message!!)
+                            StreamState.fallbackReason.set(failure.message!!)
+                            StreamState.h264Failed.set(true)
+                        }
                     }
+                }
+                override fun onClosed(camera: CameraDevice) {
+                    closedSignal.complete(Unit)
                 }
             }, cameraHandler)
         } catch (e: Exception) {
+            closedSignal.complete(Unit)
             continuation.resumeWithException(e)
         }
     }
 
-    private suspend fun createSession(device: CameraDevice, chosen: H264EncoderSelection) =
-        suspendCancellableCoroutine<Unit> { continuation ->
-            val encodeSurface = encoderSurface ?: return@suspendCancellableCoroutine continuation.resumeWithException(
-                IllegalStateException("Encoder surface was not created"))
-            val targets = mutableListOf(encodeSurface)
-            val preview = StreamState.camera2PreviewSurface.get()
-            if (StreamState.localPreviewEnabled.get() && preview?.isValid == true) targets.add(preview)
-
-            val executor = Executor { command -> cameraHandler?.post(command) }
-            fun configure(activeTargets: List<Surface>, mayRetryWithoutPreview: Boolean) {
-              try {
-                val callback = object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(configured: CameraCaptureSession) {
-                        if (!continuation.isActive) { configured.close(); return }
-                        session = configured
-                        val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-                        activeTargets.forEach(builder::addTarget)
-                        configureRequest(builder, chosen)
-                        requestBuilder = builder
-                        configured.setRepeatingRequest(builder.build(), captureCallback, cameraHandler)
-                        continuation.resume(Unit)
-                    }
-                    override fun onConfigureFailed(session: CameraCaptureSession) {
-                        session.close()
-                        if (!continuation.isActive) return
-                        if (mayRetryWithoutPreview) {
-                            StreamState.fallbackReason.set("Phone preview surface was incompatible with this H.264 profile; streaming continues without preview")
-                            configure(listOf(encodeSurface), false)
-                        } else {
-                            continuation.resumeWithException(IllegalStateException("Camera2 session configuration failed"))
-                        }
+    private suspend fun createSession(device: CameraDevice, chosen: H264EncoderSelection, generation: Long) {
+        val encodeSurface = encoderSurface ?: throw IllegalStateException("Encoder surface was not created")
+        val preview = StreamState.camera2PreviewSurface.get()
+            ?.takeIf { activeConfig?.localPreviewEnabled == true && it.isValid }
+        val captureSurface = if (chosen.captureEngine == H264CaptureEngine.HIGH_SPEED_GPU_BRIDGE) {
+            HighSpeedGpuBridge(
+                encoderSurface = encodeSurface,
+                previewSurface = preview,
+                width = chosen.mode.width,
+                height = chosen.mode.height,
+                outputFps = chosen.mode.fps,
+                onFrameRendered = ::onBridgeFrameRendered,
+                onError = { error ->
+                    if (generation == captureGeneration.get()) {
+                        publishError(error)
+                        StreamState.capturePathError.set(error)
+                        StreamState.fallbackReason.set(error)
+                        StreamState.h264Failed.set(true)
                     }
                 }
+            ).also { gpuBridge = it }.start()
+        } else {
+            encodeSurface
+        }
+        val targets = mutableListOf(captureSurface)
+        if (chosen.captureEngine != H264CaptureEngine.HIGH_SPEED_GPU_BRIDGE && preview != null) {
+            targets.add(preview)
+        }
+        configureCameraSession(device, chosen, targets, captureSurface, targets.size > 1, generation)
+    }
+
+    private suspend fun configureCameraSession(
+        device: CameraDevice,
+        chosen: H264EncoderSelection,
+        initialTargets: List<Surface>,
+        requiredSurface: Surface,
+        mayRetryWithoutPreview: Boolean,
+        generation: Long
+    ) = suspendCancellableCoroutine<Unit> { continuation ->
+        val executor = Executor { command -> cameraHandler?.post(command) }
+        fun configure(activeTargets: List<Surface>, mayRetry: Boolean) {
+            try {
+                val closedSignal = CompletableDeferred<Unit>()
+                sessionClosedSignal = closedSignal
+                val callback = object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(configured: CameraCaptureSession) {
+                        if (generation != captureGeneration.get()) {
+                            configured.close()
+                            if (continuation.isActive) continuation.resumeWithException(
+                                IllegalStateException("${chosen.captureEngine} callback belonged to a stale generation")
+                            )
+                            return
+                        }
+                        if (!continuation.isActive) {
+                            configured.close()
+                            return
+                        }
+                        try {
+                            session = configured
+                            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                            activeTargets.forEach(builder::addTarget)
+                            configureRequest(builder, chosen)
+                            requestBuilder = builder
+                            submitRepeating(configured, builder.build(), chosen)
+                            continuation.resume(Unit)
+                        } catch (e: Exception) {
+                            configured.close()
+                            session = null
+                            if (continuation.isActive) continuation.resumeWithException(
+                                IllegalStateException(
+                                    "${chosen.captureEngine} repeating request rejected: ${e.javaClass.simpleName}: ${e.message}",
+                                    e
+                                )
+                            )
+                        }
+                    }
+
+                    override fun onConfigureFailed(failedSession: CameraCaptureSession) {
+                        failedSession.close()
+                        if (!continuation.isActive) return
+                        if (mayRetry) {
+                            AppLogger.w(
+                                "H264Path",
+                                "${chosen.captureEngine} rejected optional preview surface; retrying encoder/capture surface only"
+                            )
+                            configure(listOf(requiredSurface), false)
+                        } else {
+                            continuation.resumeWithException(
+                                IllegalStateException("${chosen.captureEngine} session onConfigureFailed")
+                            )
+                        }
+                    }
+
+                    override fun onClosed(closedSession: CameraCaptureSession) {
+                        closedSignal.complete(Unit)
+                    }
+                }
+                val sessionType = if (chosen.captureEngine == H264CaptureEngine.REGULAR_SURFACE) {
+                    SessionConfiguration.SESSION_REGULAR
+                } else {
+                    SessionConfiguration.SESSION_HIGH_SPEED
+                }
                 val configuration = SessionConfiguration(
-                    SessionConfiguration.SESSION_REGULAR,
+                    sessionType,
                     activeTargets.map(::OutputConfiguration),
                     executor,
                     callback
                 )
                 device.createCaptureSession(configuration)
-              } catch (e: Exception) {
-                  if (continuation.isActive) {
-                      if (mayRetryWithoutPreview) configure(listOf(encodeSurface), false)
-                      else continuation.resumeWithException(e)
-                  }
-              }
+            } catch (e: Exception) {
+                if (!continuation.isActive) return
+                if (mayRetry) {
+                    configure(listOf(requiredSurface), false)
+                } else {
+                    continuation.resumeWithException(
+                        IllegalStateException(
+                            "${chosen.captureEngine} createCaptureSession rejected: ${e.javaClass.simpleName}: ${e.message}",
+                            e
+                        )
+                    )
+                }
             }
-            configure(targets, targets.size > 1)
         }
+        continuation.invokeOnCancellation { session?.close() }
+        configure(initialTargets, mayRetryWithoutPreview)
+    }
 
     private fun configureRequest(builder: CaptureRequest.Builder, chosen: H264EncoderSelection) {
-        val chars = manager.getCameraCharacteristics(StreamState.cameraId.get())
-        val ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
-        val range = ranges.filter { it.lower <= chosen.mode.fps && it.upper >= chosen.mode.fps }
-            .minWithOrNull(compareBy<Range<Int>>({ it.upper - it.lower }, { -it.lower }))
-        if (range != null) builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+        val chars = manager.getCameraCharacteristics(activeConfig?.cameraId ?: StreamState.cameraId.get())
+        builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, chosen.cameraFpsRange)
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
         builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
         applyControls(builder, chars)
     }
 
+    private fun submitRepeating(
+        activeSession: CameraCaptureSession,
+        request: CaptureRequest,
+        chosen: H264EncoderSelection
+    ) {
+        if (chosen.captureEngine == H264CaptureEngine.REGULAR_SURFACE) {
+            activeSession.setRepeatingRequest(request, captureCallback, cameraHandler)
+            return
+        }
+        val highSpeed = activeSession as? CameraConstrainedHighSpeedCaptureSession
+            ?: throw IllegalStateException(
+                "${chosen.captureEngine} configured a non-constrained session: ${activeSession.javaClass.name}"
+            )
+        val burst = highSpeed.createHighSpeedRequestList(request)
+        highSpeed.setRepeatingBurst(burst, captureCallback, cameraHandler)
+    }
+
+    private fun onBridgeFrameRendered(timestampNs: Long) {
+        if (bridgeWindowStartNs == 0L) bridgeWindowStartNs = timestampNs
+        bridgeWindowFrames++
+        if (timestampNs - bridgeWindowStartNs >= 1_000_000_000L) {
+            StreamState.gpuBridgeFps.set(bridgeWindowFrames)
+            bridgeWindowFrames = 0
+            bridgeWindowStartNs = timestampNs
+        }
+    }
+
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            if (session !== this@H264Streamer.session) return
             val timestamp = result.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP) ?: SystemClock.elapsedRealtimeNanos()
             if (captureWindowStartNs == 0L) captureWindowStartNs = timestamp
             captureWindowFrames++
@@ -485,9 +682,10 @@ class H264Streamer(
     private fun refreshRequest() {
         val builder = requestBuilder ?: return
         val currentSession = session ?: return
+        val chosen = selection ?: return
         try {
-            applyControls(builder, manager.getCameraCharacteristics(StreamState.cameraId.get()))
-            currentSession.setRepeatingRequest(builder.build(), captureCallback, cameraHandler)
+            applyControls(builder, manager.getCameraCharacteristics(activeConfig?.cameraId ?: StreamState.cameraId.get()))
+            submitRepeating(currentSession, builder.build(), chosen)
         } catch (e: Exception) { Log.w(TAG, "Camera control update failed", e) }
     }
 
@@ -497,7 +695,7 @@ class H264Streamer(
     }
 
     fun setLinearZoom(linear: Float) {
-        val chars = try { manager.getCameraCharacteristics(StreamState.cameraId.get()) } catch (_: Exception) { return }
+        val chars = try { manager.getCameraCharacteristics(activeConfig?.cameraId ?: StreamState.cameraId.get()) } catch (_: Exception) { return }
         val range = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) else null
         val maxZoom = range?.upper ?: chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
         val minZoom = range?.lower ?: 1f
@@ -526,7 +724,7 @@ class H264Streamer(
      * this returns a mode. */
     fun prepareAdaptiveDowngrade(): H264ModeDto? {
         val current = selection?.mode ?: return null
-        val modes = H264Capabilities.supportedModes(context, StreamState.cameraId.get())
+        val modes = H264Capabilities.supportedModes(context, activeConfig?.cameraId ?: StreamState.cameraId.get())
         val index = modes.indexOfFirst { it == current }
         if (index < 0 || index + 1 >= modes.size) return null
         return modes[index + 1].also { adaptiveMode = it }
@@ -534,26 +732,40 @@ class H264Streamer(
 
     fun resetAdaptiveProfile() { adaptiveMode = null }
 
-    private fun publishSelection(chosen: H264EncoderSelection) {
+    private fun publishSelection(chosen: H264EncoderSelection, rejectedPaths: List<String>) {
         val m = chosen.mode
+        val config = activeConfig ?: StreamState.currentConfig()
         StreamState.encoderName.set(chosen.codecName)
         StreamState.hardwareEncoder.set(chosen.hardware)
+        StreamState.captureEngine.set(chosen.captureEngine.name)
+        StreamState.cameraSessionFps.set(chosen.cameraCaptureFps)
+        StreamState.capturePathError.set(rejectedPaths.joinToString(" | "))
+        StreamState.gpuBridgeFps.set(0)
         StreamState.frameWidth.set(m.width); StreamState.frameHeight.set(m.height)
         StreamState.encodedWidth.set(m.width); StreamState.encodedHeight.set(m.height)
         StreamState.selectedFps.set(m.fps)
         StreamState.selectedRawWidth.set(m.width); StreamState.selectedRawHeight.set(m.height)
         StreamState.selectedEffectiveWidth.set(m.width); StreamState.selectedEffectiveHeight.set(m.height)
-        StreamState.fallbackUsed.set(m.width != StreamState.width.get() || m.height != StreamState.height.get() || m.fps != StreamState.fps.get())
-        StreamState.fallbackReason.set(if (StreamState.fallbackUsed.get()) "Requested profile unsupported; selected ${m.width}x${m.height}@${m.fps}" else "")
+        StreamState.fallbackUsed.set(m.width != config.width || m.height != config.height || m.fps != config.fps)
+        StreamState.fallbackReason.set(
+            when {
+                StreamState.fallbackUsed.get() -> "Requested profile unsupported or rejected; selected ${m.width}x${m.height}@${m.fps} using ${chosen.captureEngine}"
+                rejectedPaths.isNotEmpty() -> "Earlier capture paths rejected; using ${chosen.captureEngine}: ${rejectedPaths.joinToString(" | ")}"
+                else -> ""
+            }
+        )
         val payload = JSONObject().apply {
             put("codec", "H264")
             put("framing", "annex-b-access-units")
             put("width", m.width); put("height", m.height)
             put("fpsNumerator", m.fps); put("fpsDenominator", 1)
             put("bitrate", StreamState.actualBitrate.get())
-            put("cameraId", StreamState.cameraId.get())
+            put("cameraId", config.cameraId)
             put("encoderName", chosen.codecName)
             put("hardwareEncoder", chosen.hardware)
+            put("captureEngine", chosen.captureEngine.name)
+            put("cameraCaptureFps", chosen.cameraCaptureFps)
+            put("rejectedCapturePaths", rejectedPaths.joinToString(" | "))
             put("pixelFormat", "NV12")
         }.toString().toByteArray(Charsets.UTF_8)
         streamInfo = Ocb2.record(Ocb2.TYPE_STREAM_INFO, Ocb2.FLAG_DISCONTINUITY, currentSequence(), SystemClock.elapsedRealtimeNanos(), 0, payload)

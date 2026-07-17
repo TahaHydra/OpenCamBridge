@@ -174,6 +174,7 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setCamera2PreviewSurface(surface: android.view.Surface?) {
         StreamState.camera2PreviewSurface.set(surface)
+        ServiceBridge.previewSurfaceChanged?.invoke(surface?.isValid == true)
     }
 
     fun toggleLocalPreview(enabled: Boolean) {
@@ -268,7 +269,10 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         req.outputWidth?.let { StreamState.outputWidth.set(it) }
         req.outputHeight?.let { StreamState.outputHeight.set(it) }
         req.profile?.let { StreamState.profile.set(it) }
-        req.fps?.let { StreamState.fps.set(it.coerceIn(1, 120)) }
+        req.fps?.takeIf {
+            val mode = req.streamMode ?: StreamState.streamMode.get()
+            it == 30 || it == 60 || (mode == "mjpeg" && it == 15)
+        }?.let { StreamState.fps.set(it) }
         req.jpegQuality?.let { StreamState.jpegQuality.set(it.coerceIn(1, 100)) }
         req.previewFitMode?.let { StreamState.previewFitMode.set(it) }
         req.aspectRatio?.let { StreamState.aspectRatio.set(it) }
@@ -280,6 +284,7 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         req.accessMode?.let { StreamState.accessMode.set(it) }
         req.port?.let { StreamState.port.set(it) }
         req.accessToken?.let { StreamState.accessToken.set(it) }
+        StreamState.refreshConfigSnapshotFromLegacy()
         settingsManager.save()
         StreamState.incrementRevision("phone")
     }

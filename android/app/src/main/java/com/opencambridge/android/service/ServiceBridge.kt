@@ -25,6 +25,7 @@ object ServiceBridge {
     @Volatile var startCamera: (() -> Unit)? = null
     @Volatile var stopCamera: (() -> Unit)? = null
     @Volatile var recoverCamera: (() -> Unit)? = null
+    @Volatile var previewSurfaceChanged: ((Boolean) -> Unit)? = null
 
     val isServiceRunning: Boolean get() = applyPatch != null
 
@@ -36,5 +37,6 @@ object ServiceBridge {
         startCamera = null
         stopCamera = null
         recoverCamera = null
+        previewSurfaceChanged = null
     }
 }

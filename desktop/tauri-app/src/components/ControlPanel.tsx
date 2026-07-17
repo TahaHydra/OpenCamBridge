@@ -97,6 +97,42 @@ interface ControlPanelProps {
   setPreviewOff: (val: boolean) => void;
 }
 
+function normalizeAndroidMetrics(raw: any): any {
+  if (!raw || !('capture' in raw)) return raw;
+  const capture = raw.capture;
+  const h264 = raw.h264;
+  const mjpeg = raw.mjpeg;
+  const selection = raw.selection || {};
+  const fallback = raw.fallback;
+  return {
+    ...raw,
+    ...selection,
+    fps: capture?.actualFps ?? 0,
+    requestedFps: capture?.requestedFps ?? 0,
+    actualFps: capture?.actualFps ?? 0,
+    captureFps: capture?.actualFps ?? 0,
+    selectedFps: capture?.selectedFps ?? 0,
+    cameraSessionFps: capture?.cameraSessionFps ?? 0,
+    gpuBridgeFps: capture?.gpuBridgeFps,
+    captureEngine: capture?.engine,
+    encodedWidth: capture?.actualWidth ?? 0,
+    encodedHeight: capture?.actualHeight ?? 0,
+    encodedFps: h264?.encodedFps ?? mjpeg?.encodedFps ?? 0,
+    encodedBitrate: h264?.bitrate ?? 0,
+    encoderName: h264?.encoderName,
+    hardwareEncoder: h264?.hardwareEncoder ?? false,
+    androidEncodeMsAvg: mjpeg?.encodeMs,
+    yuvMsAvg: mjpeg?.yuvMs,
+    jpegMsAvg: mjpeg?.jpegMs,
+    rotateMsAvg: mjpeg?.rotateMs,
+    latestFrameRevision: mjpeg?.latestFrameRevision ?? 0,
+    estimatedMbps: raw.transport?.estimatedMbps ?? '0.0',
+    targetBandwidthMbps: raw.transport?.targetBandwidthMbps ?? 0,
+    fallbackUsed: fallback?.active ?? false,
+    fallbackReason: fallback?.reason ?? '',
+  };
+}
+
 export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, previewOff, setPreviewOff }: ControlPanelProps) {
   const [cameras, setCameras] = useState<any[]>([]);
   const [settings, setSettings] = useState({
@@ -122,10 +158,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   const PROFILE_PRESETS: Record<string, any> = {
     'low-latency': {
       profile: 'low-latency',
-      width: 960,
-      height: 540,
-      outputWidth: 960,
-      outputHeight: 540,
+      width: 1280,
+      height: 720,
+      outputWidth: 1280,
+      outputHeight: 720,
       fps: 30,
       jpegQuality: 70,
       aspectRatio: '16:9'
@@ -173,6 +209,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   };
 
   const settingsRef = useRef(settings);
+  const authoritativeRevisionRef = useRef<number | null>(null);
+  const settingsHydratedRef = useRef(false);
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -296,6 +334,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       .then(data => {
         const status = data.status || data;
         if (status) {
+          authoritativeRevisionRef.current = Number(status.revision ?? 0);
+          settingsHydratedRef.current = true;
           // The phone has caught up to our latest apply once appliedVersion >=
           // our local apply id. Until then, keep the user's just-selected
           // stream-shaping values (no snapback from stale rebind status).
@@ -336,12 +376,25 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   }, [baseUrl, token]);
 
   useEffect(() => {
+    const events = new EventSource(buildUrl(baseUrl, '/api/state/events', token));
+    const onState = () => fetchStatus();
+    events.addEventListener('state', onState);
+    events.onerror = () => {
+      // The existing one-second poll remains a reconnect/version-skew fallback.
+    };
+    return () => {
+      events.removeEventListener('state', onState);
+      events.close();
+    };
+  }, [baseUrl, token, fetchStatus]);
+
+  useEffect(() => {
     apiFetch(baseUrl, '/api/device/info', token)
       .then(res => res.json())
       .then(setPhoneInfo)
       .catch(() => setPhoneInfo(null));
 
-    apiFetch(baseUrl, '/api/camera/list', token)
+    apiFetch(baseUrl, '/api/pipeline/capabilities', token)
       .then(res => res.json())
       .then(data => {
         const list = Array.isArray(data) ? data : data.cameras || [];
@@ -390,7 +443,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
       apiFetch(baseUrl, '/api/stream/metrics', token)
         .then(res => res.json())
-        .then(data => setAndroidMetrics(data))
+        .then(data => setAndroidMetrics(normalizeAndroidMetrics(data)))
         .catch(() => setAndroidMetrics(null));
 
     }, 1000);
@@ -502,8 +555,15 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     setIsVcamRegistering(false);
   };
 
-  const startStream = () => apiFetch(baseUrl, '/api/stream/start', token, { method: 'POST' });
-  const stopStream = () => apiFetch(baseUrl, '/api/stream/stop', token, { method: 'POST' });
+  const pipelineCommand = async (path: string) => {
+    const response = await apiFetch(baseUrl, path, token, { method: 'POST' });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.success === false) throw new Error(body.message || `HTTP ${response.status}`);
+    if (body.revision != null) authoritativeRevisionRef.current = Number(body.revision);
+    return body;
+  };
+  const startStream = () => pipelineCommand('/api/stream/start');
+  const stopStream = () => pipelineCommand('/api/stream/stop');
 
   const handleStartProducer = async (s: any, actual?: any) => {
     const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
@@ -546,7 +606,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         await invoke('start_virtual_camera_host');
       }
 
-      await restartFullPipelineWithSettings(s);
+      await restartFullPipelineWithSettings(s, []);
 
       setVcamMessage('');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
@@ -573,7 +633,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
     setVcamMessage('Starting feed...');
     try {
-      const actual = await restartAndroidStreamWithSettings(s);
+      const actual = await restartAndroidStreamWithSettings(s, []);
       await handleStartProducer(s, actual);
 
       setVcamMessage('');
@@ -601,33 +661,42 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-  const postSettingsToAndroid = async (s: any) => {
+  const postSettingsToAndroid = async (s: any, keysChanged: string[]) => {
+    if (keysChanged.length === 0) return null;
+    if (!settingsHydratedRef.current || authoritativeRevisionRef.current == null) {
+      throw new Error('Phone settings have not been loaded; refusing to post local defaults');
+    }
     localApplyVersionRef.current += 1;
-    await apiFetch(baseUrl, '/api/settings', token, {
+    const patch: any = {};
+    const directKeys = [
+      'profile', 'width', 'height', 'outputWidth', 'outputHeight', 'fps', 'jpegQuality',
+      'cameraId', 'aspectRatio', 'displayRotation', 'mirror', 'streamMode',
+      'targetBandwidthMbps', 'h264Bitrate', 'h264KeyframeInterval'
+    ];
+    for (const key of directKeys) {
+      if (keysChanged.includes(key)) patch[key] = s[key];
+    }
+    if (keysChanged.includes('width') || keysChanged.includes('height')) {
+      patch.outputWidth = s.outputWidth;
+      patch.outputHeight = s.outputHeight;
+    }
+    const response = await apiFetch(baseUrl, '/api/settings', token, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        ...patch,
+        baseRevision: authoritativeRevisionRef.current,
+        requestId: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${localApplyVersionRef.current}`,
         applyId: localApplyVersionRef.current,
-        profile: s.profile,
-        width: s.width,
-        height: s.height,
-        outputWidth: s.outputWidth,
-        outputHeight: s.outputHeight,
-        fps: s.fps,
-        jpegQuality: s.jpegQuality,
-        cameraId: s.cameraId,
-        aspectRatio: s.aspectRatio || 'auto',
-        // These two were missing, so desktop orientation/mirror changes never
-        // actually reached the phone (and polling snapped the UI back).
-        displayRotation: s.displayRotation ?? '0',
-        mirror: !!s.mirror,
-        streamMode: s.streamMode,
-        targetBandwidthMbps: s.targetBandwidthMbps,
-        h264Bitrate: s.h264Bitrate,
-        h264KeyframeInterval: s.h264KeyframeInterval,
-        localPreviewEnabled: !previewOff
       })
     });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.success === false) {
+      if (response.status === 409) fetchStatus();
+      throw new Error(body.message || `HTTP ${response.status}`);
+    }
+    if (body.revision != null) authoritativeRevisionRef.current = Number(body.revision);
+    return body;
   };
 
   const applySettingsAndRefreshPreview = async (nextSettings: any, keysChanged: string[]) => {
@@ -658,19 +727,19 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         // Producer is feeding OBS: a resolution/fps/lens/codec change needs both
         // the Android stream AND the producer restarted.
         addDiag('apply', `[${keysChanged.join(',')}] -> full pipeline restart (Android + producer)`);
-        await restartFullPipelineWithSettings(nextSettings);
+        await restartFullPipelineWithSettings(nextSettings, keysChanged);
       } else if (streamImpacting && androidStreaming) {
         // Only the phone stream/preview is live (producer OFF). Rebind Android
         // alone — do NOT start the producer. Preview reconnects itself when
         // frames resume (metrics-based recovery in Preview).
         addDiag('apply', `[${keysChanged.join(',')}] -> Android rebind only (producer off)`);
-        await restartAndroidStreamWithSettings(nextSettings);
+        await restartAndroidStreamWithSettings(nextSettings, keysChanged);
       } else {
         addDiag('apply', `[${keysChanged.join(',')}] -> settings only (no rebind)`);
         // Non-stream-impacting change (quality/mirror/rotation/bandwidth), or
         // nothing is live. The running MJPEG already reflects quality/rotation
         // live and mirror is a preview transform, so do NOT reload the preview.
-        await postSettingsToAndroid(nextSettings);
+        await postSettingsToAndroid(nextSettings, keysChanged);
       }
     } catch (err: any) {
       console.error('[Tauri UI] applySettingsAndRefreshPreview failed:', err);
@@ -726,7 +795,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       try {
         const res = await apiFetch(baseUrl, '/api/stream/metrics', token);
         if (res.ok) {
-          const m = await res.json();
+          const m = normalizeAndroidMetrics(await res.json());
           lastMetrics = m;
 
           const encodedOk =
@@ -768,15 +837,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     );
   };
 
-  const restartAndroidStreamWithSettings = async (s: any) => {
-    console.log('[Tauri UI] Restarting Android stream with settings:', s);
-
-    await stopStream();
-    await sleep(500);
-
-    await postSettingsToAndroid(s);
-    await sleep(200);
-
+  const restartAndroidStreamWithSettings = async (s: any, keysChanged: string[]) => {
+    console.log('[Tauri UI] Applying Android pipeline settings:', keysChanged);
+    await postSettingsToAndroid(s, keysChanged);
+    // Start is idempotent. If settings were applied while streaming, the phone
+    // actor has already completed the required rebind before POST returned.
     await startStream();
 
     const metrics = await waitForAndroidResolution(s);
@@ -785,7 +850,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     return metrics;
   };
 
-  const restartFullPipelineWithSettings = async (s: any) => {
+  const restartFullPipelineWithSettings = async (s: any, keysChanged: string[]) => {
     // This path is only taken when the producer was actually running (see
     // applySettingsAndRefreshPreview using vcamState.running), so it MUST end
     // with the producer running again. Verify it and surface a real error if not
@@ -795,17 +860,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     catch (e: any) { addDiag('pipeline', `stopProducer fail: ${e}`); }
 
     let actual: any = null;
-    try { actual = await restartAndroidStreamWithSettings(s); addDiag('pipeline', `androidRebind ok (${actual?.activeStreamMode || s.streamMode})`); }
+    try { actual = await restartAndroidStreamWithSettings(s, keysChanged); addDiag('pipeline', `androidRebind ok (${actual?.activeStreamMode || s.streamMode})`); }
     catch (e: any) { addDiag('pipeline', `androidRebind fail: ${e}`); throw e; }
 
     await handleStartProducer(s, actual);
-    let state = await invoke<VirtualCamState>('get_virtual_camera_status');
-    if (!state.running) {
-      addDiag('pipeline', 'producer not running after start — retrying once');
-      await sleep(600);
-      await handleStartProducer(s, actual);
-      state = await invoke<VirtualCamState>('get_virtual_camera_status');
-    }
+    const state = await invoke<VirtualCamState>('get_virtual_camera_status');
     setVcamState(state);
     addDiag('pipeline', `finalProducerRunning=${!!state.running}`);
     if (!state.running) {
@@ -1121,24 +1180,36 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                     {settings.fps} / {androidMetrics.captureFps ?? androidMetrics.actualFps ?? androidMetrics.fps}
                   </span>
                 </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Encoder:</span>
-                  <span>{androidMetrics.encoderName || 'MJPEG'} ({androidMetrics.hardwareEncoder ? 'hardware' : 'compatibility'})</span>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Encoded FPS / bitrate:</span>
-                  <span>{androidMetrics.encodedFps || 0} / {((androidMetrics.encodedBitrate || 0) / 1_000_000).toFixed(2)} Mbps</span>
-                </div>
+                {androidMetrics.capture && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                    <span>Capture engine / session FPS:</span>
+                    <span>{androidMetrics.captureEngine || 'Unknown'} / {androidMetrics.cameraSessionFps || 0}{androidMetrics.gpuBridgeFps != null ? ` → GPU ${androidMetrics.gpuBridgeFps}` : ''}</span>
+                  </div>
+                )}
+                {androidMetrics.h264 && (
+                  <>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                      <span>Encoder:</span>
+                      <span>{androidMetrics.encoderName} ({androidMetrics.hardwareEncoder ? 'hardware' : 'software fallback'})</span>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                      <span>Encoded FPS / bitrate:</span>
+                      <span>{androidMetrics.encodedFps || 0} / {((androidMetrics.encodedBitrate || 0) / 1_000_000).toFixed(2)} Mbps</span>
+                    </div>
+                  </>
+                )}
                 {(androidMetrics.fallbackReason || vcamState.metrics?.fallback_reason) && (
                   <div style={{ display: 'flex', justifyContent: 'space-between', color: '#ffb300', marginTop: 4 }}>
                     <span>Active fallback:</span>
                     <span>{androidMetrics.fallbackReason || vcamState.metrics?.fallback_reason}</span>
                   </div>
                 )}
-                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Android encode time:</span>
-                  <span>{Number(androidMetrics.androidEncodeMsAvg || 0).toFixed(1)} ms</span>
-                </div>
+                {androidMetrics.mjpeg && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                    <span>MJPEG encode time:</span>
+                    <span>{Number(androidMetrics.androidEncodeMsAvg || 0).toFixed(1)} ms</span>
+                  </div>
+                )}
 
                 {/* Degradation Warnings */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8 }}>
@@ -1186,7 +1257,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                       <div style={{ marginTop: 4, fontStyle: 'italic', color: '#888' }}>
                         Bottleneck Analysis:
                         <ul style={{ margin: '2px 0 0 16px', padding: 0 }}>
-                          <li>Android Encode: {androidMetrics.actualFps || 0} FPS ({Number(androidMetrics.androidEncodeMsAvg || 0).toFixed(1)}ms)</li>
+                          <li>Android Capture: {androidMetrics.actualFps || 0} FPS via {androidMetrics.captureEngine || 'unknown'}</li>
                           <li>Rust Decode: {vcamState.metrics.decode_ms_avg} ms</li>
                           <li>IPC Write: {vcamState.metrics.write_ms_avg} ms</li>
                         </ul>
@@ -1297,11 +1368,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           </p>
           {devMode && activeCam?.supportsHighSpeed && (
             <p style={{ fontSize: '0.68rem', color: '#ffb300', marginTop: 4 }}>
-              Diagnostics: this lens has high-speed (slow-motion) modes
+              Diagnostics: this lens has constrained high-speed modes
               {Array.isArray(activeCam.highSpeedFpsRanges) && activeCam.highSpeedFpsRanges.length > 0
                 ? ` up to ${Math.max(...activeCam.highSpeedFpsRanges.map((r: any) => r.max))} fps`
-                : ''}, but Android's constrained high-speed session is not usable by the
-              MJPEG webcam path — so the webcam max stays the normal-API value above.
+                : ''}. H.264 may use a direct high-speed surface or the GPU bridge;
+              MJPEG remains limited to the regular ImageAnalysis capability.
             </p>
           )}
         </div>
@@ -1314,7 +1385,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
               value={settings.profile}
               onChange={(e) => updateProfile(e.target.value)}
             >
-              <option value="low-latency">Low Latency (960x540, Q70)</option>
+              <option value="low-latency">Low Latency (1280x720, Q70)</option>
               <option value="balanced">Balanced (1280x720, Q85)</option>
               <option value="balanced-720p60">Balanced 60 (1280x720 @ 60fps, Q80)</option>
               <option value="quality">Quality (1920x1080, Q90)</option>
@@ -1450,13 +1521,13 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
               </label>
               <input
                 type="range"
-                min="1" max="10" step="1"
+                min="1" max="1" step="1" disabled
                 style={{ width: '100%', marginTop: 8 }}
                 value={settings.h264KeyframeInterval}
                 onChange={(e) => updateSetting('h264KeyframeInterval', parseInt(e.target.value))}
               />
               <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-                Shorter intervals recover faster after network hiccups but cost bandwidth.
+                Fixed at one second for bounded webcam recovery latency.
               </p>
             </div>
           </div>
