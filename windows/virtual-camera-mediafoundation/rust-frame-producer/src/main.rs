@@ -31,7 +31,7 @@ use windows::Win32::System::Performance::QueryPerformanceCounter;
 
 const OCBR_MAGIC: u32 = 0x5242434F; // "OCBR"
 const RING_VERSION: u16 = 3;
-const RING_ABI_HASH: u64 = 0x4f43_4252_0003_0080;
+const RING_ABI_HASH: u64 = 0x4f43_4252_0003_0090;
 const FORMAT_NV12: u32 = 2;
 const RING_HEADER_SIZE: usize = 256;
 const SLOT_HEADER_SIZE: usize = 128;
@@ -73,7 +73,11 @@ struct OpenCamBridgeRingHeader {
     ring_abi_hash: u64,
     installed_dll_build_hash: [u8; 32],
     producer_build_hash: [u8; 32],
-    reserved: [u8; 32],
+    producer_fps_num: std::sync::atomic::AtomicU32,
+    producer_fps_den: std::sync::atomic::AtomicU32,
+    resize_backend: std::sync::atomic::AtomicU32,
+    resize_failures: std::sync::atomic::AtomicU32,
+    reserved: [u8; 16],
 }
 
 #[repr(C)]
@@ -128,14 +132,6 @@ struct Args {
     /// a command-line argument (same-user processes can inspect argv).
     #[arg(skip)]
     token: Option<String>,
-
-    /// Explicit output rotation in degrees (0, 90, 180, 270). Overrides portrait auto-rotate.
-    #[arg(long)]
-    rotate: Option<u32>,
-
-    /// Horizontally mirror the output frame (applied after rotation).
-    #[arg(long)]
-    mirror: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -400,6 +396,7 @@ impl SharedMemoryIpc {
                 && (*header).version == RING_VERSION
                 && (*header).header_size as usize == RING_HEADER_SIZE
                 && (*header).slot_size as usize == SLOT_SIZE
+                && (*header).ring_abi_hash == RING_ABI_HASH
             {
                 (*header).max_width = 1920;
                 (*header).max_height = 1920;
@@ -429,6 +426,17 @@ impl SharedMemoryIpc {
             (*header)
                 .consumer_fps_den
                 .store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn set_source_fps(&self, numerator: u32, denominator: u32) {
+        self.initialize_ring_if_needed();
+        unsafe {
+            let ring = &*(self.p_map as *const OpenCamBridgeRingHeader);
+            ring.producer_fps_num
+                .store(numerator, std::sync::atomic::Ordering::Release);
+            ring.producer_fps_den
+                .store(denominator.max(1), std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -592,6 +600,25 @@ impl SharedMemoryIpc {
                 negotiated_fps_den: ring
                     .consumer_fps_den
                     .load(std::sync::atomic::Ordering::Acquire),
+                source_fps_num: ring
+                    .producer_fps_num
+                    .load(std::sync::atomic::Ordering::Acquire),
+                source_fps_den: ring
+                    .producer_fps_den
+                    .load(std::sync::atomic::Ordering::Acquire),
+                resize_backend: match ring
+                    .resize_backend
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    0 => "native-match",
+                    1 => "gpu",
+                    2 => "cpu-fallback",
+                    _ => "unknown",
+                }
+                .to_string(),
+                resize_failures: ring
+                    .resize_failures
+                    .load(std::sync::atomic::Ordering::Acquire),
                 installed_dll_build_hash: hex_hash(&ring.installed_dll_build_hash),
                 producer_build_hash: self.producer_hash_hex.clone(),
                 ring_abi_hash: ring.ring_abi_hash,
@@ -638,6 +665,10 @@ struct RingDiagnostics {
     negotiated_height: u32,
     negotiated_fps_num: u32,
     negotiated_fps_den: u32,
+    source_fps_num: u32,
+    source_fps_den: u32,
+    resize_backend: String,
+    resize_failures: u32,
     installed_dll_build_hash: String,
     producer_build_hash: String,
     ring_abi_hash: u64,
@@ -842,6 +873,10 @@ mod ring_tests {
             negotiated_height: 720,
             negotiated_fps_num: 60,
             negotiated_fps_den: 1,
+            source_fps_num: 60,
+            source_fps_den: 1,
+            resize_backend: "native-match".into(),
+            resize_failures: 0,
             installed_dll_build_hash: "a".repeat(64),
             producer_build_hash: "b".repeat(64),
             ring_abi_hash: RING_ABI_HASH,
@@ -1154,9 +1189,9 @@ fn backoff_secs(consecutive_failures: u32) -> u64 {
     }
 }
 
-/// Rotation/mirror/resize applied to a decoded frame before it is written to
-/// the shared framebuffer. The pixel data is BGRA stored in an RgbaImage; all
-/// operations used here are channel-order agnostic.
+/// Compatibility resize applied after decoding the source-authoritative MJPEG
+/// pixels. Android has already applied rotation and mirror before JPEG encode;
+/// the producer must never transform them a second time.
 struct StageTimings {
     rotate_ms: u32,
     resize_ms: u32,
@@ -1273,46 +1308,17 @@ fn fast_jpeg_decode_bgra(jpeg: &[u8]) -> Option<image::RgbaImage> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn orient_resize_write(
+fn resize_authoritative_mjpeg_write(
     rgba: image::RgbaImage,
-    rotate_arg: Option<u32>,
-    mirror: bool,
     out_w: u32,
     out_h: u32,
     ipc: &SharedMemoryIpc,
     frame_counter: u64,
     allow_simd: bool,
 ) -> StageTimings {
-    let src_w = rgba.width();
-    let src_h = rgba.height();
-
-    let rotate_start = Instant::now();
-    // Explicit --rotate wins; otherwise auto-rotate portrait sources into
-    // landscape outputs (legacy behavior).
-    let rotation = match rotate_arg {
-        Some(r) => r % 360,
-        None => {
-            if src_w < src_h && out_w >= out_h {
-                90
-            } else {
-                0
-            }
-        }
-    };
-    let rotated = match rotation {
-        90 => image::imageops::rotate90(&rgba),
-        180 => image::imageops::rotate180(&rgba),
-        270 => image::imageops::rotate270(&rgba),
-        _ => rgba,
-    };
-    // Mirror is applied after rotation so it always means "flip left/right as
-    // seen by the viewer".
-    let oriented = if mirror {
-        image::imageops::flip_horizontal(&rotated)
-    } else {
-        rotated
-    };
-    let rotate_ms = rotate_start.elapsed().as_millis() as u32;
+    let oriented = rgba;
+    let rotate_ms = 0;
+    let rotation = 0;
 
     let resize_start = Instant::now();
     // The Media Foundation virtual camera renders a fixed output size, so the
@@ -1910,6 +1916,10 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                                     || old.fps_denominator != info.fps_denominator
                                             })
                                             .unwrap_or(true);
+                                        ipc.set_source_fps(
+                                            info.fps_numerator,
+                                            info.fps_denominator,
+                                        );
                                         stream_info = Some(info);
                                         consumer_readiness.reset();
                                         if changed {
@@ -2227,7 +2237,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                 serde_json::to_string(&readiness).unwrap_or_else(|_| "{}".into());
                             let virtual_camera_ready = readiness.ready;
                             println!(
-                                r#"{{"type":"metrics","producer_state":"WRITING_RING","ring_frames_committed":{},"source":"ocb2-h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":0,"replaced_frames":{},"jpeg_queue_len":0,"decode_ms_avg":{},"rotate_ms_avg":0,"resize_ms_avg":0,"write_ms_avg":0,"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"{}","d3d11_output":{},"hardware_decoder":{},"encoder_name":"{}","hardware_encoder":{},"camera_id":"{}","fallback_reason":"{}","resize_backend":"gpu-or-exact","rotation":{},"mirror":{},"sensor_orientation":{},"device_rotation":{},"last_error":{},"ring":{},"virtual_camera_readiness":{},"virtual_camera_ready":{}}}"#,
+                                r#"{{"type":"metrics","producer_state":"WRITING_RING","ring_frames_committed":{},"source":"ocb2-h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":0,"replaced_frames":{},"jpeg_queue_len":0,"decode_ms_avg":{},"rotate_ms_avg":0,"resize_ms_avg":0,"write_ms_avg":0,"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"{}","d3d11_output":{},"hardware_decoder":{},"encoder_name":"{}","hardware_encoder":{},"camera_id":"{}","fallback_reason":"{}","resize_backend":"nv12-transform","rotation":{},"mirror":{},"sensor_orientation":{},"device_rotation":{},"last_error":{},"ring":{},"virtual_camera_readiness":{},"virtual_camera_ready":{}}}"#,
                                 ring_frames_committed,
                                 json_escape(&args.profile),
                                 info.map(|i| i.width).unwrap_or(0),
@@ -2365,15 +2375,9 @@ fn main() {
         std::process::exit(2);
     }
 
-    if let Some(r) = args.rotate {
-        if r % 90 != 0 || r >= 360 {
-            eprintln!("--rotate must be one of 0, 90, 180, 270 (got {}).", r);
-            std::process::exit(2);
-        }
-    }
-
     let ipc = SharedMemoryIpc::new().expect("Failed to initialize IPC");
     ipc.initialize_ring_if_needed();
+    ipc.set_source_fps(args.fps.unwrap_or(30), 1);
     emit_event(
         "info",
         "PRODUCER_BUILD",
@@ -2623,10 +2627,8 @@ fn main() {
                     sum_decode_ms += decode_start.elapsed().as_millis() as u32;
                     last_decode_backend = decode_backend;
 
-                    let timings = orient_resize_write(
+                    let timings = resize_authoritative_mjpeg_write(
                         rgba,
-                        args.rotate,
-                        args.mirror,
                         width,
                         height,
                         &ipc,

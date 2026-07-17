@@ -32,7 +32,7 @@ $builtInstaller = "$mfRoot\x64\Release\VirtualCamera_Installer.exe"
 $targetInstaller = "$mfRoot\VirtualCamera_Installer\x64\Release\VirtualCamera_Installer.exe"
 $sourceCommit = (& git -C $root rev-parse HEAD).Trim()
 $abiVersion = 3
-$abiHash = "0x4f43425200030080"
+$abiHash = "0x4f43425200030090"
 
 Write-Host "Source commit: $sourceCommit" -ForegroundColor Cyan
 Write-Host "Ring ABI: version=$abiVersion hash=$abiHash" -ForegroundColor Cyan
@@ -153,6 +153,12 @@ if ($builtDllHash -ne $installedDllHash) {
 
 Write-Host "Virtual camera host exe:" -ForegroundColor Green
 Get-Item $targetInstaller | Select-Object FullName,Length,LastWriteTime
+
+Write-Host "Running native buffer-lock and NV12 resize fallback tests..." -ForegroundColor Yellow
+& $targetInstaller --self-test-pipeline
+if ($LASTEXITCODE -ne 0) {
+    throw "Virtual-camera native pipeline self-tests failed with exit code $LASTEXITCODE"
+}
 
 # The COM registration decides which DLL the Windows FrameServer actually
 # loads. If it points at another clone/path, rebuilding here changes nothing

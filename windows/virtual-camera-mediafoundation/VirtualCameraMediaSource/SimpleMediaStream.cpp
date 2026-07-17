@@ -3,6 +3,7 @@
 //
 
 #include "pch.h"
+#include "BufferLockFallback.h"
 
 namespace winrt::WindowsSample::implementation
 {
@@ -13,35 +14,65 @@ namespace winrt::WindowsSample::implementation
         {
             RETURN_HR_IF_NULL(E_POINTER, buffer);
             m_buffer = buffer;
-            if (SUCCEEDED(buffer->QueryInterface(IID_PPV_ARGS(&m_buffer2D2))))
-            {
-                RETURN_IF_FAILED(m_buffer2D2->Lock2DSize(
-                    MF2DBuffer_LockFlags_Write, &scanline, &pitch, &bufferStart, &bufferLength));
-                m_kind = Kind::Buffer2D2;
-                return S_OK;
-            }
-
-            if (SUCCEEDED(buffer->QueryInterface(IID_PPV_ARGS(&m_buffer2D))))
-            {
-                RETURN_IF_FAILED(m_buffer2D->Lock2D(&scanline, &pitch));
+            auto clearPointers = [&] {
+                scanline = nullptr; bufferStart = nullptr; bufferLength = 0; pitch = 0;
+            };
+            auto try2D2 = [&]() -> HRESULT {
+                m_buffer2D2.reset();
+                clearPointers();
+                HRESULT hr = buffer->QueryInterface(IID_PPV_ARGS(&m_buffer2D2));
+                if (FAILED(hr)) { m_buffer2D2.reset(); return hr; }
+                hr = m_buffer2D2->Lock2DSize(
+                    MF2DBuffer_LockFlags_Write, &scanline, &pitch, &bufferStart, &bufferLength);
+                if (FAILED(hr)) { m_buffer2D2.reset(); clearPointers(); }
+                return hr;
+            };
+            auto try2D = [&]() -> HRESULT {
+                m_buffer2D.reset();
+                clearPointers();
+                HRESULT hr = buffer->QueryInterface(IID_PPV_ARGS(&m_buffer2D));
+                if (FAILED(hr)) { m_buffer2D.reset(); return hr; }
+                hr = m_buffer2D->Lock2D(&scanline, &pitch);
+                if (FAILED(hr)) { m_buffer2D.reset(); clearPointers(); return hr; }
                 DWORD maxLength = 0;
-                RETURN_IF_FAILED(buffer->GetMaxLength(&maxLength));
+                hr = buffer->GetMaxLength(&maxLength);
+                if (FAILED(hr)) {
+                    (void)m_buffer2D->Unlock2D();
+                    m_buffer2D.reset(); clearPointers(); return hr;
+                }
                 bufferStart = pitch < 0
                     ? scanline + static_cast<ptrdiff_t>(pitch) * (height - 1)
                     : scanline;
                 bufferLength = maxLength;
-                m_kind = Kind::Buffer2D;
                 return S_OK;
+            };
+            auto tryContiguous = [&]() -> HRESULT {
+                clearPointers();
+                DWORD currentLength = 0;
+                HRESULT hr = buffer->Lock(&bufferStart, &bufferLength, &currentLength);
+                if (FAILED(hr)) { clearPointers(); return hr; }
+                scanline = bufferStart;
+                pitch = subtype == MFVideoFormat_NV12
+                    ? static_cast<LONG>(width)
+                    : static_cast<LONG>(width * 4);
+                return S_OK;
+            };
+            RETURN_IF_FAILED(OcbTryBufferLockChain(try2D2, try2D, tryContiguous, m_kind));
+            if (subtype == MFVideoFormat_NV12 && pitch < 0) {
+                (void)Unlock();
+                return MF_E_UNSUPPORTED_FORMAT;
             }
-
-            DWORD currentLength = 0;
-            RETURN_IF_FAILED(buffer->Lock(&bufferStart, &bufferLength, &currentLength));
-            scanline = bufferStart;
-            pitch = subtype == MFVideoFormat_NV12
-                ? static_cast<LONG>(width)
-                : static_cast<LONG>(width * 4);
-            m_kind = Kind::Contiguous;
             return S_OK;
+        }
+
+        HRESULT CommitLength(UINT32 width, UINT32 height, GUID const& subtype)
+        {
+            if (m_kind != OcbBufferLockKind::Contiguous) return S_OK;
+            const uint64_t required = subtype == MFVideoFormat_NV12
+                ? static_cast<uint64_t>(width) * height * 3 / 2
+                : static_cast<uint64_t>(width) * height * 4;
+            RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER), required > bufferLength || required > MAXDWORD);
+            return m_buffer->SetCurrentLength(static_cast<DWORD>(required));
         }
 
         HRESULT Unlock()
@@ -49,16 +80,19 @@ namespace winrt::WindowsSample::implementation
             HRESULT result = S_OK;
             switch (m_kind)
             {
-            case Kind::Buffer2D2: result = m_buffer2D2->Unlock2D(); break;
-            case Kind::Buffer2D: result = m_buffer2D->Unlock2D(); break;
-            case Kind::Contiguous: result = m_buffer->Unlock(); break;
+            case OcbBufferLockKind::Buffer2D2: result = m_buffer2D2->Unlock2D(); break;
+            case OcbBufferLockKind::Buffer2D: result = m_buffer2D->Unlock2D(); break;
+            case OcbBufferLockKind::Contiguous: result = m_buffer->Unlock(); break;
             default: break;
             }
-            m_kind = Kind::None;
+            m_kind = OcbBufferLockKind::None;
+            m_buffer2D2.reset();
+            m_buffer2D.reset();
+            m_buffer.reset();
             return result;
         }
 
-        ~MediaBufferWriteLock() { if (m_kind != Kind::None) (void)Unlock(); }
+        ~MediaBufferWriteLock() { if (m_kind != OcbBufferLockKind::None) (void)Unlock(); }
 
         BYTE* scanline = nullptr;
         BYTE* bufferStart = nullptr;
@@ -66,8 +100,7 @@ namespace winrt::WindowsSample::implementation
         LONG pitch = 0;
 
     private:
-        enum class Kind { None, Buffer2D2, Buffer2D, Contiguous };
-        Kind m_kind = Kind::None;
+        OcbBufferLockKind m_kind = OcbBufferLockKind::None;
         wil::com_ptr_nothrow<IMFMediaBuffer> m_buffer;
         wil::com_ptr_nothrow<IMF2DBuffer2> m_buffer2D2;
         wil::com_ptr_nothrow<IMF2DBuffer> m_buffer2D;
@@ -298,6 +331,12 @@ namespace winrt::WindowsSample::implementation
                 (void)m_shmClient.ReportSampleCopyFailure(fallbackResult);
                 return fallbackResult;
             }
+        }
+        HRESULT lengthResult = bufferLock.CommitLength(width, height, subtype);
+        if (FAILED(lengthResult)) {
+            (void)bufferLock.Unlock();
+            (void)m_shmClient.ReportSampleCopyFailure(lengthResult);
+            return lengthResult;
         }
         //RETURN_IF_FAILED(WriteSampleData(pbuf, bufferLength, pitch, width, height));
         HRESULT unlockResult = bufferLock.Unlock();

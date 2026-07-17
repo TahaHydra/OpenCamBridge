@@ -12,6 +12,8 @@
 #include "SimpleMediaSourceUT.h"
 #include "HWMediaSourceUT.h"
 #include "AugmentedMediaSourceUT.h"
+#include "../VirtualCameraMediaSource/BufferLockFallback.h"
+#include "../VirtualCameraMediaSource/Nv12ResizeFallback.h"
 
 using namespace VirtualCameraTest::impl;
 
@@ -373,6 +375,15 @@ int wmain(int argc, wchar_t* argv[])
     EnableVTMode();
     wil::SetResultLoggingCallback(WilFailureLog);
 
+    if (argc == 2 && _wcsicmp(argv[1], L"--self-test-pipeline") == 0)
+    {
+        const bool locksPassed = OcbRunBufferLockFallbackSelfTests();
+        const bool resizePassed = OcbRunResizeFallbackSelfTests();
+        std::wcout << L"OCB_BUFFER_LOCK_FALLBACK_TEST=" << (locksPassed ? L"PASSED" : L"FAILED") << std::endl;
+        std::wcout << L"OCB_NV12_RESIZE_FALLBACK_TEST=" << (resizePassed ? L"PASSED" : L"FAILED") << std::endl;
+        return locksPassed && resizePassed ? 0 : 1;
+    }
+
     LOG_COMMENT(L"Virtual Camera simple application !");
     RETURN_IF_FAILED(MFStartup(MF_VERSION));
 
@@ -395,6 +406,10 @@ int wmain(int argc, wchar_t* argv[])
             return hr;
         }
 
+        // Machine-readable activation handshake consumed by the Tauri parent.
+        // The process being alive is insufficient: this is emitted only after
+        // MFCreateVirtualCamera/Start completed successfully.
+        std::wcout << L"OCB_VCAM_HOST_READY" << std::endl;
         LOG_COMMENT(L"OpenCamBridge Camera host is running. Press Ctrl+C to exit.");
         
         // Wait indefinitely until killed by Tauri

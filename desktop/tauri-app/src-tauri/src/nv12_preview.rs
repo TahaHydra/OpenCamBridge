@@ -15,7 +15,7 @@ use windows::Win32::System::Memory::{
 
 const OCBR_MAGIC: u32 = 0x5242_434f;
 const RING_VERSION: u16 = 3;
-const RING_ABI_HASH: u64 = 0x4f43_4252_0003_0080;
+const RING_ABI_HASH: u64 = 0x4f43_4252_0003_0090;
 const FORMAT_NV12: u32 = 2;
 const RING_HEADER_SIZE: usize = 256;
 const SLOT_HEADER_SIZE: usize = 128;
@@ -58,7 +58,11 @@ struct RingHeader {
     ring_abi_hash: u64,
     installed_dll_build_hash: [u8; 32],
     producer_build_hash: [u8; 32],
-    reserved: [u8; 32],
+    producer_fps_num: AtomicU32,
+    producer_fps_den: AtomicU32,
+    resize_backend: AtomicU32,
+    resize_failures: AtomicU32,
+    reserved: [u8; 16],
 }
 
 #[repr(C)]

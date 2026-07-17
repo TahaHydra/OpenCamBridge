@@ -10,7 +10,7 @@
 #define OCBR_VERSION 3
 #define OCBR_FORMAT_NV12 2
 #define OCBR_FORMAT_RGB32 3
-#define OCBR_ABI_HASH 0x4f43425200030080ULL
+#define OCBR_ABI_HASH 0x4f43425200030090ULL
 #define OCBR_HEADER_SIZE 256
 #define OCBR_SLOT_HEADER_SIZE 128
 #define OCBR_SLOT_COUNT 3
@@ -48,7 +48,11 @@ struct OpenCamBridgeRingHeader {
     uint64_t ringAbiHash;
     uint8_t installedDllBuildHash[32];
     uint8_t producerBuildHash[32];
-    uint8_t reserved[32];
+    volatile LONG producerFpsNum;
+    volatile LONG producerFpsDen;
+    volatile LONG resizeBackend;
+    volatile LONG resizeFailures;
+    uint8_t reserved[16];
 };
 
 struct OpenCamBridgeSlotHeader {
@@ -111,8 +115,12 @@ private:
         REFGUID outputSubtype, OpenCamBridgeFrameMetadata* metadata);
     HRESULT ResizeNv12Gpu(const BYTE* source, DWORD sourceWidth, DWORD sourceHeight,
         DWORD sourceYStride, DWORD sourceUvStride, DWORD outputWidth, DWORD outputHeight,
+        DWORD inputFpsNumerator, DWORD inputFpsDenominator,
+        DWORD outputFpsNumerator, DWORD outputFpsDenominator,
         std::vector<BYTE>& output);
-    HRESULT EnsureGpuResizeResources(DWORD sourceWidth, DWORD sourceHeight, DWORD outputWidth, DWORD outputHeight);
+    HRESULT EnsureGpuResizeResources(DWORD sourceWidth, DWORD sourceHeight, DWORD outputWidth, DWORD outputHeight,
+        DWORD inputFpsNumerator, DWORD inputFpsDenominator,
+        DWORD outputFpsNumerator, DWORD outputFpsDenominator);
     HRESULT PublishDllIdentity();
     void UpdateConsumerHeartbeat(OpenCamBridgeRingHeader* ring);
     void ResetGpuResizeResources();
@@ -139,5 +147,9 @@ private:
     DWORD m_resizeSourceHeight = 0;
     DWORD m_resizeOutputWidth = 0;
     DWORD m_resizeOutputHeight = 0;
+    DWORD m_resizeInputFpsNumerator = 0;
+    DWORD m_resizeInputFpsDenominator = 0;
+    DWORD m_resizeOutputFpsNumerator = 0;
+    DWORD m_resizeOutputFpsDenominator = 0;
     bool m_identityPublished = false;
 };

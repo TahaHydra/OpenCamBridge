@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
@@ -98,6 +99,10 @@ pub struct RingDiagnostics {
     pub negotiated_height: u32,
     pub negotiated_fps_num: u32,
     pub negotiated_fps_den: u32,
+    pub source_fps_num: u32,
+    pub source_fps_den: u32,
+    pub resize_backend: String,
+    pub resize_failures: u32,
     pub installed_dll_build_hash: String,
     pub producer_build_hash: String,
     pub ring_abi_hash: u64,
@@ -118,9 +123,11 @@ pub struct VirtualCamState {
     pub running: bool,
     pub process_running: bool,
     pub pipeline_ready: bool,
+    pub producer_ready: bool,
     pub virtual_camera_ready: bool,
     pub producer_state: String,
     pub host_running: bool,
+    pub host_activated: bool,
     pub registered: bool,
     pub metrics: Option<VirtualCamMetrics>,
     pub producer_path: Option<String>,
@@ -142,6 +149,16 @@ pub struct VirtualCamManager {
     producer_state: Mutex<String>,
     last_event: Mutex<Option<String>>,
     producer_instance: AtomicU64,
+    host_activated: AtomicBool,
+}
+
+fn complete_pipeline_ready(
+    producer_ready: bool,
+    host_running: bool,
+    host_activated: bool,
+    registered: bool,
+) -> bool {
+    producer_ready && host_running && host_activated && registered
 }
 
 impl VirtualCamManager {
@@ -156,6 +173,7 @@ impl VirtualCamManager {
             producer_state: Mutex::new("STOPPED".to_string()),
             last_event: Mutex::new(None),
             producer_instance: AtomicU64::new(0),
+            host_activated: AtomicBool::new(false),
         }
     }
 
@@ -211,7 +229,12 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
     // Start button a silent no-op after the host crashed or failed to start).
     if let Some(child) = host_guard.as_mut() {
         match child.try_wait() {
-            Ok(None) => return Ok(()), // genuinely still running
+            Ok(None) if state.host_activated.load(Ordering::Acquire) => return Ok(()),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                *host_guard = None;
+            }
             _ => {
                 *host_guard = None;
             }
@@ -234,11 +257,18 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
     }
     let exe_path = std::fs::canonicalize(&exe_path_release).unwrap_or(exe_path_release);
 
-    let child = Command::new(exe_path)
+    if !check_virtual_camera_backend() {
+        return Err(
+            "Virtual-camera COM backend is not registered; run the installer before Start Webcam"
+                .into(),
+        );
+    }
+
+    let mut child = Command::new(exe_path)
         .arg("--mode")
         .arg("host")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
             let msg = format!("Failed to start virtual camera host: {}", e);
@@ -246,16 +276,79 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
             msg
         })?;
 
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Virtual-camera host stdout was unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("Virtual-camera host stderr was unavailable")?;
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    let stdout_tx = ready_tx.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = stdout_tx.send(Ok(line));
+        }
+    });
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = ready_tx.send(Err(line));
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut activation_error = None;
+    let activated = loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            activation_error = Some(format!(
+                "Virtual-camera host exited before activation: {status}"
+            ));
+            break false;
+        }
+        match ready_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(Ok(line)) if line.contains("OCB_VCAM_HOST_READY") => break true,
+            Ok(Ok(line)) => println!(">>> [VCam Host] {line}"),
+            Ok(Err(line)) => {
+                eprintln!(">>> [VCam Host] {line}");
+                activation_error = Some(line);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                activation_error.get_or_insert_with(|| {
+                    "Virtual-camera host closed its activation output".into()
+                });
+                break false;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            activation_error
+                .get_or_insert_with(|| "Virtual-camera host activation handshake timed out".into());
+            break false;
+        }
+    };
+    if !activated {
+        let _ = child.kill();
+        let _ = child.wait();
+        state.host_activated.store(false, Ordering::Release);
+        let message =
+            activation_error.unwrap_or_else(|| "Virtual-camera host activation failed".into());
+        *state.last_error.lock().unwrap() = Some(message.clone());
+        return Err(message);
+    }
+
     println!(
-        ">>> [Tauri] Spawned virtual camera host with PID: {}",
+        ">>> [Tauri] Virtual camera host activated with PID: {}",
         child.id()
     );
+    state.host_activated.store(true, Ordering::Release);
     *host_guard = Some(child);
     Ok(())
 }
 
 #[tauri::command]
 pub fn stop_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<(), String> {
+    state.host_activated.store(false, Ordering::Release);
     let mut host_guard = state.host_child.lock().unwrap();
     if let Some(mut child) = host_guard.take() {
         let _ = child.kill();
@@ -273,8 +366,6 @@ pub fn start_virtual_camera_feeder(
     height: u32,
     fps: f64,
     profile: Option<String>,
-    rotate: Option<u32>,
-    mirror: Option<bool>,
     token: Option<String>,
     source: Option<String>,
 ) -> Result<(), String> {
@@ -344,14 +435,6 @@ pub fn start_virtual_camera_feeder(
 
     if let Some(p) = profile {
         cmd.arg("--profile").arg(p);
-    }
-
-    if let Some(r) = rotate {
-        cmd.arg("--rotate").arg(r.to_string());
-    }
-
-    if mirror.unwrap_or(false) {
-        cmd.arg("--mirror");
     }
 
     // Pass the LAN token via environment variable so it never appears in the
@@ -566,6 +649,7 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
         }
         if !alive && host_guard.is_some() {
             *host_guard = None;
+            state.host_activated.store(false, Ordering::Release);
         }
         alive
     };
@@ -586,13 +670,16 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
             *state.producer_state.lock().unwrap() = "STALLED".to_string();
         }
     }
-    let pipeline_ready = process_running
+    let producer_ready = process_running
         && metrics_fresh
         && metrics.as_ref().is_some_and(|m| {
             m.producer_state == "WRITING_RING"
                 && m.ring_frames_committed >= 3
                 && m.last_error.is_none()
         });
+    let host_activated = host_running && state.host_activated.load(Ordering::Acquire);
+    let pipeline_ready =
+        complete_pipeline_ready(producer_ready, host_running, host_activated, registered);
     let virtual_camera_ready =
         pipeline_ready && metrics.as_ref().is_some_and(|m| m.virtual_camera_ready);
     let producer_state = state.producer_state.lock().unwrap().clone();
@@ -610,9 +697,11 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
         running: pipeline_ready,
         process_running,
         pipeline_ready,
+        producer_ready,
         virtual_camera_ready,
         producer_state,
         host_running,
+        host_activated,
         registered,
         metrics,
         producer_path,
@@ -622,5 +711,19 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
         last_error,
         last_metrics_time,
         last_event,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::complete_pipeline_ready;
+
+    #[test]
+    fn complete_readiness_requires_host_activation_and_registration() {
+        assert!(complete_pipeline_ready(true, true, true, true));
+        assert!(!complete_pipeline_ready(true, false, true, true));
+        assert!(!complete_pipeline_ready(true, true, false, true));
+        assert!(!complete_pipeline_ready(true, true, true, false));
+        assert!(!complete_pipeline_ready(false, true, true, true));
     }
 }

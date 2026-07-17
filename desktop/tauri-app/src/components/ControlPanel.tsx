@@ -66,6 +66,10 @@ interface RingDiagnostics {
   negotiated_height: number;
   negotiated_fps_num: number;
   negotiated_fps_den: number;
+  source_fps_num: number;
+  source_fps_den: number;
+  resize_backend: string;
+  resize_failures: number;
   installed_dll_build_hash: string;
   producer_build_hash: string;
   ring_abi_hash: number;
@@ -75,9 +79,11 @@ interface VirtualCamState {
   running: boolean;
   process_running?: boolean;
   pipeline_ready?: boolean;
+  producer_ready?: boolean;
   virtual_camera_ready?: boolean;
   producer_state?: string;
   host_running: boolean;
+  host_activated: boolean;
   registered: boolean;
   metrics: VirtualCamMetrics | null;
   producer_path?: string;
@@ -300,8 +306,6 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     // not rotate again.
     const obsUrl = buildUrl(baseUrl, '/obs', token, {
       fit: fitMode === 'fill' ? 'cover' : 'contain',
-      mirror: settings.mirror ? 'true' : 'false',
-      rotate: '0',
     });
 
     const success = await connectAndSetupObs(obsPassword, obsUrl, obsMode, (status) => setObsStatus(status));
@@ -547,14 +551,9 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
     const source = (actual?.activeStreamMode || s.streamMode) === 'h264' ? 'h264' : 'mjpeg';
     const targetUrl = source === 'h264' ? `${base}/stream.ocb2` : `${base}/stream.mjpeg`;
-    // The CLI transform is compatibility-only. MJPEG pixels are already rotated
-    // on the phone, while H.264 carries the authoritative effective rotation and
-    // mirror in every OCB2 stream-info generation. Passing zero here prevents a
-    // second transform and does not suppress the OCB2-driven H.264 transform.
-    const rotate = 0;
     // jpegQuality is applied on the Android side; the producer no longer takes it.
     console.log('[Tauri UI] Calling start_virtual_camera_feeder with', {
-      url: targetUrl, source, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, profile: s.profile, rotate, mirror: s.mirror
+      url: targetUrl, source, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, profile: s.profile
     });
     await invoke('start_virtual_camera_feeder', {
       url: targetUrl,
@@ -563,10 +562,6 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       height: s.outputHeight || s.height,
       fps: s.fps,
       profile: s.profile,
-      rotate,
-      // H.264 transform is authoritative OCB2 metadata. MJPEG pixels are
-      // rotated on-phone but still use the producer compatibility mirror.
-      mirror: source === 'mjpeg' ? !!s.mirror : false,
       token: token || undefined
     });
     console.log('[Tauri UI] start_virtual_camera_feeder completed');
@@ -577,7 +572,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
     setVcamMessage('Starting pipeline...');
     try {
-      if (!vcamState?.host_running) {
+      if (!vcamState?.host_running || !vcamState?.host_activated) {
         await invoke('start_virtual_camera_host');
       }
 
@@ -588,6 +583,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     } catch (e: any) {
       console.error('[Tauri UI] handleStartNativeCamera failed:', e);
       setVcamMessage(`Error: ${e.toString()}`);
+      // A producer that is alive but failed readiness must not leave the Start
+      // button disabled. Keep the visible error and return to a retryable state.
+      try { await invoke('stop_virtual_camera_feeder'); } catch {}
+      try { setVcamState(await invoke<VirtualCamState>('get_virtual_camera_status')); } catch {}
     }
   };
 
@@ -865,6 +864,9 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     await startStream();
 
     const metrics = await waitForAndroidResolution(s);
+    if (metrics.lifecycleState !== 'STREAMING') {
+      throw new Error(`Android pipeline is ${metrics.lifecycleState || 'not STREAMING'} after startup`);
+    }
     console.log('[Tauri UI] Android stream rebound OK:', metrics);
 
     return metrics;
@@ -884,14 +886,30 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     catch (e: any) { addDiag('pipeline', `androidRebind fail: ${e}`); throw e; }
 
     await handleStartProducer(s, actual);
-    const state = await invoke<VirtualCamState>('get_virtual_camera_status');
+    const readinessDeadline = Date.now() + 12_000;
+    let state = await invoke<VirtualCamState>('get_virtual_camera_status');
+    while (Date.now() < readinessDeadline) {
+      setVcamState(state);
+      if (!state.host_running || !state.host_activated) {
+        throw new Error(state.last_error || 'Virtual-camera host exited before pipeline readiness');
+      }
+      if (!state.process_running && state.producer_state === 'FAILED') {
+        throw new Error(state.last_error || 'Producer process exited during startup');
+      }
+      if (state.pipeline_ready) break;
+      await sleep(250);
+      state = await invoke<VirtualCamState>('get_virtual_camera_status');
+    }
     setVcamState(state);
     const committed = Number(state.metrics?.ring_frames_committed || 0);
     addDiag('pipeline', `finalProducerRunning=${!!state.process_running} state=${state.producer_state} committed=${committed}`);
     if (!state.process_running) throw new Error('Producer process exited during startup');
     if (state.producer_state !== 'WRITING_RING') throw new Error(`Producer is ${state.producer_state || 'not writing the ring'}`);
     if (committed < 3) throw new Error(`Producer committed only ${committed}/3 readiness frames`);
-    if (!state.pipeline_ready) throw new Error('Producer readiness timed out before the pipeline became ready');
+    if (!state.host_running) throw new Error('Virtual-camera host exited during startup');
+    if (!state.host_activated) throw new Error('Virtual-camera host did not activate the Media Foundation camera');
+    if (!state.registered) throw new Error('Virtual-camera backend is not registered');
+    if (!state.pipeline_ready) throw new Error('Complete webcam readiness timed out before the pipeline became ready');
 
     fetchStatus();
 
@@ -1181,6 +1199,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                     <span>{vcamState.metrics.ring.negotiated_width}x{vcamState.metrics.ring.negotiated_height} @ {vcamState.metrics.ring.negotiated_fps_num}/{vcamState.metrics.ring.negotiated_fps_den}</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                    <span>VCam resize / source FPS:</span>
+                    <span style={{ color: vcamState.metrics.ring.resize_backend === 'cpu-fallback' ? '#ffb300' : '#51cf66' }}>
+                      {vcamState.metrics.ring.resize_backend || 'unknown'} ({vcamState.metrics.ring.resize_failures} GPU failures) / {vcamState.metrics.ring.source_fps_num}/{vcamState.metrics.ring.source_fps_den}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
                     <span>Producer / DLL hashes:</span>
                     <span title={`${vcamState.metrics.ring.producer_build_hash} / ${vcamState.metrics.ring.installed_dll_build_hash}`}>
                       {vcamState.metrics.ring.producer_build_hash.slice(0, 12) || 'unknown'} / {vcamState.metrics.ring.installed_dll_build_hash.slice(0, 12) || 'unknown'}
@@ -1220,6 +1244,14 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                     <span>{androidMetrics.captureEngine || 'Unknown'} / {androidMetrics.cameraSessionFps || 0}{androidMetrics.gpuBridgeFps != null ? ` → GPU ${androidMetrics.gpuBridgeFps}` : ''}</span>
                   </div>
                 )}
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: '#888' }}>Phone preview:</span>
+                  <span style={{ color: androidMetrics.phonePreviewRequested && !androidMetrics.phonePreviewActive ? '#ffb300' : '#51cf66' }}>
+                    {!androidMetrics.phonePreviewRequested ? 'Not requested'
+                      : androidMetrics.phonePreviewActive ? 'Active'
+                      : `Inactive: ${androidMetrics.phonePreviewFailureReason || 'waiting for target/session'}`}
+                  </span>
+                </div>
                 {androidMetrics.h264 && (
                   <>
                     <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>

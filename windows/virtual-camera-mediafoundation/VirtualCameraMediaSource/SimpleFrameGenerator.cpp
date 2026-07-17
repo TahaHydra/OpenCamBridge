@@ -75,17 +75,20 @@ HRESULT SimpleFrameGenerator::_CreateRGB32Frame(
     _In_ ULONG rgbMask )
 {
     RETURN_HR_IF_NULL(E_INVALIDARG, pBuf);
-    if (len < (abs(pitch) * height ))
-    {
-        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-    }
+    RETURN_HR_IF(E_INVALIDARG, pitch == 0);
+    const uint64_t absolutePitch = pitch < 0
+        ? static_cast<uint64_t>(-static_cast<int64_t>(pitch))
+        : static_cast<uint64_t>(pitch);
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+        absolutePitch < static_cast<uint64_t>(width) * 4 || absolutePitch * height > len);
 
     LONGLONG curSysTimeInS = MFGetSystemTime() / (MFTIME)10000000;
     int offset = curSysTimeInS % height;
 
     for (unsigned int r = 0; r < height; r++)
     {
-        uint32_t* p = (uint32_t*)(pBuf + (r * pitch));
+        uint32_t* p = reinterpret_cast<uint32_t*>(
+            pBuf + static_cast<ptrdiff_t>(r) * static_cast<ptrdiff_t>(pitch));
         for (unsigned int c = 0; c < width; c++)
         {
             BYTE gray = (BYTE)(r + offset);

@@ -98,7 +98,6 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
   const showOverlay = isError || rebinding || stopped || offline || cameraError;
 
   const layout = serverStatus?.aspectRatio || 'auto';
-  const mirror = serverStatus?.mirror || false;
 
   // The phone streams already-rotated, always-upright frames. The orientation
   // mode only shapes this VIEW:
@@ -113,9 +112,9 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
     framePortrait; // auto
   const boxClass = boxPortrait ? 'layout-portrait' : 'layout-landscape';
 
-  // No content rotation here (frames arrive rotated) — mirror only.
+  // MJPEG pixels arrive fully transformed (rotation and mirror) from Android.
   const rotatorStyle: any = {
-    transform: `translate(-50%, -50%) scaleX(${mirror ? -1 : 1})`,
+    transform: 'translate(-50%, -50%)',
     width: boxSize.w ? `${boxSize.w}px` : '100%',
     height: boxSize.h ? `${boxSize.h}px` : '100%',
   };

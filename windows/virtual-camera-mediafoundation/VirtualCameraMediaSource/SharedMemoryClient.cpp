@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "SharedMemoryClient.h"
+#include "Nv12ResizeFallback.h"
 #include <algorithm>
 #include <bcrypt.h>
 #include <limits>
@@ -87,13 +88,23 @@ void SharedMemoryClient::ResetGpuResizeResources()
     ReleaseCom(m_d3dContext);
     ReleaseCom(m_d3dDevice);
     m_resizeSourceWidth = m_resizeSourceHeight = m_resizeOutputWidth = m_resizeOutputHeight = 0;
+    m_resizeInputFpsNumerator = m_resizeInputFpsDenominator = 0;
+    m_resizeOutputFpsNumerator = m_resizeOutputFpsDenominator = 0;
 }
 
 HRESULT SharedMemoryClient::EnsureGpuResizeResources(
-    DWORD sourceWidth, DWORD sourceHeight, DWORD outputWidth, DWORD outputHeight)
+    DWORD sourceWidth, DWORD sourceHeight, DWORD outputWidth, DWORD outputHeight,
+    DWORD inputFpsNumerator, DWORD inputFpsDenominator,
+    DWORD outputFpsNumerator, DWORD outputFpsDenominator)
 {
+    inputFpsNumerator = (std::max<DWORD>)(1, inputFpsNumerator);
+    inputFpsDenominator = (std::max<DWORD>)(1, inputFpsDenominator);
+    outputFpsNumerator = (std::max<DWORD>)(1, outputFpsNumerator);
+    outputFpsDenominator = (std::max<DWORD>)(1, outputFpsDenominator);
     if (m_videoProcessor && sourceWidth == m_resizeSourceWidth && sourceHeight == m_resizeSourceHeight &&
-        outputWidth == m_resizeOutputWidth && outputHeight == m_resizeOutputHeight) return S_OK;
+        outputWidth == m_resizeOutputWidth && outputHeight == m_resizeOutputHeight &&
+        inputFpsNumerator == m_resizeInputFpsNumerator && inputFpsDenominator == m_resizeInputFpsDenominator &&
+        outputFpsNumerator == m_resizeOutputFpsNumerator && outputFpsDenominator == m_resizeOutputFpsDenominator) return S_OK;
 
     ResetGpuResizeResources();
     UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -105,10 +116,10 @@ HRESULT SharedMemoryClient::EnsureGpuResizeResources(
 
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC content = {};
     content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-    content.InputFrameRate = { 60, 1 };
+    content.InputFrameRate = { inputFpsNumerator, inputFpsDenominator };
     content.InputWidth = sourceWidth;
     content.InputHeight = sourceHeight;
-    content.OutputFrameRate = { 60, 1 };
+    content.OutputFrameRate = { outputFpsNumerator, outputFpsDenominator };
     content.OutputWidth = outputWidth;
     content.OutputHeight = outputHeight;
     content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
@@ -184,14 +195,21 @@ HRESULT SharedMemoryClient::EnsureGpuResizeResources(
     m_resizeSourceHeight = sourceHeight;
     m_resizeOutputWidth = outputWidth;
     m_resizeOutputHeight = outputHeight;
+    m_resizeInputFpsNumerator = inputFpsNumerator;
+    m_resizeInputFpsDenominator = inputFpsDenominator;
+    m_resizeOutputFpsNumerator = outputFpsNumerator;
+    m_resizeOutputFpsDenominator = outputFpsDenominator;
     return S_OK;
 }
 
 HRESULT SharedMemoryClient::ResizeNv12Gpu(const BYTE* source, DWORD sourceWidth, DWORD sourceHeight,
     DWORD sourceYStride, DWORD sourceUvStride, DWORD outputWidth, DWORD outputHeight,
+    DWORD inputFpsNumerator, DWORD inputFpsDenominator,
+    DWORD outputFpsNumerator, DWORD outputFpsDenominator,
     std::vector<BYTE>& output)
 {
-    RETURN_IF_FAILED(EnsureGpuResizeResources(sourceWidth, sourceHeight, outputWidth, outputHeight));
+    RETURN_IF_FAILED(EnsureGpuResizeResources(sourceWidth, sourceHeight, outputWidth, outputHeight,
+        inputFpsNumerator, inputFpsDenominator, outputFpsNumerator, outputFpsDenominator));
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     RETURN_IF_FAILED(m_d3dContext->Map(m_inputUpload, 0, D3D11_MAP_WRITE, 0, &mapped));
     for (DWORD row = 0; row < sourceHeight; ++row) {
@@ -357,14 +375,41 @@ HRESULT SharedMemoryClient::SetConsumerFormat(DWORD width, DWORD height, DWORD f
 
 static BYTE ClampByte(int value) { return static_cast<BYTE>(std::clamp(value, 0, 255)); }
 
-static HRESULT Nv12ToRgb32(const BYTE* nv12, DWORD width, DWORD height, LONG pitch, BYTE* output, DWORD outputLen)
+static bool IsD3dDeviceLoss(HRESULT error)
 {
-    const uint64_t required = static_cast<uint64_t>(abs(pitch)) * height;
-    if (pitch <= 0 || required > outputLen) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    return error == DXGI_ERROR_DEVICE_REMOVED || error == DXGI_ERROR_DEVICE_RESET ||
+        error == DXGI_ERROR_DEVICE_HUNG;
+}
+
+static HRESULT Nv12ToRgb32(const BYTE* nv12, DWORD width, DWORD height, LONG pitch,
+    BYTE* scanline, BYTE* bufferStart, DWORD bufferLength)
+{
+    RETURN_HR_IF(E_INVALIDARG, pitch == 0);
+    const uint64_t rowBytes = static_cast<uint64_t>(width) * 4;
+    const uint64_t absolutePitch = pitch < 0
+        ? static_cast<uint64_t>(-static_cast<int64_t>(pitch))
+        : static_cast<uint64_t>(pitch);
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER), absolutePitch < rowBytes);
+    const uintptr_t bufferBegin = reinterpret_cast<uintptr_t>(bufferStart);
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW),
+        bufferLength > UINTPTR_MAX - bufferBegin);
+    const uintptr_t bufferEnd = bufferBegin + bufferLength;
+    const uintptr_t firstScanline = reinterpret_cast<uintptr_t>(scanline);
     const BYTE* yPlane = nv12;
     const BYTE* uvPlane = nv12 + static_cast<size_t>(width) * height;
     for (DWORD y = 0; y < height; ++y) {
-        BYTE* dst = output + static_cast<size_t>(y) * pitch;
+        const uint64_t rowOffset = static_cast<uint64_t>(y) * absolutePitch;
+        uintptr_t rowAddress = firstScanline;
+        if (pitch < 0) {
+            RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER), rowOffset > rowAddress);
+            rowAddress -= static_cast<uintptr_t>(rowOffset);
+        } else {
+            RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW), rowOffset > UINTPTR_MAX - rowAddress);
+            rowAddress += static_cast<uintptr_t>(rowOffset);
+        }
+        RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+            rowAddress < bufferBegin || rowAddress > bufferEnd || rowBytes > bufferEnd - rowAddress);
+        BYTE* dst = reinterpret_cast<BYTE*>(rowAddress);
         for (DWORD x = 0; x < width; ++x) {
             int yy = static_cast<int>(yPlane[static_cast<size_t>(y) * width + x]) - 16;
             int u = static_cast<int>(uvPlane[static_cast<size_t>(y / 2) * width + (x & ~1u)]) - 128;
@@ -455,18 +500,44 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
         uint64_t sourceYBytes = expectedY;
         bool sourceCompact = false;
         if (local.width != width || local.height != height) {
-            RETURN_IF_FAILED(ResizeNv12Gpu(source, local.width, local.height, local.yStride, local.uvStride,
-                width, height, m_nv12Scratch));
+            const DWORD inputFpsNumerator = static_cast<DWORD>((std::max<LONG>)(1,
+                InterlockedCompareExchange(&ring->producerFpsNum, 0, 0)));
+            const DWORD inputFpsDenominator = static_cast<DWORD>((std::max<LONG>)(1,
+                InterlockedCompareExchange(&ring->producerFpsDen, 0, 0)));
+            const DWORD outputFpsNumerator = static_cast<DWORD>((std::max<LONG>)(1,
+                InterlockedCompareExchange(&ring->consumerFpsNum, 0, 0)));
+            const DWORD outputFpsDenominator = static_cast<DWORD>((std::max<LONG>)(1,
+                InterlockedCompareExchange(&ring->consumerFpsDen, 0, 0)));
+            OcbResizeBackend backend = OcbResizeBackend::NativeMatch;
+            auto tryGpu = [&] {
+                HRESULT hr = ResizeNv12Gpu(source, local.width, local.height, local.yStride, local.uvStride,
+                    width, height, inputFpsNumerator, inputFpsDenominator,
+                    outputFpsNumerator, outputFpsDenominator, m_nv12Scratch);
+                if (FAILED(hr)) InterlockedIncrement(&ring->resizeFailures);
+                return hr;
+            };
+            HRESULT resizeResult = OcbResizeWithFallback(
+                tryGpu,
+                [&] { ResetGpuResizeResources(); },
+                [&] { return OcbResizeNv12Cpu(source, local.width, local.height, local.yStride,
+                    local.uvStride, width, height, m_nv12Scratch); },
+                IsD3dDeviceLoss,
+                backend);
+            RETURN_IF_FAILED(resizeResult);
+            InterlockedExchange(&ring->resizeBackend, static_cast<LONG>(backend));
             source = m_nv12Scratch.data();
             sourceYStride = width;
             sourceUvStride = width;
             sourceYBytes = static_cast<uint64_t>(width) * height;
             sourceCompact = true;
+        } else {
+            InterlockedExchange(&ring->resizeBackend, static_cast<LONG>(OcbResizeBackend::NativeMatch));
         }
 
         HRESULT copyResult = S_OK;
         if (outputSubtype == MFVideoFormat_NV12) {
-            if (pitch <= 0 || static_cast<uint64_t>(pitch) * (height + height / 2) > destinationAvailable || static_cast<DWORD>(pitch) < width) {
+            if (pitch < 0) return MF_E_UNSUPPORTED_FORMAT;
+            if (pitch == 0 || static_cast<uint64_t>(pitch) * (height + height / 2) > destinationAvailable || static_cast<DWORD>(pitch) < width) {
                 return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
             }
             for (DWORD row = 0; row < height; ++row) {
@@ -489,7 +560,7 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
                     srcUv + static_cast<size_t>(row) * sourceUvStride, width);
                 source = m_nv12Scratch.data();
             }
-            copyResult = Nv12ToRgb32(source, width, height, pitch, pBuf, static_cast<DWORD>(destinationAvailable));
+            copyResult = Nv12ToRgb32(source, width, height, pitch, pBuf, bufferStart, len);
         } else {
             return MF_E_UNSUPPORTED_FORMAT;
         }
