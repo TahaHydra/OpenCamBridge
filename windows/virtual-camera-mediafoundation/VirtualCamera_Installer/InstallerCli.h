@@ -58,14 +58,22 @@ inline bool OcbRunInstallerCliSelfTests()
 {
     wchar_t exe[] = L"VirtualCamera_Installer.exe";
     wchar_t registerArg[] = L"--register";
+    wchar_t unregisterArg[] = L"--unregister";
     wchar_t statusArg[] = L"--status";
+    wchar_t selfTestArg[] = L"--self-test-pipeline";
+    wchar_t devMenuArg[] = L"--dev-menu";
+    wchar_t helpArg[] = L"--help";
     wchar_t modeArg[] = L"--mode";
     wchar_t hostArg[] = L"host";
     wchar_t invalidArg[] = L"--unknown";
     wchar_t extraArg[] = L"extra";
     wchar_t* noArgs[] = { exe };
     wchar_t* registerArgs[] = { exe, registerArg };
+    wchar_t* unregisterArgs[] = { exe, unregisterArg };
     wchar_t* statusArgs[] = { exe, statusArg };
+    wchar_t* selfTestArgs[] = { exe, selfTestArg };
+    wchar_t* devMenuArgs[] = { exe, devMenuArg };
+    wchar_t* helpArgs[] = { exe, helpArg };
     wchar_t* hostArgs[] = { exe, modeArg, hostArg };
     wchar_t* invalidArgs[] = { exe, invalidArg };
     wchar_t* extraArgs[] = { exe, registerArg, extraArg };
@@ -73,12 +81,19 @@ inline bool OcbRunInstallerCliSelfTests()
     return OcbParseInstallerArguments(1, noArgs).command == OcbInstallerCommand::Usage &&
         OcbParseInstallerArguments(1, noArgs).expectedExitCode == 0 &&
         OcbParseInstallerArguments(2, registerArgs).command == OcbInstallerCommand::Register &&
+        OcbParseInstallerArguments(2, unregisterArgs).command == OcbInstallerCommand::Unregister &&
         OcbParseInstallerArguments(2, statusArgs).command == OcbInstallerCommand::Status &&
+        OcbParseInstallerArguments(2, selfTestArgs).command == OcbInstallerCommand::SelfTestPipeline &&
+        OcbParseInstallerArguments(2, devMenuArgs).command == OcbInstallerCommand::DevMenu &&
+        OcbParseInstallerArguments(2, helpArgs).command == OcbInstallerCommand::Usage &&
         OcbParseInstallerArguments(3, hostArgs).command == OcbInstallerCommand::Host &&
         OcbParseInstallerArguments(2, invalidArgs).command == OcbInstallerCommand::Invalid &&
         OcbParseInstallerArguments(2, invalidArgs).expectedExitCode == 2 &&
         OcbParseInstallerArguments(3, extraArgs).command == OcbInstallerCommand::Invalid &&
         OcbInstallerExitCode(S_OK) == 0 &&
         OcbInstallerExitCode(E_ACCESSDENIED) == 5 &&
+        OcbInstallerExitCode(HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)) == 5 &&
+        OcbInstallerExitCode(HRESULT_FROM_WIN32(ERROR_ELEVATION_REQUIRED)) == 5 &&
+        OcbInstallerExitCode(HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) == 1 &&
         OcbInstallerExitCode(E_FAIL) == 1;
 }

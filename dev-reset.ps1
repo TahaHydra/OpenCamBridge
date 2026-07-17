@@ -1,4 +1,7 @@
-param([string]$DeviceSerial)
+param(
+    [string]$DeviceSerial,
+    [string]$SelfTestScenario = ""
+)
 
 $ErrorActionPreference = "Stop"
 Write-Host "=== OpenCamBridge HARD DEV RESET ===" -ForegroundColor Cyan
@@ -43,6 +46,42 @@ function Invoke-ResetStep {
     } catch {
         Write-StepResult $Name "FAILED" $_.Exception.Message $Essential
     }
+}
+
+function Complete-Reset {
+    param(
+        [string[]]$Failures,
+        [bool]$PrintReminder = $true
+    )
+    $failureList = @($Failures | Where-Object { $_ })
+    if ($failureList.Count -gt 0) {
+        Write-Host "Reset FAILED. Required remediation:" -ForegroundColor Red
+        foreach ($failure in $failureList) {
+            Write-Host "  - $failure" -ForegroundColor Red
+        }
+        return 1
+    }
+
+    Write-Host "Reset done." -ForegroundColor Green
+    if ($PrintReminder) {
+        Write-Host "Important: OBS was closed. Reopen OBS only after Tauri + producer are running." -ForegroundColor Cyan
+    }
+    return 0
+}
+
+# Non-destructive packaging regression hook. It exercises the exact completion
+# policy used below without stopping processes, services, ports, or ADB state.
+if ($SelfTestScenario) {
+    $simulatedFailures = switch ($SelfTestScenario) {
+        "success" { @() }
+        "essential-failure" { @("Simulated essential step") }
+        default {
+            Write-Host "[FAILED] Unknown reset self-test scenario: $SelfTestScenario" -ForegroundColor Red
+            exit 2
+        }
+    }
+    $selfTestExit = Complete-Reset -Failures $simulatedFailures -PrintReminder $false
+    exit $selfTestExit
 }
 
 Write-StepResult "Elevation" $(if ($isElevated) { "PASSED" } else { "SKIPPED" }) $(if ($isElevated) { "Administrator token present" } else { "Not elevated; active camera services cannot be stopped" }) $false
@@ -127,14 +166,5 @@ if (Test-Path $producerLog) {
     Write-StepResult "Remove producer log" "SKIPPED" "Log is absent" $false
 }
 
-if ($script:essentialFailures.Count -gt 0) {
-    Write-Host "Reset FAILED. Required remediation:" -ForegroundColor Red
-    foreach ($failure in $script:essentialFailures) {
-        Write-Host "  - $failure" -ForegroundColor Red
-    }
-    exit 1
-}
-
-Write-Host "Reset done." -ForegroundColor Green
-Write-Host "Important: OBS was closed. Reopen OBS only after Tauri + producer are running." -ForegroundColor Cyan
-exit 0
+$resetExit = Complete-Reset -Failures $script:essentialFailures
+exit $resetExit

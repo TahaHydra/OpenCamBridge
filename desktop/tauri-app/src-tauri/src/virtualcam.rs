@@ -272,6 +272,46 @@ fn registered_dll_path() -> String {
         .unwrap_or_default()
 }
 
+fn binary_identity_mismatches(
+    built_dll_hash: &str,
+    installed_dll_hash: &str,
+    registered_dll_hash: &str,
+    producer_file_hash: &str,
+    producer_runtime_hash: &str,
+    loaded_dll_hash: &str,
+    loaded_dll_current: bool,
+) -> Vec<&'static str> {
+    let mut mismatches = Vec::new();
+    if !built_dll_hash.is_empty()
+        && !installed_dll_hash.is_empty()
+        && built_dll_hash != installed_dll_hash
+    {
+        mismatches.push("built DLL differs from installed DLL");
+    }
+    if installed_dll_hash.is_empty() {
+        mismatches.push("installed DLL is missing");
+    }
+    if registered_dll_hash.is_empty() {
+        mismatches.push("registered DLL is missing or unreadable");
+    } else if !installed_dll_hash.is_empty() && registered_dll_hash != installed_dll_hash {
+        mismatches.push("registered DLL differs from installed DLL");
+    }
+    if !producer_runtime_hash.is_empty()
+        && !producer_file_hash.is_empty()
+        && producer_runtime_hash != producer_file_hash
+    {
+        mismatches.push("running producer differs from its on-disk executable");
+    }
+    if loaded_dll_current
+        && !loaded_dll_hash.is_empty()
+        && !registered_dll_hash.is_empty()
+        && loaded_dll_hash != registered_dll_hash
+    {
+        mismatches.push("loaded DLL differs from the registered DLL");
+    }
+    mismatches
+}
+
 fn evaluate_binary_identity(
     producer_path: Option<&str>,
     metrics: Option<&VirtualCamMetrics>,
@@ -304,34 +344,15 @@ fn evaluate_binary_identity(
         .map(|item| item.installed_dll_build_hash.to_ascii_lowercase())
         .unwrap_or_default();
     let loaded_dll_current = ring.is_some_and(|item| item.consumer_attached);
-    let mut mismatches = Vec::new();
-    if !built_dll_hash.is_empty()
-        && !installed_dll_hash.is_empty()
-        && built_dll_hash != installed_dll_hash
-    {
-        mismatches.push("built DLL differs from installed DLL");
-    }
-    if installed_dll_hash.is_empty() {
-        mismatches.push("installed DLL is missing");
-    }
-    if registered_dll_hash.is_empty() {
-        mismatches.push("registered DLL is missing or unreadable");
-    } else if !installed_dll_hash.is_empty() && registered_dll_hash != installed_dll_hash {
-        mismatches.push("registered DLL differs from installed DLL");
-    }
-    if !producer_runtime_hash.is_empty()
-        && !producer_file_hash.is_empty()
-        && producer_runtime_hash != producer_file_hash
-    {
-        mismatches.push("running producer differs from its on-disk executable");
-    }
-    if loaded_dll_current
-        && !loaded_dll_hash.is_empty()
-        && !registered_dll_hash.is_empty()
-        && loaded_dll_hash != registered_dll_hash
-    {
-        mismatches.push("loaded DLL differs from the registered DLL");
-    }
+    let mismatches = binary_identity_mismatches(
+        &built_dll_hash,
+        &installed_dll_hash,
+        &registered_dll_hash,
+        &producer_file_hash,
+        &producer_runtime_hash,
+        &loaded_dll_hash,
+        loaded_dll_current,
+    );
     let remediation = format!(
         "Stop camera consumers, then run .\\dev-build-vcam.ps1 and {}",
         installer_remediation("--register")
@@ -916,7 +937,7 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
 
 #[cfg(test)]
 mod tests {
-    use super::complete_pipeline_ready;
+    use super::{binary_identity_mismatches, complete_pipeline_ready};
 
     #[test]
     fn complete_readiness_requires_host_activation_and_registration() {
@@ -925,5 +946,57 @@ mod tests {
         assert!(!complete_pipeline_ready(true, true, false, true));
         assert!(!complete_pipeline_ready(true, true, true, false));
         assert!(!complete_pipeline_ready(false, true, true, true));
+    }
+
+    #[test]
+    fn stale_binary_combinations_are_never_ready() {
+        assert!(
+            binary_identity_mismatches("same", "same", "same", "same", "same", "same", true)
+                .is_empty()
+        );
+        assert_eq!(
+            binary_identity_mismatches(
+                "built",
+                "installed",
+                "installed",
+                "producer",
+                "producer",
+                "installed",
+                true
+            ),
+            vec!["built DLL differs from installed DLL"]
+        );
+        assert_eq!(
+            binary_identity_mismatches(
+                "dll",
+                "dll",
+                "dll",
+                "producer-file",
+                "producer-runtime",
+                "dll",
+                true
+            ),
+            vec!["running producer differs from its on-disk executable"]
+        );
+        assert_eq!(
+            binary_identity_mismatches(
+                "dll",
+                "dll",
+                "registered",
+                "producer",
+                "producer",
+                "loaded",
+                true
+            ),
+            vec![
+                "registered DLL differs from installed DLL",
+                "loaded DLL differs from the registered DLL"
+            ]
+        );
+        assert_eq!(
+            binary_identity_mismatches("dll", "dll", "dll", "producer", "producer", "stale", false),
+            Vec::<&'static str>::new(),
+            "an inactive stale ring is not treated as the currently loaded DLL"
+        );
     }
 }
