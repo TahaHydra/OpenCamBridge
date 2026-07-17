@@ -67,6 +67,9 @@ class ControlServer(
 ) {
     private var engine: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
     private val cameraRepo = CameraRepository(context)
+    private val ocb2BrowserParserSource: String by lazy {
+        context.assets.open("ocb2-parser.js").bufferedReader().use { it.readText() }
+    }
 
     /**
      * Snapshot of the access mode taken when the server socket was bound.
@@ -213,6 +216,7 @@ class ControlServer(
                 canvas{width:100%;height:100%;object-fit:$fit;display:block}
                 #error{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;background:#000;font:18px system-ui;text-align:center;padding:24px}
                 </style></head><body><canvas id="stream"></canvas><div id="error">Connecting H.264 preview…</div><script>
+                $ocb2BrowserParserSource
                 const token = "$token", tokenRequired = "$accessMode" === "lanToken";
                 const canvas = document.getElementById('stream'), errorBox = document.getElementById('error');
                 let info={effectiveRotation:0,mirror:false}, configBytes=new Uint8Array(0), decoder=null, lastTs=-1;
@@ -220,7 +224,7 @@ class ControlServer(
                 function codec(bytes){for(let i=0;i+7<bytes.length;i++){let s=0;if(bytes[i]===0&&bytes[i+1]===0&&bytes[i+2]===1)s=i+3;else if(bytes[i]===0&&bytes[i+1]===0&&bytes[i+2]===0&&bytes[i+3]===1)s=i+4;if(s&&(bytes[s]&31)===7)return'avc1.'+[bytes[s+1],bytes[s+2],bytes[s+3]].map(v=>v.toString(16).padStart(2,'0')).join('').toUpperCase()}return'avc1.42E01E'}
                 function draw(frame){const r=Number(info.effectiveRotation||0),swap=r===90||r===270,w=frame.displayWidth||frame.codedWidth,h=frame.displayHeight||frame.codedHeight;canvas.width=swap?h:w;canvas.height=swap?w:h;const c=canvas.getContext('2d',{alpha:false,desynchronized:true});c.save();c.fillStyle='#000';c.fillRect(0,0,canvas.width,canvas.height);c.translate(canvas.width/2,canvas.height/2);c.rotate(r*Math.PI/180);c.scale(info.mirror?-1:1,1);c.drawImage(frame,-w/2,-h/2,w,h);c.restore();frame.close();errorBox.style.display='none'}
                 async function configure(){if(decoder||!configBytes.length)return;const c={codec:codec(configBytes),codedWidth:Number(info.width||1280),codedHeight:Number(info.height||720),optimizeForLatency:true,hardwareAcceleration:'prefer-hardware'};const support=await VideoDecoder.isConfigSupported(c);if(!support.supported)throw new Error('Browser cannot decode '+c.codec);decoder=new VideoDecoder({output:draw,error:e=>fail('H.264 decoder failed: '+e.message)});decoder.configure(c)}
-                async function run(){if(!('VideoDecoder'in window)||!('EncodedVideoChunk'in window)){fail('H.264 OBS preview unavailable: this browser lacks WebCodecs. Select MJPEG compatibility mode.');return}try{const u=new URL('/stream.ocb2',location.origin);if(tokenRequired&&token)u.searchParams.set('token',token);const response=await fetch(u);if(!response.ok||!response.body)throw new Error('OCB2 HTTP '+response.status);const reader=response.body.getReader();let b=new Uint8Array(0);while(true){const n=await reader.read();if(n.done)throw new Error('stream ended');const j=new Uint8Array(b.length+n.value.length);j.set(b);j.set(n.value,b.length);b=j;let o=0;while(b.length-o>=48){const v=new DataView(b.buffer,b.byteOffset+o,b.length-o);if(v.getUint32(0,false)!==0x4f434232||v.getUint16(4,true)!==2||v.getUint16(6,true)!==48)throw new Error('malformed OCB2');const l=v.getUint32(40,true);if(l>16777216)throw new Error('OCB2 payload too large');if(b.length-o<48+l)break;const t=v.getUint16(8,true),f=v.getUint32(12,true),ts=Number(v.getBigInt64(32,true)),p=b.slice(o+48,o+48+l);if(t===1){info=JSON.parse(new TextDecoder().decode(p));if(decoder){decoder.close();decoder=null}configBytes=new Uint8Array(0);lastTs=-1}else if(t===2&&(f&1)){configBytes=p;await configure()}else if(t===3){await configure();if(decoder){const key=!!(f&2);let d=p;if(key&&configBytes.length){d=new Uint8Array(configBytes.length+p.length);d.set(configBytes);d.set(p,configBytes.length)}const stamp=Math.max(lastTs+1,ts);lastTs=stamp;decoder.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:stamp,data:d}))}}else if(t===5||(f&8))throw new Error('stream ended');else if(t===6)throw new Error(new TextDecoder().decode(p));o+=48+l}if(o)b=b.slice(o)}}catch(e){fail('H.264 OBS preview unavailable: '+(e.message||String(e)))}}
+                async function run(){if(!('VideoDecoder'in window)||!('EncodedVideoChunk'in window)){fail('H.264 OBS preview unavailable: this browser lacks WebCodecs. Select MJPEG compatibility mode.');return}try{const u=new URL('/stream.ocb2',location.origin);if(tokenRequired&&token)u.searchParams.set('token',token);const response=await fetch(u);if(!response.ok||!response.body)throw new Error('OCB2 HTTP '+response.status);const reader=response.body.getReader(),parser=new Ocb2Browser.Parser();while(true){const n=await reader.read();if(n.done)throw new Error('stream ended');parser.push(n.value);for(let record;(record=parser.next())!==null;){const t=record.type,f=record.flags,ts=Number(record.encoderTimestampUs),p=record.payload;if(t===1){info=JSON.parse(new TextDecoder().decode(p));if(decoder){decoder.close();decoder=null}configBytes=new Uint8Array(0);lastTs=-1}else if(t===2&&(f&1)){configBytes=p;await configure()}else if(t===3){await configure();if(decoder){const key=!!(f&2);let d=p;if(key&&configBytes.length){d=new Uint8Array(configBytes.length+p.length);d.set(configBytes);d.set(p,configBytes.length)}const stamp=Math.max(lastTs+1,ts);lastTs=stamp;decoder.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:stamp,data:d}))}}else if(t===5||(f&8))throw new Error('stream ended');else if(t===6)throw new Error(new TextDecoder().decode(p));}}}catch(e){fail('H.264 OBS preview unavailable: '+(e.message||String(e)))}}
                 run();</script></body></html>
                 """.trimIndent()
             }
@@ -638,6 +642,7 @@ class ControlServer(
               </main>
 
               <script>
+                $ocb2BrowserParserSource
                 const TOKEN = "${'$'}{StreamState.accessToken.get()}";
                 const isTokenRequired = "${'$'}{StreamState.accessMode.get()}" === "lanToken";
 
@@ -862,25 +867,16 @@ class ControlServer(
                         const response = await fetchWithAuth('/stream.ocb2', { signal: h264Abort.signal });
                         if (!response.ok || !response.body) throw new Error('OCB2 HTTP ' + response.status);
                         const reader = response.body.getReader();
-                        let buffered = new Uint8Array(0);
+                        const parser = new Ocb2Browser.Parser();
                         while (h264PreviewRunning) {
                             const result = await reader.read();
                             if (result.done) throw new Error('OCB2 preview stream ended');
-                            const joined = new Uint8Array(buffered.length + result.value.length);
-                            joined.set(buffered); joined.set(result.value, buffered.length); buffered = joined;
-                            let offset = 0;
-                            while (buffered.length - offset >= 48) {
-                                const view = new DataView(buffered.buffer, buffered.byteOffset + offset, buffered.length - offset);
-                                if (view.getUint32(0, false) !== 0x4f434232 || view.getUint16(4, true) !== 2 || view.getUint16(6, true) !== 48) {
-                                    throw new Error('Malformed OCB2 preview header');
-                                }
-                                const payloadLength = view.getUint32(40, true);
-                                if (payloadLength > 16 * 1024 * 1024) throw new Error('OCB2 preview payload exceeds limit');
-                                if (buffered.length - offset < 48 + payloadLength) break;
-                                const type = view.getUint16(8, true);
-                                const flags = view.getUint32(12, true);
-                                const encoderTimestamp = Number(view.getBigInt64(32, true));
-                                const payload = buffered.slice(offset + 48, offset + 48 + payloadLength);
+                            parser.push(result.value);
+                            for (let record; (record = parser.next()) !== null;) {
+                                const type = record.type;
+                                const flags = record.flags;
+                                const encoderTimestamp = Number(record.encoderTimestampUs);
+                                const payload = record.payload;
                                 if (type === 1) {
                                     h264Info = JSON.parse(new TextDecoder().decode(payload));
                                     if (h264Decoder) { h264Decoder.close(); h264Decoder = null; }
@@ -906,9 +902,7 @@ class ControlServer(
                                 } else if (type === 6) {
                                     throw new Error(new TextDecoder().decode(payload));
                                 }
-                                offset += 48 + payloadLength;
                             }
-                            if (offset) buffered = buffered.slice(offset);
                         }
                     } catch (error) {
                         if (error.name !== 'AbortError') {

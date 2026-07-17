@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:ocb2": "node ../../protocol/conformance/run-browser-corpus.cjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

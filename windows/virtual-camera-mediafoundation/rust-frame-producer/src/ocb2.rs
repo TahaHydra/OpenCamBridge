@@ -172,6 +172,44 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Corpus {
+        cases: Vec<CorpusCase>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CorpusCase {
+        id: String,
+        actions: Vec<CorpusAction>,
+        #[serde(default)]
+        expected_records: Vec<ExpectedRecord>,
+        expected_error: Option<String>,
+        #[serde(default)]
+        accepted_video_sequences: Vec<u64>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CorpusAction {
+        hex: Option<String>,
+        fragment_sizes: Option<Vec<usize>>,
+        #[serde(default)]
+        reset: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ExpectedRecord {
+        #[serde(rename = "type")]
+        record_type: u16,
+        flags: u32,
+        sequence: u64,
+        payload_hex: String,
+    }
 
     fn encoded(record_type: u16, flags: u32, sequence: u64, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_SIZE + payload.len());
@@ -265,5 +303,111 @@ mod tests {
         assert_eq!(config.flags & FLAG_CODEC_CONFIG, FLAG_CODEC_CONFIG);
         assert!(config.is_discontinuity());
         assert!(idr.is_keyframe());
+    }
+
+    #[test]
+    fn shared_conformance_corpus() {
+        let corpus: Corpus = serde_json::from_str(include_str!(
+            "../../../../protocol/conformance/ocb2-corpus.json"
+        ))
+        .unwrap();
+        for case in corpus.cases {
+            let mut parser = Parser::new();
+            let mut records = Vec::new();
+            let mut error = None;
+            for action in case.actions {
+                if action.reset {
+                    parser.reset();
+                    continue;
+                }
+                let bytes = decode_hex(action.hex.as_deref().unwrap_or_default());
+                let fragments = action.fragment_sizes.unwrap_or_else(|| vec![bytes.len()]);
+                let mut offset = 0usize;
+                for requested in fragments {
+                    let end = (offset + requested).min(bytes.len());
+                    parser.push(&bytes[offset..end]);
+                    offset = end;
+                    drain(&mut parser, &mut records, &mut error);
+                }
+                if offset < bytes.len() {
+                    parser.push(&bytes[offset..]);
+                    drain(&mut parser, &mut records, &mut error);
+                }
+            }
+
+            if let Some(expected) = case.expected_error {
+                assert_eq!(Some(expected.as_str()), error.as_deref(), "{}", case.id);
+                continue;
+            }
+            assert_eq!(None, error, "{}", case.id);
+            assert_eq!(case.expected_records.len(), records.len(), "{}", case.id);
+            for (expected, actual) in case.expected_records.iter().zip(&records) {
+                assert_eq!(expected.record_type, actual.record_type, "{}", case.id);
+                assert_eq!(expected.flags, actual.flags, "{}", case.id);
+                assert_eq!(expected.sequence, actual.sequence, "{}", case.id);
+                assert_eq!(
+                    decode_hex(&expected.payload_hex),
+                    actual.payload,
+                    "{}",
+                    case.id
+                );
+            }
+            assert_eq!(
+                case.accepted_video_sequences,
+                accepted_video_sequences(&records),
+                "{}",
+                case.id
+            );
+        }
+    }
+
+    fn drain(parser: &mut Parser, records: &mut Vec<Record>, error: &mut Option<String>) {
+        loop {
+            match parser.next() {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => return,
+                Err(caught) => {
+                    *error = Some(error_code(&caught).to_owned());
+                    return;
+                }
+            }
+        }
+    }
+
+    fn error_code(error: &ParseError) -> &'static str {
+        match error {
+            ParseError::BadMagic => "BAD_MAGIC",
+            ParseError::UnsupportedVersion(_) => "UNSUPPORTED_VERSION",
+            ParseError::InvalidHeaderSize(_) => "INVALID_HEADER_SIZE",
+            ParseError::InvalidRecordType(_) => "INVALID_RECORD_TYPE",
+            ParseError::PayloadTooLarge(_) => "PAYLOAD_TOO_LARGE",
+        }
+    }
+
+    fn accepted_video_sequences(records: &[Record]) -> Vec<u64> {
+        let mut waiting_for_keyframe = true;
+        let mut accepted = Vec::new();
+        for record in records {
+            if record.record_type == TYPE_STREAM_INFO || record.is_discontinuity() {
+                waiting_for_keyframe = true;
+            }
+            if record.record_type == TYPE_VIDEO_ACCESS_UNIT {
+                if record.is_keyframe() {
+                    waiting_for_keyframe = false;
+                }
+                if !waiting_for_keyframe {
+                    accepted.push(record.sequence);
+                }
+            }
+        }
+        accepted
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        assert_eq!(0, value.len() % 2);
+        (0..value.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+            .collect()
     }
 }

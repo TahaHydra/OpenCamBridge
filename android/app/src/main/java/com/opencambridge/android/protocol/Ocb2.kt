@@ -24,6 +24,80 @@ object Ocb2 {
     const val FLAG_DISCONTINUITY = 1 shl 2
     const val FLAG_END_OF_STREAM = 1 shl 3
 
+    data class Record(
+        val type: Short,
+        val flags: Int,
+        val sequence: Long,
+        val captureTimestampNs: Long,
+        val encoderTimestampUs: Long,
+        val payload: ByteArray
+    )
+
+    class ParseException(val code: String, message: String) : IllegalArgumentException(message)
+
+    /** Incremental reference parser used by Kotlin conformance tests and diagnostics. */
+    class Parser(initialCapacity: Int = 128 * 1024) {
+        private var bytes = ByteArray(initialCapacity)
+        private var length = 0
+
+        fun reset() {
+            length = 0
+        }
+
+        fun push(input: ByteArray, offset: Int = 0, count: Int = input.size - offset) {
+            require(offset >= 0 && count >= 0 && offset + count <= input.size)
+            ensureCapacity(length + count)
+            input.copyInto(bytes, length, offset, offset + count)
+            length += count
+        }
+
+        fun next(): Record? {
+            if (length < HEADER_SIZE) return null
+            if (bytes[0] != 'O'.code.toByte() || bytes[1] != 'C'.code.toByte() ||
+                bytes[2] != 'B'.code.toByte() || bytes[3] != '2'.code.toByte()
+            ) throw ParseException("BAD_MAGIC", "OCB2 magic mismatch")
+
+            val header = ByteBuffer.wrap(bytes, 0, HEADER_SIZE.toInt()).order(ByteOrder.LITTLE_ENDIAN)
+            header.position(4)
+            val version = header.short.toInt() and 0xffff
+            if (version != VERSION.toInt()) {
+                throw ParseException("UNSUPPORTED_VERSION", "unsupported OCB2 version $version")
+            }
+            val headerSize = header.short.toInt() and 0xffff
+            if (headerSize != HEADER_SIZE.toInt()) {
+                throw ParseException("INVALID_HEADER_SIZE", "invalid OCB2 header size $headerSize")
+            }
+            val type = header.short
+            if (type !in TYPE_STREAM_INFO..TYPE_ERROR) {
+                throw ParseException("INVALID_RECORD_TYPE", "invalid OCB2 record type $type")
+            }
+            header.short // reserved
+            val flags = header.int
+            val sequence = header.long
+            val captureTimestampNs = header.long
+            val encoderTimestampUs = header.long
+            val payloadLength = header.int.toLong() and 0xffff_ffffL
+            if (payloadLength > MAX_PAYLOAD_SIZE) {
+                throw ParseException("PAYLOAD_TOO_LARGE", "OCB2 payload exceeds canonical limit")
+            }
+            val total = HEADER_SIZE.toLong() + payloadLength
+            if (total > Int.MAX_VALUE || length.toLong() < total) return null
+            val totalInt = total.toInt()
+            val payload = bytes.copyOfRange(HEADER_SIZE.toInt(), totalInt)
+            val remaining = length - totalInt
+            if (remaining > 0) bytes.copyInto(bytes, 0, totalInt, length)
+            length = remaining
+            return Record(type, flags, sequence, captureTimestampNs, encoderTimestampUs, payload)
+        }
+
+        private fun ensureCapacity(required: Int) {
+            if (required <= bytes.size) return
+            var capacity = bytes.size.coerceAtLeast(1)
+            while (capacity < required) capacity = (capacity * 2).coerceAtLeast(required)
+            bytes = bytes.copyOf(capacity)
+        }
+    }
+
     fun record(
         type: Short,
         flags: Int,
