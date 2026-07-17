@@ -1,7 +1,10 @@
 use serde::Serialize;
 use std::env;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
+
+use crate::winproc::CREATE_NO_WINDOW;
 
 fn get_adb_path() -> String {
     if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
@@ -27,6 +30,7 @@ pub struct AdbDevice {
 fn authorized_devices(adb: &str) -> Result<Vec<AdbDevice>, String> {
     let output = Command::new(adb)
         .args(["devices", "-l"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("Failed to list ADB devices: {e}"))?;
     if !output.status.success() {
@@ -78,6 +82,7 @@ pub fn get_adb_status() -> Result<String, String> {
     let adb = get_adb_path();
     let output = Command::new(adb)
         .arg("--version")
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("Failed to execute adb: {}", e))?;
 
@@ -103,6 +108,7 @@ pub fn forward_port(port: u16, serial: Option<String>) -> Result<String, String>
     cmd.args(["-s", &serial]);
     let output = cmd
         .args(["forward", &port_str, &port_str])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("Failed to execute adb: {}", e))?;
 
@@ -124,6 +130,7 @@ pub fn remove_forwards(port: u16, serial: Option<String>) -> Result<String, Stri
     // forwards owned by other tools (scrcpy, Android Studio, ...).
     let output = cmd
         .args(["forward", "--remove", &port_str])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("Failed to execute adb: {}", e))?;
 

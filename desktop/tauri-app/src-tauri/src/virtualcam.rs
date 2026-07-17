@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
 use std::io::{BufRead, BufReader};
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicBool;
@@ -11,6 +12,7 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 
 use crate::sync_state::RecoverMutex;
+use crate::winproc::CREATE_NO_WINDOW;
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub struct VirtualCamMetrics {
@@ -190,6 +192,31 @@ fn complete_pipeline_ready(
     producer_ready && host_running && host_activated && registered
 }
 
+/// How a producer process exit should be surfaced to the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProducerExitKind {
+    /// Terminated by a console/Ctrl control event (`STATUS_CONTROL_C_EXIT`,
+    /// `0xC000013A`). This is a managed teardown, never a producer-reported
+    /// failure, so it must not become a persistent `FAILED`/`Last Error`.
+    Benign,
+    /// The producer died on its own for an unknown reason (a real crash).
+    Unexpected,
+}
+
+/// Classify a *self-observed* producer exit. Intentional stop/restart paths take
+/// the child handle before killing it, so they never reach this classifier; it
+/// only guards exits the status poll observes while the handle is still owned.
+/// The producer reports genuine failures via structured stdout events, so the
+/// raw exit code alone is only ever used to reject benign terminations.
+fn classify_producer_exit(exit_code: Option<i32>) -> ProducerExitKind {
+    match exit_code {
+        // STATUS_CONTROL_C_EXIT — the process was terminated by a console
+        // control event, not an internal producer failure.
+        Some(code) if code as u32 == 0xC000_013A => ProducerExitKind::Benign,
+        _ => ProducerExitKind::Unexpected,
+    }
+}
+
 fn repository_root() -> PathBuf {
     let mut root = std::env::current_dir().unwrap_or_default();
     while !root.join("windows").exists() && root.parent().is_some() {
@@ -221,6 +248,7 @@ fn run_installer_command(argument: &str) -> Result<String, String> {
     }
     let output = Command::new(&installer)
         .arg(argument)
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("Failed to launch {}: {error}", installer.display()))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -478,6 +506,7 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
         .arg("host")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| {
             let msg = format!("Failed to start virtual camera host: {}", e);
@@ -668,7 +697,12 @@ pub fn start_virtual_camera_feeder(
         cmd.get_args().collect::<Vec<_>>()
     );
 
-    let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+    let mut child = match cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    {
         Ok(c) => c,
         Err(e) => {
             println!(">>> [Tauri] Spawn failed: {}", e);
@@ -827,15 +861,33 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
     if let Some(child) = child_guard.as_mut() {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Process exited
-                let mut err_guard = state.last_error.lock_recover();
-                let current_err = err_guard.clone().unwrap_or_default();
-                if !current_err.contains(&status.to_string()) {
-                    *err_guard = Some(format!("Exited with {}. {}", status, current_err));
+                // Process exited on its own while we still held the handle.
+                match classify_producer_exit(status.code()) {
+                    ProducerExitKind::Benign => {
+                        // A console-control teardown is not a crash. Drop any
+                        // stale exit error so it does not linger as "Last Error",
+                        // and report a clean STOPPED rather than FAILED.
+                        let mut err_guard = state.last_error.lock_recover();
+                        if err_guard
+                            .as_deref()
+                            .is_some_and(|error| error.contains("xited"))
+                        {
+                            *err_guard = None;
+                        }
+                        *state.producer_state.lock_recover() = "STOPPED".to_string();
+                    }
+                    ProducerExitKind::Unexpected => {
+                        // Keep any structured error the producer already reported
+                        // (the real reason); only synthesize one if none exists.
+                        let mut err_guard = state.last_error.lock_recover();
+                        if err_guard.as_deref().unwrap_or_default().is_empty() {
+                            *err_guard = Some(format!("Producer exited unexpectedly: {status}"));
+                        }
+                        *state.producer_state.lock_recover() = "FAILED".to_string();
+                    }
                 }
                 *state.metrics.lock_recover() = None;
                 *state.last_metrics_time.lock_recover() = None;
-                *state.producer_state.lock_recover() = "FAILED".to_string();
             }
             Ok(None) => {
                 // Still running
@@ -940,7 +992,30 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
 
 #[cfg(test)]
 mod tests {
-    use super::{binary_identity_mismatches, complete_pipeline_ready};
+    use super::{
+        binary_identity_mismatches, classify_producer_exit, complete_pipeline_ready,
+        ProducerExitKind,
+    };
+
+    #[test]
+    fn console_control_exit_is_benign_not_a_crash() {
+        // 0xC000013A (STATUS_CONTROL_C_EXIT) as an i32 exit code.
+        let control_c = 0xC000_013Au32 as i32;
+        assert_eq!(
+            classify_producer_exit(Some(control_c)),
+            ProducerExitKind::Benign
+        );
+        // Any other exit (a real crash, or an unknown code) is unexpected.
+        assert_eq!(
+            classify_producer_exit(Some(1)),
+            ProducerExitKind::Unexpected
+        );
+        assert_eq!(
+            classify_producer_exit(Some(-1073741819)), // 0xC0000005 access violation
+            ProducerExitKind::Unexpected
+        );
+        assert_eq!(classify_producer_exit(None), ProducerExitKind::Unexpected);
+    }
 
     #[test]
     fn complete_readiness_requires_host_activation_and_registration() {
