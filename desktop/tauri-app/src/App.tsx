@@ -357,7 +357,7 @@ export default function App() {
   }
 
   const stateClass = serverStatus?.lifecycleState?.toLowerCase() || 'stopped';
-  const isError = serverStatus?.lifecycleState === 'ERROR' || serverStatus?.lifecycleState === 'OFFLINE';
+  const isError = serverStatus?.lifecycleState === 'FAILED' || serverStatus?.lifecycleState === 'OFFLINE';
   const transportLabel = token ? 'LAN' : 'USB';
 
   if (obsMode) {

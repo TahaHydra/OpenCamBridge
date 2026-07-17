@@ -18,7 +18,9 @@ data class PipelineResult(
     val message: String,
     val revision: Long,
     val generation: Long,
-    val lifecycleState: String
+    val lifecycleState: String,
+    val requested: String? = null,
+    val alternatives: List<String> = emptyList()
 ) {
     val success: Boolean get() = code == PipelineResultCode.OK
 }
@@ -47,7 +49,10 @@ class PipelineController(
     scope: CoroutineScope,
     private val handle: suspend (PipelineCommand) -> PipelineResult
 ) {
-    private val commands = Channel<PipelineCommand>(Channel.UNLIMITED)
+    // Rendezvous keeps lifecycle/control queue depth at zero: each producer
+    // hands one command directly to the sole owner and then awaits completion.
+    // This prevents a burst of stale reconfiguration commands accumulating.
+    private val commands = Channel<PipelineCommand>(Channel.RENDEZVOUS)
     private val actor = scope.launch {
         for (command in commands) {
             try {

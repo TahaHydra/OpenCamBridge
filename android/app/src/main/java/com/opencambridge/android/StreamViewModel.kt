@@ -131,24 +131,26 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
         viewModelScope.launch {
             while (true) {
-                _isStreaming.value = StreamState.streaming.get()
-                _lifecycleState.value = StreamState.lifecycleState.get().name
+                val config = StreamState.currentConfig()
+                val lifecycle = StreamState.lifecycleState.get()
+                _isStreaming.value = lifecycle == com.opencambridge.android.state.LifecycleState.STREAMING
+                _lifecycleState.value = lifecycle.name
                 _lastError.value = StreamState.lastError.get()
                 _wifiIp.value = NetworkUtils.getWifiIpAddress(getApplication())
-                _selectedCameraId.value = StreamState.cameraId.get()
-                _width.value = StreamState.width.get()
-                _height.value = StreamState.height.get()
+                _selectedCameraId.value = config.cameraId
+                _width.value = config.width
+                _height.value = config.height
                 _frameWidth.value = StreamState.frameWidth.get()
                 _frameHeight.value = StreamState.frameHeight.get()
-                _fps.value = StreamState.fps.get()
-                _jpegQuality.value = StreamState.jpegQuality.get()
-                _previewFitMode.value = StreamState.previewFitMode.get()
-                _aspectRatio.value = StreamState.aspectRatio.get()
-                _zoomSpeed.value = StreamState.zoomSpeed.get()
-                _displayRotation.value = StreamState.displayRotation.get()
-                _mirror.value = StreamState.mirror.get()
-                _streamMode.value = StreamState.streamMode.get()
-                _localPreviewEnabled.value = StreamState.localPreviewEnabled.get()
+                _fps.value = config.fps
+                _jpegQuality.value = config.jpegQuality
+                _previewFitMode.value = config.previewFitMode
+                _aspectRatio.value = config.aspectRatio
+                _zoomSpeed.value = config.zoomSpeed
+                _displayRotation.value = config.displayRotation
+                _mirror.value = config.mirror
+                _streamMode.value = config.streamMode
+                _localPreviewEnabled.value = config.localPreviewEnabled
                 _rebindInProgress.value = StreamState.rebindInProgress.get()
                 _torchEnabled.value = StreamState.torchEnabled.get()
                 _hasTorch.value = StreamState.hasTorch.get()
@@ -156,9 +158,9 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 _rotationDegrees.value = StreamState.rotationDegrees.get()
                 _actualFps.value = StreamState.actualFps.get()
                 _developerMode.value = StreamState.developerMode.get()
-                _accessMode.value = StreamState.accessMode.get()
-                _port.value = StreamState.port.get()
-                _accessToken.value = StreamState.accessToken.get()
+                _accessMode.value = config.accessMode
+                _port.value = config.port
+                _accessToken.value = config.accessToken
                 _logs.value = com.opencambridge.android.state.AppLogger.getLogs()
                 delay(500)
             }
@@ -174,7 +176,16 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setCamera2PreviewSurface(surface: android.view.Surface?) {
         StreamState.camera2PreviewSurface.set(surface)
-        ServiceBridge.previewSurfaceChanged?.invoke(surface?.isValid == true)
+        val handler = ServiceBridge.previewSurfaceChanged ?: return
+        viewModelScope.launch {
+            try {
+                val result = handler(surface?.isValid == true)
+                if (!result.success) _controlError.value = result.message
+            } catch (e: Exception) {
+                AppLogger.e("Control", "Preview surface change failed: ${e.javaClass.simpleName}: ${e.message}")
+                _controlError.value = "Preview update failed: ${e.javaClass.simpleName}"
+            }
+        }
     }
 
     fun toggleLocalPreview(enabled: Boolean) {
@@ -235,57 +246,57 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun stopStream() {
-        ServiceBridge.stopCamera?.invoke()
+        submitPipelineControl("Stop stream", ServiceBridge.stopCamera)
     }
 
     fun startStream() {
         // If the service is running, ask it to start the camera pipeline; the
         // initial service launch itself is handled by MainActivity.
-        ServiceBridge.startCamera?.invoke()
+        submitPipelineControl("Start stream", ServiceBridge.startCamera)
     }
 
     /**
-     * Applies a settings patch IN-PROCESS via the running service (no loopback
-     * HTTP — that's what caused IOExceptions on slow devices). If the service is
-     * not running yet, persist locally so the change takes effect at next start.
-     * The HTTP API remains for desktop/web/remote clients.
+     * Applies a settings patch IN-PROCESS via the same serialized controller as
+     * HTTP clients and awaits its authoritative result. There is intentionally
+     * no second local mutation path: while the service is starting, controls
+     * report that state and the user can retry after the controller is ready.
      */
     private fun controlPatch(req: UpdateSettingsRequest) {
-        val h = ServiceBridge.applyPatch
-        try {
-            if (h != null) h(req, "phone") else persistPatchLocally(req)
-        } catch (e: Exception) {
-            AppLogger.e("Control", "Apply failed: ${e.javaClass.simpleName}: ${e.message}")
-            _controlError.value = "Action failed: ${e.javaClass.simpleName}"
+        val handler = ServiceBridge.applyPatch
+        if (handler == null) {
+            _controlError.value = "Streaming service is starting; try again"
+            return
+        }
+        viewModelScope.launch {
+            try {
+                val result = handler(req, "phone")
+                if (!result.success) {
+                    AppLogger.w("Control", "Settings rejected: ${result.message}")
+                    _controlError.value = result.message
+                }
+            } catch (e: Exception) {
+                AppLogger.e("Control", "Apply failed: ${e.javaClass.simpleName}: ${e.message}")
+                _controlError.value = "Action failed: ${e.javaClass.simpleName}"
+            }
         }
     }
 
-    /** Fallback used when the service is not running: persist to StreamState +
-     *  SharedPreferences so settings take effect on the next stream start. */
-    private fun persistPatchLocally(req: UpdateSettingsRequest) {
-        req.cameraId?.let { StreamState.cameraId.set(it) }
-        req.width?.let { StreamState.width.set(it) }
-        req.height?.let { StreamState.height.set(it) }
-        req.outputWidth?.let { StreamState.outputWidth.set(it) }
-        req.outputHeight?.let { StreamState.outputHeight.set(it) }
-        req.profile?.let { StreamState.profile.set(it) }
-        req.fps?.takeIf {
-            val mode = req.streamMode ?: StreamState.streamMode.get()
-            it == 30 || it == 60 || (mode == "mjpeg" && it == 15)
-        }?.let { StreamState.fps.set(it) }
-        req.jpegQuality?.let { StreamState.jpegQuality.set(it.coerceIn(1, 100)) }
-        req.previewFitMode?.let { StreamState.previewFitMode.set(it) }
-        req.aspectRatio?.let { StreamState.aspectRatio.set(it) }
-        req.zoomSpeed?.let { StreamState.zoomSpeed.set(it) }
-        req.displayRotation?.let { StreamState.displayRotation.set(it) }
-        req.mirror?.let { StreamState.mirror.set(it) }
-        req.streamMode?.let { StreamState.streamMode.set(it) }
-        (req.phonePreviewEnabled ?: req.localPreviewEnabled)?.let { StreamState.localPreviewEnabled.set(it) }
-        req.accessMode?.let { StreamState.accessMode.set(it) }
-        req.port?.let { StreamState.port.set(it) }
-        req.accessToken?.let { StreamState.accessToken.set(it) }
-        StreamState.refreshConfigSnapshotFromLegacy()
-        settingsManager.save()
-        StreamState.incrementRevision("phone")
+    private fun submitPipelineControl(
+        label: String,
+        handler: (suspend () -> com.opencambridge.android.service.PipelineResult)?
+    ) {
+        if (handler == null) {
+            _controlError.value = "Streaming service is starting; try again"
+            return
+        }
+        viewModelScope.launch {
+            try {
+                val result = handler()
+                if (!result.success) _controlError.value = result.message
+            } catch (e: Exception) {
+                AppLogger.e("Control", "$label failed: ${e.javaClass.simpleName}: ${e.message}")
+                _controlError.value = "$label failed: ${e.javaClass.simpleName}"
+            }
+        }
     }
 }

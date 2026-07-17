@@ -85,10 +85,10 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
   }, []);
 
   // Human-readable state for the overlay.
-  const rebinding = lifecycle === 'STARTING' || lifecycle === 'REBINDING';
+  const rebinding = lifecycle === 'STARTING' || lifecycle === 'RECONFIGURING' || lifecycle === 'RECOVERING';
   const stopped = lifecycle === 'STOPPED' || lifecycle === 'STOPPING';
   const offline = lifecycle === 'OFFLINE' || lifecycle === 'UNKNOWN';
-  const cameraError = lifecycle === 'ERROR';
+  const cameraError = lifecycle === 'FAILED';
   const statusMsg = offline ? 'Android server unreachable'
     : cameraError ? 'Camera error — check the phone Logs tab'
     : stopped ? 'Camera stopped'

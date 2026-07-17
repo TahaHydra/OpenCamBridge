@@ -18,4 +18,9 @@ internal object CapturePathPolicy {
                 it != requested && (requested.fps > 30 || it.fps <= 30)
             }
         }
+
+    /** MJPEG remains compatibility-only and uses the regular CameraX analysis
+     * path. Never expose 60 unless that exact camera/size path reports it. */
+    fun selectableMjpegFps(maxRegularFps: Int): List<Int> =
+        listOf(15, 30, 60).filter { it <= maxRegularFps }
 }

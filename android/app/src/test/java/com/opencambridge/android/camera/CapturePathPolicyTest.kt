@@ -31,4 +31,14 @@ class CapturePathPolicyTest {
         val requested = H264ModeDto(1920, 1080, 60)
         assertEquals(H264Capabilities.preferredModes, CapturePathPolicy.adaptiveModes(requested, H264Capabilities.preferredModes))
     }
+
+    @Test
+    fun mjpegNeverAdvertisesSixtyOnAThirtyFpsPath() {
+        assertEquals(listOf(15, 30), CapturePathPolicy.selectableMjpegFps(30))
+    }
+
+    @Test
+    fun mjpegAdvertisesSixtyOnlyWhenTheRegularPathReportsIt() {
+        assertEquals(listOf(15, 30, 60), CapturePathPolicy.selectableMjpegFps(60))
+    }
 }

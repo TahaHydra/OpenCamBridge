@@ -11,6 +11,7 @@ import com.opencambridge.android.service.PipelineResult
 import com.opencambridge.android.service.PipelineResultCode
 import com.opencambridge.android.state.SettingsManager
 import com.opencambridge.android.state.StreamState
+import com.opencambridge.android.state.StreamStatusDto
 import com.opencambridge.android.state.AppLogger
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -472,7 +473,7 @@ class ControlServer(
                                 <p id="preview-overlay-text">Camera is Offline</p>
                                 <button class="refresh-btn" onclick="fetchStatus()">Refresh Stream</button>
                             </div>
-                            <span id="preview-rebind-warning" style="display:none; position:absolute; top:16px; left:16px; background:rgba(255,165,0,0.8); color:#000; padding:4px 8px; border-radius:4px; font-size:0.8rem; z-index:20; font-weight:bold;">REBINDING...</span>
+                            <span id="preview-rebind-warning" style="display:none; position:absolute; top:16px; left:16px; background:rgba(255,165,0,0.8); color:#000; padding:4px 8px; border-radius:4px; font-size:0.8rem; z-index:20; font-weight:bold;">RECONFIGURING...</span>
                             <button class="manual-refresh-btn" onclick="reloadPreviewImage()">Reload Image</button>
                             <div id="stream-rotator" class="stream-rotator">
                                 <img id="stream-img" class="stream-img fit-contain" src="" alt="Live Stream">
@@ -804,7 +805,7 @@ class ControlServer(
                             document.getElementById('preview-rebind-warning').style.display = 'none';
                         }
 
-                        if (currentLifecycleState !== 'STREAMING' && currentLifecycleState !== 'REBINDING') {
+                        if (currentLifecycleState !== 'STREAMING' && currentLifecycleState !== 'RECONFIGURING' && currentLifecycleState !== 'RECOVERING') {
                             document.getElementById('preview-overlay-text').textContent = 'Camera is Offline';
                             document.getElementById('offline-overlay').style.display = 'flex';
                             document.getElementById('stream-img').style.opacity = '0.3';
@@ -1170,7 +1171,17 @@ class ControlServer(
                 message = result.message,
                 revision = result.revision,
                 generation = result.generation,
-                lifecycleState = result.lifecycleState
+                lifecycleState = result.lifecycleState,
+                code = result.code.name,
+                error = when (result.code) {
+                    PipelineResultCode.OK -> null
+                    PipelineResultCode.CONFLICT -> "Revision conflict"
+                    PipelineResultCode.UNPROCESSABLE -> "Unsupported mode"
+                    PipelineResultCode.FAILED -> "Pipeline failure"
+                },
+                requested = result.requested,
+                alternatives = result.alternatives,
+                authoritativeState = StreamState.toStatusDto()
             )
         )
     }
@@ -1234,13 +1245,13 @@ class ControlServer(
                 val targetFps = StreamState.fps.get().coerceIn(1, 120)
                 val minIntervalMs = 1000L / targetFps
 
-                // Survive transient states (STARTING/REBINDING) so clients don't have
+                // Survive transient states so clients don't have
                 // to reconnect on every settings change; only end the stream when the
                 // camera is actually going away.
                 val lifecycle = StreamState.lifecycleState.get()
                 if (lifecycle == com.opencambridge.android.state.LifecycleState.STOPPING ||
                     lifecycle == com.opencambridge.android.state.LifecycleState.STOPPED ||
-                    lifecycle == com.opencambridge.android.state.LifecycleState.ERROR
+                    lifecycle == com.opencambridge.android.state.LifecycleState.FAILED
                 ) break
 
                 val currentRev = StreamState.latestFrameRevision.get()
@@ -1292,7 +1303,7 @@ class ControlServer(
                     if (!currentCoroutineContext().isActive ||
                         lifecycle == com.opencambridge.android.state.LifecycleState.STOPPING ||
                         lifecycle == com.opencambridge.android.state.LifecycleState.STOPPED ||
-                        lifecycle == com.opencambridge.android.state.LifecycleState.ERROR
+                        lifecycle == com.opencambridge.android.state.LifecycleState.FAILED
                     ) break
                     writeFully(frame)
                     flush()
@@ -1416,7 +1427,14 @@ data class PipelineResultDto(
     val message: String,
     val revision: Long,
     val generation: Long,
-    val lifecycleState: String
+    val lifecycleState: String,
+    val code: String,
+    val error: String?,
+    val requested: String?,
+    val alternatives: List<String>,
+    /** Returned for success, 409, 422, and failure so clients can immediately
+     * replace local state with the authoritative desired/selected/actual view. */
+    val authoritativeState: StreamStatusDto
 )
 
 @Serializable
