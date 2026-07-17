@@ -97,6 +97,14 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     val controlError: StateFlow<String?> = _controlError.asStateFlow()
     fun clearControlError() { _controlError.value = null }
 
+    // Foreground-service launch errors need a retry action, unlike ordinary
+    // transient control errors. MainActivity owns the actual retry because it
+    // must re-run the Android permission/startForegroundService boundary.
+    private val _serviceStartError = MutableStateFlow<String?>(null)
+    val serviceStartError: StateFlow<String?> = _serviceStartError.asStateFlow()
+    fun reportServiceStartFailure(message: String) { _serviceStartError.value = message }
+    fun clearServiceStartError() { _serviceStartError.value = null }
+
     // Preview / Controls
     private val _localPreviewEnabled = MutableStateFlow(false)
     val localPreviewEnabled: StateFlow<Boolean> = _localPreviewEnabled.asStateFlow()

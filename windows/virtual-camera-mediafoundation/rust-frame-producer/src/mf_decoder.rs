@@ -12,6 +12,17 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 
+use crate::ocb2::MAX_PAYLOAD;
+
+fn validate_access_unit_size(size: usize) -> Result<(), String> {
+    if size > MAX_PAYLOAD {
+        return Err(format!(
+            "H.264 access unit exceeds OCB2 MAX_PAYLOAD: {size} > {MAX_PAYLOAD}"
+        ));
+    }
+    Ok(())
+}
+
 pub struct DecodedNv12<'a> {
     pub bytes: &'a [u8],
     pub width: u32,
@@ -222,9 +233,12 @@ impl MfH264Decoder {
     where
         F: FnMut(DecodedNv12<'_>),
     {
+        // The decoder is a trust boundary of its own. Do not rely on every
+        // caller having passed the access unit through the OCB2 parser first.
+        validate_access_unit_size(access_unit.len())?;
         unsafe {
             if access_unit.len() > self.input_capacity {
-                let capacity = access_unit.len().next_power_of_two().min(16 * 1024 * 1024);
+                let capacity = access_unit.len().next_power_of_two().min(MAX_PAYLOAD);
                 let (sample, buffer) = make_input_sample(capacity as u32)?;
                 self.input_sample = sample;
                 self.input_buffer = buffer;
@@ -384,6 +398,24 @@ impl MfH264Decoder {
         };
         let _ = buffer.Unlock();
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_access_unit_size;
+    use crate::ocb2::MAX_PAYLOAD;
+
+    #[test]
+    fn access_unit_at_canonical_limit_is_accepted() {
+        assert!(validate_access_unit_size(MAX_PAYLOAD).is_ok());
+    }
+
+    #[test]
+    fn access_unit_over_canonical_limit_is_rejected() {
+        let error = validate_access_unit_size(MAX_PAYLOAD + 1).unwrap_err();
+        assert!(error.contains("exceeds OCB2 MAX_PAYLOAD"));
+        assert!(error.contains(&(MAX_PAYLOAD + 1).to_string()));
     }
 }
 

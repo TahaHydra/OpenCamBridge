@@ -438,7 +438,6 @@ namespace winrt::WindowsSample::implementation
         return S_OK;
     }
 
-    _Requires_lock_held_(m_Lock)
     HRESULT SimpleMediaStream::Stop(_In_ bool bSendEvent)
     {
         winrt::slim_lock_guard lock(m_Lock);

@@ -45,7 +45,9 @@ import androidx.core.content.ContextCompat
 import com.opencambridge.android.camera.CameraInfoDto
 import com.opencambridge.android.camera.CapturePathPolicy
 import com.opencambridge.android.service.StreamService
+import com.opencambridge.android.state.AppLogger
 import com.opencambridge.android.state.LogEntry
+import com.opencambridge.android.state.StreamState
 import kotlin.math.roundToInt
 import kotlin.math.max
 import kotlin.math.min
@@ -212,6 +214,7 @@ class MainActivity : ComponentActivity() {
                     streamMode = streamMode,
                     logs = logs,
                     onStartStop = { if (isStreaming) viewModel.stopStream() else requestPermissionsAndStart() },
+                    onRetryStreamStart = { requestPermissionsAndStart() },
                     onCameraSelect = { viewModel.selectCamera(it) },
                     onResolutionSelect = { w, h -> viewModel.updateResolution(w, h) },
                     onFpsSelect = { viewModel.updateFps(it) },
@@ -256,6 +259,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startStreamService() {
+        viewModel.clearServiceStartError()
         val intent = StreamService.startIntent(this)
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -264,7 +268,14 @@ class MainActivity : ComponentActivity() {
                 startService(intent)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start StreamService", e)
+            // Keep the original Throwable/stack in logcat for engineering
+            // diagnosis. App/UI state receives a deliberately sanitized
+            // message so an exception cannot leak intent extras or secrets.
+            val safeMessage = "Unable to start the camera service (${e.javaClass.simpleName})."
+            Log.e(TAG, safeMessage, e)
+            AppLogger.e("System", safeMessage)
+            StreamState.lastError.set(safeMessage)
+            viewModel.reportServiceStartFailure(safeMessage)
         }
     }
 
@@ -333,6 +344,7 @@ fun MainScreen(
     streamMode: String,
     logs: List<LogEntry>,
     onStartStop: () -> Unit,
+    onRetryStreamStart: () -> Unit,
     onCameraSelect: (String) -> Unit,
     onResolutionSelect: (Int, Int) -> Unit,
     onFpsSelect: (Int) -> Unit,
@@ -360,10 +372,25 @@ fun MainScreen(
     // button that silently failed is visible, not buried in the Logs tab.
     val snackbarHostState = remember { SnackbarHostState() }
     val controlError by viewModel.controlError.collectAsState()
+    val serviceStartError by viewModel.serviceStartError.collectAsState()
     LaunchedEffect(controlError) {
         controlError?.let {
             snackbarHostState.showSnackbar(it)
             viewModel.clearControlError()
+        }
+    }
+    LaunchedEffect(serviceStartError) {
+        serviceStartError?.let { message ->
+            val result = snackbarHostState.showSnackbar(
+                message = message,
+                actionLabel = "Retry",
+                withDismissAction = true,
+                duration = SnackbarDuration.Indefinite
+            )
+            viewModel.clearServiceStartError()
+            if (result == SnackbarResult.ActionPerformed) {
+                onRetryStreamStart()
+            }
         }
     }
 
