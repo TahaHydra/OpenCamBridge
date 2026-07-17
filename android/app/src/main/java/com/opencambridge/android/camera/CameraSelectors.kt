@@ -2,6 +2,7 @@ package com.opencambridge.android.camera
 
 import android.util.Log
 import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
 
 /**
@@ -14,6 +15,7 @@ import androidx.camera.core.CameraSelector
  * filter falls back to the full camera list so binding still succeeds with the
  * device default instead of throwing.
  */
+@androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
 object CameraSelectors {
 
     fun forCameraId(cameraId: String): CameraSelector =

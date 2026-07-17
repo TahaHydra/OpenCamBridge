@@ -3,6 +3,7 @@ package com.opencambridge.android.camera
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -31,6 +32,7 @@ import kotlin.coroutines.suspendCoroutine
  * Opens the camera via CameraX ImageAnalysis and optional Preview.
  * Safely handles configuration changes using a Mutex.
  */
+@androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
 class MjpegStreamer(
     private val context: Context,
     private val lifecycleOwner: LifecycleOwner
