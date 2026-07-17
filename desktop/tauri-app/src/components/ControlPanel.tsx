@@ -513,7 +513,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         `androidFps=${am?.actualFps ?? '?'}`,
         // Android per-stage profiling (ms): YUV->NV21, rotate, JPEG encode, total.
         am ? `android[yuv=${(am.yuvMsAvg ?? 0).toFixed?.(1) ?? am.yuvMsAvg} rot=${(am.rotateMsAvg ?? 0).toFixed?.(1) ?? am.rotateMsAvg} jpeg=${(am.jpegMsAvg ?? 0).toFixed?.(1) ?? am.jpegMsAvg} enc=${(am.androidEncodeMsAvg ?? 0).toFixed?.(1) ?? am.androidEncodeMsAvg}]` : '',
-        m ? `prodIn=${m.decoded_fps} prodOut=${m.written_fps}` : 'prod=off (producer not started — OBS is not receiving frames)',
+        // recv = JPEGs the producer pulled off the wire; written = distinct
+        // frames it published to the ring. recv >> written means the producer
+        // is the bottleneck (starved/too slow), not the phone or the transport.
+        m ? `recv=${m.http_jpeg_fps} decoded=${m.decoded_fps} written=${m.written_fps} paceFps=${m.fps_target}` : 'prod=off (producer not started — OBS is not receiving frames)',
         // Producer per-stage profiling (ms) + which optimized paths ran.
         m ? `prod[decode=${m.decode_ms_avg}(${m.decode_backend ?? '?'}) rot=${m.rotate_ms_avg} resize=${m.resize_ms_avg}(${m.resize_backend ?? '?'}) write=${m.write_ms_avg}]` : '',
         m ? `mbps=${m.estimated_mbps} lat=${m.total_pipeline_ms}ms drop=${m.dropped_jpegs} q=${m.jpeg_queue_len}` : '',
