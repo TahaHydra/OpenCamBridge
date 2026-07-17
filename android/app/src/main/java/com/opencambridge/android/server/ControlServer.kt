@@ -80,15 +80,15 @@ class ControlServer(
      * disable authentication for everyone while the server is still LAN-reachable.
      */
     @Volatile
-    private var boundLan: Boolean = false
+    private var boundAuthentication = BoundAuthenticationSnapshot("usbOnly", null)
 
     fun start() {
         val port = StreamState.port.get()
         val accessMode = StreamState.accessMode.get()
-        boundLan = accessMode != "usbOnly"
-        val host = if (boundLan) "0.0.0.0" else "127.0.0.1"
+        boundAuthentication = BoundAuthenticationSnapshot(accessMode, StreamState.accessToken.get())
+        val host = if (boundAuthentication.requiresToken) "0.0.0.0" else "127.0.0.1"
 
-        if (boundLan) {
+        if (boundAuthentication.requiresToken) {
             AppLogger.w("Security", "LAN access mode ($accessMode) is active. Requiring token for all endpoints except /health.")
         }
 
@@ -106,9 +106,9 @@ class ControlServer(
                 // The phone web UI and the /obs page are same-origin. Allowing any
                 // host would let arbitrary websites script requests against the
                 // camera server, so keep this list tight.
-                allowHost("tauri.localhost", schemes = listOf("http", "https"))
-                allowHost("localhost:1420", schemes = listOf("http", "https"))
-                allowHost("127.0.0.1:1420", schemes = listOf("http", "https"))
+                ControlServerSecurityPolicy.corsEndpoints.forEach { endpoint ->
+                    allowHost(endpoint.host, schemes = endpoint.schemes)
+                }
             }
             install(ContentNegotiation) {
                 json(Json { ignoreUnknownKeys = true })
@@ -116,11 +116,8 @@ class ControlServer(
             routing {
                 intercept(io.ktor.server.application.ApplicationCallPipeline.Plugins) {
                     val path = call.request.path()
-                    if (path == "/health") return@intercept
-
-                    if (boundLan) {
-                        val token = call.request.queryParameters["token"] ?: call.request.headers["X-OpenCamBridge-Token"]
-                        if (!tokenMatches(token)) {
+                    val token = call.request.queryParameters["token"] ?: call.request.headers["X-OpenCamBridge-Token"]
+                    if (!boundAuthentication.authorizes(path, token)) {
                             AppLogger.w("Security", "Rejected unauthorized request to $path")
                             if (call.request.accept()?.contains("text/html") == true || path == "/") {
                                 call.respondText("Unauthorized. Missing or invalid token.", ContentType.Text.Html, HttpStatusCode.Unauthorized)
@@ -130,7 +127,6 @@ class ControlServer(
                             finish()
                             return@intercept
                         }
-                    }
                 }
 
                 get("/")                           { serveIndex(call) }
@@ -182,26 +178,13 @@ class ControlServer(
         engine = null
     }
 
-    /** Constant-time token comparison. A null or empty expected token never matches on LAN. */
-    private fun tokenMatches(provided: String?): Boolean {
-        val expected = StreamState.accessToken.get()
-        if (provided == null || expected.isNullOrEmpty()) return false
-        return java.security.MessageDigest.isEqual(
-            provided.toByteArray(Charsets.UTF_8),
-            expected.toByteArray(Charsets.UTF_8)
-        )
-    }
-
     /**
      * True when the request originates from the device itself (phone UI) or an
      * adb-forwarded USB connection. Both appear as loopback on the phone.
      */
     private fun isLoopbackRequest(call: RoutingCall): Boolean = try {
-        val addr = call.request.origin.remoteAddress
-        addr == "127.0.0.1" || addr == "::1" || addr == "0:0:0:0:0:0:0:1" || addr == "localhost"
-    } catch (e: Throwable) {
-        false
-    }
+        ControlServerSecurityPolicy.isLoopback(call.request.origin.remoteAddress)
+    } catch (_: Throwable) { false }
 
     private suspend fun serveObs(call: RoutingCall) {
         val fit = call.request.queryParameters["fit"].takeIf { it == "contain" || it == "cover" } ?: "cover"
@@ -805,7 +788,6 @@ class ControlServer(
                         if (start && (bytes[start] & 31) === 7 && start + 3 < bytes.length) {
                             return 'avc1.' + [bytes[start+1], bytes[start+2], bytes[start+3]]
                                 .map(v => v.toString(16).padStart(2, '0')).join('').toUpperCase();
-                        }
                     }
                     return 'avc1.42E01E';
                 }
