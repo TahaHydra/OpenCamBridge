@@ -10,10 +10,12 @@
 #define OCBR_VERSION 3
 #define OCBR_FORMAT_NV12 2
 #define OCBR_FORMAT_RGB32 3
-#define OCBR_ABI_HASH 0x4f43425200030090ULL
 #define OCBR_HEADER_SIZE 256
 #define OCBR_SLOT_HEADER_SIZE 128
 #define OCBR_SLOT_COUNT 3
+
+// ABI source of truth: protocol/ring-abi.schema.json. The generated C++
+// assertions below and the two Rust generated files must move together.
 
 #pragma pack(push, 8)
 struct OpenCamBridgeRingHeader {
@@ -74,11 +76,7 @@ struct OpenCamBridgeSlotHeader {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(OpenCamBridgeRingHeader) == OCBR_HEADER_SIZE, "OCB2 ring header layout changed");
-static_assert(sizeof(OpenCamBridgeSlotHeader) == OCBR_SLOT_HEADER_SIZE, "OCB2 slot header layout changed");
-static_assert(offsetof(OpenCamBridgeRingHeader, consumerAttached) == 80, "OCB ring diagnostics offset changed");
-static_assert(offsetof(OpenCamBridgeRingHeader, lastAcceptedSequence) == 144, "OCB ring sequence offset changed");
-static_assert(offsetof(OpenCamBridgeRingHeader, producerBuildHash) == 192, "OCB build identity offset changed");
+#include "RingAbi.generated.h"
 
 struct OpenCamBridgeFrameMetadata {
     uint64_t sequence = 0;

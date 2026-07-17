@@ -37,6 +37,7 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="RingAbi.generated.h" />
     <None Include="packages.config" />
     <None Include="PropertySheet.props" />
     <None Include="VirtualCameraMediaSource.def" />

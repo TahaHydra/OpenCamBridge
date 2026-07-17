@@ -17,16 +17,14 @@ use crate::sync_state::RecoverMutex;
 
 const OCBR_MAGIC: u32 = 0x5242_434f;
 const RING_VERSION: u16 = 3;
-const RING_ABI_HASH: u64 = 0x4f43_4252_0003_0090;
 const FORMAT_NV12: u32 = 2;
-const RING_HEADER_SIZE: usize = 256;
-const SLOT_HEADER_SIZE: usize = 128;
-const SLOT_COUNT: usize = 3;
 const MAX_NV12_SIZE: usize = 1920 * 1080 * 3 / 2;
 const SLOT_SIZE: usize = SLOT_HEADER_SIZE + MAX_NV12_SIZE;
 const MAPPING_SIZE: usize = RING_HEADER_SIZE + SLOT_COUNT * SLOT_SIZE;
 const PREVIEW_HEADER_SIZE: usize = 48;
 
+// ABI source of truth: protocol/ring-abi.schema.json. Compile-time generated
+// checks below bind every field type, size, and offset to C++ and the producer.
 #[repr(C)]
 struct RingHeader {
     magic: u32,
@@ -86,6 +84,8 @@ struct SlotHeader {
     reserved: [u64; 6],
     committed_epoch: u64,
 }
+
+include!("ring_abi_generated.rs");
 
 struct Mapping {
     file: Option<HANDLE>,
@@ -193,7 +193,10 @@ impl Mapping {
             || ring.slot_size as usize != SLOT_SIZE
             || ring.ring_abi_hash != RING_ABI_HASH
         {
-            Err("NV12 preview rejected incompatible ring ABI".to_string())
+            Err(format!(
+                "NV12 preview rejected incompatible ring ABI (layout {})",
+                &RING_ABI_LAYOUT_SHA256[..12]
+            ))
         } else {
             Ok(())
         }

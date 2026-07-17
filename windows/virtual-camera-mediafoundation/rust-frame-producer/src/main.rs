@@ -31,15 +31,13 @@ use windows::Win32::System::Performance::QueryPerformanceCounter;
 
 const OCBR_MAGIC: u32 = 0x5242434F; // "OCBR"
 const RING_VERSION: u16 = 3;
-const RING_ABI_HASH: u64 = 0x4f43_4252_0003_0090;
 const FORMAT_NV12: u32 = 2;
-const RING_HEADER_SIZE: usize = 256;
-const SLOT_HEADER_SIZE: usize = 128;
-const SLOT_COUNT: usize = 3;
 const MAX_NV12_SIZE: usize = 1920 * 1080 * 3 / 2;
 const SLOT_SIZE: usize = SLOT_HEADER_SIZE + MAX_NV12_SIZE;
 const MAX_SHM_SIZE: u32 = (RING_HEADER_SIZE + SLOT_COUNT * SLOT_SIZE) as u32;
 
+// ABI source of truth: protocol/ring-abi.schema.json. Compile-time generated
+// checks below bind every field type, size, and offset to the C++/Tauri views.
 #[repr(C)]
 struct OpenCamBridgeRingHeader {
     magic: u32,
@@ -99,6 +97,8 @@ struct OpenCamBridgeSlotHeader {
     reserved: [u64; 6],
     committed_epoch: u64,
 }
+
+include!("ring_abi_generated.rs");
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

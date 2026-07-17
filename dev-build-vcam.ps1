@@ -31,8 +31,13 @@ $targetDll = "$mfRoot\VirtualCamera_Installer\x64\Release\VirtualCameraMediaSour
 $builtInstaller = "$mfRoot\x64\Release\VirtualCamera_Installer.exe"
 $targetInstaller = "$mfRoot\VirtualCamera_Installer\x64\Release\VirtualCamera_Installer.exe"
 $sourceCommit = (& git -C $root rev-parse HEAD).Trim()
-$abiVersion = 3
-$abiHash = "0x4f43425200030090"
+$abiSchema = Get-Content "$root\protocol\ring-abi.schema.json" -Raw | ConvertFrom-Json
+$abiVersion = $abiSchema.version
+& "$root\protocol\generate-ring-abi.ps1" -Check
+if ($LASTEXITCODE -ne 0) { throw "Ring ABI generated-file validation failed" }
+$generatedAbi = Get-Content "$mfRoot\VirtualCameraMediaSource\RingAbi.generated.h" -Raw
+if ($generatedAbi -notmatch '#define OCBR_ABI_HASH (0x[0-9a-f]+)ULL') { throw "Generated ring ABI fingerprint is missing" }
+$abiHash = $Matches[1]
 
 Write-Host "Source commit: $sourceCommit" -ForegroundColor Cyan
 Write-Host "Ring ABI: version=$abiVersion hash=$abiHash" -ForegroundColor Cyan
