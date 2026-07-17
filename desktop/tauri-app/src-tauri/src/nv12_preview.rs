@@ -1,6 +1,7 @@
 use std::ptr::copy_nonoverlapping;
 use std::sync::atomic::{fence, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::ipc::Response;
 use windows::core::w;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
@@ -102,22 +103,16 @@ impl Drop for Mapping {
 
 impl Mapping {
     fn open() -> Result<Self, String> {
+        // Match producer and virtual-camera preference. The named global map is
+        // only a compatibility fallback when the service-safe file ring cannot
+        // be opened.
+        Self::open_file().or_else(|file_error| {
+            Self::open_global().map_err(|global_error| format!("{file_error}; {global_error}"))
+        })
+    }
+
+    fn open_file() -> Result<Self, String> {
         unsafe {
-            if let Ok(mapping) = OpenFileMappingW(
-                FILE_MAP_READ.0,
-                false,
-                w!("Global\\OpenCamBridgeFrameBuffer"),
-            ) {
-                let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, MAPPING_SIZE);
-                if !view.Value.is_null() {
-                    return Ok(Self {
-                        file: None,
-                        mapping,
-                        view,
-                    });
-                }
-                let _ = CloseHandle(mapping);
-            }
             let file = CreateFileW(
                 w!("C:\\ProgramData\\OpenCamBridge\\framebuffer.bin"),
                 GENERIC_READ.0,
@@ -148,19 +143,61 @@ impl Mapping {
         }
     }
 
+    fn open_global() -> Result<Self, String> {
+        unsafe {
+            let mapping = OpenFileMappingW(
+                FILE_MAP_READ.0,
+                false,
+                w!("Global\\OpenCamBridgeFrameBuffer"),
+            )
+            .map_err(|e| format!("NV12 global fallback mapping unavailable: {e}"))?;
+            let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, MAPPING_SIZE);
+            if view.Value.is_null() {
+                let _ = CloseHandle(mapping);
+                return Err("NV12 global fallback MapViewOfFile failed".into());
+            }
+            Ok(Self {
+                file: None,
+                mapping,
+                view,
+            })
+        }
+    }
+
+    fn progress(&self) -> Result<(u64, u64, [u8; 32]), String> {
+        unsafe {
+            let ring = &*(self.view.Value as *const RingHeader);
+            self.validate_header(ring)?;
+            if ring.producer_build_hash.iter().all(|value| *value == 0) {
+                return Err("NV12 preview rejected ring without producer build hash".into());
+            }
+            Ok((
+                ring.published_sequence.load(Ordering::Acquire),
+                ring.producer_heartbeat_qpc.load(Ordering::Acquire),
+                ring.producer_build_hash,
+            ))
+        }
+    }
+
+    fn validate_header(&self, ring: &RingHeader) -> Result<(), String> {
+        if ring.magic != OCBR_MAGIC
+            || ring.version != RING_VERSION
+            || ring.header_size as usize != RING_HEADER_SIZE
+            || ring.slot_count as usize != SLOT_COUNT
+            || ring.slot_size as usize != SLOT_SIZE
+            || ring.ring_abi_hash != RING_ABI_HASH
+        {
+            Err("NV12 preview rejected incompatible ring ABI".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
     fn read_latest(&self, after_sequence: u64) -> Result<Vec<u8>, String> {
         unsafe {
             let base = self.view.Value as *const u8;
             let ring = &*(base as *const RingHeader);
-            if ring.magic != OCBR_MAGIC
-                || ring.version != RING_VERSION
-                || ring.header_size as usize != RING_HEADER_SIZE
-                || ring.slot_count as usize != SLOT_COUNT
-                || ring.slot_size as usize != SLOT_SIZE
-                || ring.ring_abi_hash != RING_ABI_HASH
-            {
-                return Err("NV12 preview rejected incompatible ring ABI".to_string());
-            }
+            self.validate_header(ring)?;
             let published_sequence = ring.published_sequence.load(Ordering::Acquire);
             if published_sequence <= after_sequence {
                 return Ok(Vec::new());
@@ -242,13 +279,29 @@ impl Mapping {
 }
 
 pub struct Nv12PreviewReader {
-    mapping: Mutex<Option<Mapping>>,
+    state: Mutex<ReaderState>,
+}
+
+struct ReaderState {
+    mapping: Option<Mapping>,
+    producer_instance: u64,
+    producer_pid: Option<u32>,
+    last_sequence: u64,
+    last_heartbeat: u64,
+    last_progress: Instant,
 }
 
 impl Nv12PreviewReader {
     pub fn new() -> Self {
         Self {
-            mapping: Mutex::new(None),
+            state: Mutex::new(ReaderState {
+                mapping: None,
+                producer_instance: 0,
+                producer_pid: None,
+                last_sequence: 0,
+                last_heartbeat: 0,
+                last_progress: Instant::now(),
+            }),
         }
     }
 }
@@ -257,21 +310,60 @@ impl Nv12PreviewReader {
 pub fn get_nv12_preview_frame(
     after_sequence: u64,
     state: tauri::State<'_, Nv12PreviewReader>,
+    manager: tauri::State<'_, crate::virtualcam::VirtualCamManager>,
 ) -> Result<Response, String> {
-    let mut mapping = state
-        .mapping
+    let (producer_pid, producer_instance, producer_streaming, expected_build_hash) =
+        manager.preview_identity();
+    let mut reader = state
+        .state
         .lock()
         .map_err(|_| "NV12 preview lock poisoned")?;
-    if mapping.is_none() {
+    if reader.producer_instance != producer_instance || reader.producer_pid != producer_pid {
+        reader.mapping = None;
+        reader.producer_instance = producer_instance;
+        reader.producer_pid = producer_pid;
+        reader.last_sequence = 0;
+        reader.last_heartbeat = 0;
+        reader.last_progress = Instant::now();
+    }
+    if reader.mapping.is_none() {
         match Mapping::open() {
-            Ok(opened) => *mapping = Some(opened),
+            Ok(opened) => reader.mapping = Some(opened),
             Err(_) => return Ok(Response::new(Vec::new())),
         }
     }
-    match mapping.as_ref().unwrap().read_latest(after_sequence) {
+    let (sequence, heartbeat, build_hash) = match reader.mapping.as_ref().unwrap().progress() {
+        Ok(progress) => progress,
+        Err(error) => {
+            reader.mapping = None;
+            return Err(error);
+        }
+    };
+    if let Some(expected) = expected_build_hash.filter(|value| !value.is_empty()) {
+        let actual: String = build_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if !actual.eq_ignore_ascii_case(&expected) {
+            reader.mapping = None;
+            return Err("NV12 preview rejected ring from a different producer build".into());
+        }
+    }
+    if sequence != reader.last_sequence || heartbeat != reader.last_heartbeat {
+        reader.last_sequence = sequence;
+        reader.last_heartbeat = heartbeat;
+        reader.last_progress = Instant::now();
+    } else if producer_streaming && reader.last_progress.elapsed() >= Duration::from_secs(2) {
+        // A valid but stale fallback mapping is indistinguishable from a live
+        // ring unless both sequence and producer heartbeat are observed.
+        reader.mapping = None;
+        reader.last_progress = Instant::now();
+        return Ok(Response::new(Vec::new()));
+    }
+    match reader.mapping.as_ref().unwrap().read_latest(after_sequence) {
         Ok(bytes) => Ok(Response::new(bytes)),
         Err(error) => {
-            *mapping = None;
+            reader.mapping = None;
             Err(error)
         }
     }

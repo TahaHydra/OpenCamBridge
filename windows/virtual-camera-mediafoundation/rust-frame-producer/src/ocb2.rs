@@ -50,6 +50,26 @@ pub struct StreamInfo {
     pub encoder_name: String,
     pub hardware_encoder: bool,
     pub pixel_format: String,
+    #[serde(default)]
+    pub effective_rotation: u32,
+    #[serde(default)]
+    pub mirror: bool,
+    #[serde(default)]
+    pub sensor_orientation: u32,
+    #[serde(default)]
+    pub device_rotation: u32,
+}
+
+impl StreamInfo {
+    pub fn has_valid_transform(&self) -> bool {
+        [
+            self.effective_rotation,
+            self.sensor_orientation,
+            self.device_rotation,
+        ]
+        .iter()
+        .all(|value| matches!(value, 0 | 90 | 180 | 270))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -168,6 +188,16 @@ mod tests {
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(payload);
         out
+    }
+
+    #[test]
+    fn stream_info_transform_is_validated() {
+        let mut info: StreamInfo = serde_json::from_str(
+            r#"{"codec":"H264","framing":"annex-b-access-units","width":1280,"height":720,"fpsNumerator":60,"fpsDenominator":1,"bitrate":4000000,"cameraId":"0","encoderName":"test","hardwareEncoder":true,"pixelFormat":"NV12","effectiveRotation":270,"mirror":true,"sensorOrientation":90,"deviceRotation":180}"#
+        ).unwrap();
+        assert!(info.has_valid_transform());
+        info.effective_rotation = 45;
+        assert!(!info.has_valid_transform());
     }
 
     #[test]

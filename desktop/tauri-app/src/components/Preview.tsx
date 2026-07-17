@@ -147,7 +147,7 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
         </div>}
 
         {h264Primary ? (
-          <Nv12RingPreview fitMode={effectiveFit} mirror={mirror} />
+          <Nv12RingPreview fitMode={effectiveFit} />
         ) : showOverlay && (
           <div className="preview-overlay">
             {rebinding ? <RefreshCw size={48} opacity={0.6} className="animate-spin" /> : <CameraOff size={48} opacity={0.5} />}

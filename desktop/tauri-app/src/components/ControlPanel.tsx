@@ -38,7 +38,8 @@ interface VirtualCamMetrics {
   decode_backend?: string;
   resize_backend?: string;
   decoder_name?: string;
-  hardware_decoder?: boolean;
+  d3d11_output?: boolean;
+  hardware_decoder?: boolean | null;
   encoder_name?: string;
   hardware_encoder?: boolean;
   camera_id?: string;
@@ -222,18 +223,6 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   // poll overwrite the user's just-made selection with the pre-change server
   // value (which would make the desktop controls appear to "snap back").
   const isSyncingRef = useRef(false);
-  // After a local change, ignore incoming status merges until this time so a
-  // lagging phone status poll can't revert the value the user just set (the
-  // "I changed quality and had to reload the page for it to move" bug). The
-  // phone needs a beat to apply and report the new value.
-  const settleUntilRef = useRef(0);
-  const bumpSettle = () => { settleUntilRef.current = Date.now() + 2500; };
-  // Monotonic apply id. Each desktop settings POST carries the next value; the
-  // phone echoes the highest it has applied in status.appliedVersion. We refuse
-  // to merge stream-shaping fields from status until the phone has caught up to
-  // our latest apply — otherwise a slow CameraX rebind lets stale status snap
-  // the resolution/fps dropdowns back to the old value.
-  const localApplyVersionRef = useRef(0);
 
   const [obsPassword, setObsPassword] = useState('');
   const [obsMode, setObsMode] = useState<'browser' | 'window'>('browser');
@@ -281,26 +270,20 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   // version skew never hides a working torch.
   const torchSupported = activeCam ? activeCam.hasTorch !== false : false;
   const h264Modes: any[] = Array.isArray(activeCam?.h264Modes) ? activeCam.h264Modes : [];
-  const h264ModeFor = (w: number, h: number, fps: number) =>
-    h264Modes.some((m: any) => m.width === w && m.height === h && m.fps === fps);
+  const mjpegModes: any[] = Array.isArray(activeCam?.mjpegModes) ? activeCam.mjpegModes : [];
+  const activeModes = settings.streamMode === 'h264' ? h264Modes : mjpegModes;
   const fpsCapFor = (w: number, h: number): number => {
     if (settings.streamMode === 'h264') {
       return Math.max(0, ...h264Modes.filter((m: any) => m.width === w && m.height === h).map((m: any) => m.fps));
     }
-    const e = activeCam?.fpsByResolution?.find((r: any) => r.width === w && r.height === h);
-    return e ? e.maxFps : 0; // 0 = unknown (do not restrict)
+    return Math.max(0, ...mjpegModes.filter((m: any) => m.width === w && m.height === h).map((m: any) => m.fps));
   };
   const maxFpsHere = fpsCapFor(settings.width, settings.height);
-  const supports60 = settings.streamMode === 'h264' ? h264ModeFor(settings.width, settings.height, 60) : maxFpsHere === 0 || maxFpsHere >= 50;
-  const supports30 = settings.streamMode === 'h264' ? h264ModeFor(settings.width, settings.height, 30) : maxFpsHere === 0 || maxFpsHere >= 25;
-  const resolutionChoices = settings.streamMode === 'h264'
-    ? Array.from(new Map(h264Modes.map((m: any) => [`${m.width}x${m.height}`, { width: m.width, height: m.height }])).values()) as any[]
-    : [
-        { width: 640, height: 480 },
-        { width: 960, height: 540 },
-        { width: 1280, height: 720 },
-        { width: 1920, height: 1080 }
-      ];
+  const fpsChoices = Array.from(new Set(activeModes
+    .filter((m: any) => m.width === settings.width && m.height === settings.height)
+    .map((m: any) => Number(m.fps)))).sort((a, b) => a - b);
+  const resolutionChoices = Array.from(new Map(activeModes.map((m: any) =>
+    [`${m.width}x${m.height}`, { width: m.width, height: m.height }])).values()) as any[];
 
   const handleStartObs = async () => {
     if (obsMode === 'window' && onEnterObsMode) {
@@ -328,52 +311,47 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     }
   };
 
+  const importAuthoritativeState = useCallback((raw: any) => {
+    const status = raw?.status || raw;
+    if (!status) return;
+    authoritativeRevisionRef.current = Number(status.revision ?? 0);
+    settingsHydratedRef.current = true;
+    const current = settingsRef.current;
+    const next: any = {
+      ...current,
+      cameraId: status.cameraId ?? current.cameraId,
+      profile: status.profile ?? current.profile,
+      width: status.width ?? current.width,
+      height: status.height ?? current.height,
+      outputWidth: status.outputWidth ?? current.outputWidth,
+      outputHeight: status.outputHeight ?? current.outputHeight,
+      fps: status.fps ?? current.fps,
+      jpegQuality: status.jpegQuality ?? current.jpegQuality,
+      streamMode: status.streamMode ?? current.streamMode,
+      displayRotation: status.displayRotation ?? current.displayRotation,
+      aspectRatio: status.aspectRatio ?? current.aspectRatio,
+      mirror: status.mirror ?? current.mirror,
+      torchEnabled: status.torchEnabled ?? current.torchEnabled,
+      linearZoom: status.linearZoom ?? current.linearZoom,
+      targetBandwidthMbps: status.targetBandwidthMbps ?? current.targetBandwidthMbps,
+      h264Bitrate: status.h264Bitrate ?? current.h264Bitrate,
+      h264KeyframeInterval: status.h264KeyframeInterval ?? current.h264KeyframeInterval
+    };
+    settingsRef.current = next;
+    setSettings(next);
+  }, []);
+
   const fetchStatus = useCallback(() => {
     apiFetch(baseUrl, '/api/camera/status', token)
       .then(res => res.json())
       .then(data => {
         const status = data.status || data;
         if (status) {
-          authoritativeRevisionRef.current = Number(status.revision ?? 0);
-          settingsHydratedRef.current = true;
-          // The phone has caught up to our latest apply once appliedVersion >=
-          // our local apply id. Until then, keep the user's just-selected
-          // stream-shaping values (no snapback from stale rebind status).
-          const androidCaughtUp = Number(status.appliedVersion || 0) >= localApplyVersionRef.current;
-          setSettings(prev => {
-            const merged: any = {
-              ...prev,
-              // Display/control fields round-trip fast and are safe to mirror on
-              // every poll, so phone-side changes show on the desktop within ~1s.
-              displayRotation: status.displayRotation ?? prev.displayRotation,
-              aspectRatio: status.aspectRatio ?? prev.aspectRatio,
-              mirror: status.mirror ?? prev.mirror,
-              torchEnabled: status.torchEnabled ?? prev.torchEnabled,
-              linearZoom: status.linearZoom ?? prev.linearZoom,
-              targetBandwidthMbps: status.targetBandwidthMbps ?? prev.targetBandwidthMbps,
-              h264Bitrate: status.h264Bitrate ?? prev.h264Bitrate,
-              h264KeyframeInterval: status.h264KeyframeInterval ?? prev.h264KeyframeInterval
-            };
-            // Stream-shaping fields (resolution/fps/quality/profile/lens/codec):
-            // only merge once the phone has applied our latest change, so an
-            // in-flight rebind can't revert the dropdowns.
-            if (androidCaughtUp) {
-              merged.cameraId = status.cameraId ?? prev.cameraId;
-              merged.profile = status.profile ?? prev.profile;
-              merged.width = status.width ?? prev.width;
-              merged.height = status.height ?? prev.height;
-              merged.outputWidth = status.outputWidth ?? prev.outputWidth;
-              merged.outputHeight = status.outputHeight ?? prev.outputHeight;
-              merged.fps = status.fps ?? prev.fps;
-              merged.jpegQuality = status.jpegQuality ?? prev.jpegQuality;
-              merged.streamMode = status.streamMode ?? prev.streamMode;
-            }
-            return merged;
-          });
+          importAuthoritativeState(status);
         }
       })
       .catch(console.error);
-  }, [baseUrl, token]);
+  }, [baseUrl, token, importAuthoritativeState]);
 
   useEffect(() => {
     const events = new EventSource(buildUrl(baseUrl, '/api/state/events', token));
@@ -569,32 +547,29 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
     const source = (actual?.activeStreamMode || s.streamMode) === 'h264' ? 'h264' : 'mjpeg';
     const targetUrl = source === 'h264' ? `${base}/stream.ocb2` : `${base}/stream.mjpeg`;
-    // Rotation is applied on the phone now (the /stream.mjpeg frames are already
-    // rotated), so the producer must NOT rotate again — pass 0 explicitly, which
-    // also disables its portrait auto-rotate. The producer still letterboxes a
-    // portrait frame into the fixed landscape output.
+    // The CLI transform is compatibility-only. MJPEG pixels are already rotated
+    // on the phone, while H.264 carries the authoritative effective rotation and
+    // mirror in every OCB2 stream-info generation. Passing zero here prevents a
+    // second transform and does not suppress the OCB2-driven H.264 transform.
     const rotate = 0;
     // jpegQuality is applied on the Android side; the producer no longer takes it.
     console.log('[Tauri UI] Calling start_virtual_camera_feeder with', {
       url: targetUrl, source, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, profile: s.profile, rotate, mirror: s.mirror
     });
-    try {
-      await invoke('start_virtual_camera_feeder', {
-        url: targetUrl,
-        source,
-        width: s.outputWidth || s.width,
-        height: s.outputHeight || s.height,
-        fps: s.fps,
-        profile: s.profile,
-        rotate,
-        mirror: !!s.mirror,
-        token: token || undefined
-      });
-      console.log('[Tauri UI] start_virtual_camera_feeder completed');
-    } catch (e: any) {
-      console.error('[Tauri UI] start_virtual_camera_feeder failed:', e);
-      setVcamMessage(`Failed to start producer: ${e.toString()}`);
-    }
+    await invoke('start_virtual_camera_feeder', {
+      url: targetUrl,
+      source,
+      width: s.outputWidth || s.width,
+      height: s.outputHeight || s.height,
+      fps: s.fps,
+      profile: s.profile,
+      rotate,
+      // H.264 transform is authoritative OCB2 metadata. MJPEG pixels are
+      // rotated on-phone but still use the producer compatibility mirror.
+      mirror: source === 'mjpeg' ? !!s.mirror : false,
+      token: token || undefined
+    });
+    console.log('[Tauri UI] start_virtual_camera_feeder completed');
   };
 
   const handleStartNativeCamera = async () => {
@@ -666,7 +641,6 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     if (!settingsHydratedRef.current || authoritativeRevisionRef.current == null) {
       throw new Error('Phone settings have not been loaded; refusing to post local defaults');
     }
-    localApplyVersionRef.current += 1;
     const patch: any = {};
     const directKeys = [
       'profile', 'width', 'height', 'outputWidth', 'outputHeight', 'fps', 'jpegQuality',
@@ -686,23 +660,28 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       body: JSON.stringify({
         ...patch,
         baseRevision: authoritativeRevisionRef.current,
-        requestId: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${localApplyVersionRef.current}`,
-        applyId: localApplyVersionRef.current,
+        requestId: globalThis.crypto?.randomUUID?.() || `tauri-${Date.now()}`,
+        clientType: 'tauri',
       })
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok || body.success === false) {
-      if (response.status === 409) fetchStatus();
-      throw new Error(body.message || `HTTP ${response.status}`);
+      if ((response.status === 409 || response.status === 422) && body.authoritativeState) {
+        importAuthoritativeState(body.authoritativeState);
+      } else {
+        fetchStatus();
+      }
+      const requested = body.requested ? ` Requested: ${body.requested}.` : '';
+      const alternatives = Array.isArray(body.alternatives) && body.alternatives.length
+        ? ` Alternatives: ${body.alternatives.join(', ')}.` : '';
+      throw new Error(`${body.message || `HTTP ${response.status}`}.${requested}${alternatives}`);
     }
     if (body.revision != null) authoritativeRevisionRef.current = Number(body.revision);
+    if (body.authoritativeState) importAuthoritativeState(body.authoritativeState);
     return body;
   };
 
   const applySettingsAndRefreshPreview = async (nextSettings: any, keysChanged: string[]) => {
-    setSettings(nextSettings);
-    settingsRef.current = nextSettings;
-    bumpSettle();
     setIsSyncing(true);
     isSyncingRef.current = true;
 
@@ -712,7 +691,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       // MediaCodec.setParameters; JPEG quality is read per-frame). Restarting
       // the whole pipeline on every quality-slider step was the source of the
       // repeated producer restarts.
-      const streamImpacting = ['profile', 'width', 'height', 'fps', 'cameraId', 'streamMode', 'h264KeyframeInterval'].some(k => keysChanged.includes(k));
+      const streamImpacting = ['profile', 'width', 'height', 'fps', 'cameraId', 'streamMode', 'h264KeyframeInterval', 'displayRotation', 'mirror'].some(k => keysChanged.includes(k));
 
       // Android streaming and the producer/virtual-camera are SEPARATE things.
       // The producer must never be started just because Android has frames.
@@ -741,9 +720,14 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         // live and mirror is a preview transform, so do NOT reload the preview.
         await postSettingsToAndroid(nextSettings, keysChanged);
       }
+      // The phone accepted the revision. Reflect the requested desired state;
+      // the next authoritative status import may refine it after adaptation.
+      settingsRef.current = nextSettings;
+      setSettings(nextSettings);
     } catch (err: any) {
       console.error('[Tauri UI] applySettingsAndRefreshPreview failed:', err);
       setVcamMessage(`Settings apply failed: ${err.toString()}`);
+      fetchStatus();
     } finally {
       setIsSyncing(false);
       isSyncingRef.current = false;
@@ -751,19 +735,34 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   };
 
   const updateSetting = async (key: string, value: any) => {
-    const newSettings = { ...settingsRef.current, [key]: value };
+    let newSettings = { ...settingsRef.current, [key]: value };
+    if (key === 'cameraId' || key === 'streamMode') {
+      const camera = cameras.find(c => c.id === newSettings.cameraId) as any;
+      const modes = newSettings.streamMode === 'h264' ? camera?.h264Modes : camera?.mjpegModes;
+      const canonical = Array.isArray(modes) ? modes : [];
+      const selected = canonical.find((m: any) =>
+        m.width === newSettings.width && m.height === newSettings.height && m.fps === newSettings.fps
+      ) || canonical[0];
+      if (selected) newSettings = {
+        ...newSettings, width: selected.width, height: selected.height, fps: selected.fps,
+        outputWidth: selected.width, outputHeight: selected.height
+      };
+    }
 
     if (key === 'torchEnabled') {
-      setSettings(newSettings);
-      settingsRef.current = newSettings;
-      bumpSettle();
       try {
-        const res = await apiFetch(baseUrl, '/api/camera/torch', token, { method: 'POST', body: JSON.stringify({ enabled: value }), headers: { 'Content-Type': 'application/json' }});
+        const res = await apiFetch(baseUrl, '/api/camera/torch', token, { method: 'POST', body: JSON.stringify({
+          enabled: value, baseRevision: authoritativeRevisionRef.current,
+          requestId: globalThis.crypto?.randomUUID?.() || `tauri-${Date.now()}`, clientType: 'tauri'
+        }), headers: { 'Content-Type': 'application/json' }});
+        const body = await res.json().catch(() => ({}));
         if (!res.ok) {
-          const body = await res.text().catch(() => '');
-          addDiag('torch', `Torch ${value ? 'on' : 'off'} failed: HTTP ${res.status} ${body}`);
+          if (body.authoritativeState) importAuthoritativeState(body.authoritativeState); else fetchStatus();
+          addDiag('torch', `Torch ${value ? 'on' : 'off'} failed: HTTP ${res.status} ${body.message || ''}`);
           setVcamMessage(`Torch not available on this camera (HTTP ${res.status}).`);
         } else {
+          if (body.revision != null) authoritativeRevisionRef.current = Number(body.revision);
+          settingsRef.current = newSettings; setSettings(newSettings);
           addDiag('torch', `Torch ${value ? 'on' : 'off'}`);
         }
       } catch (e: any) {
@@ -772,19 +771,31 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       }
       return;
     } else if (key === 'linearZoom') {
-      setSettings(newSettings);
-      settingsRef.current = newSettings;
-      bumpSettle();
       try {
-        const res = await apiFetch(baseUrl, '/api/camera/zoom', token, { method: 'POST', body: JSON.stringify({ linearZoom: value }), headers: { 'Content-Type': 'application/json' }});
-        if (!res.ok) addDiag('zoom', `Zoom failed: HTTP ${res.status}`);
+        const res = await apiFetch(baseUrl, '/api/camera/zoom', token, { method: 'POST', body: JSON.stringify({
+          linearZoom: value, baseRevision: authoritativeRevisionRef.current,
+          requestId: globalThis.crypto?.randomUUID?.() || `tauri-${Date.now()}`, clientType: 'tauri'
+        }), headers: { 'Content-Type': 'application/json' }});
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          if (body.authoritativeState) importAuthoritativeState(body.authoritativeState); else fetchStatus();
+          addDiag('zoom', `Zoom failed: HTTP ${res.status}`);
+        } else {
+          if (body.revision != null) authoritativeRevisionRef.current = Number(body.revision);
+          settingsRef.current = newSettings; setSettings(newSettings);
+        }
       } catch (e: any) {
         addDiag('zoom', `Zoom request failed: ${e}`);
       }
       return;
     }
 
-    await applySettingsAndRefreshPreview(newSettings, [key]);
+    await applySettingsAndRefreshPreview(
+      newSettings,
+      key === 'cameraId' || key === 'streamMode'
+        ? [key, 'width', 'height', 'fps', 'outputWidth', 'outputHeight']
+        : [key]
+    );
   };
 
   const waitForAndroidResolution = async (s: any, timeoutMs = 8000) => {
@@ -816,20 +827,29 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       await sleep(300);
     }
 
-    // The device may legitimately pick a nearby supported size instead of the
-    // exact request (that is what the resolution policy is for). If frames are
-    // flowing, proceed with a warning instead of failing the whole pipeline.
+    // A different size is accepted only as an explicit adaptive/fallback
+    // selection. An unexplained mismatch is a failed start, not silent resize.
     const hasAnyFrame = lastMetrics && (
       Number(lastMetrics.latestFrameRevision || 0) > 0 ||
       Number(lastMetrics.encodedWidth || 0) > 0
     );
-    if (hasAnyFrame) {
+    if (hasAnyFrame && (lastMetrics.fallbackUsed || lastMetrics.activeStreamMode !== s.streamMode || s.profile === 'adaptive')) {
       console.warn(
         `[Tauri UI] Android is streaming ${lastMetrics.encodedWidth}x${lastMetrics.encodedHeight} ` +
         `instead of the requested ${s.width}x${s.height}; continuing (producer resizes).`
       );
+      setVcamMessage(
+        `Adaptive capture: requested ${s.width}x${s.height}@${s.fps}, ` +
+        `selected/actual ${lastMetrics.encodedWidth}x${lastMetrics.encodedHeight}@${lastMetrics.captureFps || 0}. ` +
+        `${lastMetrics.fallbackReason || 'Producer will resize once on the GPU.'}`
+      );
       return lastMetrics;
     }
+
+    if (hasAnyFrame) throw new Error(
+      `Android streamed unexplained ${lastMetrics.encodedWidth}x${lastMetrics.encodedHeight} ` +
+      `instead of requested ${s.width}x${s.height}; refusing silent fallback.`
+    );
 
     throw new Error(
       `Android did not start streaming after settings change (requested ${s.width}x${s.height}). ` +
@@ -866,10 +886,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     await handleStartProducer(s, actual);
     const state = await invoke<VirtualCamState>('get_virtual_camera_status');
     setVcamState(state);
-    addDiag('pipeline', `finalProducerRunning=${!!state.running}`);
-    if (!state.running) {
-      setVcamMessage('Producer failed to restart — OBS is not receiving frames. See Logs.');
-    }
+    const committed = Number(state.metrics?.ring_frames_committed || 0);
+    addDiag('pipeline', `finalProducerRunning=${!!state.process_running} state=${state.producer_state} committed=${committed}`);
+    if (!state.process_running) throw new Error('Producer process exited during startup');
+    if (state.producer_state !== 'WRITING_RING') throw new Error(`Producer is ${state.producer_state || 'not writing the ring'}`);
+    if (committed < 3) throw new Error(`Producer committed only ${committed}/3 readiness frames`);
+    if (!state.pipeline_ready) throw new Error('Producer readiness timed out before the pipeline became ready');
 
     fetchStatus();
 
@@ -884,8 +906,18 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       console.error('Unknown profile:', profile);
       return;
     }
-
-    const newSettings = { ...settingsRef.current, ...preset };
+    const selected = activeModes.find((m: any) =>
+      m.width === preset.width && m.height === preset.height && m.fps === preset.fps
+    ) || activeModes[0];
+    if (!selected) {
+      setVcamMessage(`No canonical ${settingsRef.current.streamMode.toUpperCase()} modes are available on this camera.`);
+      return;
+    }
+    const newSettings = {
+      ...settingsRef.current, ...preset,
+      width: selected.width, height: selected.height, fps: selected.fps,
+      outputWidth: selected.width, outputHeight: selected.height
+    };
     await applySettingsAndRefreshPreview(newSettings, ['profile', 'width', 'height', 'fps', 'jpegQuality']);
   };
 
@@ -895,12 +927,14 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   // resolution can pair with any FPS (e.g. 720p30, 720p60, 1080p30, 1080p60).
   const updateResolution = async (w: number, h: number) => {
     const profile = w >= 1920 ? 'quality' : w >= 1280 ? 'balanced' : 'low-latency';
+    const validFps = activeModes.filter((m: any) => m.width === w && m.height === h).map((m: any) => Number(m.fps));
+    const selectedFps = validFps.includes(settingsRef.current.fps) ? settingsRef.current.fps : validFps[0];
     const next = {
       ...settingsRef.current,
-      width: w, height: h, outputWidth: w, outputHeight: h, profile,
+      width: w, height: h, outputWidth: w, outputHeight: h, profile, fps: selectedFps,
     };
     logTestMarker('START', `${next.streamMode} ${w}x${h}@${next.fps} lens=${next.cameraId} q${next.jpegQuality}`);
-    await applySettingsAndRefreshPreview(next, ['width', 'height', 'profile']);
+    await applySettingsAndRefreshPreview(next, ['width', 'height', 'outputWidth', 'outputHeight', 'profile', 'fps']);
   };
 
   const updateFps = async (fps: number) => {
@@ -1167,17 +1201,17 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                   <span style={{ color: androidMetrics.aspectRatioMatch ? '#51cf66' : '#ffb300' }}>{androidMetrics.selectedAspectRatio}</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Resolution requested / actual:</span>
-                  <span>{settings.width}x{settings.height} / {androidMetrics.encodedWidth}x{androidMetrics.encodedHeight}</span>
+                  <span>Resolution requested / selected / actual:</span>
+                  <span>{settings.width}x{settings.height} / {androidMetrics.selectedEffectiveWidth || 0}x{androidMetrics.selectedEffectiveHeight || 0} / {androidMetrics.encodedWidth}x{androidMetrics.encodedHeight}</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
                   <span>Rotation Resizing:</span>
                   <span style={{ color: androidMetrics.resizeNeeded ? '#ffb300' : '#51cf66' }}>{androidMetrics.resizeNeeded ? 'Required' : 'Native Match'}</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Capture FPS requested / actual:</span>
+                  <span>Capture FPS requested / selected / actual:</span>
                   <span style={{ color: (androidMetrics.captureFps || androidMetrics.actualFps || androidMetrics.fps) >= settings.fps - 5 ? '#51cf66' : '#ffb300' }}>
-                    {settings.fps} / {androidMetrics.captureFps ?? androidMetrics.actualFps ?? androidMetrics.fps}
+                    {settings.fps} / {androidMetrics.selectedFps || 0} / {androidMetrics.captureFps ?? androidMetrics.actualFps ?? androidMetrics.fps}
                   </span>
                 </div>
                 {androidMetrics.capture && (
@@ -1297,7 +1331,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                     <span style={{ color: '#888' }}>Decoder:</span>
-                    <span>{vcamState.metrics.decoder_name || vcamState.metrics.decode_backend || 'MJPEG'} ({vcamState.metrics.hardware_decoder ? 'hardware' : 'fallback'})</span>
+                    <span>{vcamState.metrics.decoder_name || vcamState.metrics.decode_backend || 'MJPEG'} (
+                      {vcamState.metrics.hardware_decoder == null
+                        ? `hardware unknown; D3D11 output ${vcamState.metrics.d3d11_output ? 'active' : 'inactive'}`
+                        : vcamState.metrics.hardware_decoder ? 'hardware' : 'software fallback'})</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                     <span style={{ color: '#888' }}>Replaced / dropped:</span>
@@ -1338,7 +1375,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
               updateResolution(w, h);
             }}
           >
-            {resolutionChoices.length === 0 && <option value="" disabled>No hardware H.264 modes on this lens</option>}
+            {resolutionChoices.length === 0 && <option value="" disabled>No supported modes on this lens</option>}
             {resolutionChoices.map((r: any) => (
               <option key={`${r.width}x${r.height}`} value={`${r.width}x${r.height}`}>
                 {r.height === 1080 ? '1080p' : r.height === 720 ? '720p' : `${r.height}p`} ({r.width}x{r.height})
@@ -1354,9 +1391,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
             value={settings.fps}
             onChange={(e) => updateFps(parseInt(e.target.value, 10))}
           >
-            {settings.streamMode === 'mjpeg' && <option value={15}>15 fps</option>}
-            <option value={30} disabled={!supports30}>30 fps{!supports30 ? ' (unsupported here)' : ''}</option>
-            <option value={60} disabled={!supports60}>60 fps{!supports60 ? ' (unsupported here)' : ''}</option>
+            {fpsChoices.map(rate => <option key={rate} value={rate}>{rate} fps</option>)}
+            {fpsChoices.length === 0 && <option value="" disabled>No supported rate</option>}
           </select>
           <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
             Resolution and frame rate are validated as one complete camera/encoder mode.

@@ -643,6 +643,102 @@ struct RingDiagnostics {
     ring_abi_hash: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct ConsumerReadinessStatus {
+    ready: bool,
+    consumer_attached: bool,
+    consumer_pid: u32,
+    heartbeat_recent: bool,
+    sample_requests_recent: bool,
+    ring_reads_recent: bool,
+    accepted_sequence_recent: bool,
+}
+
+struct ConsumerReadiness {
+    consumer_pid: u32,
+    heartbeat: u64,
+    sample_requests: u64,
+    ring_reads: u64,
+    accepted_sequence: u64,
+    heartbeat_at: Option<Instant>,
+    sample_requests_at: Option<Instant>,
+    ring_reads_at: Option<Instant>,
+    accepted_sequence_at: Option<Instant>,
+}
+
+impl ConsumerReadiness {
+    fn new() -> Self {
+        Self {
+            consumer_pid: 0,
+            heartbeat: 0,
+            sample_requests: 0,
+            ring_reads: 0,
+            accepted_sequence: 0,
+            heartbeat_at: None,
+            sample_requests_at: None,
+            ring_reads_at: None,
+            accepted_sequence_at: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn observe(&mut self, ring: &RingDiagnostics, now: Instant) -> ConsumerReadinessStatus {
+        if !ring.consumer_attached
+            || ring.consumer_pid == 0
+            || ring.consumer_pid != self.consumer_pid
+        {
+            self.reset();
+            self.consumer_pid = ring.consumer_pid;
+            self.heartbeat = ring.consumer_heartbeat_qpc;
+            self.sample_requests = ring.sample_requests;
+            self.ring_reads = ring.ring_read_successes;
+            self.accepted_sequence = ring.last_accepted_sequence;
+        } else {
+            if ring.consumer_heartbeat_qpc != self.heartbeat {
+                self.heartbeat = ring.consumer_heartbeat_qpc;
+                self.heartbeat_at = Some(now);
+            }
+            if ring.sample_requests != self.sample_requests {
+                self.sample_requests = ring.sample_requests;
+                self.sample_requests_at = Some(now);
+            }
+            if ring.ring_read_successes != self.ring_reads {
+                self.ring_reads = ring.ring_read_successes;
+                self.ring_reads_at = Some(now);
+            }
+            if ring.last_accepted_sequence != self.accepted_sequence {
+                self.accepted_sequence = ring.last_accepted_sequence;
+                self.accepted_sequence_at = Some(now);
+            }
+        }
+        let recent = |value: Option<Instant>| {
+            value
+                .map(|at| now.duration_since(at) < Duration::from_secs(2))
+                .unwrap_or(false)
+        };
+        let heartbeat_recent = recent(self.heartbeat_at);
+        let sample_requests_recent = recent(self.sample_requests_at);
+        let ring_reads_recent = recent(self.ring_reads_at);
+        let accepted_sequence_recent = recent(self.accepted_sequence_at);
+        ConsumerReadinessStatus {
+            ready: ring.consumer_attached
+                && heartbeat_recent
+                && sample_requests_recent
+                && ring_reads_recent
+                && accepted_sequence_recent,
+            consumer_attached: ring.consumer_attached,
+            consumer_pid: ring.consumer_pid,
+            heartbeat_recent,
+            sample_requests_recent,
+            ring_reads_recent,
+            accepted_sequence_recent,
+        }
+    }
+}
+
 fn hex_hash(hash: &[u8; 32]) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -728,6 +824,63 @@ fn bgra_to_nv12(src: &[u8], width: u32, height: u32, dst: &mut [u8]) {
 #[cfg(test)]
 mod ring_tests {
     use super::*;
+
+    fn readiness_ring(pid: u32, value: u64) -> RingDiagnostics {
+        RingDiagnostics {
+            consumer_attached: true,
+            consumer_pid: pid,
+            consumer_heartbeat_qpc: value,
+            sample_requests: value,
+            ring_read_attempts: value,
+            ring_read_successes: value,
+            ring_validation_failures: 0,
+            sample_copy_failures: 0,
+            last_ring_error: 0,
+            last_accepted_sequence: value,
+            negotiated_subtype: FORMAT_NV12,
+            negotiated_width: 1280,
+            negotiated_height: 720,
+            negotiated_fps_num: 60,
+            negotiated_fps_den: 1,
+            installed_dll_build_hash: "a".repeat(64),
+            producer_build_hash: "b".repeat(64),
+            ring_abi_hash: RING_ABI_HASH,
+        }
+    }
+
+    #[test]
+    fn virtual_camera_readiness_requires_recent_counter_progress() {
+        let now = Instant::now();
+        let mut readiness = ConsumerReadiness::new();
+        assert!(!readiness.observe(&readiness_ring(10, 1), now).ready);
+        assert!(
+            readiness
+                .observe(&readiness_ring(10, 2), now + Duration::from_millis(50))
+                .ready
+        );
+        assert!(
+            !readiness
+                .observe(&readiness_ring(10, 2), now + Duration::from_secs(3))
+                .ready
+        );
+    }
+
+    #[test]
+    fn virtual_camera_readiness_resets_when_consumer_pid_changes() {
+        let now = Instant::now();
+        let mut readiness = ConsumerReadiness::new();
+        readiness.observe(&readiness_ring(10, 1), now);
+        assert!(
+            readiness
+                .observe(&readiness_ring(10, 2), now + Duration::from_millis(10))
+                .ready
+        );
+        assert!(
+            !readiness
+                .observe(&readiness_ring(11, 3), now + Duration::from_millis(20))
+                .ready
+        );
+    }
 
     #[test]
     fn ring_struct_sizes_are_stable_for_cpp_consumer() {
@@ -1420,11 +1573,40 @@ enum V2Decoder {
 fn request_phone_mjpeg_fallback(args: &Args) -> Result<(), String> {
     let stream_url = args.url.as_ref().ok_or("missing stream URL")?;
     let settings_url = stream_url.replace("/stream.ocb2", "/api/settings");
+    let status_url = stream_url.replace("/stream.ocb2", "/api/camera/status");
     let client = build_http_client()?;
+    let mut status_request = client.get(status_url);
+    if let Some(token) = &args.token {
+        status_request = status_request.header("X-OpenCamBridge-Token", token);
+    }
+    let status_response = status_request
+        .send()
+        .map_err(|e| format!("could not read authoritative phone revision: {e}"))?;
+    let status_code = status_response.status();
+    let status_text = status_response
+        .text()
+        .map_err(|e| format!("could not read phone status body: {e}"))?;
+    if !status_code.is_success() {
+        return Err(format!("phone status rejected with HTTP {status_code}"));
+    }
+    let status: serde_json::Value = serde_json::from_str(&status_text)
+        .map_err(|e| format!("invalid phone status JSON: {e}"))?;
+    let revision = status
+        .get("revision")
+        .and_then(|v| v.as_u64())
+        .ok_or("phone status omitted authoritative revision")?;
+    let request_id = format!("producer-{}-{}", std::process::id(), monotonic_ns());
+    let body = serde_json::json!({
+        "streamMode": "mjpeg",
+        "clientType": "producer",
+        "baseRevision": revision,
+        "requestId": request_id
+    })
+    .to_string();
     let mut request = client
         .post(settings_url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(r#"{"streamMode":"mjpeg","clientType":"producer"}"#);
+        .body(body);
     if let Some(token) = &args.token {
         request = request.header("X-OpenCamBridge-Token", token);
     }
@@ -1448,8 +1630,17 @@ impl V2Decoder {
             Self::Software { .. } => "OpenH264 software fallback",
         }
     }
-    fn hardware_active(&self) -> bool {
-        matches!(self, Self::MediaFoundation(d) if d.hardware_active)
+    fn is_media_foundation(&self) -> bool {
+        matches!(self, Self::MediaFoundation(_))
+    }
+    fn d3d11_output_active(&self) -> bool {
+        matches!(self, Self::MediaFoundation(d) if d.d3d11_output_active)
+    }
+    fn hardware_decode(&self) -> Option<bool> {
+        match self {
+            Self::MediaFoundation(_) => None,
+            Self::Software { .. } => Some(false),
+        }
     }
 }
 
@@ -1620,9 +1811,11 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
     let mut oriented_nv12 = Vec::with_capacity(MAX_NV12_SIZE);
     let mut phone_encoder_error: bool;
     let (mut last_vcam_unique, mut last_vcam_repeated) = ipc.virtual_camera_counters();
+    let mut consumer_readiness = ConsumerReadiness::new();
 
     loop {
         parser.reset();
+        consumer_readiness.reset();
         waiting_for_keyframe = true;
         phone_encoder_error = false;
         if let Some(V2Decoder::MediaFoundation(d)) = decoder.as_mut() {
@@ -1698,6 +1891,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                             && info.framing == "annex-b-access-units"
                                             && info.bitrate <= 100_000_000
                                             && info.pixel_format == "NV12"
+                                            && info.has_valid_transform()
                                             && validate_nv12_metadata(
                                                 info.width,
                                                 info.height,
@@ -1717,6 +1911,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                             })
                                             .unwrap_or(true);
                                         stream_info = Some(info);
+                                        consumer_readiness.reset();
                                         if changed {
                                             decoder = None;
                                             codec_config.clear();
@@ -1784,9 +1979,13 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                         "info",
                                         "DECODER_SELECTED",
                                         &format!(
-                                            "{} (hardware={})",
+                                            "{} (D3D11 output={}, hardware decode={})",
                                             selected.name(),
-                                            selected.hardware_active()
+                                            selected.d3d11_output_active(),
+                                            selected
+                                                .hardware_decode()
+                                                .map(|v| v.to_string())
+                                                .unwrap_or_else(|| "unknown".into())
                                         ),
                                         Some("DECODING"),
                                     );
@@ -1794,7 +1993,8 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                 waiting_for_keyframe = false;
                                 let start = Instant::now();
                                 let mut decoded_this_au = 0u32;
-                                let was_hardware = decoder.as_ref().unwrap().hardware_active();
+                                let was_media_foundation =
+                                    decoder.as_ref().unwrap().is_media_foundation();
                                 let decode_result = match decoder.as_mut().unwrap() {
                                     V2Decoder::MediaFoundation(d) => d.decode(
                                         &record.payload,
@@ -1809,8 +2009,9 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                                 replaced_frames +=
                                                     sequence - last_published_sequence - 1;
                                             }
-                                            let rotation = args.rotate.unwrap_or(0);
-                                            let oriented = if rotation != 0 || args.mirror {
+                                            let rotation = info.effective_rotation;
+                                            let mirror = info.mirror;
+                                            let oriented = if rotation != 0 || mirror {
                                                 orient_nv12(
                                                     frame.bytes,
                                                     frame.width,
@@ -1818,7 +2019,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                                     frame.y_stride,
                                                     frame.uv_stride,
                                                     rotation,
-                                                    args.mirror,
+                                                    mirror,
                                                     &mut oriented_nv12,
                                                 ).ok().map(|(w, h)| (oriented_nv12.as_slice(), w, h, w, w))
                                             } else {
@@ -1871,8 +2072,9 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                             Ok(Some(yuv)) => {
                                                 let (w, h) = copy_i420_to_nv12(&yuv, scratch)?;
                                                 let decode_ns = monotonic_ns();
-                                                let rotation = args.rotate.unwrap_or(0);
-                                                let (pixels, output_width, output_height) = if rotation != 0 || args.mirror {
+                                                let rotation = info.effective_rotation;
+                                                let mirror = info.mirror;
+                                                let (pixels, output_width, output_height) = if rotation != 0 || mirror {
                                                     let (output_width, output_height) = orient_nv12(
                                                         scratch,
                                                         w,
@@ -1880,7 +2082,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                                         w,
                                                         w,
                                                         rotation,
-                                                        args.mirror,
+                                                        mirror,
                                                         &mut oriented_nv12,
                                                     )?;
                                                     (oriented_nv12.as_slice(), output_width, output_height)
@@ -1923,15 +2125,17 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                         consecutive_decode_errors += 1;
                                         last_error = Some(e);
                                         waiting_for_keyframe = true;
-                                        if !was_hardware && consecutive_decode_errors >= 3 {
+                                        if !was_media_foundation && consecutive_decode_errors >= 3 {
                                             return Err(last_error.take().unwrap_or_else(|| {
                                                 "software H.264 decoder failed".into()
                                             }));
-                                        } else if was_hardware && consecutive_decode_errors >= 3 {
+                                        } else if was_media_foundation
+                                            && consecutive_decode_errors >= 3
+                                        {
                                             force_software = true;
                                             decoder = None;
                                             consecutive_decode_errors = 0;
-                                        } else if was_hardware {
+                                        } else if was_media_foundation {
                                             // Recreate the D3D11 device/MFT after any hardware
                                             // failure; this is also the device-loss recovery path.
                                             decoder = None;
@@ -1984,10 +2188,21 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                             } else {
                                 0
                             };
-                            let (decoder_name, hardware) = decoder
-                                .as_ref()
-                                .map(|d| (d.name(), d.hardware_active()))
-                                .unwrap_or(("initializing", false));
+                            let (decoder_name, d3d11_output, hardware_decode, media_foundation) =
+                                decoder
+                                    .as_ref()
+                                    .map(|d| {
+                                        (
+                                            d.name(),
+                                            d.d3d11_output_active(),
+                                            d.hardware_decode(),
+                                            d.is_media_foundation(),
+                                        )
+                                    })
+                                    .unwrap_or(("initializing", false, None, false));
+                            let hardware_decode_json = hardware_decode
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "null".into());
                             let info = stream_info.as_ref();
                             let (consumer_width, consumer_height, _) = ipc.consumer_format();
                             let (vcam_unique_total, vcam_repeated_total) =
@@ -2007,10 +2222,12 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                             let ring = ipc.diagnostics();
                             let ring_json =
                                 serde_json::to_string(&ring).unwrap_or_else(|_| "{}".into());
-                            let virtual_camera_ready =
-                                ring.consumer_attached && ring.ring_read_successes > 0;
+                            let readiness = consumer_readiness.observe(&ring, Instant::now());
+                            let readiness_json =
+                                serde_json::to_string(&readiness).unwrap_or_else(|_| "{}".into());
+                            let virtual_camera_ready = readiness.ready;
                             println!(
-                                r#"{{"type":"metrics","producer_state":"WRITING_RING","ring_frames_committed":{},"source":"ocb2-h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":0,"replaced_frames":{},"jpeg_queue_len":0,"decode_ms_avg":{},"rotate_ms_avg":0,"resize_ms_avg":0,"write_ms_avg":0,"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"{}","hardware_decoder":{},"encoder_name":"{}","hardware_encoder":{},"camera_id":"{}","fallback_reason":"{}","resize_backend":"gpu-or-exact","rotation":{},"last_error":{},"ring":{},"virtual_camera_ready":{}}}"#,
+                                r#"{{"type":"metrics","producer_state":"WRITING_RING","ring_frames_committed":{},"source":"ocb2-h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":0,"replaced_frames":{},"jpeg_queue_len":0,"decode_ms_avg":{},"rotate_ms_avg":0,"resize_ms_avg":0,"write_ms_avg":0,"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"{}","d3d11_output":{},"hardware_decoder":{},"encoder_name":"{}","hardware_encoder":{},"camera_id":"{}","fallback_reason":"{}","resize_backend":"gpu-or-exact","rotation":{},"mirror":{},"sensor_orientation":{},"device_rotation":{},"last_error":{},"ring":{},"virtual_camera_readiness":{},"virtual_camera_ready":{}}}"#,
                                 ring_frames_committed,
                                 json_escape(&args.profile),
                                 info.map(|i| i.width).unwrap_or(0),
@@ -2031,25 +2248,30 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                 latency,
                                 (bytes_received as f64 / seconds) as u64,
                                 (bytes_received as f64 * 8.0 / seconds) / 1_000_000.0,
-                                if hardware {
+                                if media_foundation {
                                     "media-foundation-d3d11"
                                 } else {
                                     "software-fallback"
                                 },
                                 json_escape(decoder_name),
-                                hardware,
+                                d3d11_output,
+                                hardware_decode_json,
                                 info.map(|i| json_escape(&i.encoder_name))
                                     .unwrap_or_default(),
                                 info.map(|i| i.hardware_encoder).unwrap_or(false),
                                 info.map(|i| json_escape(&i.camera_id)).unwrap_or_default(),
-                                if hardware {
+                                if media_foundation {
                                     ""
                                 } else {
                                     "hardware decoder unavailable"
                                 },
-                                args.rotate.unwrap_or(0),
+                                info.map(|i| i.effective_rotation).unwrap_or(0),
+                                info.map(|i| i.mirror).unwrap_or(false),
+                                info.map(|i| i.sensor_orientation).unwrap_or(0),
+                                info.map(|i| i.device_rotation).unwrap_or(0),
                                 err_json,
                                 ring_json,
+                                readiness_json,
                                 virtual_camera_ready
                             );
                             if matches!(&decoder, Some(V2Decoder::Software { .. })) {
@@ -2233,6 +2455,7 @@ fn main() {
     let mut last_print = Instant::now();
     let mut output_fps_counter = 0;
     let (mut last_vcam_unique, mut last_vcam_repeated) = ipc.virtual_camera_counters();
+    let mut consumer_readiness = ConsumerReadiness::new();
 
     // MJPEG source state
     let latest_jpeg = Arc::new(Mutex::new(None));
@@ -2484,10 +2707,12 @@ fn main() {
             };
             let ring = ipc.diagnostics();
             let ring_json = serde_json::to_string(&ring).unwrap_or_else(|_| "{}".into());
-            let virtual_camera_ready = ring.consumer_attached && ring.ring_read_successes > 0;
+            let readiness = consumer_readiness.observe(&ring, Instant::now());
+            let readiness_json = serde_json::to_string(&readiness).unwrap_or_else(|_| "{}".into());
+            let virtual_camera_ready = readiness.ready;
 
             println!(
-                r#"{{"type":"metrics","producer_state":"WRITING_RING","ring_frames_committed":{},"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":{},"replaced_frames":{},"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"JPEG software compatibility","hardware_decoder":false,"encoder_name":"Android JPEG","hardware_encoder":false,"camera_id":"","fallback_reason":"{}","resize_backend":"{}","rotation":{},"last_error":{},"ring":{},"virtual_camera_ready":{}}}"#,
+                r#"{{"type":"metrics","producer_state":"WRITING_RING","ring_frames_committed":{},"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":{},"replaced_frames":{},"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"JPEG software compatibility","d3d11_output":false,"hardware_decoder":false,"encoder_name":"Android JPEG","hardware_encoder":false,"camera_id":"","fallback_reason":"{}","resize_backend":"{}","rotation":{},"last_error":{},"ring":{},"virtual_camera_readiness":{},"virtual_camera_ready":{}}}"#,
                 frame_counter,
                 args.source,
                 json_escape(&args.profile),
@@ -2520,6 +2745,7 @@ fn main() {
                 last_rotation,
                 last_error_json,
                 ring_json,
+                readiness_json,
                 virtual_camera_ready
             );
 

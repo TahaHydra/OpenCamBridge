@@ -36,7 +36,9 @@ pub struct MfH264Decoder {
     _context: ID3D11DeviceContext,
     _device_manager: IMFDXGIDeviceManager,
     pub name: String,
-    pub hardware_active: bool,
+    /** The MFT accepted the DXGI device manager and is producing through the
+     * D3D11-aware path. This does not prove that DXVA acceleration is active. */
+    pub d3d11_output_active: bool,
     // Keep this last: Rust drops fields in declaration order, so Media
     // Foundation and COM remain alive until every object above is released.
     _runtime: MfRuntimeGuard,
@@ -191,8 +193,8 @@ impl MfH264Decoder {
                 _device: device,
                 _context: context,
                 _device_manager: device_manager,
-                name: "Microsoft H.264 Video Decoder MFT (D3D11)".to_string(),
-                hardware_active: d3d_set,
+                name: "Microsoft H.264 Video Decoder MFT".to_string(),
+                d3d11_output_active: d3d_set,
                 _runtime: runtime,
             })
         }

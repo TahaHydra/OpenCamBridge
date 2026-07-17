@@ -1,7 +1,7 @@
-use std::process::Command;
+use serde::Serialize;
 use std::env;
 use std::path::PathBuf;
-use serde::Serialize;
+use std::process::Command;
 
 fn get_adb_path() -> String {
     if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
@@ -25,7 +25,9 @@ pub struct AdbDevice {
 }
 
 fn authorized_devices(adb: &str) -> Result<Vec<AdbDevice>, String> {
-    let output = Command::new(adb).args(["devices", "-l"]).output()
+    let output = Command::new(adb)
+        .args(["devices", "-l"])
+        .output()
         .map_err(|e| format!("Failed to list ADB devices: {e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).to_string());
@@ -38,9 +40,15 @@ fn authorized_devices(adb: &str) -> Result<Vec<AdbDevice>, String> {
             let mut parts = line.split_whitespace();
             let serial = parts.next()?;
             let state = parts.next()?;
-            if state != "device" { return None; }
+            if state != "device" {
+                return None;
+            }
             let model = parts.find_map(|field| field.strip_prefix("model:").map(str::to_string));
-            Some(AdbDevice { serial: serial.to_string(), state: state.to_string(), model })
+            Some(AdbDevice {
+                serial: serial.to_string(),
+                state: state.to_string(),
+                model,
+            })
         })
         .collect())
 }
@@ -48,13 +56,20 @@ fn authorized_devices(adb: &str) -> Result<Vec<AdbDevice>, String> {
 fn resolve_serial(adb: &str, selected: Option<&str>) -> Result<String, String> {
     let devices = authorized_devices(adb)?;
     if let Some(serial) = selected.filter(|s| !s.is_empty()) {
-        return devices.iter().find(|d| d.serial == serial).map(|d| d.serial.clone())
-            .ok_or_else(|| format!("Selected ADB device '{serial}' is no longer connected or authorized"));
+        return devices
+            .iter()
+            .find(|d| d.serial == serial)
+            .map(|d| d.serial.clone())
+            .ok_or_else(|| {
+                format!("Selected ADB device '{serial}' is no longer connected or authorized")
+            });
     }
     match devices.as_slice() {
         [] => Err("No authorized ADB device is connected".to_string()),
         [device] => Ok(device.serial.clone()),
-        _ => Err("Several ADB devices are connected; select the phone before connecting".to_string()),
+        _ => {
+            Err("Several ADB devices are connected; select the phone before connecting".to_string())
+        }
     }
 }
 
@@ -65,7 +80,7 @@ pub fn get_adb_status() -> Result<String, String> {
         .arg("--version")
         .output()
         .map_err(|e| format!("Failed to execute adb: {}", e))?;
-        
+
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {

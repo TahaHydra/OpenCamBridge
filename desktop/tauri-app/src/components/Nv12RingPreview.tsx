@@ -3,7 +3,6 @@ import { invoke } from '@tauri-apps/api/core';
 
 interface Props {
   fitMode: string;
-  mirror: boolean;
 }
 
 function compile(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader {
@@ -17,7 +16,7 @@ function compile(gl: WebGL2RenderingContext, type: number, source: string): WebG
   return shader;
 }
 
-export default function Nv12RingPreview({ fitMode, mirror }: Props) {
+export default function Nv12RingPreview({ fitMode }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState('');
@@ -35,6 +34,7 @@ export default function Nv12RingPreview({ fitMode, mirror }: Props) {
     }
     let stopped = false;
     let animation = 0;
+    let pollTimer = 0;
     let afterSequence = 0;
     let textureWidth = 0;
     let textureHeight = 0;
@@ -158,12 +158,17 @@ export default function Nv12RingPreview({ fitMode, mirror }: Props) {
         } catch (failure: any) {
           if (!stopped) setError(failure?.message || String(failure));
         }
-        if (!stopped) animation = requestAnimationFrame(() => void drawNewest());
+        // The virtual camera remains full-rate; desktop preview is deliberately
+        // capped at 30 Hz and always requests only the newest ring slot.
+        if (!stopped) pollTimer = window.setTimeout(() => {
+          animation = requestAnimationFrame(() => void drawNewest());
+        }, 33);
       };
       animation = requestAnimationFrame(() => void drawNewest());
       return () => {
         stopped = true;
         cancelAnimationFrame(animation);
+        clearTimeout(pollTimer);
         gl.deleteTexture(yTexture);
         gl.deleteTexture(uvTexture);
         gl.deleteBuffer(buffer);
@@ -180,7 +185,7 @@ export default function Nv12RingPreview({ fitMode, mirror }: Props) {
       <canvas
         ref={canvasRef}
         className={`preview-img ${fitMode === 'fit' ? 'fit-contain' : 'fit-cover'}`}
-        style={{ width: '100%', height: '100%', transform: `scaleX(${mirror ? -1 : 1})`, opacity: ready ? 1 : 0 }}
+        style={{ width: '100%', height: '100%', opacity: ready ? 1 : 0 }}
       />
       {(!ready || error) && (
         <div className="preview-overlay">
