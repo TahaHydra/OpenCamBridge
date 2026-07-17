@@ -101,6 +101,12 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private val _localPreviewEnabled = MutableStateFlow(false)
     val localPreviewEnabled: StateFlow<Boolean> = _localPreviewEnabled.asStateFlow()
 
+    private val _phonePreviewActive = MutableStateFlow(false)
+    val phonePreviewActive: StateFlow<Boolean> = _phonePreviewActive.asStateFlow()
+
+    private val _phonePreviewFailureReason = MutableStateFlow("")
+    val phonePreviewFailureReason: StateFlow<String> = _phonePreviewFailureReason.asStateFlow()
+
     private val _rebindInProgress = MutableStateFlow(false)
     val rebindInProgress: StateFlow<Boolean> = _rebindInProgress.asStateFlow()
 
@@ -151,6 +157,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 _mirror.value = config.mirror
                 _streamMode.value = config.streamMode
                 _localPreviewEnabled.value = config.localPreviewEnabled
+                _phonePreviewActive.value = StreamState.phonePreviewActive.get()
+                _phonePreviewFailureReason.value = StreamState.phonePreviewFailureReason.get()
                 _rebindInProgress.value = StreamState.rebindInProgress.get()
                 _torchEnabled.value = StreamState.torchEnabled.get()
                 _hasTorch.value = StreamState.hasTorch.get()
@@ -172,6 +180,15 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         // Dynamically attach or detach the surface to the active Preview UseCase
         // This avoids tearing down the entire CameraX session when switching tabs.
         StreamState.previewUseCase?.setSurfaceProvider(provider)
+        if (StreamState.currentConfig().streamMode == "mjpeg") {
+            StreamState.publishPhonePreview(
+                StreamState.pipelineGeneration.get(),
+                StreamState.currentConfig().localPreviewEnabled && provider != null,
+                if (StreamState.currentConfig().localPreviewEnabled && provider == null) {
+                    "CameraX preview requested but no phone SurfaceProvider is attached"
+                } else ""
+            )
+        }
     }
 
     fun setCamera2PreviewSurface(surface: android.view.Surface?) {

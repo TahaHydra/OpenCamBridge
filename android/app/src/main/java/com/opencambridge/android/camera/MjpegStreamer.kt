@@ -48,6 +48,7 @@ class MjpegStreamer(
     // Reusable buffers to avoid GC churn at 30-60 fps
     private var nv21Buffer: ByteArray? = null
     private var nv21RotatedBuffer: ByteArray? = null
+    private var nv21TransformScratch: ByteArray? = null
     private val jpegStream = ByteArrayOutputStream(512 * 1024)
 
     // Encode-side pacing: skip camera frames beyond the requested FPS so we do
@@ -56,8 +57,11 @@ class MjpegStreamer(
     private var captureWindowStartNs = 0L
     private var captureWindowFrames = 0
 
-    suspend fun start() {
-        activeConfig = StreamState.currentConfig()
+    suspend fun start(selectedFallbackMode: H264ModeDto? = null) {
+        val desired = StreamState.currentConfig()
+        activeConfig = selectedFallbackMode?.let {
+            desired.copy(width = it.width, height = it.height, fps = it.fps, profile = "exact")
+        } ?: desired
         activePipelineGeneration = StreamState.pipelineGeneration.get()
         captureWindowStartNs = 0L
         captureWindowFrames = 0
@@ -186,6 +190,13 @@ class MjpegStreamer(
                             *useCases.toTypedArray()
                         )
                         observeCameraControls()
+                        StreamState.publishPhonePreview(
+                            activePipelineGeneration,
+                            config.localPreviewEnabled && surfaceProvider != null,
+                            if (config.localPreviewEnabled && surfaceProvider == null) {
+                                "CameraX preview requested but no phone SurfaceProvider is attached"
+                            } else ""
+                        )
 
                         // Extract actual resolution selected by CameraX
                         val resolution = imageAnalysis.resolutionInfo?.resolution
@@ -407,19 +418,27 @@ class MjpegStreamer(
             val manualRot = (config.displayRotation.toIntOrNull() ?: 0).mod(360)
             val totalRot = (autoRot + manualRot).mod(360)
 
+            val transformNeeded = totalRot != 0 || config.mirror
             val outBuf: ByteArray
             val outW: Int
             val outH: Int
-            if (totalRot != 0) {
+            if (transformNeeded) {
                 if (nv21RotatedBuffer?.size != frameSize) nv21RotatedBuffer = ByteArray(frameSize)
+                if (nv21TransformScratch?.size != frameSize) nv21TransformScratch = ByteArray(frameSize)
                 val dst = nv21RotatedBuffer!!
-                // Stage B: NV21 rotation (only when a rotation is applied).
+                val scratch = nv21TransformScratch!!
+                // Stage B: authoritative NV21 rotation + mirror. Every MJPEG
+                // consumer receives these exact pixels and must not transform
+                // them again downstream.
                 val rotStartNs = System.nanoTime()
-                rotateNv21(nv21, dst, width, height, totalRot)
+                val dimensions = Nv21Transform.transform(
+                    nv21, dst, scratch, width, height, totalRot, config.mirror
+                )
                 val rotMs = (System.nanoTime() - rotStartNs) / 1_000_000.0
                 StreamState.rotateMsAvg.set(ewma(StreamState.rotateMsAvg.get(), rotMs))
                 outBuf = dst
-                if (totalRot % 180 != 0) { outW = height; outH = width } else { outW = width; outH = height }
+                outW = dimensions.width
+                outH = dimensions.height
             } else {
                 // No rotation this frame: record 0 so the average decays toward it.
                 StreamState.rotateMsAvg.set(ewma(StreamState.rotateMsAvg.get(), 0.0))
@@ -538,65 +557,6 @@ class MjpegStreamer(
                 }
                 dstOffset += width
             }
-        }
-    }
-
-    /**
-     * Rotates an NV21 frame by 90/180/270 degrees clockwise into [dst], as a
-     * pure memory permutation — no JPEG decode/re-encode, so it is cheap enough
-     * to run per frame. For 90/270 the output dimensions are (height x width).
-     * NV21 layout: full-res Y plane, then interleaved V,U at quarter resolution.
-     */
-    private fun rotateNv21(src: ByteArray, dst: ByteArray, width: Int, height: Int, degrees: Int) {
-        val ySize = width * height
-        val total = ySize + ySize / 2
-        when (degrees) {
-            90 -> {
-                var i = 0
-                for (x in 0 until width) {
-                    for (y in height - 1 downTo 0) {
-                        dst[i++] = src[y * width + x]
-                    }
-                }
-                i = ySize
-                for (x in 0 until width step 2) {
-                    for (y in height / 2 - 1 downTo 0) {
-                        val p = ySize + y * width + x
-                        dst[i++] = src[p]     // V
-                        dst[i++] = src[p + 1] // U
-                    }
-                }
-            }
-            180 -> {
-                var i = 0
-                for (p in ySize - 1 downTo 0) {
-                    dst[i++] = src[p]
-                }
-                i = ySize
-                var p = total - 2
-                while (p >= ySize) {
-                    dst[i++] = src[p]     // V
-                    dst[i++] = src[p + 1] // U
-                    p -= 2
-                }
-            }
-            270 -> {
-                var i = 0
-                for (x in width - 1 downTo 0) {
-                    for (y in 0 until height) {
-                        dst[i++] = src[y * width + x]
-                    }
-                }
-                i = ySize
-                for (x in width - 2 downTo 0 step 2) {
-                    for (y in 0 until height / 2) {
-                        val p = ySize + y * width + x
-                        dst[i++] = src[p]     // V
-                        dst[i++] = src[p + 1] // U
-                    }
-                }
-            }
-            else -> System.arraycopy(src, 0, dst, 0, total)
         }
     }
 

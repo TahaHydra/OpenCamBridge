@@ -27,6 +27,12 @@ object ResolutionPolicy {
             var resolutionPolicyName = ""
             
             when (profile) {
+                "exact" -> {
+                    resolutionPolicyName = "exact_canonical_tuple"
+                    validSizes.addAll(supportedSizes.filter {
+                        landscapeW(it) == requestedWidth && landscapeH(it) == requestedHeight
+                    })
+                }
                 "low-latency" -> {
                     resolutionPolicyName = "strict_low_latency"
                     validSizes.addAll(supportedSizes.filter { isNearAspect(it, 16, 9) && landscapeW(it) <= 1280 })
@@ -86,7 +92,7 @@ object ResolutionPolicy {
                 }
             }
             
-            if (validSizes.isEmpty()) {
+            if (validSizes.isEmpty() && profile != "exact") {
                 fallbackUsed = true
                 resolutionPolicyName = "fallback_auto_no_valid_size"
                 validSizes.addAll(supportedSizes)
@@ -101,8 +107,13 @@ object ResolutionPolicy {
 
         val boundSize = android.util.Size(requestedWidth, requestedHeight)
         
+        val fallbackRule = if (profile == "exact") {
+            androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_NONE
+        } else {
+            androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+        }
         return ResolutionSelector.Builder()
-            .setResolutionStrategy(androidx.camera.core.resolutionselector.ResolutionStrategy(boundSize, androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
+            .setResolutionStrategy(androidx.camera.core.resolutionselector.ResolutionStrategy(boundSize, fallbackRule))
             .setResolutionFilter(filter)
             .build()
     }

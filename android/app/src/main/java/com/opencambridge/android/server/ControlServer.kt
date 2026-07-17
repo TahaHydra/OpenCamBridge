@@ -202,10 +202,6 @@ class ControlServer(
 
     private suspend fun serveObs(call: RoutingCall) {
         val fit = call.request.queryParameters["fit"].takeIf { it == "contain" || it == "cover" } ?: "cover"
-        val mirror = call.request.queryParameters["mirror"] == "true"
-        val rotate = call.request.queryParameters["rotate"]?.toIntOrNull()?.takeIf { it in setOf(0, 90, 180, 270) } ?: 0
-
-        val scaleX = if (mirror) -1 else 1
         val accessMode = StreamState.accessMode.get()
         val token = StreamState.accessToken.get()
 
@@ -255,7 +251,6 @@ class ControlServer(
                     width: 100%;
                     height: 100%;
                     object-fit: $fit;
-                    transform: rotate(${rotate}deg) scaleX($scaleX);
                 }
               </style>
             </head>
@@ -527,6 +522,7 @@ class ControlServer(
                         <label>Phone Preview</label>
                         <input type="checkbox" id="preview-check" onchange="patchSetting({phonePreviewEnabled: this.checked})">
                       </div>
+                      <div id="preview-state" style="font-size:12px;color:#888;margin-top:6px;">Not requested</div>
                     </div>
 
                     <div class="controls">
@@ -685,17 +681,16 @@ class ControlServer(
                     canvas.classList.remove('fit-contain', 'fit-cover');
                     canvas.classList.add(lastMode === 'fill' ? 'fit-cover' : 'fit-contain');
 
-                    // The /stream.mjpeg frames are already rotated on the phone
-                    // (auto-upright + manual offset), so this view must NOT
-                    // rotate the content again — mirror only. The box keeps the
-                    // 16:9 virtual-camera canvas; portrait frames letterbox.
+                    // Both MJPEG rotation and mirror are baked into the JPEG on
+                    // Android. H.264 WebCodecs applies authoritative OCB2
+                    // metadata in its canvas. This wrapper never transforms
+                    // either source a second time.
                     const boxW = box.clientWidth;
                     const boxH = box.clientHeight;
                     rotator.style.width = boxW + 'px';
                     rotator.style.height = boxH + 'px';
 
-                    const scaleX = currentStreamMode === 'mjpeg' && lastMirror ? -1 : 1;
-                    rotator.style.transform = `translate(-50%, -50%) scaleX(${'$'}{scaleX})`;
+                    rotator.style.transform = 'translate(-50%, -50%)';
                 }
 
                 function updateOrientation(mode) {
@@ -972,7 +967,14 @@ class ControlServer(
                             orientSel.value = (ar === '9:16' || ar === '16:9') ? ar : 'auto';
                         }
                         document.getElementById('mirror-check').checked = !!status.mirror;
-                        document.getElementById('preview-check').checked = !!status.phonePreviewEnabled;
+                        document.getElementById('preview-check').checked = !!status.phonePreviewRequested;
+                        const previewState = document.getElementById('preview-state');
+                        if (previewState) {
+                            previewState.textContent = !status.phonePreviewRequested ? 'Not requested'
+                                : status.phonePreviewActive ? 'Active'
+                                : 'Inactive: ' + (status.phonePreviewFailureReason || 'waiting for a valid target/session');
+                            previewState.style.color = status.phonePreviewRequested && !status.phonePreviewActive ? '#fbc02d' : '#888';
+                        }
 
                         if (currentStreamMode === 'h264') {
                             document.getElementById('h264-info').style.display = 'block';
@@ -1574,7 +1576,11 @@ class ControlServer(
         call.respond(
             PipelineMetricsDto(
                 generation = status.snapshot.generation,
+                lifecycleState = status.lifecycleState,
                 activeStreamMode = mode,
+                phonePreviewRequested = status.phonePreviewRequested,
+                phonePreviewActive = status.phonePreviewActive,
+                phonePreviewFailureReason = status.phonePreviewFailureReason,
                 capture = if (!active || selected == null || actual == null) null else CaptureMetricsDto(
                     engine = selected.captureEngine,
                     cameraId = selected.cameraId,
@@ -1769,7 +1775,11 @@ private data class AutofocusRequest(val enabled: Boolean)
 @Serializable
 private data class PipelineMetricsDto(
     val generation: Long,
+    val lifecycleState: String,
     val activeStreamMode: String,
+    val phonePreviewRequested: Boolean,
+    val phonePreviewActive: Boolean,
+    val phonePreviewFailureReason: String,
     val capture: CaptureMetricsDto?,
     val h264: H264MetricsDto?,
     val mjpeg: MjpegMetricsDto?,

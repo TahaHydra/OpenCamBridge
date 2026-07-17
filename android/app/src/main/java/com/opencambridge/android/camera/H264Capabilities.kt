@@ -64,14 +64,11 @@ object H264Capabilities {
         requestedWidth: Int,
         requestedHeight: Int,
         requestedFps: Int,
-        includeAdaptiveFallbacks: Boolean = true
+        includeAdaptiveFallbacks: Boolean = false
     ): List<H264EncoderSelection> {
         val requested = H264ModeDto(requestedWidth, requestedHeight, requestedFps)
-        val modes = if (includeAdaptiveFallbacks) {
-            CapturePathPolicy.adaptiveModes(requested, preferredModes)
-        } else {
-            listOf(requested)
-        }
+        val modes = if (includeAdaptiveFallbacks) CapturePathPolicy.adaptiveModes(requested, preferredModes)
+        else listOf(requested)
         return modes.flatMap { selectionsForMode(context, cameraId, it) }
     }
 

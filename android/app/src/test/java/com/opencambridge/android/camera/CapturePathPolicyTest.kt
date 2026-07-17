@@ -3,6 +3,7 @@ package com.opencambridge.android.camera
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CapturePathPolicyTest {
@@ -30,6 +31,63 @@ class CapturePathPolicyTest {
     fun sixtyAdaptiveOrderMatchesProductPreference() {
         val requested = H264ModeDto(1920, 1080, 60)
         assertEquals(H264Capabilities.preferredModes, CapturePathPolicy.adaptiveModes(requested, H264Capabilities.preferredModes))
+    }
+
+    @Test
+    fun sevenTwentySixtyNeverUpgradesToTenEightySixty() {
+        val requested = H264ModeDto(1280, 720, 60)
+        assertEquals(
+            listOf(H264ModeDto(1280, 720, 60), H264ModeDto(1280, 720, 30)),
+            CapturePathPolicy.adaptiveModes(requested, H264Capabilities.preferredModes)
+        )
+    }
+
+    @Test
+    fun sevenTwentyThirtyNeverUpgradesToTenEightyThirty() {
+        val requested = H264ModeDto(1280, 720, 30)
+        assertEquals(
+            listOf(requested),
+            CapturePathPolicy.adaptiveModes(requested, H264Capabilities.preferredModes)
+        )
+    }
+
+    @Test
+    fun explicitProfileTriesOnlyTheRequestedTuple() {
+        val requested = H264ModeDto(1920, 1080, 60)
+        assertEquals(
+            listOf(requested),
+            CapturePathPolicy.candidateModes("quality", requested, H264Capabilities.preferredModes)
+        )
+        assertEquals(
+            listOf(requested),
+            CapturePathPolicy.candidateModes("native", requested, H264Capabilities.preferredModes)
+        )
+    }
+
+    @Test
+    fun adaptiveOrderIsExactAndOnlyDowngrades() {
+        val requested = H264ModeDto(1920, 1080, 60)
+        val candidates = CapturePathPolicy.candidateModes("adaptive", requested, H264Capabilities.preferredModes)
+        assertEquals(
+            listOf(
+                H264ModeDto(1920, 1080, 60),
+                H264ModeDto(1280, 720, 60),
+                H264ModeDto(1920, 1080, 30),
+                H264ModeDto(1280, 720, 30)
+            ),
+            candidates
+        )
+        assertTrue(candidates.all { it.width <= requested.width && it.height <= requested.height && it.fps <= requested.fps })
+    }
+
+    @Test
+    fun h264SixtyFallbackSelectsCanonicalMjpegThirty() {
+        val selected = CapturePathPolicy.selectMjpegFallback(
+            H264ModeDto(1920, 1080, 60),
+            listOf(H264ModeDto(1280, 720, 30), H264ModeDto(1920, 1080, 30))
+        )
+        assertEquals(H264ModeDto(1920, 1080, 30), selected)
+        assertFalse(selected?.fps == 60)
     }
 
     @Test

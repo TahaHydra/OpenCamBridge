@@ -33,6 +33,7 @@ class HighSpeedGpuBridge(
     private val height: Int,
     private val outputFps: Int,
     private val onFrameRendered: (timestampNs: Long) -> Unit,
+    private val onPreviewState: (active: Boolean, failureReason: String) -> Unit,
     private val onError: (String) -> Unit
 ) {
     private data class Target(val eglSurface: EGLSurface, val width: Int, val height: Int)
@@ -115,12 +116,17 @@ class HighSpeedGpuBridge(
         }
         previewTarget = if (previewSurface?.isValid == true) {
             try {
-                createWindowTarget(config, previewSurface, null, null)
+                createWindowTarget(config, previewSurface, width, height).also {
+                    onPreviewState(true, "")
+                }
             } catch (e: Exception) {
-                Log.w(TAG, "Optional preview EGL surface rejected: ${e.message}")
+                val reason = "Optional preview EGL surface rejected: ${e.javaClass.simpleName}: ${e.message}"
+                Log.w(TAG, reason)
+                onPreviewState(false, reason)
                 null
             }
         } else {
+            if (previewSurface != null) onPreviewState(false, "Phone preview Surface is invalid")
             null
         }
         program = linkProgram(VERTEX_SHADER, FRAGMENT_SHADER)
@@ -204,9 +210,11 @@ class HighSpeedGpuBridge(
             previewTarget?.let {
                 draw(it)
                 if (!EGL14.eglSwapBuffers(display, it.eglSurface)) {
-                    Log.w(TAG, "Preview surface detached: 0x${Integer.toHexString(EGL14.eglGetError())}")
+                    val reason = "GPU preview surface detached: 0x${Integer.toHexString(EGL14.eglGetError())}"
+                    Log.w(TAG, reason)
                     EGL14.eglDestroySurface(display, it.eglSurface)
                     previewTarget = null
+                    onPreviewState(false, reason)
                 }
             }
             onFrameRendered(cameraTimestampNs)

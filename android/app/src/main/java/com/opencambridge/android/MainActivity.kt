@@ -2,12 +2,16 @@ package com.opencambridge.android
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.content.Context
+import android.graphics.SurfaceTexture
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.view.Gravity
+import android.view.Surface
+import android.view.TextureView
 import android.view.ViewGroup
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -43,10 +47,89 @@ import com.opencambridge.android.camera.CapturePathPolicy
 import com.opencambridge.android.service.StreamService
 import com.opencambridge.android.state.LogEntry
 import kotlin.math.roundToInt
+import kotlin.math.max
+import kotlin.math.min
 
 private const val TAG = "MainActivity"
 
 enum class NavTab { Stream, Controls, Security, Logs }
+
+private class CameraPreviewContainer(context: Context) : FrameLayout(context) {
+    private val texture = TextureView(context)
+    private var cameraSurface: Surface? = null
+    private var bufferWidth = 1280
+    private var bufferHeight = 720
+    private var rotationDegrees = 0
+    private var mirrored = false
+    private var fitMode = "fill"
+    var onSurfaceChanged: ((Surface?) -> Unit)? = null
+
+    init {
+        clipChildren = true
+        addView(texture, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT, Gravity.CENTER))
+        texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
+                surfaceTexture.setDefaultBufferSize(bufferWidth, bufferHeight)
+                cameraSurface?.release()
+                cameraSurface = Surface(surfaceTexture).also { onSurfaceChanged?.invoke(it) }
+                updateChildTransform()
+            }
+
+            override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+                updateChildTransform()
+            }
+
+            override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+                onSurfaceChanged?.invoke(null)
+                cameraSurface?.release()
+                cameraSurface = null
+                return true
+            }
+
+            override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+        }
+    }
+
+    fun configure(width: Int, height: Int, rotation: Int, mirror: Boolean, mode: String) {
+        bufferWidth = width.coerceAtLeast(2)
+        bufferHeight = height.coerceAtLeast(2)
+        rotationDegrees = rotation.mod(360)
+        mirrored = mirror
+        fitMode = mode
+        texture.surfaceTexture?.setDefaultBufferSize(bufferWidth, bufferHeight)
+        updateChildTransform()
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        updateChildTransform()
+    }
+
+    private fun updateChildTransform() {
+        if (width <= 0 || height <= 0) return
+        val swapsAxes = rotationDegrees == 90 || rotationDegrees == 270
+        val displayedWidth = if (swapsAxes) bufferHeight else bufferWidth
+        val displayedHeight = if (swapsAxes) bufferWidth else bufferHeight
+        val containScale = min(width.toFloat() / displayedWidth, height.toFloat() / displayedHeight)
+        val coverScale = max(width.toFloat() / displayedWidth, height.toFloat() / displayedHeight)
+        val scale = if (fitMode == "fill") coverScale else containScale
+        texture.layoutParams = LayoutParams(
+            max(2, (bufferWidth * scale).roundToInt()),
+            max(2, (bufferHeight * scale).roundToInt()),
+            Gravity.CENTER
+        )
+        texture.rotation = rotationDegrees.toFloat()
+        texture.scaleX = if (mirrored) -1f else 1f
+        texture.scaleY = 1f
+    }
+
+    fun releasePreview() {
+        onSurfaceChanged?.invoke(null)
+        cameraSurface?.release()
+        cameraSurface = null
+        texture.surfaceTextureListener = null
+    }
+}
 
 class MainActivity : ComponentActivity() {
 
@@ -85,6 +168,8 @@ class MainActivity : ComponentActivity() {
                 val zoomSpeed by viewModel.zoomSpeed.collectAsState()
                 
                 val localPreviewEnabled by viewModel.localPreviewEnabled.collectAsState()
+                val phonePreviewActive by viewModel.phonePreviewActive.collectAsState()
+                val phonePreviewFailureReason by viewModel.phonePreviewFailureReason.collectAsState()
                 val rebindInProgress by viewModel.rebindInProgress.collectAsState()
                 val torchEnabled by viewModel.torchEnabled.collectAsState()
                 val hasTorch by viewModel.hasTorch.collectAsState()
@@ -112,6 +197,8 @@ class MainActivity : ComponentActivity() {
                     aspectRatio = aspectRatio,
                     zoomSpeed = zoomSpeed,
                     localPreviewEnabled = localPreviewEnabled,
+                    phonePreviewActive = phonePreviewActive,
+                    phonePreviewFailureReason = phonePreviewFailureReason,
                     rebindInProgress = rebindInProgress,
                     torchEnabled = torchEnabled,
                     hasTorch = hasTorch,
@@ -231,6 +318,8 @@ fun MainScreen(
     aspectRatio: String,
     zoomSpeed: String,
     localPreviewEnabled: Boolean,
+    phonePreviewActive: Boolean,
+    phonePreviewFailureReason: String,
     rebindInProgress: Boolean,
     torchEnabled: Boolean,
     hasTorch: Boolean,
@@ -315,7 +404,10 @@ fun MainScreen(
         ) {
             when (currentTab) {
                 NavTab.Stream -> {
-                    StreamTabContent(isLandscape, localPreviewEnabled, previewFitMode, viewModel, isStreaming, wifiIp, onStartStop, rebindInProgress, onTogglePreview)
+                    StreamTabContent(
+                        isLandscape, localPreviewEnabled, phonePreviewActive, phonePreviewFailureReason,
+                        previewFitMode, viewModel, isStreaming, wifiIp, onStartStop, rebindInProgress, onTogglePreview
+                    )
                 }
                 NavTab.Controls -> {
                     Column(
@@ -324,7 +416,8 @@ fun MainScreen(
                     ) {
                         MainControls(
                             isStreaming, wifiIp, cameras, selectedCameraId, width, height, fps, jpegQuality,
-                            previewFitMode, aspectRatio, zoomSpeed, localPreviewEnabled, rebindInProgress,
+                            previewFitMode, aspectRatio, zoomSpeed, localPreviewEnabled, phonePreviewActive,
+                            phonePreviewFailureReason, rebindInProgress,
                             torchEnabled, hasTorch, linearZoom, rotationDegrees, displayRotation, mirror, streamMode,
                             onStartStop, onCameraSelect, onResolutionSelect, onFpsSelect, onJpegQualitySelect,
                             onPreviewFitModeSelect, onAspectRatioSelect, onZoomSpeedSelect, onTogglePreview,
@@ -367,6 +460,8 @@ fun MainScreen(
 fun StreamTabContent(
     isLandscape: Boolean,
     localPreviewEnabled: Boolean,
+    phonePreviewActive: Boolean,
+    phonePreviewFailureReason: String,
     previewFitMode: String,
     viewModel: StreamViewModel,
     isStreaming: Boolean,
@@ -434,7 +529,16 @@ fun StreamTabContent(
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Column {
                                 Text("Preview on phone", color = if (!rebindInProgress) Color.Unspecified else Color.Gray)
-                                Text(if (localPreviewEnabled) "Enabled" else "Disabled", color = Color.Gray, fontSize = 12.sp)
+                                Text(
+                                    when {
+                                        !localPreviewEnabled -> "Not requested"
+                                        phonePreviewActive -> "Active"
+                                        phonePreviewFailureReason.isNotBlank() -> "Inactive: $phonePreviewFailureReason"
+                                        else -> "Requested — waiting for target"
+                                    },
+                                    color = if (localPreviewEnabled && !phonePreviewActive) Color(0xFFFBC02D) else Color.Gray,
+                                    fontSize = 12.sp
+                                )
                             }
                             Switch(checked = localPreviewEnabled, enabled = !rebindInProgress, onCheckedChange = onTogglePreview, colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary))
                         }
@@ -500,7 +604,16 @@ fun StreamTabContent(
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         Column {
                             Text("Preview on phone", color = if (!rebindInProgress) Color.Unspecified else Color.Gray)
-                            Text(if (localPreviewEnabled) "Enabled" else "Disabled", color = Color.Gray, fontSize = 12.sp)
+                            Text(
+                                when {
+                                    !localPreviewEnabled -> "Not requested"
+                                    phonePreviewActive -> "Active"
+                                    phonePreviewFailureReason.isNotBlank() -> "Inactive: $phonePreviewFailureReason"
+                                    else -> "Requested — waiting for target"
+                                },
+                                color = if (localPreviewEnabled && !phonePreviewActive) Color(0xFFFBC02D) else Color.Gray,
+                                fontSize = 12.sp
+                            )
                         }
                         Switch(checked = localPreviewEnabled, enabled = !rebindInProgress, onCheckedChange = onTogglePreview, colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary))
                     }
@@ -514,7 +627,8 @@ fun StreamTabContent(
 fun MainControls(
     isStreaming: Boolean, wifiIp: String?, cameras: List<CameraInfoDto>, selectedCameraId: String,
     width: Int, height: Int, fps: Int, jpegQuality: Int, previewFitMode: String, aspectRatio: String,
-    zoomSpeed: String, localPreviewEnabled: Boolean, rebindInProgress: Boolean, torchEnabled: Boolean,
+    zoomSpeed: String, localPreviewEnabled: Boolean, phonePreviewActive: Boolean,
+    phonePreviewFailureReason: String, rebindInProgress: Boolean, torchEnabled: Boolean,
     hasTorch: Boolean, linearZoom: Float, rotationDegrees: Int, displayRotation: String, mirror: Boolean, streamMode: String,
     onStartStop: () -> Unit, onCameraSelect: (String) -> Unit, onResolutionSelect: (Int, Int) -> Unit,
     onFpsSelect: (Int) -> Unit, onJpegQualitySelect: (Int) -> Unit, onPreviewFitModeSelect: (String) -> Unit,
@@ -628,26 +742,26 @@ fun MainControls(
 @Composable
 fun LocalPreviewBox(fitMode: String, viewModel: StreamViewModel) {
     val streamMode by viewModel.streamMode.collectAsState()
+    val width by viewModel.width.collectAsState()
+    val height by viewModel.height.collectAsState()
+    val rotation by viewModel.rotationDegrees.collectAsState()
+    val mirror by viewModel.mirror.collectAsState()
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .aspectRatio(16f / 9f)
             .background(Color.Black, RoundedCornerShape(8.dp))
     ) {
-        if (streamMode == "h264") AndroidView(
+        if (streamMode == "h264") AndroidView<CameraPreviewContainer>(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
-                SurfaceView(ctx).apply {
+                CameraPreviewContainer(ctx).apply {
                     layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-                    holder.addCallback(object : SurfaceHolder.Callback {
-                        override fun surfaceCreated(holder: SurfaceHolder) = viewModel.setCamera2PreviewSurface(holder.surface)
-                        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) =
-                            viewModel.setCamera2PreviewSurface(holder.surface)
-                        override fun surfaceDestroyed(holder: SurfaceHolder) = viewModel.setCamera2PreviewSurface(null)
-                    })
+                    onSurfaceChanged = viewModel::setCamera2PreviewSurface
                 }
             },
-            onRelease = { viewModel.setCamera2PreviewSurface(null) }
+            update = { it.configure(width, height, rotation, mirror, fitMode) },
+            onRelease = { it.releasePreview() }
         ) else AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->

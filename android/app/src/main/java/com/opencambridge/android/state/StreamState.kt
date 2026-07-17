@@ -97,6 +97,8 @@ private data class PipelineSnapshot(
     val selected: SelectedPipeline? = null,
     val actual: ActualPipeline? = null,
     val fallback: FallbackState? = null,
+    val phonePreviewActive: Boolean = false,
+    val phonePreviewFailureReason: String = "",
     val lastRequestId: String? = null,
     val updatedAtMillis: Long = System.currentTimeMillis(),
     val lastUpdatedBy: String = "system"
@@ -122,13 +124,19 @@ object StreamState {
                     generation = it.generation + 1,
                     selected = null,
                     actual = null,
-                    fallback = null
+                    fallback = null,
+                    phonePreviewActive = false,
+                    phonePreviewFailureReason = if (it.desired.localPreviewEnabled) {
+                        "Waiting for a preview target in pipeline generation ${it.generation + 1}"
+                    } else ""
                 )
             }.generation
         }
     )
     val updatedAtMillis = SnapshotReadValue { pipelineSnapshot.get().updatedAtMillis }
     val lastUpdatedBy = SnapshotReadValue { pipelineSnapshot.get().lastUpdatedBy }
+    val phonePreviewActive = SnapshotReadValue { pipelineSnapshot.get().phonePreviewActive }
+    val phonePreviewFailureReason = SnapshotReadValue { pipelineSnapshot.get().phonePreviewFailureReason }
 
     val streaming = AtomicBoolean(false) // Deprecated, use lifecycleState
     val lifecycleState = SnapshotValue({ pipelineSnapshot.get().lifecycle }) { value ->
@@ -284,6 +292,12 @@ object StreamState {
                 selected = if (shapeChanged) null else it.selected,
                 actual = if (shapeChanged) null else it.actual,
                 fallback = if (shapeChanged) null else it.fallback,
+                phonePreviewActive = if (shapeChanged || !config.localPreviewEnabled) false else it.phonePreviewActive,
+                phonePreviewFailureReason = when {
+                    !config.localPreviewEnabled -> ""
+                    shapeChanged -> "Waiting for preview session reconfiguration"
+                    else -> it.phonePreviewFailureReason
+                },
                 lastRequestId = requestId,
                 updatedAtMillis = System.currentTimeMillis(),
                 lastUpdatedBy = source
@@ -358,6 +372,16 @@ object StreamState {
         }
         fallbackUsed.set(active)
         fallbackReason.set(reason)
+    }
+
+    fun publishPhonePreview(generation: Long, active: Boolean, failureReason: String = "") {
+        updatePipelineSnapshot { current ->
+            if (current.generation != generation) return@updatePipelineSnapshot current
+            current.copy(
+                phonePreviewActive = current.desired.localPreviewEnabled && active,
+                phonePreviewFailureReason = if (!current.desired.localPreviewEnabled || active) "" else failureReason
+            )
+        }
     }
 
     private fun mirrorLegacyConfig(config: StreamConfig) {
@@ -455,6 +479,9 @@ object StreamState {
             selected = selected,
             actual = actual,
             fallback = fallbackState?.let { FallbackStateDto(it.generation, it.active, it.reason) },
+            phonePreviewRequested = config.localPreviewEnabled,
+            phonePreviewActive = snapshot.phonePreviewActive,
+            phonePreviewFailureReason = snapshot.phonePreviewFailureReason,
             lastRequestId = snapshot.lastRequestId,
             lastUpdatedBy = snapshot.lastUpdatedBy
         )
@@ -491,6 +518,9 @@ object StreamState {
         zoomSpeed = config.zoomSpeed,
         localPreviewEnabled = config.localPreviewEnabled,
         phonePreviewEnabled = config.localPreviewEnabled,
+        phonePreviewRequested = config.localPreviewEnabled,
+        phonePreviewActive = snapshot.phonePreviewActive,
+        phonePreviewFailureReason = snapshot.phonePreviewFailureReason,
         rebindInProgress = rebindInProgress.get(),
         hasTorch = hasTorch.get(),
         torchEnabled = torchEnabled.get(),
@@ -572,6 +602,9 @@ data class StreamStatusDto(
     val zoomSpeed: String,
     val localPreviewEnabled: Boolean,
     val phonePreviewEnabled: Boolean = localPreviewEnabled,
+    val phonePreviewRequested: Boolean = phonePreviewEnabled,
+    val phonePreviewActive: Boolean = false,
+    val phonePreviewFailureReason: String = "",
     val rebindInProgress: Boolean,
     val hasTorch: Boolean,
     val torchEnabled: Boolean = false,
@@ -626,6 +659,9 @@ data class PipelineSnapshotDto(
     val selected: SelectedPipelineDto?,
     val actual: ActualPipelineDto?,
     val fallback: FallbackStateDto?,
+    val phonePreviewRequested: Boolean,
+    val phonePreviewActive: Boolean,
+    val phonePreviewFailureReason: String,
     val lastRequestId: String?,
     val lastUpdatedBy: String
 )

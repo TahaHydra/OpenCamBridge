@@ -379,12 +379,21 @@ class StreamService : LifecycleService() {
         StreamState.lifecycleState.set(LifecycleState.RECONFIGURING)
         StreamState.streaming.set(false)
         beginPipelineGeneration()
-        val fallback = "H.264 failed: $reason; using MJPEG compatibility"
+        val desired = StreamState.currentConfig()
+        val selected = selectCanonicalMjpegFallback(desired)
+            ?: return handleCameraError(
+                "H.264 to MJPEG fallback failed",
+                IllegalStateException(
+                    "H.264 failed: $reason; camera ${desired.cameraId} exposes no MJPEG fallback at or below " +
+                        "${desired.width}x${desired.height}@${desired.fps}"
+                )
+            )
+        val fallback = "H.264 failed: $reason; selected MJPEG ${selected.width}x${selected.height}@${selected.fps}"
         StreamState.publishRuntimeRevision("runtime-h264-fallback", java.util.UUID.randomUUID().toString())
         AppLogger.w("H264", fallback)
         return try {
             h264Streamer.stop()
-            mjpegStreamer.start()
+            mjpegStreamer.start(selected)
             StreamState.activeStreamMode.set("mjpeg")
             StreamState.publishFallback(true, fallback)
             StreamState.lifecycleState.set(LifecycleState.STREAMING)
@@ -490,12 +499,25 @@ class StreamService : LifecycleService() {
             h264Streamer.start()
             StreamState.activeStreamMode.set("h264")
         } catch (h264Error: Exception) {
-            val reason = "H.264 unavailable: ${h264Error.message}; using MJPEG"
+            val selected = selectCanonicalMjpegFallback(config) ?: throw IllegalStateException(
+                "H.264 failed exactly at ${config.width}x${config.height}@${config.fps}: ${h264Error.message}; " +
+                    "camera ${config.cameraId} exposes no valid MJPEG fallback"
+            )
+            val reason = "H.264 failed exactly at ${config.width}x${config.height}@${config.fps}: " +
+                "${h264Error.message}; selected MJPEG ${selected.width}x${selected.height}@${selected.fps}"
             AppLogger.w("H264", reason)
-            StreamState.publishFallback(true, reason)
-            mjpegStreamer.start()
+            mjpegStreamer.start(selected)
             StreamState.activeStreamMode.set("mjpeg")
+            StreamState.publishFallback(true, reason)
         }
+    }
+
+    private fun selectCanonicalMjpegFallback(config: com.opencambridge.android.state.StreamConfig): H264ModeDto? {
+        val camera = cameraRepository.listCameras().firstOrNull { it.id == config.cameraId } ?: return null
+        return com.opencambridge.android.camera.CapturePathPolicy.selectMjpegFallback(
+            H264ModeDto(config.width, config.height, config.fps),
+            camera.mjpegModes
+        )
     }
 
     private suspend fun applySettingsPatch(req: UpdateSettingsRequest, source: String?): PipelineResult {

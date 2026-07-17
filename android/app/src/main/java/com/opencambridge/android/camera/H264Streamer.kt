@@ -116,7 +116,7 @@ class H264Streamer(
                 requested?.width ?: config.width,
                 requested?.height ?: config.height,
                 requested?.fps ?: config.fps,
-                includeAdaptiveFallbacks = requested == null
+                includeAdaptiveFallbacks = requested == null && config.profile == "adaptive"
             )
             if (candidates.isEmpty()) {
                 val requestedMode = H264ModeDto(
@@ -501,8 +501,16 @@ class H264Streamer(
 
     private suspend fun createSession(device: CameraDevice, chosen: H264EncoderSelection, generation: Long) {
         val encodeSurface = encoderSurface ?: throw IllegalStateException("Encoder surface was not created")
+        val pipelineGeneration = activePipelineGeneration
+        val previewRequested = activeConfig?.localPreviewEnabled == true
         val preview = StreamState.camera2PreviewSurface.get()
-            ?.takeIf { activeConfig?.localPreviewEnabled == true && it.isValid }
+            ?.takeIf { previewRequested && it.isValid }
+        if (!previewRequested) StreamState.publishPhonePreview(pipelineGeneration, false, "")
+        else if (preview == null) StreamState.publishPhonePreview(
+            pipelineGeneration,
+            false,
+            "Phone preview requested but no valid Camera2 Surface target is attached"
+        )
         val captureSurface = if (chosen.captureEngine == H264CaptureEngine.HIGH_SPEED_GPU_BRIDGE) {
             HighSpeedGpuBridge(
                 encoderSurface = encodeSurface,
@@ -511,6 +519,9 @@ class H264Streamer(
                 height = chosen.mode.height,
                 outputFps = chosen.mode.fps,
                 onFrameRendered = ::onBridgeFrameRendered,
+                onPreviewState = { active, failure ->
+                    StreamState.publishPhonePreview(pipelineGeneration, active, failure)
+                },
                 onError = { error ->
                     if (generation == captureGeneration.get()) {
                         publishError(error)
@@ -527,7 +538,9 @@ class H264Streamer(
         if (chosen.captureEngine != H264CaptureEngine.HIGH_SPEED_GPU_BRIDGE && preview != null) {
             targets.add(preview)
         }
-        configureCameraSession(device, chosen, targets, captureSurface, targets.size > 1, generation)
+        configureCameraSession(
+            device, chosen, targets, captureSurface, targets.size > 1, generation, pipelineGeneration
+        )
     }
 
     private suspend fun configureCameraSession(
@@ -536,7 +549,8 @@ class H264Streamer(
         initialTargets: List<Surface>,
         requiredSurface: Surface,
         mayRetryWithoutPreview: Boolean,
-        generation: Long
+        generation: Long,
+        pipelineGeneration: Long
     ) = suspendCancellableCoroutine<Unit> { continuation ->
         val executor = Executor { command -> cameraHandler?.post(command) }
         fun configure(activeTargets: List<Surface>, mayRetry: Boolean) {
@@ -563,6 +577,16 @@ class H264Streamer(
                             configureRequest(builder, chosen)
                             requestBuilder = builder
                             submitRepeating(configured, builder.build(), chosen)
+                            if (chosen.captureEngine != H264CaptureEngine.HIGH_SPEED_GPU_BRIDGE) {
+                                val previewActive = activeTargets.size > 1
+                                StreamState.publishPhonePreview(
+                                    pipelineGeneration,
+                                    previewActive,
+                                    if (!previewActive && activeConfig?.localPreviewEnabled == true) {
+                                        "${chosen.captureEngine} is running encoder-only after preview rejection"
+                                    } else ""
+                                )
+                            }
                             continuation.resume(Unit)
                         } catch (e: Exception) {
                             configured.close()
@@ -580,10 +604,12 @@ class H264Streamer(
                         failedSession.close()
                         if (!continuation.isActive) return
                         if (mayRetry) {
+                            val reason = "${chosen.captureEngine} rejected encoder+preview session; retrying encoder-only"
                             AppLogger.w(
                                 "H264Path",
-                                "${chosen.captureEngine} rejected optional preview surface; retrying encoder/capture surface only"
+                                reason
                             )
+                            StreamState.publishPhonePreview(pipelineGeneration, false, reason)
                             configure(listOf(requiredSurface), false)
                         } else {
                             continuation.resumeWithException(
@@ -611,6 +637,12 @@ class H264Streamer(
             } catch (e: Exception) {
                 if (!continuation.isActive) return
                 if (mayRetry) {
+                    StreamState.publishPhonePreview(
+                        pipelineGeneration,
+                        false,
+                        "${chosen.captureEngine} encoder+preview createCaptureSession rejected: " +
+                            "${e.javaClass.simpleName}: ${e.message}; retrying encoder-only"
+                    )
                     configure(listOf(requiredSurface), false)
                 } else {
                     continuation.resumeWithException(
@@ -738,8 +770,13 @@ class H264Streamer(
      * the user's requested settings. The service restarts this streamer after
      * this returns a mode. */
     fun prepareAdaptiveDowngrade(): H264ModeDto? {
+        val config = activeConfig ?: return null
+        if (config.profile != "adaptive") return null
         val current = selection?.mode ?: return null
-        val modes = H264Capabilities.supportedModes(context, activeConfig?.cameraId ?: StreamState.cameraId.get())
+        val supported = H264Capabilities.supportedModes(context, config.cameraId)
+        val requested = H264ModeDto(config.width, config.height, config.fps)
+        val modes = CapturePathPolicy.adaptiveModes(requested, H264Capabilities.preferredModes)
+            .filter(supported::contains)
         val index = modes.indexOfFirst { it == current }
         if (index < 0 || index + 1 >= modes.size) return null
         return modes[index + 1].also { adaptiveMode = it }

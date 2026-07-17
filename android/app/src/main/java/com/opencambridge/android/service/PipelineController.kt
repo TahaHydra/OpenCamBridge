@@ -16,6 +16,49 @@ enum class PipelineResultCode {
     FAILED
 }
 
+internal object ApplyPatchCoalescingPolicy {
+    private const val CAPTURE = 1
+    private const val TRANSFORM = 1 shl 1
+    private const val PREVIEW = 1 shl 2
+    private const val NETWORK = 1 shl 3
+    private const val ENCODING = 1 shl 4
+    private const val DISPLAY = 1 shl 5
+
+    fun canMerge(
+        older: UpdateSettingsRequest,
+        olderSource: String?,
+        newer: UpdateSettingsRequest,
+        newerSource: String?
+    ): Boolean {
+        val oldSourceIdentity = olderSource ?: older.clientType
+        val newSourceIdentity = newerSource ?: newer.clientType
+        val oldClientIdentity = older.clientType ?: olderSource
+        val newClientIdentity = newer.clientType ?: newerSource
+        return !oldSourceIdentity.isNullOrBlank() && oldSourceIdentity == newSourceIdentity &&
+            !oldClientIdentity.isNullOrBlank() && oldClientIdentity == newClientIdentity &&
+            older.baseRevision != null && older.baseRevision == newer.baseRevision &&
+            categoryMask(older) == categoryMask(newer)
+    }
+
+    private fun categoryMask(request: UpdateSettingsRequest): Int {
+        var mask = 0
+        if (request.cameraId != null || request.width != null || request.height != null ||
+            request.outputWidth != null || request.outputHeight != null || request.profile != null ||
+            request.fps != null || request.streamMode != null
+        ) mask = mask or CAPTURE
+        if (request.displayRotation != null || request.mirror != null) mask = mask or TRANSFORM
+        if (request.localPreviewEnabled != null || request.phonePreviewEnabled != null) mask = mask or PREVIEW
+        if (request.accessMode != null || request.port != null || request.accessToken != null) mask = mask or NETWORK
+        if (request.jpegQuality != null || request.h264Bitrate != null ||
+            request.h264KeyframeInterval != null || request.targetBandwidthMbps != null
+        ) mask = mask or ENCODING
+        if (request.previewFitMode != null || request.aspectRatio != null || request.zoomSpeed != null) {
+            mask = mask or DISPLAY
+        }
+        return mask
+    }
+}
+
 data class PipelineResult(
     val code: PipelineResultCode,
     val message: String,
@@ -102,7 +145,9 @@ class PipelineController(
             }
             when (command) {
                 is PipelineCommand.ApplySettings -> {
-                    val older = pending.filterIsInstance<PipelineCommand.ApplySettings>()
+                    val older = pending.filterIsInstance<PipelineCommand.ApplySettings>().filter {
+                        ApplyPatchCoalescingPolicy.canMerge(it.request, it.source, command.request, command.source)
+                    }
                     older.forEach {
                         pending.remove(it)
                         cancelled += it
