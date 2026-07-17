@@ -8,8 +8,8 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
-    MEMORY_MAPPED_VIEW_ADDRESS, FILE_MAP_READ, PAGE_READONLY,
+    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
+    MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY,
 };
 
 const OCBR_MAGIC: u32 = 0x5242_434f;
@@ -103,10 +103,18 @@ impl Drop for Mapping {
 impl Mapping {
     fn open() -> Result<Self, String> {
         unsafe {
-            if let Ok(mapping) = OpenFileMappingW(FILE_MAP_READ.0, false, w!("Global\\OpenCamBridgeFrameBuffer")) {
+            if let Ok(mapping) = OpenFileMappingW(
+                FILE_MAP_READ.0,
+                false,
+                w!("Global\\OpenCamBridgeFrameBuffer"),
+            ) {
                 let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, MAPPING_SIZE);
                 if !view.Value.is_null() {
-                    return Ok(Self { file: None, mapping, view });
+                    return Ok(Self {
+                        file: None,
+                        mapping,
+                        view,
+                    });
                 }
                 let _ = CloseHandle(mapping);
             }
@@ -120,18 +128,23 @@ impl Mapping {
                 None,
             )
             .map_err(|e| format!("NV12 preview ring is not available: {e}"))?;
-            let mapping = CreateFileMappingW(file, None, PAGE_READONLY, 0, MAPPING_SIZE as u32, None)
-                .map_err(|e| {
-                    let _ = CloseHandle(file);
-                    format!("NV12 preview file mapping failed: {e}")
-                })?;
+            let mapping =
+                CreateFileMappingW(file, None, PAGE_READONLY, 0, MAPPING_SIZE as u32, None)
+                    .map_err(|e| {
+                        let _ = CloseHandle(file);
+                        format!("NV12 preview file mapping failed: {e}")
+                    })?;
             let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, MAPPING_SIZE);
             if view.Value.is_null() {
                 let _ = CloseHandle(mapping);
                 let _ = CloseHandle(file);
                 return Err("NV12 preview MapViewOfFile failed".to_string());
             }
-            Ok(Self { file: Some(file), mapping, view })
+            Ok(Self {
+                file: Some(file),
+                mapping,
+                view,
+            })
         }
     }
 
@@ -139,9 +152,12 @@ impl Mapping {
         unsafe {
             let base = self.view.Value as *const u8;
             let ring = &*(base as *const RingHeader);
-            if ring.magic != OCBR_MAGIC || ring.version != RING_VERSION ||
-                ring.header_size as usize != RING_HEADER_SIZE || ring.slot_count as usize != SLOT_COUNT ||
-                ring.slot_size as usize != SLOT_SIZE || ring.ring_abi_hash != RING_ABI_HASH
+            if ring.magic != OCBR_MAGIC
+                || ring.version != RING_VERSION
+                || ring.header_size as usize != RING_HEADER_SIZE
+                || ring.slot_count as usize != SLOT_COUNT
+                || ring.slot_size as usize != SLOT_SIZE
+                || ring.ring_abi_hash != RING_ABI_HASH
             {
                 return Err("NV12 preview rejected incompatible ring ABI".to_string());
             }
@@ -158,8 +174,11 @@ impl Mapping {
             let first_epoch = std::ptr::read_volatile(&(*slot_ptr).committed_epoch);
             fence(Ordering::Acquire);
             let metadata = std::ptr::read(slot_ptr);
-            if first_epoch == 0 || first_epoch != metadata.write_epoch || first_epoch & 1 == 0 ||
-                metadata.sequence != published_sequence || metadata.pixel_format != FORMAT_NV12
+            if first_epoch == 0
+                || first_epoch != metadata.write_epoch
+                || first_epoch & 1 == 0
+                || metadata.sequence != published_sequence
+                || metadata.pixel_format != FORMAT_NV12
             {
                 return Ok(Vec::new());
             }
@@ -167,17 +186,31 @@ impl Mapping {
             let height = metadata.height as usize;
             let y_stride = metadata.y_stride as usize;
             let uv_stride = metadata.uv_stride as usize;
-            if width == 0 || height == 0 || width > 1920 || height > 1080 || width & 1 != 0 || height & 1 != 0 ||
-                y_stride < width || uv_stride < width || y_stride > 8192 || uv_stride > 8192
+            if width == 0
+                || height == 0
+                || width > 1920
+                || height > 1920
+                || width & 1 != 0
+                || height & 1 != 0
+                || y_stride < width
+                || uv_stride < width
+                || y_stride > 8192
+                || uv_stride > 8192
             {
                 return Err("NV12 preview rejected invalid dimensions or strides".to_string());
             }
-            let expected = y_stride.checked_mul(height)
-                .and_then(|y| uv_stride.checked_mul(height / 2).and_then(|uv| y.checked_add(uv)))
+            let expected = y_stride
+                .checked_mul(height)
+                .and_then(|y| {
+                    uv_stride
+                        .checked_mul(height / 2)
+                        .and_then(|uv| y.checked_add(uv))
+                })
                 .ok_or("NV12 preview frame size overflow")?;
-            if expected != metadata.payload_size as usize || expected > MAX_NV12_SIZE ||
-                metadata.data_offset as usize != slot_offset + SLOT_HEADER_SIZE ||
-                metadata.data_offset as usize + expected > MAPPING_SIZE
+            if expected != metadata.payload_size as usize
+                || expected > MAX_NV12_SIZE
+                || metadata.data_offset as usize != slot_offset + SLOT_HEADER_SIZE
+                || metadata.data_offset as usize + expected > MAPPING_SIZE
             {
                 return Err("NV12 preview rejected invalid payload bounds".to_string());
             }
@@ -213,7 +246,11 @@ pub struct Nv12PreviewReader {
 }
 
 impl Nv12PreviewReader {
-    pub fn new() -> Self { Self { mapping: Mutex::new(None) } }
+    pub fn new() -> Self {
+        Self {
+            mapping: Mutex::new(None),
+        }
+    }
 }
 
 #[tauri::command]
@@ -221,7 +258,10 @@ pub fn get_nv12_preview_frame(
     after_sequence: u64,
     state: tauri::State<'_, Nv12PreviewReader>,
 ) -> Result<Response, String> {
-    let mut mapping = state.mapping.lock().map_err(|_| "NV12 preview lock poisoned")?;
+    let mut mapping = state
+        .mapping
+        .lock()
+        .map_err(|_| "NV12 preview lock poisoned")?;
     if mapping.is_none() {
         match Mapping::open() {
             Ok(opened) => *mapping = Some(opened),

@@ -124,7 +124,7 @@ export default function Nv12RingPreview({ fitMode, mirror }: Props) {
             const nextUvStride = view.getUint32(36, true);
             const payload = view.getUint32(40, true);
             const yBytes = nextYStride * height;
-            if (!width || !height || width > 1920 || height > 1080 || width % 2 || height % 2 ||
+            if (!width || !height || width > 1920 || height > 1920 || width % 2 || height % 2 ||
                 nextYStride < width || nextUvStride < width || yBytes + nextUvStride * (height / 2) !== payload ||
                 48 + payload > bytes.byteLength) {
               throw new Error('Native preview rejected invalid NV12 dimensions/strides');

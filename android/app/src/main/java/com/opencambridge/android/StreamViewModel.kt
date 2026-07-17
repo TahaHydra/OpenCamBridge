@@ -181,7 +181,7 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         if (!enabled) {
             StreamState.previewUseCase?.setSurfaceProvider(null)
         }
-        controlPatch(UpdateSettingsRequest(localPreviewEnabled = enabled, clientType = "phone"))
+        controlPatch(UpdateSettingsRequest(phonePreviewEnabled = enabled, clientType = "phone"))
     }
 
     fun selectCamera(cameraId: String) = controlPatch(UpdateSettingsRequest(cameraId = cameraId, clientType = "phone"))
@@ -280,7 +280,7 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         req.displayRotation?.let { StreamState.displayRotation.set(it) }
         req.mirror?.let { StreamState.mirror.set(it) }
         req.streamMode?.let { StreamState.streamMode.set(it) }
-        req.localPreviewEnabled?.let { StreamState.localPreviewEnabled.set(it) }
+        (req.phonePreviewEnabled ?: req.localPreviewEnabled)?.let { StreamState.localPreviewEnabled.set(it) }
         req.accessMode?.let { StreamState.accessMode.set(it) }
         req.port?.let { StreamState.port.set(it) }
         req.accessToken?.let { StreamState.accessToken.set(it) }

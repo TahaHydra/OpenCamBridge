@@ -401,6 +401,8 @@ impl SharedMemoryIpc {
                 && (*header).header_size as usize == RING_HEADER_SIZE
                 && (*header).slot_size as usize == SLOT_SIZE
             {
+                (*header).max_width = 1920;
+                (*header).max_height = 1920;
                 (*header).ring_abi_hash = RING_ABI_HASH;
                 (*header).producer_build_hash = self.producer_hash;
                 return;
@@ -412,7 +414,7 @@ impl SharedMemoryIpc {
             (*header).slot_count = SLOT_COUNT as u32;
             (*header).slot_size = SLOT_SIZE as u32;
             (*header).max_width = 1920;
-            (*header).max_height = 1080;
+            (*header).max_height = 1920;
             (*header).ring_abi_hash = RING_ABI_HASH;
             (*header).producer_build_hash = self.producer_hash;
             (*header)
@@ -655,7 +657,7 @@ fn validate_nv12_metadata(
     if width == 0
         || height == 0
         || width > 1920
-        || height > 1080
+        || height > 1920
         || width % 2 != 0
         || height % 2 != 0
     {
@@ -762,6 +764,10 @@ mod ring_tests {
             validate_nv12_metadata(u32::MAX, u32::MAX, u32::MAX, u32::MAX, usize::MAX),
             None
         );
+        assert_eq!(
+            validate_nv12_metadata(1080, 1920, 1080, 1080, MAX_NV12_SIZE),
+            Some(MAX_NV12_SIZE)
+        );
     }
 
     #[derive(Default)]
@@ -838,6 +844,32 @@ mod ring_tests {
             std::mem::offset_of!(OpenCamBridgeRingHeader, producer_build_hash),
             192
         );
+    }
+
+    #[test]
+    fn nv12_orientation_rotates_both_planes_without_rgb_conversion() {
+        let input = vec![
+            0, 1, 2, 3, // Y row 0
+            4, 5, 6, 7, // Y row 1
+            10, 11, 20, 21, // UV row: two interleaved chroma samples
+        ];
+        let mut output = Vec::new();
+        let dimensions = orient_nv12(&input, 4, 2, 4, 4, 90, false, &mut output).unwrap();
+        assert_eq!(dimensions, (2, 4));
+        assert_eq!(output, vec![4, 0, 5, 1, 6, 2, 7, 3, 10, 11, 20, 21]);
+    }
+
+    #[test]
+    fn nv12_orientation_mirrors_luma_and_chroma_samples() {
+        let input = vec![
+            0, 1, 2, 3, // Y row 0
+            4, 5, 6, 7, // Y row 1
+            10, 11, 20, 21, // UV row: two interleaved chroma samples
+        ];
+        let mut output = Vec::new();
+        let dimensions = orient_nv12(&input, 4, 2, 4, 4, 0, true, &mut output).unwrap();
+        assert_eq!(dimensions, (4, 2));
+        assert_eq!(output, vec![3, 2, 1, 0, 7, 6, 5, 4, 20, 21, 10, 11]);
     }
 }
 
@@ -1486,6 +1518,76 @@ fn copy_i420_to_nv12(yuv: &impl YUVSource, scratch: &mut Vec<u8>) -> Result<(u32
     Ok((width as u32, height as u32))
 }
 
+/// Rotate/mirror directly in NV12. This is used only for explicit orientation
+/// controls and never passes through RGBA/BGRA. The following consumer-side
+/// D3D11 video-processor pass performs any aspect-preserving resize once.
+fn orient_nv12(
+    input: &[u8],
+    width: u32,
+    height: u32,
+    y_stride: u32,
+    uv_stride: u32,
+    rotation: u32,
+    mirror: bool,
+    output: &mut Vec<u8>,
+) -> Result<(u32, u32), String> {
+    if !matches!(rotation, 0 | 90 | 180 | 270) {
+        return Err(format!("invalid NV12 rotation {rotation}"));
+    }
+    validate_nv12_metadata(width, height, y_stride, uv_stride, input.len())
+        .ok_or_else(|| "invalid source NV12 metadata for orientation".to_string())?;
+    let (out_width, out_height) = if rotation == 90 || rotation == 270 {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let needed = out_width as usize * out_height as usize * 3 / 2;
+    if needed > MAX_NV12_SIZE {
+        return Err("oriented NV12 frame exceeds ring slot".to_string());
+    }
+    output.resize(needed, 0);
+
+    let map = |x: u32, y: u32, source_width: u32, source_height: u32, output_width: u32| {
+        let oriented_x = if mirror { output_width - 1 - x } else { x };
+        match rotation {
+            0 => (oriented_x, y),
+            90 => (y, source_height - 1 - oriented_x),
+            180 => (source_width - 1 - oriented_x, source_height - 1 - y),
+            270 => (source_width - 1 - y, oriented_x),
+            _ => unreachable!(),
+        }
+    };
+
+    for y in 0..out_height {
+        for x in 0..out_width {
+            let (source_x, source_y) = map(x, y, width, height, out_width);
+            output[(y * out_width + x) as usize] = input[(source_y * y_stride + source_x) as usize];
+        }
+    }
+    let source_uv = y_stride as usize * height as usize;
+    let output_uv = out_width as usize * out_height as usize;
+    let source_chroma_width = width / 2;
+    let source_chroma_height = height / 2;
+    let output_chroma_width = out_width / 2;
+    let output_chroma_height = out_height / 2;
+    for y in 0..output_chroma_height {
+        for x in 0..output_chroma_width {
+            let (source_x, source_y) = map(
+                x,
+                y,
+                source_chroma_width,
+                source_chroma_height,
+                output_chroma_width,
+            );
+            let source_offset = source_uv + (source_y * (uv_stride / 2) + source_x) as usize * 2;
+            let output_offset = output_uv + (y * output_chroma_width + x) as usize * 2;
+            output[output_offset] = input[source_offset];
+            output[output_offset + 1] = input[source_offset + 1];
+        }
+    }
+    Ok((out_width, out_height))
+}
+
 fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
     emit_event(
         "info",
@@ -1515,6 +1617,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
     let mut low_software_windows = 0u32;
     let mut capture_clock_offset: Option<i128> = None;
     let mut last_error: Option<String> = None;
+    let mut oriented_nv12 = Vec::with_capacity(MAX_NV12_SIZE);
     let mut phone_encoder_error: bool;
     let (mut last_vcam_unique, mut last_vcam_repeated) = ipc.virtual_camera_counters();
 
@@ -1706,17 +1809,36 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                                 replaced_frames +=
                                                     sequence - last_published_sequence - 1;
                                             }
+                                            let rotation = args.rotate.unwrap_or(0);
+                                            let oriented = if rotation != 0 || args.mirror {
+                                                orient_nv12(
+                                                    frame.bytes,
+                                                    frame.width,
+                                                    frame.height,
+                                                    frame.y_stride,
+                                                    frame.uv_stride,
+                                                    rotation,
+                                                    args.mirror,
+                                                    &mut oriented_nv12,
+                                                ).ok().map(|(w, h)| (oriented_nv12.as_slice(), w, h, w, w))
+                                            } else {
+                                                Some((frame.bytes, frame.width, frame.height, frame.y_stride, frame.uv_stride))
+                                            };
+                                            let Some((pixels, output_width, output_height, output_y_stride, output_uv_stride)) = oriented else {
+                                                last_error = Some("NV12 orientation failed".to_string());
+                                                return;
+                                            };
                                             if ipc.write_nv12_frame(
                                                 sequence,
                                                 record.capture_timestamp_ns,
                                                 receive_ns,
                                                 decode_ns,
-                                                frame.width,
-                                                frame.height,
-                                                frame.y_stride,
-                                                frame.uv_stride,
+                                                output_width,
+                                                output_height,
+                                                output_y_stride,
+                                                output_uv_stride,
                                                 record.flags,
-                                                frame.bytes,
+                                                pixels,
                                             ) {
                                                 if decoded_unique == 0 {
                                                     emit_event(
@@ -1749,17 +1871,33 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                             Ok(Some(yuv)) => {
                                                 let (w, h) = copy_i420_to_nv12(&yuv, scratch)?;
                                                 let decode_ns = monotonic_ns();
+                                                let rotation = args.rotate.unwrap_or(0);
+                                                let (pixels, output_width, output_height) = if rotation != 0 || args.mirror {
+                                                    let (output_width, output_height) = orient_nv12(
+                                                        scratch,
+                                                        w,
+                                                        h,
+                                                        w,
+                                                        w,
+                                                        rotation,
+                                                        args.mirror,
+                                                        &mut oriented_nv12,
+                                                    )?;
+                                                    (oriented_nv12.as_slice(), output_width, output_height)
+                                                } else {
+                                                    (scratch.as_slice(), w, h)
+                                                };
                                                 if ipc.write_nv12_frame(
                                                     record.sequence,
                                                     record.capture_timestamp_ns,
                                                     receive_ns,
                                                     decode_ns,
-                                                    w,
-                                                    h,
-                                                    w,
-                                                    w,
+                                                    output_width,
+                                                    output_height,
+                                                    output_width,
+                                                    output_width,
                                                     record.flags,
-                                                    scratch,
+                                                    pixels,
                                                 ) {
                                                     last_published_sequence = record.sequence;
                                                     ring_frames_committed += 1;
@@ -1872,7 +2010,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                             let virtual_camera_ready =
                                 ring.consumer_attached && ring.ring_read_successes > 0;
                             println!(
-                                r#"{{"type":"metrics","producer_state":"WRITING_RING","ring_frames_committed":{},"source":"ocb2-h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":0,"replaced_frames":{},"jpeg_queue_len":0,"decode_ms_avg":{},"rotate_ms_avg":0,"resize_ms_avg":0,"write_ms_avg":0,"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"{}","hardware_decoder":{},"encoder_name":"{}","hardware_encoder":{},"camera_id":"{}","fallback_reason":"{}","resize_backend":"gpu-or-exact","rotation":0,"last_error":{},"ring":{},"virtual_camera_ready":{}}}"#,
+                                r#"{{"type":"metrics","producer_state":"WRITING_RING","ring_frames_committed":{},"source":"ocb2-h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":0,"replaced_frames":{},"jpeg_queue_len":0,"decode_ms_avg":{},"rotate_ms_avg":0,"resize_ms_avg":0,"write_ms_avg":0,"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"{}","hardware_decoder":{},"encoder_name":"{}","hardware_encoder":{},"camera_id":"{}","fallback_reason":"{}","resize_backend":"gpu-or-exact","rotation":{},"last_error":{},"ring":{},"virtual_camera_ready":{}}}"#,
                                 ring_frames_committed,
                                 json_escape(&args.profile),
                                 info.map(|i| i.width).unwrap_or(0),
@@ -1909,6 +2047,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                 } else {
                                     "hardware decoder unavailable"
                                 },
+                                args.rotate.unwrap_or(0),
                                 err_json,
                                 ring_json,
                                 virtual_camera_ready

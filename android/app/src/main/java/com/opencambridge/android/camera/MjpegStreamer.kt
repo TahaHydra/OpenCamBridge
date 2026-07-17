@@ -52,9 +52,14 @@ class MjpegStreamer(
     // Encode-side pacing: skip camera frames beyond the requested FPS so we do
     // not burn CPU JPEG-encoding frames the HTTP layer would drop anyway.
     private var lastEncodeNs = 0L
+    private var captureWindowStartNs = 0L
+    private var captureWindowFrames = 0
 
     suspend fun start() {
         activeConfig = StreamState.currentConfig()
+        captureWindowStartNs = 0L
+        captureWindowFrames = 0
+        lastEncodeNs = 0L
         StreamState.activeStreamMode.set("mjpeg")
         val provider = suspendCoroutine<ProcessCameraProvider> { cont ->
             val future = ProcessCameraProvider.getInstance(context)
@@ -98,6 +103,7 @@ class MjpegStreamer(
                 )
 
                 val targetFps = config.fps
+                StreamState.selectedFps.set(targetFps)
 
                 // Pick an FPS range the *device* actually supports; hardcoded
                 // ranges like [30,30] do not exist on all sensors.
@@ -301,6 +307,14 @@ class MjpegStreamer(
         }
 
         try {
+            val captureNowNs = System.nanoTime()
+            if (captureWindowStartNs == 0L) captureWindowStartNs = captureNowNs
+            captureWindowFrames++
+            if (captureNowNs - captureWindowStartNs >= 1_000_000_000L) {
+                StreamState.captureFps.set(captureWindowFrames)
+                captureWindowFrames = 0
+                captureWindowStartNs = captureNowNs
+            }
             StreamState.rotationDegrees.set(imageProxy.imageInfo.rotationDegrees)
             StreamState.frameWidth.set(imageProxy.width)
             StreamState.frameHeight.set(imageProxy.height)

@@ -1534,12 +1534,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         )}
 
         <div className="control-row" style={{ marginTop: 20 }}>
-          <label style={{ fontSize: '0.9rem' }}>Disable Preview (Diagnostic)</label>
+          <label style={{ fontSize: '0.9rem' }}>Desktop Preview Enabled</label>
           <label className="switch">
             <input
               type="checkbox"
-              checked={previewOff}
-              onChange={(e) => setPreviewOff(e.target.checked)}
+              checked={!previewOff}
+              onChange={(e) => setPreviewOff(!e.target.checked)}
             />
             <span className="slider"></span>
           </label>

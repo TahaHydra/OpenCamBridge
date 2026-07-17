@@ -138,6 +138,13 @@ class StreamService : LifecycleService() {
         } else {
             AppLogger.w("Rotation", "Device cannot detect orientation; stream stays upright only for the natural (vertical) position")
         }
+        val power = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        if (!power.isIgnoringBatteryOptimizations(packageName)) {
+            AppLogger.w(
+                "Power",
+                "OEM battery optimization is active. The foreground camera service and stream wake lock are configured, but a restrictive OEM may still require the user to exempt OpenCamBridge for long locked-screen sessions."
+            )
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -225,16 +232,6 @@ class StreamService : LifecycleService() {
         runBlocking(Dispatchers.IO) {
             try { pipelineController.submit(PipelineCommand.Stop()) } catch (_: Exception) {}
         }
-        if (streamWakeLock?.isHeld != true) {
-            val power = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-            streamWakeLock = power.newWakeLock(
-                android.os.PowerManager.PARTIAL_WAKE_LOCK,
-                "OpenCamBridge:StreamingPipeline"
-            ).apply {
-                setReferenceCounted(false)
-                acquire()
-            }
-        }
         pipelineController.close()
         if (streamWakeLock?.isHeld == true) streamWakeLock?.release()
         streamWakeLock = null
@@ -262,6 +259,7 @@ class StreamService : LifecycleService() {
         StreamState.lastError.set("")
         StreamState.streaming.set(false)
         beginPipelineGeneration()
+        acquireStreamWakeLock()
         Log.d(TAG, "Camera STARTING")
         AppLogger.i("Camera", "Camera starting (generation ${StreamState.pipelineGeneration.get()})")
         return try {
@@ -271,6 +269,7 @@ class StreamService : LifecycleService() {
             AppLogger.i("Camera", "Camera streaming successfully")
             pipelineResult("Camera streaming")
         } catch (e: Exception) {
+            releaseStreamWakeLock()
             handleCameraError("Failed to start camera", e)
         }
     }
@@ -286,9 +285,11 @@ class StreamService : LifecycleService() {
             h264Streamer.stop()
             resetPipelineMetrics()
             StreamState.lifecycleState.set(LifecycleState.STOPPED)
+            releaseStreamWakeLock()
             AppLogger.i("Camera", "Camera stopped cleanly")
             pipelineResult("Camera stopped")
         } catch (e: Exception) {
+            releaseStreamWakeLock()
             handleCameraError("Failed to stop camera cleanly", e)
         }
     }
@@ -300,6 +301,7 @@ class StreamService : LifecycleService() {
         StreamState.lifecycleState.set(LifecycleState.REBINDING)
         StreamState.streaming.set(false)
         beginPipelineGeneration()
+        acquireStreamWakeLock()
         AppLogger.i("Camera", "Camera rebinding: $reason")
         return try {
             mjpegStreamer.stop()
@@ -318,6 +320,7 @@ class StreamService : LifecycleService() {
         AppLogger.i("Camera", "Camera recovery requested")
         StreamState.lifecycleState.set(LifecycleState.STOPPING)
         StreamState.streaming.set(false)
+        acquireStreamWakeLock()
         return try {
             mjpegStreamer.stop()
             h264Streamer.stop()
@@ -379,7 +382,25 @@ class StreamService : LifecycleService() {
         StreamState.lastError.set(errText)
         StreamState.lifecycleState.set(LifecycleState.ERROR)
         StreamState.streaming.set(false)
+        releaseStreamWakeLock()
         return pipelineResult("$message: $errText", PipelineResultCode.FAILED)
+    }
+
+    private fun acquireStreamWakeLock() {
+        if (streamWakeLock?.isHeld == true) return
+        val power = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        streamWakeLock = power.newWakeLock(
+            android.os.PowerManager.PARTIAL_WAKE_LOCK,
+            "OpenCamBridge:StreamingPipeline"
+        ).apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    private fun releaseStreamWakeLock() {
+        if (streamWakeLock?.isHeld == true) streamWakeLock?.release()
+        streamWakeLock = null
     }
 
     private fun pipelineResult(message: String, code: PipelineResultCode = PipelineResultCode.OK) = PipelineResult(
@@ -465,7 +486,7 @@ class StreamService : LifecycleService() {
             zoomSpeed = req.zoomSpeed ?: previous.zoomSpeed,
             displayRotation = req.displayRotation ?: previous.displayRotation,
             mirror = req.mirror ?: previous.mirror,
-            localPreviewEnabled = req.localPreviewEnabled ?: previous.localPreviewEnabled,
+            localPreviewEnabled = req.phonePreviewEnabled ?: req.localPreviewEnabled ?: previous.localPreviewEnabled,
             targetBandwidthMbps = req.targetBandwidthMbps ?: previous.targetBandwidthMbps
         )
         val touchesPath = req.cameraId != null || req.streamMode != null || req.width != null ||
@@ -513,7 +534,7 @@ class StreamService : LifecycleService() {
         // run on the MAIN thread; this patch is applied from the Ktor HTTP worker
         // thread, so calling it directly threw and returned HTTP 500 when the
         // preview was disabled. Post to main and swallow any error.
-        if (req.localPreviewEnabled == false) {
+        if (req.phonePreviewEnabled == false || req.localPreviewEnabled == false) {
             android.os.Handler(android.os.Looper.getMainLooper()).post {
                 try {
                     StreamState.previewUseCase?.setSurfaceProvider(null)

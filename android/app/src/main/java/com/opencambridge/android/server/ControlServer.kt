@@ -501,7 +501,7 @@ class ControlServer(
                       </div>
                       <div class="control-row" style="margin-top:16px;">
                         <label>Phone Preview</label>
-                        <input type="checkbox" id="preview-check" onchange="patchSetting({localPreviewEnabled: this.checked})">
+                        <input type="checkbox" id="preview-check" onchange="patchSetting({phonePreviewEnabled: this.checked})">
                       </div>
                     </div>
 
@@ -769,7 +769,7 @@ class ControlServer(
                             orientSel.value = (ar === '9:16' || ar === '16:9') ? ar : 'auto';
                         }
                         document.getElementById('mirror-check').checked = !!status.mirror;
-                        document.getElementById('preview-check').checked = !!status.localPreviewEnabled;
+                        document.getElementById('preview-check').checked = !!status.phonePreviewEnabled;
 
                         if (currentStreamMode === 'h264') {
                             document.getElementById('h264-info').style.display = 'block';
@@ -960,8 +960,10 @@ class ControlServer(
         }
     }
     private suspend fun serveDeviceInfo(call: RoutingCall) {
+        val power = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
         call.respond(DeviceInfoDto(app = "OpenCamBridge", version = "2.0.0", platform = "android", serverPort = StreamState.port.get(),
-            manufacturer = android.os.Build.MANUFACTURER, model = android.os.Build.MODEL))
+            manufacturer = android.os.Build.MANUFACTURER, model = android.os.Build.MODEL,
+            batteryOptimizationExempt = power.isIgnoringBatteryOptimizations(context.packageName)))
     }
 
     private suspend fun serveCameraList(call: RoutingCall) {
@@ -1392,7 +1394,8 @@ private data class DeviceInfoDto(
     val platform: String,
     val serverPort: Int,
     val manufacturer: String,
-    val model: String
+    val model: String,
+    val batteryOptimizationExempt: Boolean
 )
 
 @Serializable
@@ -1477,6 +1480,7 @@ data class UpdateSettingsRequest(
     val displayRotation: String? = null,
     val mirror: Boolean? = null,
     val localPreviewEnabled: Boolean? = null,
+    val phonePreviewEnabled: Boolean? = null,
     val accessMode: String? = null,
     val port: Int? = null,
     val accessToken: String? = null,

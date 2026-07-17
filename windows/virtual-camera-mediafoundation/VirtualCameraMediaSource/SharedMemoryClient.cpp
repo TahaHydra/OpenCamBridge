@@ -156,11 +156,29 @@ HRESULT SharedMemoryClient::EnsureGpuResizeResources(
         m_outputTexture, m_videoEnumerator, &outputDesc, &m_outputView));
 
     RECT sourceRect = { 0, 0, static_cast<LONG>(sourceWidth), static_cast<LONG>(sourceHeight) };
-    RECT outputRect = { 0, 0, static_cast<LONG>(outputWidth), static_cast<LONG>(outputHeight) };
+    // Preserve source aspect ratio in the exact consumer canvas. Portrait or
+    // rotated frames are GPU-letterboxed once instead of being stretched or
+    // passed through the removed CPU nearest-neighbour path.
+    DWORD fittedWidth = outputWidth;
+    DWORD fittedHeight = outputHeight;
+    if (static_cast<uint64_t>(sourceWidth) * outputHeight > static_cast<uint64_t>(outputWidth) * sourceHeight) {
+        fittedHeight = static_cast<DWORD>((static_cast<uint64_t>(outputWidth) * sourceHeight) / sourceWidth);
+    } else {
+        fittedWidth = static_cast<DWORD>((static_cast<uint64_t>(outputHeight) * sourceWidth) / sourceHeight);
+    }
+    fittedWidth = std::max<DWORD>(2, fittedWidth & ~1u);
+    fittedHeight = std::max<DWORD>(2, fittedHeight & ~1u);
+    const LONG left = static_cast<LONG>((outputWidth - fittedWidth) / 2);
+    const LONG top = static_cast<LONG>((outputHeight - fittedHeight) / 2);
+    RECT outputRect = { left, top, left + static_cast<LONG>(fittedWidth), top + static_cast<LONG>(fittedHeight) };
+    RECT outputCanvas = { 0, 0, static_cast<LONG>(outputWidth), static_cast<LONG>(outputHeight) };
+    D3D11_VIDEO_COLOR background = {};
+    background.YCbCr = { 16.0f / 255.0f, 0.5f, 0.5f, 1.0f };
+    m_videoContext->VideoProcessorSetOutputBackgroundColor(m_videoProcessor, TRUE, &background);
     m_videoContext->VideoProcessorSetStreamFrameFormat(m_videoProcessor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
     m_videoContext->VideoProcessorSetStreamSourceRect(m_videoProcessor, 0, TRUE, &sourceRect);
     m_videoContext->VideoProcessorSetStreamDestRect(m_videoProcessor, 0, TRUE, &outputRect);
-    m_videoContext->VideoProcessorSetOutputTargetRect(m_videoProcessor, TRUE, &outputRect);
+    m_videoContext->VideoProcessorSetOutputTargetRect(m_videoProcessor, TRUE, &outputCanvas);
 
     m_resizeSourceWidth = sourceWidth;
     m_resizeSourceHeight = sourceHeight;
