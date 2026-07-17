@@ -590,3 +590,32 @@ Virtual-camera readiness is a separate condition:
 
 consumer attached
 + first frame delivered
+
+---
+
+## Implementation status (v2/streaming-engine)
+
+This table is the live branch checklist. A checked **code** box means the code-side finding is implemented and covered by the listed automated evidence. It does not imply that a physical-device, OBS, FFmpeg, reconnect, or screen-off test passed. Those results are recorded separately and remain `NOT YET TESTED` until actually performed.
+
+| # | Code status | Files / implementation commit | Automated evidence | Live-test status |
+|---|---|---|---|---|
+| 1 | [ ] In progress: regular surface exists; constrained high-speed surface and GPU bridge still required | Android capture files; pending | Existing Android build only; new engine tests pending | NOT YET TESTED |
+| 2 | [ ] Format enumeration is implemented; external enumeration/visible-frame acceptance remains | `SimpleMediaStream.cpp`; earlier `1ebbcf9`, diagnostics `dac442c` | Media Foundation DLL and host build passed on 2026-07-17 | NOT YET TESTED (FFmpeg and OBS) |
+| 3 | [x] Code-side diagnostics and deterministic direct-NV12 patterns implemented | producer ring ABI v3, `SharedMemoryClient.*`, `SimpleMediaStream.cpp`, `ControlPanel.tsx`, `dev-build-vcam.ps1`; `dac442c` | Producer 11/11 tests; NV12 pattern colour/plane test; ring ABI layout test; DLL/host build with matching built/installed/registered hashes | NOT YET TESTED (OBS visible output) |
+| 4 | [x] `IMF2DBuffer2::Lock2DSize` bounds and true scanline offset/pitch are used; `IMF2DBuffer::Lock2D`, contiguous fallback retained | `SharedMemoryClient.*`, `SimpleMediaStream.cpp`; `dac442c` | Media Foundation DLL/host build passed; ring metadata/bounds tests passed | NOT YET TESTED |
+| 5 | [ ] Serialized Android controller and awaited teardown still required | pending | pending | NOT YET TESTED |
+| 6 | [ ] Authoritative revisioned snapshot, common capability endpoint, conflict handling, and server-pushed state still required | pending | pending | NOT YET TESTED |
+| 7 | [ ] Common exact-path capability validation and HTTP 422 rejection still required | pending | pending | NOT YET TESTED |
+| 8 | [ ] Native decoded-NV12 desktop preview still required | pending | pending | NOT YET TESTED |
+| 9 | [ ] Wake lock and activity-independent streaming lifecycle still required | pending | pending | NOT YET TESTED (30-minute screen-off test) |
+| 10 | [ ] Generation-scoped nullable metrics schema/reset still required | pending | pending | NOT YET TESTED |
+| 11 | [x] Human stderr is no longer health; producer emits structured events and only `severity=error` sets desktop `last_error` | `main.rs`, `mf_decoder.rs`, `virtualcam.rs`; `dac442c` | Tauri `cargo check` and frontend production build passed | NOT YET TESTED |
+| 12 | [x] Code-side producer and readiness states implemented; Start waits for `WRITING_RING` plus three committed frames; consumer readiness is separate | `main.rs`, `virtualcam.rs`, `ControlPanel.tsx`; `dac442c` | Tauri `cargo check`; frontend production build; producer 11/11 tests | NOT YET TESTED (live connect/consume) |
+
+### Automated evidence log
+
+- 2026-07-17 — `cargo test`, `windows/virtual-camera-mediafoundation/rust-frame-producer`: **PASSED, 11/11**. Covers fragmented OCB2 reads, malformed lengths, multiple records/read, mid-record reconnect, codec config/keyframe flags, ring bounds/metadata, stable C++ ABI layouts, exact 30/60 pacing, unique versus repeated samples, and deterministic NV12 patterns.
+- 2026-07-17 — `cargo build --release`, Rust producer: **PASSED**.
+- 2026-07-17 — `cargo check`, Tauri Rust backend: **PASSED**.
+- 2026-07-17 — `npm run build`, Tauri frontend: **PASSED**.
+- 2026-07-17 — `dev-build-vcam.ps1 -NoKill`, Media Foundation DLL and host: **PASSED**, zero warnings/errors; built, installed, and registered DLL hashes matched. This is a build/identity result, not an OBS/FFmpeg frame-output pass.
