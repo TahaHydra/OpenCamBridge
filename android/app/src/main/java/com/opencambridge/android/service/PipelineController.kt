@@ -1,11 +1,15 @@
 package com.opencambridge.android.service
 
 import com.opencambridge.android.server.UpdateSettingsRequest
+import com.opencambridge.android.state.LifecycleState
 import com.opencambridge.android.state.StreamState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 
 enum class PipelineResultCode {
@@ -14,6 +18,26 @@ enum class PipelineResultCode {
     UNPROCESSABLE,
     CANCELLED,
     FAILED
+}
+
+internal object PipelineLifecyclePolicy {
+    private val allowed = mapOf(
+        LifecycleState.STOPPED to setOf(LifecycleState.STARTING, LifecycleState.RECOVERING),
+        LifecycleState.STARTING to setOf(LifecycleState.STREAMING, LifecycleState.FAILED),
+        LifecycleState.STREAMING to setOf(
+            LifecycleState.STOPPING, LifecycleState.RECONFIGURING,
+            LifecycleState.RECOVERING, LifecycleState.FAILED
+        ),
+        LifecycleState.STOPPING to setOf(LifecycleState.STOPPED, LifecycleState.FAILED),
+        LifecycleState.RECONFIGURING to setOf(LifecycleState.STREAMING, LifecycleState.FAILED),
+        LifecycleState.RECOVERING to setOf(LifecycleState.STREAMING, LifecycleState.FAILED),
+        LifecycleState.FAILED to setOf(
+            LifecycleState.STARTING, LifecycleState.STOPPING,
+            LifecycleState.RECONFIGURING, LifecycleState.RECOVERING
+        )
+    )
+
+    fun permits(from: LifecycleState, to: LifecycleState): Boolean = from == to || to in allowed[from].orEmpty()
 }
 
 internal object ApplyPatchCoalescingPolicy {
@@ -113,6 +137,9 @@ class PipelineController(
                     } ?: break
                     try {
                         command.completion.complete(handle(command))
+                    } catch (e: CancellationException) {
+                        cancel(command, "Pipeline command cancelled")
+                        currentCoroutineContext().ensureActive()
                     } catch (e: Exception) {
                         command.completion.completeExceptionally(e)
                     } finally {
@@ -200,6 +227,11 @@ class PipelineController(
                 }
                 else -> pending.addLast(command)
             }
+            while (pending.size > MAX_PENDING_COMMANDS) {
+                val victim = pending.firstOrNull { !it.isPriorityCommand() } ?: pending.last()
+                pending.remove(victim)
+                cancelled += victim
+            }
         }
         cancelled.forEach { cancel(it, "Superseded by a newer complete pipeline command") }
         wake.trySend(Unit)
@@ -231,6 +263,10 @@ class PipelineController(
         )
     }
 
+    private fun PipelineCommand.isPriorityCommand(): Boolean =
+        this is PipelineCommand.Stop || this is PipelineCommand.Recover ||
+            this is PipelineCommand.RuntimeH264Failure
+
     /** Newer non-null values win while older pending fields are retained, so a
      * burst of partial slider/dropdown patches becomes one complete desired
      * state rather than a replay of obsolete intermediate configurations. */
@@ -261,4 +297,8 @@ class PipelineController(
         h264KeyframeInterval = newer.h264KeyframeInterval ?: older.h264KeyframeInterval,
         targetBandwidthMbps = newer.targetBandwidthMbps ?: older.targetBandwidthMbps
     )
+
+    private companion object {
+        const val MAX_PENDING_COMMANDS = 64
+    }
 }

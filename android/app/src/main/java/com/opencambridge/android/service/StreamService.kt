@@ -294,7 +294,7 @@ class StreamService : LifecycleService() {
     private suspend fun startCameraNow(): PipelineResult {
         val currentState = StreamState.lifecycleState.get()
         if (currentState == LifecycleState.STREAMING) return pipelineResult("Camera is already streaming")
-        StreamState.lifecycleState.set(LifecycleState.STARTING)
+        transitionLifecycle(LifecycleState.STARTING)
         StreamState.lastError.set("")
         beginPipelineGeneration()
         acquireStreamWakeLock()
@@ -302,7 +302,7 @@ class StreamService : LifecycleService() {
         AppLogger.i("Camera", "Camera starting (generation ${StreamState.pipelineGeneration.get()})")
         return try {
             startSelectedPipeline()
-            StreamState.lifecycleState.set(LifecycleState.STREAMING)
+            transitionLifecycle(LifecycleState.STREAMING)
             AppLogger.i("Camera", "Camera streaming successfully")
             pipelineResult("Camera streaming")
         } catch (e: Exception) {
@@ -313,14 +313,14 @@ class StreamService : LifecycleService() {
 
     private suspend fun stopCameraNow(): PipelineResult {
         if (StreamState.lifecycleState.get() == LifecycleState.STOPPED) return pipelineResult("Camera is already stopped")
-        StreamState.lifecycleState.set(LifecycleState.STOPPING)
+        transitionLifecycle(LifecycleState.STOPPING)
         StreamState.pipelineGeneration.incrementAndGet()
         AppLogger.i("Camera", "Camera stopping")
         return try {
             mjpegStreamer.stop()
             h264Streamer.stop()
             resetPipelineMetrics()
-            StreamState.lifecycleState.set(LifecycleState.STOPPED)
+            transitionLifecycle(LifecycleState.STOPPED)
             releaseStreamWakeLock()
             AppLogger.i("Camera", "Camera stopped cleanly")
             pipelineResult("Camera stopped")
@@ -334,7 +334,7 @@ class StreamService : LifecycleService() {
         if (StreamState.lifecycleState.get() != LifecycleState.STREAMING &&
             StreamState.lifecycleState.get() != LifecycleState.FAILED
         ) return pipelineResult("Settings saved; camera is not currently streaming")
-        StreamState.lifecycleState.set(LifecycleState.RECONFIGURING)
+        transitionLifecycle(LifecycleState.RECONFIGURING)
         beginPipelineGeneration()
         acquireStreamWakeLock()
         AppLogger.i("Camera", "Camera rebinding: $reason")
@@ -342,7 +342,7 @@ class StreamService : LifecycleService() {
             mjpegStreamer.stop()
             h264Streamer.stop()
             startSelectedPipeline()
-            StreamState.lifecycleState.set(LifecycleState.STREAMING)
+            transitionLifecycle(LifecycleState.STREAMING)
             AppLogger.i("Camera", "Camera rebound successfully")
             pipelineResult("Settings applied and camera rebound")
         } catch (e: Exception) {
@@ -352,7 +352,7 @@ class StreamService : LifecycleService() {
 
     private suspend fun recoverCameraNow(): PipelineResult {
         AppLogger.i("Camera", "Camera recovery requested")
-        StreamState.lifecycleState.set(LifecycleState.RECOVERING)
+        transitionLifecycle(LifecycleState.RECOVERING)
         acquireStreamWakeLock()
         return try {
             mjpegStreamer.stop()
@@ -360,7 +360,7 @@ class StreamService : LifecycleService() {
             StreamState.lastError.set("")
             beginPipelineGeneration()
             startSelectedPipeline()
-            StreamState.lifecycleState.set(LifecycleState.STREAMING)
+            transitionLifecycle(LifecycleState.STREAMING)
             pipelineResult("Camera recovered")
         } catch (e: Exception) {
             handleCameraError("Failed to recover camera", e)
@@ -369,7 +369,7 @@ class StreamService : LifecycleService() {
 
     private suspend fun switchToMjpegNow(reason: String): PipelineResult {
         if (StreamState.activeStreamMode.get() != "h264") return pipelineResult("H.264 fallback already inactive")
-        StreamState.lifecycleState.set(LifecycleState.RECONFIGURING)
+        transitionLifecycle(LifecycleState.RECONFIGURING)
         beginPipelineGeneration()
         val desired = StreamState.currentConfig()
         val selected = selectCanonicalMjpegFallback(desired)
@@ -388,7 +388,7 @@ class StreamService : LifecycleService() {
             mjpegStreamer.start(selected)
             StreamState.activeStreamMode.set("mjpeg")
             StreamState.publishFallback(true, fallback)
-            StreamState.lifecycleState.set(LifecycleState.STREAMING)
+            transitionLifecycle(LifecycleState.STREAMING)
             pipelineResult(fallback)
         } catch (e: Exception) {
             handleCameraError("H.264 to MJPEG fallback failed", e)
@@ -418,9 +418,17 @@ class StreamService : LifecycleService() {
         Log.e(TAG, "$message: $errText", e)
         AppLogger.e("Camera", "$message: $errText")
         StreamState.lastError.set(errText)
-        StreamState.lifecycleState.set(LifecycleState.FAILED)
+        transitionLifecycle(LifecycleState.FAILED)
         releaseStreamWakeLock()
         return pipelineResult("$message: $errText", PipelineResultCode.FAILED)
+    }
+
+    private fun transitionLifecycle(target: LifecycleState) {
+        val current = StreamState.lifecycleState.get()
+        check(PipelineLifecyclePolicy.permits(current, target)) {
+            "Invalid pipeline lifecycle transition $current -> $target"
+        }
+        StreamState.lifecycleState.set(target)
     }
 
     private fun acquireStreamWakeLock() {
