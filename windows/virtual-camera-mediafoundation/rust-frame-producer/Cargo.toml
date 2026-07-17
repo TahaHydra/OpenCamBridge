@@ -20,6 +20,7 @@ zune-jpeg = "0.4"
 reqwest = { version = "0.11", features = ["blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 # Software fallback for systems where the Media Foundation/D3D11 decoder cannot
 # run. The primary H.264 decoder is implemented in mf_decoder.rs.
 openh264 = "0.6"

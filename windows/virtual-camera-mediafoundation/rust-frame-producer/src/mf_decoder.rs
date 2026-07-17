@@ -160,10 +160,6 @@ impl MfH264Decoder {
                 & ((MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0)
                     as u32)
                 != 0;
-            eprintln!(
-                "MF decoder output flags=0x{:X}, decoder_allocates_samples={}",
-                output_info.dwFlags, output_provides_samples
-            );
             let output_sample = if output_provides_samples {
                 None
             } else {

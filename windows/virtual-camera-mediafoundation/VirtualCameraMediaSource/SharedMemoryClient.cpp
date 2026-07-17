@@ -1,10 +1,12 @@
 #include "pch.h"
 #include "SharedMemoryClient.h"
 #include <algorithm>
+#include <bcrypt.h>
 #include <limits>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 SharedMemoryClient::SharedMemoryClient()
     : m_hFile(NULL), m_hMapFile(NULL), m_pMappedView(nullptr), m_viewSize(0), m_lastSequence(0)
@@ -17,7 +19,53 @@ static SIZE_T QueryMappedViewSize(void* view)
     return VirtualQuery(view, &mbi, sizeof(mbi)) == sizeof(mbi) ? mbi.RegionSize : 0;
 }
 
-SharedMemoryClient::~SharedMemoryClient() { ResetGpuResizeResources(); CloseHandles(); }
+static HRESULT HashCurrentModule(BYTE output[32])
+{
+    HMODULE module = nullptr;
+    RETURN_IF_WIN32_BOOL_FALSE(GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&QueryMappedViewSize), &module));
+    wchar_t path[MAX_PATH] = {};
+    DWORD pathLength = GetModuleFileNameW(module, path, ARRAYSIZE(path));
+    RETURN_HR_IF(HRESULT_FROM_WIN32(GetLastError()), pathLength == 0 || pathLength >= ARRAYSIZE(path));
+
+    wil::unique_hfile file(CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    RETURN_LAST_ERROR_IF(!file);
+
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectSize = 0, resultSize = 0;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    RETURN_HR_IF(HRESULT_FROM_NT(status), status < 0);
+    auto closeAlgorithm = wil::scope_exit([&] { BCryptCloseAlgorithmProvider(algorithm, 0); });
+    status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectSize),
+        sizeof(objectSize), &resultSize, 0);
+    RETURN_HR_IF(HRESULT_FROM_NT(status), status < 0);
+    std::vector<BYTE> object(objectSize);
+    status = BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0);
+    RETURN_HR_IF(HRESULT_FROM_NT(status), status < 0);
+    auto destroyHash = wil::scope_exit([&] { BCryptDestroyHash(hash); });
+
+    BYTE buffer[64 * 1024];
+    for (;;) {
+        DWORD read = 0;
+        RETURN_IF_WIN32_BOOL_FALSE(ReadFile(file.get(), buffer, sizeof(buffer), &read, nullptr));
+        if (read == 0) break;
+        status = BCryptHashData(hash, buffer, read, 0);
+        RETURN_HR_IF(HRESULT_FROM_NT(status), status < 0);
+    }
+    status = BCryptFinishHash(hash, output, 32, 0);
+    RETURN_HR_IF(HRESULT_FROM_NT(status), status < 0);
+    return S_OK;
+}
+
+SharedMemoryClient::~SharedMemoryClient()
+{
+    (void)SetConsumerAttached(false);
+    ResetGpuResizeResources();
+    CloseHandles();
+}
 
 template<typename T> static void ReleaseCom(T*& value)
 {
@@ -205,19 +253,87 @@ void SharedMemoryClient::CloseHandles()
     m_hFile = NULL;
     m_viewSize = 0;
     m_lastSequence = 0;
+    m_identityPublished = false;
 }
 
-HRESULT SharedMemoryClient::SetConsumerFormat(DWORD width, DWORD height, DWORD fpsNumerator, DWORD fpsDenominator)
+void SharedMemoryClient::UpdateConsumerHeartbeat(OpenCamBridgeRingHeader* ring)
+{
+    LARGE_INTEGER qpc = {};
+    QueryPerformanceCounter(&qpc);
+    InterlockedExchange64(&ring->consumerHeartbeatQpc, qpc.QuadPart);
+}
+
+HRESULT SharedMemoryClient::PublishDllIdentity()
+{
+    if (m_identityPublished) return S_OK;
+    RETURN_HR_IF_NULL(E_POINTER, m_pMappedView);
+    auto* ring = static_cast<OpenCamBridgeRingHeader*>(m_pMappedView);
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH),
+        ring->magic != OCBR_MAGIC || ring->version != OCBR_VERSION ||
+        ring->headerSize != OCBR_HEADER_SIZE || ring->ringAbiHash != OCBR_ABI_HASH);
+    BYTE hash[32] = {};
+    RETURN_IF_FAILED(HashCurrentModule(hash));
+    memcpy(ring->installedDllBuildHash, hash, sizeof(hash));
+    MemoryBarrier();
+    m_identityPublished = true;
+    return S_OK;
+}
+
+HRESULT SharedMemoryClient::SetConsumerAttached(bool attached)
+{
+    if (!attached && (!m_hMapFile || !m_pMappedView)) return S_OK;
+    RETURN_IF_FAILED(OpenHandles());
+    RETURN_IF_FAILED(PublishDllIdentity());
+    auto* ring = static_cast<OpenCamBridgeRingHeader*>(m_pMappedView);
+    const LONG pid = static_cast<LONG>(GetCurrentProcessId());
+    if (attached) {
+        InterlockedExchange(&ring->consumerPid, pid);
+        InterlockedExchange(&ring->consumerAttached, 1);
+        UpdateConsumerHeartbeat(ring);
+    } else if (InterlockedCompareExchange(&ring->consumerPid, 0, 0) == pid) {
+        InterlockedExchange(&ring->consumerAttached, 0);
+        InterlockedExchange(&ring->consumerPid, 0);
+        UpdateConsumerHeartbeat(ring);
+    }
+    return S_OK;
+}
+
+HRESULT SharedMemoryClient::MarkSampleRequest()
+{
+    RETURN_IF_FAILED(SetConsumerAttached(true));
+    auto* ring = static_cast<OpenCamBridgeRingHeader*>(m_pMappedView);
+    InterlockedIncrement64(&ring->sampleRequests);
+    UpdateConsumerHeartbeat(ring);
+    return S_OK;
+}
+
+HRESULT SharedMemoryClient::ReportSampleCopyFailure(HRESULT error)
 {
     RETURN_IF_FAILED(OpenHandles());
     auto* ring = static_cast<OpenCamBridgeRingHeader*>(m_pMappedView);
-    if (ring->magic != OCBR_MAGIC || ring->version != OCBR_VERSION || ring->headerSize != OCBR_HEADER_SIZE) {
+    InterlockedIncrement64(&ring->sampleCopyFailures);
+    InterlockedExchange(&ring->lastRingError, error);
+    UpdateConsumerHeartbeat(ring);
+    return S_OK;
+}
+
+HRESULT SharedMemoryClient::SetConsumerFormat(DWORD width, DWORD height, DWORD fpsNumerator, DWORD fpsDenominator, REFGUID subtype)
+{
+    RETURN_IF_FAILED(OpenHandles());
+    RETURN_IF_FAILED(PublishDllIdentity());
+    auto* ring = static_cast<OpenCamBridgeRingHeader*>(m_pMappedView);
+    if (ring->magic != OCBR_MAGIC || ring->version != OCBR_VERSION ||
+        ring->headerSize != OCBR_HEADER_SIZE || ring->ringAbiHash != OCBR_ABI_HASH) {
         return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
     }
     InterlockedExchange(&ring->consumerWidth, static_cast<LONG>(width));
     InterlockedExchange(&ring->consumerHeight, static_cast<LONG>(height));
     InterlockedExchange(&ring->consumerFpsNum, static_cast<LONG>(fpsNumerator));
     InterlockedExchange(&ring->consumerFpsDen, static_cast<LONG>(fpsDenominator ? fpsDenominator : 1));
+    InterlockedExchange(&ring->negotiatedSubtype,
+        subtype == MFVideoFormat_NV12 ? OCBR_FORMAT_NV12 :
+        subtype == MFVideoFormat_RGB32 ? OCBR_FORMAT_RGB32 : 0);
+    RETURN_IF_FAILED(SetConsumerAttached(true));
     return S_OK;
 }
 
@@ -245,24 +361,48 @@ static HRESULT Nv12ToRgb32(const BYTE* nv12, DWORD width, DWORD height, LONG pit
     return S_OK;
 }
 
-HRESULT SharedMemoryClient::ReadFrame(BYTE* pBuf, DWORD len, LONG pitch, DWORD width, DWORD height,
+HRESULT SharedMemoryClient::ReadFrame(BYTE* pBuf, BYTE* bufferStart, DWORD len, LONG pitch, DWORD width, DWORD height,
     REFGUID outputSubtype, OpenCamBridgeFrameMetadata* metadata)
 {
     RETURN_HR_IF_NULL(E_POINTER, pBuf);
+    RETURN_HR_IF_NULL(E_POINTER, bufferStart);
     RETURN_HR_IF_NULL(E_POINTER, metadata);
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_DATA), pBuf < bufferStart);
+    const uint64_t destinationOffset = static_cast<uint64_t>(pBuf - bufferStart);
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER), destinationOffset > len);
     RETURN_IF_FAILED(OpenHandles());
-    return CopyStableSlot(pBuf, len, pitch, width, height, outputSubtype, metadata);
+    RETURN_IF_FAILED(PublishDllIdentity());
+    auto* ring = static_cast<OpenCamBridgeRingHeader*>(m_pMappedView);
+    InterlockedIncrement64(&ring->ringReadAttempts);
+    UpdateConsumerHeartbeat(ring);
+    HRESULT result = CopyStableSlot(pBuf, bufferStart, len, pitch, width, height, outputSubtype, metadata);
+    if (SUCCEEDED(result)) {
+        InterlockedIncrement64(&ring->ringReadSuccesses);
+        InterlockedExchange64(&ring->lastAcceptedSequence, static_cast<LONG64>(metadata->sequence));
+        InterlockedExchange(&ring->lastRingError, S_OK);
+    } else {
+        InterlockedExchange(&ring->lastRingError, result);
+        if (result == HRESULT_FROM_WIN32(ERROR_INVALID_DATA) || result == HRESULT_FROM_WIN32(ERROR_RETRY)) {
+            InterlockedIncrement64(&ring->ringValidationFailures);
+        } else {
+            InterlockedIncrement64(&ring->sampleCopyFailures);
+        }
+    }
+    return result;
 }
 
-HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, DWORD len, LONG pitch, DWORD width, DWORD height,
+HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD len, LONG pitch, DWORD width, DWORD height,
     REFGUID outputSubtype, OpenCamBridgeFrameMetadata* metadata)
 {
+    const uint64_t destinationOffset = static_cast<uint64_t>(pBuf - bufferStart);
+    const uint64_t destinationAvailable = static_cast<uint64_t>(len) - destinationOffset;
     auto* ring = static_cast<OpenCamBridgeRingHeader*>(m_pMappedView);
     const uint64_t slotSpan = ring->slotSize;
     const uint64_t ringBytes = static_cast<uint64_t>(ring->headerSize) + static_cast<uint64_t>(ring->slotCount) * slotSpan;
     const bool ringValid =
         ring->magic == OCBR_MAGIC && ring->version == OCBR_VERSION && ring->headerSize == OCBR_HEADER_SIZE &&
-        ring->slotCount == OCBR_SLOT_COUNT && ring->slotSize >= OCBR_SLOT_HEADER_SIZE && ringBytes <= m_viewSize;
+        ring->ringAbiHash == OCBR_ABI_HASH && ring->slotCount == OCBR_SLOT_COUNT &&
+        ring->slotSize >= OCBR_SLOT_HEADER_SIZE && ringBytes <= m_viewSize;
     if (!ringValid) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
 
     for (int attempt = 0; attempt < 3; ++attempt) {
@@ -308,7 +448,7 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, DWORD len, LONG pitch, DW
 
         HRESULT copyResult = S_OK;
         if (outputSubtype == MFVideoFormat_NV12) {
-            if (pitch <= 0 || static_cast<uint64_t>(pitch) * (height + height / 2) > len || static_cast<DWORD>(pitch) < width) {
+            if (pitch <= 0 || static_cast<uint64_t>(pitch) * (height + height / 2) > destinationAvailable || static_cast<DWORD>(pitch) < width) {
                 return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
             }
             for (DWORD row = 0; row < height; ++row) {
@@ -331,7 +471,7 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, DWORD len, LONG pitch, DW
                     srcUv + static_cast<size_t>(row) * sourceUvStride, width);
                 source = m_nv12Scratch.data();
             }
-            copyResult = Nv12ToRgb32(source, width, height, pitch, pBuf, len);
+            copyResult = Nv12ToRgb32(source, width, height, pitch, pBuf, static_cast<DWORD>(destinationAvailable));
         } else {
             return MF_E_UNSUPPORTED_FORMAT;
         }

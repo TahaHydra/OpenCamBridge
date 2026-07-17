@@ -197,6 +197,7 @@ namespace winrt::WindowsSample::implementation
         {
             RETURN_HR_MSG(MF_E_INVALIDREQUEST, "Stream is not in running state, state:%d, selected: %d", m_streamState, m_bSelected);
         }
+        RETURN_IF_FAILED(m_shmClient.MarkSampleRequest());
 
         RETURN_IF_FAILED(m_spSampleAllocator->AllocateSample(&sample));
         RETURN_IF_FAILED(sample->GetBufferByIndex(0, &outputBuffer));
@@ -218,16 +219,32 @@ namespace winrt::WindowsSample::implementation
         UINT32 fpsNum = 30;
         UINT32 fpsDen = 1;
         if (m_spMediaType) MFGetAttributeRatio(m_spMediaType.get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen);
-        (void)m_shmClient.SetConsumerFormat(width, height, fpsNum, fpsDen);
+        HRESULT formatResult = m_shmClient.SetConsumerFormat(width, height, fpsNum, fpsDen, subtype);
+        if (FAILED(formatResult)) {
+            (void)buffer2D->Unlock2D();
+            (void)m_shmClient.ReportSampleCopyFailure(formatResult);
+            return formatResult;
+        }
 
         OpenCamBridgeFrameMetadata metadata = {};
-        HRESULT hrFrame = m_shmClient.ReadFrame(pbuf, bufferLength, pitch, width, height, subtype, &metadata);
+        HRESULT hrFrame = m_shmClient.ReadFrame(pbuf, bufferStart, bufferLength, pitch, width, height, subtype, &metadata);
         if (FAILED(hrFrame)) {
-            // Test pattern is used only until the first valid producer frame.
-            RETURN_IF_FAILED(m_spFrameGenerator->CreateFrame(pbuf, bufferLength, pitch, m_rgbMask));
+            // A deterministic neutral diagnostic frame keeps the sample fully
+            // initialized, but it is never counted as a successful ring frame.
+            // The shared failure counters and lastRingError remain authoritative.
+            HRESULT fallbackResult = m_spFrameGenerator->CreateFrame(pbuf, bufferLength, pitch, m_rgbMask);
+            if (FAILED(fallbackResult)) {
+                (void)buffer2D->Unlock2D();
+                (void)m_shmClient.ReportSampleCopyFailure(fallbackResult);
+                return fallbackResult;
+            }
         }
         //RETURN_IF_FAILED(WriteSampleData(pbuf, bufferLength, pitch, width, height));
-        RETURN_IF_FAILED(buffer2D->Unlock2D());
+        HRESULT unlockResult = buffer2D->Unlock2D();
+        if (FAILED(unlockResult)) {
+            (void)m_shmClient.ReportSampleCopyFailure(unlockResult);
+            return unlockResult;
+        }
 
         LONGLONG duration = 333333;
         if (fpsNum > 0) {
@@ -479,6 +496,7 @@ namespace winrt::WindowsSample::implementation
         // Set stream state
         m_streamState = MF_STREAM_STATE_STOPPED;
         m_nextSampleTime = 0;
+        (void)m_shmClient.SetConsumerAttached(false);
 
         // NOTE: if implementation has sampleRequestQueue or sampleQueue, it must flush the queue on stopped.
         if (bSendEvent)

@@ -7,8 +7,10 @@
 #include <vector>
 
 #define OCBR_MAGIC 0x5242434F
-#define OCBR_VERSION 2
+#define OCBR_VERSION 3
 #define OCBR_FORMAT_NV12 2
+#define OCBR_FORMAT_RGB32 3
+#define OCBR_ABI_HASH 0x4f43425200030080ULL
 #define OCBR_HEADER_SIZE 256
 #define OCBR_SLOT_HEADER_SIZE 128
 #define OCBR_SLOT_COUNT 3
@@ -32,7 +34,21 @@ struct OpenCamBridgeRingHeader {
     volatile LONG consumerFpsDen;
     volatile LONG64 virtualCameraUniqueFrames;
     volatile LONG64 repeatedVirtualCameraSamples;
-    uint8_t reserved[OCBR_HEADER_SIZE - 80];
+    volatile LONG consumerAttached;
+    volatile LONG consumerPid;
+    volatile LONG64 consumerHeartbeatQpc;
+    volatile LONG64 sampleRequests;
+    volatile LONG64 ringReadAttempts;
+    volatile LONG64 ringReadSuccesses;
+    volatile LONG64 ringValidationFailures;
+    volatile LONG64 sampleCopyFailures;
+    volatile LONG lastRingError;
+    volatile LONG negotiatedSubtype;
+    volatile LONG64 lastAcceptedSequence;
+    uint64_t ringAbiHash;
+    uint8_t installedDllBuildHash[32];
+    uint8_t producerBuildHash[32];
+    uint8_t reserved[32];
 };
 
 struct OpenCamBridgeSlotHeader {
@@ -56,6 +72,9 @@ struct OpenCamBridgeSlotHeader {
 
 static_assert(sizeof(OpenCamBridgeRingHeader) == OCBR_HEADER_SIZE, "OCB2 ring header layout changed");
 static_assert(sizeof(OpenCamBridgeSlotHeader) == OCBR_SLOT_HEADER_SIZE, "OCB2 slot header layout changed");
+static_assert(offsetof(OpenCamBridgeRingHeader, consumerAttached) == 80, "OCB ring diagnostics offset changed");
+static_assert(offsetof(OpenCamBridgeRingHeader, lastAcceptedSequence) == 144, "OCB ring sequence offset changed");
+static_assert(offsetof(OpenCamBridgeRingHeader, producerBuildHash) == 192, "OCB build identity offset changed");
 
 struct OpenCamBridgeFrameMetadata {
     uint64_t sequence = 0;
@@ -72,24 +91,30 @@ public:
     ~SharedMemoryClient();
 
     HRESULT ReadFrame(
-        BYTE* pBuf,
+        BYTE* scanline,
+        BYTE* bufferStart,
         DWORD len,
         LONG pitch,
         DWORD width,
         DWORD height,
         REFGUID outputSubtype,
         OpenCamBridgeFrameMetadata* metadata);
-    HRESULT SetConsumerFormat(DWORD width, DWORD height, DWORD fpsNumerator, DWORD fpsDenominator);
+    HRESULT SetConsumerFormat(DWORD width, DWORD height, DWORD fpsNumerator, DWORD fpsDenominator, REFGUID subtype);
+    HRESULT SetConsumerAttached(bool attached);
+    HRESULT MarkSampleRequest();
+    HRESULT ReportSampleCopyFailure(HRESULT error);
 
 private:
     HRESULT OpenHandles();
     void CloseHandles();
-    HRESULT CopyStableSlot(BYTE* pBuf, DWORD len, LONG pitch, DWORD width, DWORD height,
+    HRESULT CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD len, LONG pitch, DWORD width, DWORD height,
         REFGUID outputSubtype, OpenCamBridgeFrameMetadata* metadata);
     HRESULT ResizeNv12Gpu(const BYTE* source, DWORD sourceWidth, DWORD sourceHeight,
         DWORD sourceYStride, DWORD sourceUvStride, DWORD outputWidth, DWORD outputHeight,
         std::vector<BYTE>& output);
     HRESULT EnsureGpuResizeResources(DWORD sourceWidth, DWORD sourceHeight, DWORD outputWidth, DWORD outputHeight);
+    HRESULT PublishDllIdentity();
+    void UpdateConsumerHeartbeat(OpenCamBridgeRingHeader* ring);
     void ResetGpuResizeResources();
 
     HANDLE m_hFile;
@@ -114,4 +139,5 @@ private:
     DWORD m_resizeSourceHeight = 0;
     DWORD m_resizeOutputWidth = 0;
     DWORD m_resizeOutputHeight = 0;
+    bool m_identityPublished = false;
 };

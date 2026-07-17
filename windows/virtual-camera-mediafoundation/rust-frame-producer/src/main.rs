@@ -1,6 +1,8 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::ffi::c_void;
 use std::io::Read;
 use std::ptr::{copy_nonoverlapping, null_mut};
@@ -28,7 +30,8 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Performance::QueryPerformanceCounter;
 
 const OCBR_MAGIC: u32 = 0x5242434F; // "OCBR"
-const RING_VERSION: u16 = 2;
+const RING_VERSION: u16 = 3;
+const RING_ABI_HASH: u64 = 0x4f43_4252_0003_0080;
 const FORMAT_NV12: u32 = 2;
 const RING_HEADER_SIZE: usize = 256;
 const SLOT_HEADER_SIZE: usize = 128;
@@ -56,7 +59,21 @@ struct OpenCamBridgeRingHeader {
     consumer_fps_den: std::sync::atomic::AtomicU32,
     virtual_camera_unique_frames: std::sync::atomic::AtomicU64,
     repeated_virtual_camera_samples: std::sync::atomic::AtomicU64,
-    reserved: [u8; RING_HEADER_SIZE - 80],
+    consumer_attached: std::sync::atomic::AtomicU32,
+    consumer_pid: std::sync::atomic::AtomicU32,
+    consumer_heartbeat_qpc: std::sync::atomic::AtomicU64,
+    sample_requests: std::sync::atomic::AtomicU64,
+    ring_read_attempts: std::sync::atomic::AtomicU64,
+    ring_read_successes: std::sync::atomic::AtomicU64,
+    ring_validation_failures: std::sync::atomic::AtomicU64,
+    sample_copy_failures: std::sync::atomic::AtomicU64,
+    last_ring_error: std::sync::atomic::AtomicI32,
+    negotiated_subtype: std::sync::atomic::AtomicU32,
+    last_accepted_sequence: std::sync::atomic::AtomicU64,
+    ring_abi_hash: u64,
+    installed_dll_build_hash: [u8; 32],
+    producer_build_hash: [u8; 32],
+    reserved: [u8; 32],
 }
 
 #[repr(C)]
@@ -84,8 +101,13 @@ struct OpenCamBridgeSlotHeader {
 struct Args {
     /// Frame source: "h264" (OCB2 + Media Foundation), "mjpeg" compatibility,
     /// or "test-pattern".
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "test-pattern")]
     source: String,
+
+    /// Deterministic direct-NV12 diagnostic source. Supplying this option
+    /// selects test-pattern mode even when --source is omitted.
+    #[arg(long, value_enum)]
+    test_pattern: Option<TestPatternKind>,
 
     #[arg(short, long)]
     url: Option<String>,
@@ -116,11 +138,70 @@ struct Args {
     mirror: bool,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TestPatternKind {
+    Nv12Bars,
+    Nv12Gradient,
+    SolidRed,
+    SolidGreen,
+    SolidBlue,
+}
+
+impl TestPatternKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Nv12Bars => "nv12-bars",
+            Self::Nv12Gradient => "nv12-gradient",
+            Self::SolidRed => "solid-red",
+            Self::SolidGreen => "solid-green",
+            Self::SolidBlue => "solid-blue",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ProducerEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    severity: &'a str,
+    code: &'a str,
+    message: &'a str,
+    producer_state: Option<&'a str>,
+    source_commit: &'static str,
+}
+
+fn emit_event(severity: &str, code: &str, message: &str, producer_state: Option<&str>) {
+    let event = ProducerEvent {
+        event_type: "event",
+        severity,
+        code,
+        message,
+        producer_state,
+        source_commit: env!("OCB_SOURCE_COMMIT"),
+    };
+    if let Ok(json) = serde_json::to_string(&event) {
+        println!("{json}");
+    }
+}
+
 struct SharedMemoryIpc {
     h_file: HANDLE,
     h_map: HANDLE,
     p_map: *mut c_void,
     backend_name: String,
+    producer_hash: [u8; 32],
+    producer_hash_hex: String,
+}
+
+fn executable_sha256() -> ([u8; 32], String) {
+    let bytes = std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::read(path).ok());
+    let hash: [u8; 32] = bytes
+        .map(|data| Sha256::digest(data).into())
+        .unwrap_or([0; 32]);
+    let hex = hash.iter().map(|b| format!("{b:02x}")).collect();
+    (hash, hex)
 }
 
 /// String SID of the user this process runs as (e.g. "S-1-5-21-...."), used to
@@ -162,6 +243,7 @@ fn current_user_sid() -> Option<String> {
 
 impl SharedMemoryIpc {
     fn new() -> Result<Self, String> {
+        let (producer_hash, producer_hash_hex) = executable_sha256();
         unsafe {
             let mut p_sd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR(null_mut());
             // Least-privilege ACL: SYSTEM and the current user get full access
@@ -176,7 +258,7 @@ impl SharedMemoryIpc {
                     return Err("Could not resolve the current user SID; refusing to create a broadly writable frame ring".into());
                 }
             };
-            eprintln!("Framebuffer SDDL: {}", sddl_string);
+            emit_event("info", "FRAMEBUFFER_ACL", &sddl_string, Some("STARTING"));
             let sddl: Vec<u16> = sddl_string
                 .encode_utf16()
                 .chain(std::iter::once(0))
@@ -248,6 +330,8 @@ impl SharedMemoryIpc {
                                     p_map: p_map.Value,
                                     backend_name: "C:\\ProgramData\\OpenCamBridge\\framebuffer.bin"
                                         .to_string(),
+                                    producer_hash,
+                                    producer_hash_hex,
                                 });
                             }
                             let _ = CloseHandle(h_map_val);
@@ -303,6 +387,8 @@ impl SharedMemoryIpc {
                 h_map,
                 p_map: p_map.Value,
                 backend_name: "Global\\OpenCamBridgeFrameBuffer".to_string(),
+                producer_hash,
+                producer_hash_hex,
             })
         }
     }
@@ -315,6 +401,8 @@ impl SharedMemoryIpc {
                 && (*header).header_size as usize == RING_HEADER_SIZE
                 && (*header).slot_size as usize == SLOT_SIZE
             {
+                (*header).ring_abi_hash = RING_ABI_HASH;
+                (*header).producer_build_hash = self.producer_hash;
                 return;
             }
             std::ptr::write_bytes(self.p_map as *mut u8, 0, MAX_SHM_SIZE as usize);
@@ -325,6 +413,8 @@ impl SharedMemoryIpc {
             (*header).slot_size = SLOT_SIZE as u32;
             (*header).max_width = 1920;
             (*header).max_height = 1080;
+            (*header).ring_abi_hash = RING_ABI_HASH;
+            (*header).producer_build_hash = self.producer_hash;
             (*header)
                 .consumer_width
                 .store(1920, std::sync::atomic::Ordering::Relaxed);
@@ -451,6 +541,62 @@ impl SharedMemoryIpc {
         }
     }
 
+    fn diagnostics(&self) -> RingDiagnostics {
+        self.initialize_ring_if_needed();
+        unsafe {
+            let ring = &*(self.p_map as *const OpenCamBridgeRingHeader);
+            RingDiagnostics {
+                consumer_attached: ring
+                    .consumer_attached
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != 0,
+                consumer_pid: ring.consumer_pid.load(std::sync::atomic::Ordering::Acquire),
+                consumer_heartbeat_qpc: ring
+                    .consumer_heartbeat_qpc
+                    .load(std::sync::atomic::Ordering::Acquire),
+                sample_requests: ring
+                    .sample_requests
+                    .load(std::sync::atomic::Ordering::Acquire),
+                ring_read_attempts: ring
+                    .ring_read_attempts
+                    .load(std::sync::atomic::Ordering::Acquire),
+                ring_read_successes: ring
+                    .ring_read_successes
+                    .load(std::sync::atomic::Ordering::Acquire),
+                ring_validation_failures: ring
+                    .ring_validation_failures
+                    .load(std::sync::atomic::Ordering::Acquire),
+                sample_copy_failures: ring
+                    .sample_copy_failures
+                    .load(std::sync::atomic::Ordering::Acquire),
+                last_ring_error: ring
+                    .last_ring_error
+                    .load(std::sync::atomic::Ordering::Acquire),
+                last_accepted_sequence: ring
+                    .last_accepted_sequence
+                    .load(std::sync::atomic::Ordering::Acquire),
+                negotiated_subtype: ring
+                    .negotiated_subtype
+                    .load(std::sync::atomic::Ordering::Acquire),
+                negotiated_width: ring
+                    .consumer_width
+                    .load(std::sync::atomic::Ordering::Acquire),
+                negotiated_height: ring
+                    .consumer_height
+                    .load(std::sync::atomic::Ordering::Acquire),
+                negotiated_fps_num: ring
+                    .consumer_fps_num
+                    .load(std::sync::atomic::Ordering::Acquire),
+                negotiated_fps_den: ring
+                    .consumer_fps_den
+                    .load(std::sync::atomic::Ordering::Acquire),
+                installed_dll_build_hash: hex_hash(&ring.installed_dll_build_hash),
+                producer_build_hash: self.producer_hash_hex.clone(),
+                ring_abi_hash: ring.ring_abi_hash,
+            }
+        }
+    }
+
     fn consumer_format(&self) -> (u32, u32, u32) {
         self.initialize_ring_if_needed();
         unsafe {
@@ -471,6 +617,32 @@ impl SharedMemoryIpc {
             (width, height, numerator / denominator)
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RingDiagnostics {
+    consumer_attached: bool,
+    consumer_pid: u32,
+    consumer_heartbeat_qpc: u64,
+    sample_requests: u64,
+    ring_read_attempts: u64,
+    ring_read_successes: u64,
+    ring_validation_failures: u64,
+    sample_copy_failures: u64,
+    last_ring_error: i32,
+    last_accepted_sequence: u64,
+    negotiated_subtype: u32,
+    negotiated_width: u32,
+    negotiated_height: u32,
+    negotiated_fps_num: u32,
+    negotiated_fps_den: u32,
+    installed_dll_build_hash: String,
+    producer_build_hash: String,
+    ring_abi_hash: u64,
+}
+
+fn hex_hash(hash: &[u8; 32]) -> String {
+    hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn validate_nv12_metadata(
@@ -629,6 +801,44 @@ mod ring_tests {
         let sixty_samples = (0..60).map(|n| n * duration_100ns(60)).collect::<Vec<_>>();
         assert!(sixty_samples.windows(2).all(|w| w[1] > w[0]));
     }
+
+    #[test]
+    fn deterministic_nv12_patterns_have_valid_planes_and_colours() {
+        let mut frame = Vec::new();
+        for (kind, expected) in [
+            (TestPatternKind::SolidRed, (82, 90, 240)),
+            (TestPatternKind::SolidGreen, (145, 54, 34)),
+            (TestPatternKind::SolidBlue, (41, 240, 110)),
+        ] {
+            generate_nv12_pattern(kind, 0, 1280, 720, &mut frame);
+            assert_eq!(frame.len(), 1280 * 720 * 3 / 2);
+            assert_eq!(frame[0], expected.0);
+            assert_eq!(frame[1280 * 720], expected.1);
+            assert_eq!(frame[1280 * 720 + 1], expected.2);
+            assert_eq!(
+                validate_nv12_metadata(1280, 720, 1280, 1280, frame.len()),
+                Some(frame.len())
+            );
+        }
+    }
+
+    #[test]
+    fn ring_v3_diagnostic_layout_is_stable() {
+        assert_eq!(RING_VERSION, 3);
+        assert_eq!(std::mem::size_of::<OpenCamBridgeRingHeader>(), 256);
+        assert_eq!(
+            std::mem::offset_of!(OpenCamBridgeRingHeader, consumer_attached),
+            80
+        );
+        assert_eq!(
+            std::mem::offset_of!(OpenCamBridgeRingHeader, last_accepted_sequence),
+            144
+        );
+        assert_eq!(
+            std::mem::offset_of!(OpenCamBridgeRingHeader, producer_build_hash),
+            192
+        );
+    }
 }
 
 impl Drop for SharedMemoryIpc {
@@ -650,52 +860,67 @@ impl Drop for SharedMemoryIpc {
     }
 }
 
-/// Orientation test pattern. Deliberately NOT symmetric so a vertical flip or
-/// horizontal mirror is obvious in OBS without needing the phone:
-///   - top band RED, bottom band BLUE (detects upside-down)
-///   - a GREEN square in the TOP-LEFT corner (detects mirror + which corner is
-///     "origin")
-///   - a thin moving white scanline so you can tell it is live, not frozen
-/// Run: rust-frame-producer --source test-pattern --width 1280 --height 720
-/// Correct in OBS = red on top, blue on bottom, green square top-left.
-fn generate_test_pattern(frame_counter: u64, width: u32, height: u32) -> Vec<u8> {
-    let data_size = (width * height * 4) as usize;
-    let mut buf = vec![0u8; data_size];
-
-    let band = height / 3;
-    let marker = (width.min(height)) / 6; // top-left corner square
-    let scan = (frame_counter % height as u64) as u32; // moving scanline row
-
-    for y in 0..height {
-        // BGRA channel values for this row's base colour.
-        let (mut b, mut g, mut r) = if y < band {
-            (0u8, 0u8, 220u8) // top: RED
-        } else if y >= height - band {
-            (220u8, 0u8, 0u8) // bottom: BLUE
-        } else {
-            (40u8, 40u8, 40u8) // middle: dark gray
-        };
-        if y == scan {
-            b = 255;
-            g = 255;
-            r = 255;
-        } // white scanline
-
-        for x in 0..width {
-            let index = ((y * width * 4) + (x * 4)) as usize;
-            if y < marker && x < marker {
-                buf[index] = 0;
-                buf[index + 1] = 220;
-                buf[index + 2] = 0; // GREEN top-left
-            } else {
-                buf[index] = b;
-                buf[index + 1] = g;
-                buf[index + 2] = r;
+/// Direct-NV12 diagnostics isolate the ring/DLL/registration path from Android,
+/// transport and H.264 decoding. No BGRA conversion is involved.
+fn generate_nv12_pattern(
+    kind: TestPatternKind,
+    frame_counter: u64,
+    width: u32,
+    height: u32,
+    output: &mut Vec<u8>,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    output.resize(w * h * 3 / 2, 0);
+    let (y_plane, uv_plane) = output.split_at_mut(w * h);
+    match kind {
+        TestPatternKind::Nv12Gradient => {
+            for row in 0..h {
+                for col in 0..w {
+                    y_plane[row * w + col] = 16 + ((col * 219 / w.max(1)) as u8);
+                }
             }
-            buf[index + 3] = 255;
+            uv_plane.fill(128);
+        }
+        TestPatternKind::SolidRed => fill_nv12(y_plane, uv_plane, 82, 90, 240),
+        TestPatternKind::SolidGreen => fill_nv12(y_plane, uv_plane, 145, 54, 34),
+        TestPatternKind::SolidBlue => fill_nv12(y_plane, uv_plane, 41, 240, 110),
+        TestPatternKind::Nv12Bars => {
+            const BARS: [(u8, u8, u8); 8] = [
+                (235, 128, 128),
+                (210, 16, 146),
+                (170, 166, 16),
+                (145, 54, 34),
+                (106, 202, 222),
+                (82, 90, 240),
+                (41, 240, 110),
+                (16, 128, 128),
+            ];
+            for row in 0..h {
+                for col in 0..w {
+                    let bar = (col * BARS.len() / w.max(1)).min(BARS.len() - 1);
+                    y_plane[row * w + col] = BARS[bar].0;
+                }
+            }
+            for row in 0..h / 2 {
+                for col in (0..w).step_by(2) {
+                    let bar = (col * BARS.len() / w.max(1)).min(BARS.len() - 1);
+                    uv_plane[row * w + col] = BARS[bar].1;
+                    uv_plane[row * w + col + 1] = BARS[bar].2;
+                }
+            }
+            let scan = frame_counter as usize % h.max(1);
+            y_plane[scan * w..(scan + 1) * w].fill(235);
         }
     }
-    buf
+}
+
+fn fill_nv12(y_plane: &mut [u8], uv_plane: &mut [u8], y: u8, u: u8, v: u8) {
+    y_plane.fill(y);
+    for pair in uv_plane.chunks_exact_mut(2) {
+        pair[0] = u;
+        pair[1] = v;
+    }
 }
 
 /// Minimal JSON string escaping for the single-line metrics output.
@@ -727,7 +952,7 @@ fn build_http_client() -> Result<reqwest::blocking::Client, String> {
 }
 
 fn set_error(slot: &Arc<Mutex<Option<String>>>, msg: String) {
-    eprintln!("{}", msg);
+    emit_event("error", "PRODUCER_ERROR", &msg, Some("FAILED"));
     *slot.lock().unwrap() = Some(msg);
 }
 
@@ -1209,9 +1434,12 @@ fn create_v2_decoder(
             config,
         ) {
             Ok(decoder) => return Ok(V2Decoder::MediaFoundation(decoder)),
-            Err(e) => {
-                eprintln!("Media Foundation decoder unavailable ({e}); using software fallback")
-            }
+            Err(e) => emit_event(
+                "warning",
+                "HARDWARE_DECODER_UNAVAILABLE",
+                &e,
+                Some("FALLBACK"),
+            ),
         }
     }
     let mut decoder =
@@ -1259,6 +1487,12 @@ fn copy_i420_to_nv12(yuv: &impl YUVSource, scratch: &mut Vec<u8>) -> Result<(u32
 }
 
 fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
+    emit_event(
+        "info",
+        "PRODUCER_STATE",
+        "Starting OCB2 pipeline",
+        Some("STARTING"),
+    );
     let url = args.url.clone().ok_or("URL is required for OCB2 H.264")?;
     let mut parser = ocb2::Parser::new();
     let mut stream_info: Option<ocb2::StreamInfo> = None;
@@ -1274,6 +1508,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
     let mut bytes_received = 0u64;
     let mut replaced_frames = 0u64;
     let mut last_published_sequence = 0u64;
+    let mut ring_frames_committed = 0u64;
     let mut decode_ms_sum = 0u64;
     let mut latency_ms_sum = 0u64;
     let mut latency_samples = 0u64;
@@ -1291,6 +1526,12 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
             let _ = d.flush();
         }
 
+        emit_event(
+            "info",
+            "PRODUCER_STATE",
+            "Connecting to OCB2 endpoint",
+            Some("CONNECTING"),
+        );
         let client = build_http_client()?;
         let mut request = client.get(&url);
         if let Some(token) = &args.token {
@@ -1300,6 +1541,12 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
         let mut response = match response {
             Ok(r) if r.status().is_success() => {
                 failures = 0;
+                emit_event(
+                    "info",
+                    "PRODUCER_STATE",
+                    "OCB2 connected; waiting for stream information",
+                    Some("WAITING_FOR_STREAM_INFO"),
+                );
                 r
             }
             Ok(r) => {
@@ -1372,6 +1619,12 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                             codec_config.clear();
                                         }
                                         waiting_for_keyframe = true;
+                                        emit_event(
+                                            "info",
+                                            "PRODUCER_STATE",
+                                            "Stream information accepted",
+                                            Some("WAITING_FOR_CODEC_CONFIG"),
+                                        );
                                     }
                                     Ok(_) => {
                                         last_error =
@@ -1392,6 +1645,12 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                 codec_config.extend_from_slice(&record.payload);
                                 decoder = None;
                                 waiting_for_keyframe = true;
+                                emit_event(
+                                    "info",
+                                    "PRODUCER_STATE",
+                                    "Codec configuration accepted",
+                                    Some("WAITING_FOR_KEYFRAME"),
+                                );
                             }
                             ocb2::TYPE_VIDEO_ACCESS_UNIT => {
                                 received_frames += 1;
@@ -1417,10 +1676,16 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                         &codec_config,
                                         force_software,
                                     )?);
-                                    eprintln!(
-                                        "Decoder: {} (hardware={})",
-                                        decoder.as_ref().unwrap().name(),
-                                        decoder.as_ref().unwrap().hardware_active()
+                                    let selected = decoder.as_ref().unwrap();
+                                    emit_event(
+                                        "info",
+                                        "DECODER_SELECTED",
+                                        &format!(
+                                            "{} (hardware={})",
+                                            selected.name(),
+                                            selected.hardware_active()
+                                        ),
+                                        Some("DECODING"),
                                     );
                                 }
                                 waiting_for_keyframe = false;
@@ -1453,7 +1718,16 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                                 record.flags,
                                                 frame.bytes,
                                             ) {
+                                                if decoded_unique == 0 {
+                                                    emit_event(
+                                                        "info",
+                                                        "FIRST_RING_FRAME",
+                                                        "First decoded keyframe committed to NV12 ring",
+                                                        Some("WRITING_RING"),
+                                                    );
+                                                }
                                                 last_published_sequence = sequence;
+                                                ring_frames_committed += 1;
                                                 decoded_unique += 1;
                                                 decoded_this_au += 1;
                                                 let offset = *capture_clock_offset.get_or_insert(
@@ -1488,6 +1762,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                                     scratch,
                                                 ) {
                                                     last_published_sequence = record.sequence;
+                                                    ring_frames_committed += 1;
                                                     decoded_unique += 1;
                                                     decoded_this_au = 1;
                                                 }
@@ -1591,8 +1866,14 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                 .as_ref()
                                 .map(|e| format!("\"{}\"", json_escape(e)))
                                 .unwrap_or_else(|| "null".into());
+                            let ring = ipc.diagnostics();
+                            let ring_json =
+                                serde_json::to_string(&ring).unwrap_or_else(|_| "{}".into());
+                            let virtual_camera_ready =
+                                ring.consumer_attached && ring.ring_read_successes > 0;
                             println!(
-                                r#"{{"source":"ocb2-h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":0,"replaced_frames":{},"jpeg_queue_len":0,"decode_ms_avg":{},"rotate_ms_avg":0,"resize_ms_avg":0,"write_ms_avg":0,"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"{}","hardware_decoder":{},"encoder_name":"{}","hardware_encoder":{},"camera_id":"{}","fallback_reason":"{}","resize_backend":"gpu-or-exact","rotation":0,"last_error":{}}}"#,
+                                r#"{{"type":"metrics","producer_state":"WRITING_RING","ring_frames_committed":{},"source":"ocb2-h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":0,"replaced_frames":{},"jpeg_queue_len":0,"decode_ms_avg":{},"rotate_ms_avg":0,"resize_ms_avg":0,"write_ms_avg":0,"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"{}","hardware_decoder":{},"encoder_name":"{}","hardware_encoder":{},"camera_id":"{}","fallback_reason":"{}","resize_backend":"gpu-or-exact","rotation":0,"last_error":{},"ring":{},"virtual_camera_ready":{}}}"#,
+                                ring_frames_committed,
                                 json_escape(&args.profile),
                                 info.map(|i| i.width).unwrap_or(0),
                                 info.map(|i| i.height).unwrap_or(0),
@@ -1628,7 +1909,9 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                 } else {
                                     "hardware decoder unavailable"
                                 },
-                                err_json
+                                err_json,
+                                ring_json,
+                                virtual_camera_ready
                             );
                             if matches!(&decoder, Some(V2Decoder::Software { .. })) {
                                 let target = info
@@ -1665,6 +1948,9 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
 
 fn main() {
     let mut args = Args::parse();
+    if args.test_pattern.is_some() {
+        args.source = "test-pattern".to_owned();
+    }
 
     // The OPENCAMBRIDGE_TOKEN environment variable takes precedence over
     // so the launcher can hand over the token without it appearing in the
@@ -1726,7 +2012,24 @@ fn main() {
     }
 
     let ipc = SharedMemoryIpc::new().expect("Failed to initialize IPC");
-    eprintln!("Framebuffer backend: {}", ipc.backend_name);
+    ipc.initialize_ring_if_needed();
+    emit_event(
+        "info",
+        "PRODUCER_BUILD",
+        &format!(
+            "commit={} sha256={} abi=0x{:016x}",
+            env!("OCB_SOURCE_COMMIT"),
+            ipc.producer_hash_hex,
+            RING_ABI_HASH
+        ),
+        Some("STARTING"),
+    );
+    emit_event(
+        "info",
+        "FRAMEBUFFER_BACKEND",
+        &ipc.backend_name,
+        Some("STARTING"),
+    );
     let mut active_fallback_reason = if args.source == "mjpeg" {
         "MJPEG compatibility mode selected".to_string()
     } else {
@@ -1737,24 +2040,28 @@ fn main() {
     // resize on any error). Set OCB_DISABLE_SIMD_RESIZE=1 to force the standard
     // path — the kill switch if a SIMD build ever produces bad output.
     let allow_simd = std::env::var("OCB_DISABLE_SIMD_RESIZE").is_err();
-    eprintln!(
-        "Resize backend preference: {}",
+    emit_event(
+        "info",
+        "RESIZE_BACKEND",
         if allow_simd {
             "simd (fallback: standard)"
         } else {
             "standard (simd disabled)"
-        }
+        },
+        Some("STARTING"),
     );
     // Faster pure-Rust JPEG decode (fallback: image crate). Disable with
     // OCB_DISABLE_FASTJPEG if it ever misdecodes.
     let allow_fastjpeg = std::env::var("OCB_DISABLE_FASTJPEG").is_err();
-    eprintln!(
-        "JPEG decode preference: {}",
+    emit_event(
+        "info",
+        "JPEG_DECODER",
         if allow_fastjpeg {
             "zune (fallback: image)"
         } else {
             "image (fastjpeg disabled)"
-        }
+        },
+        Some("STARTING"),
     );
 
     if args.source == "h264" {
@@ -1826,6 +2133,17 @@ fn main() {
     let mut last_backend: &str = "skipped";
     let mut last_rotation: u32 = 0;
     let mut last_decode_backend: &str = "standard";
+    let test_pattern = args.test_pattern.unwrap_or(TestPatternKind::Nv12Bars);
+    let mut test_nv12 = Vec::with_capacity(width as usize * height as usize * 3 / 2);
+
+    if args.source == "test-pattern" {
+        emit_event(
+            "info",
+            "TEST_PATTERN_SELECTED",
+            test_pattern.as_str(),
+            Some("WRITING_RING"),
+        );
+    }
 
     loop {
         let next_print = last_print + Duration::from_secs(1);
@@ -1859,9 +2177,21 @@ fn main() {
 
         if args.source == "test-pattern" {
             if Instant::now() >= next_frame_deadline {
-                let frame = generate_test_pattern(frame_counter, width, height);
+                generate_nv12_pattern(test_pattern, frame_counter, width, height, &mut test_nv12);
                 let write_start = Instant::now();
-                ipc.write_frame(frame_counter, &frame, width, height);
+                let now_ns = monotonic_ns();
+                let _ = ipc.write_nv12_frame(
+                    frame_counter + 1,
+                    now_ns,
+                    now_ns,
+                    now_ns,
+                    width,
+                    height,
+                    width,
+                    width,
+                    0,
+                    &test_nv12,
+                );
                 sum_write_ms += write_start.elapsed().as_millis() as u32;
                 frame_counter += 1;
                 output_fps_counter += 1;
@@ -2013,9 +2343,13 @@ fn main() {
                 Some(e) => format!("\"{}\"", json_escape(e)),
                 None => "null".to_string(),
             };
+            let ring = ipc.diagnostics();
+            let ring_json = serde_json::to_string(&ring).unwrap_or_else(|_| "{}".into());
+            let virtual_camera_ready = ring.consumer_attached && ring.ring_read_successes > 0;
 
             println!(
-                r#"{{"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":{},"replaced_frames":{},"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"JPEG software compatibility","hardware_decoder":false,"encoder_name":"Android JPEG","hardware_encoder":false,"camera_id":"","fallback_reason":"{}","resize_backend":"{}","rotation":{},"last_error":{}}}"#,
+                r#"{{"type":"metrics","producer_state":"WRITING_RING","ring_frames_committed":{},"source":"{}","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":{},"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":{},"replaced_frames":{},"jpeg_queue_len":{},"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":{},"write_ms_avg":{},"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"JPEG software compatibility","hardware_decoder":false,"encoder_name":"Android JPEG","hardware_encoder":false,"camera_id":"","fallback_reason":"{}","resize_backend":"{}","rotation":{},"last_error":{},"ring":{},"virtual_camera_ready":{}}}"#,
+                frame_counter,
                 args.source,
                 json_escape(&args.profile),
                 source_w,
@@ -2045,7 +2379,9 @@ fn main() {
                 json_escape(&active_fallback_reason),
                 last_backend,
                 last_rotation,
-                last_error_json
+                last_error_json,
+                ring_json,
+                virtual_camera_ready
             );
 
             last_print = Instant::now();

@@ -6,6 +6,12 @@ use tauri::{AppHandle, Manager, State};
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub struct VirtualCamMetrics {
+    #[serde(default, rename = "type")]
+    pub message_type: String,
+    #[serde(default)]
+    pub producer_state: String,
+    #[serde(default)]
+    pub ring_frames_committed: u64,
     pub source: String,
     pub profile: String,
     pub source_width: u32,
@@ -64,11 +70,51 @@ pub struct VirtualCamMetrics {
     #[serde(default)]
     pub rotation: u32,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub ring: Option<RingDiagnostics>,
+    #[serde(default)]
+    pub virtual_camera_ready: bool,
+}
+
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct RingDiagnostics {
+    pub consumer_attached: bool,
+    pub consumer_pid: u32,
+    pub consumer_heartbeat_qpc: u64,
+    pub sample_requests: u64,
+    pub ring_read_attempts: u64,
+    pub ring_read_successes: u64,
+    pub ring_validation_failures: u64,
+    pub sample_copy_failures: u64,
+    pub last_ring_error: i32,
+    pub last_accepted_sequence: u64,
+    pub negotiated_subtype: u32,
+    pub negotiated_width: u32,
+    pub negotiated_height: u32,
+    pub negotiated_fps_num: u32,
+    pub negotiated_fps_den: u32,
+    pub installed_dll_build_hash: String,
+    pub producer_build_hash: String,
+    pub ring_abi_hash: u64,
+}
+
+#[derive(Deserialize)]
+struct ProducerEvent {
+    #[serde(rename = "type")]
+    _message_type: String,
+    severity: String,
+    code: String,
+    message: String,
+    producer_state: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
 pub struct VirtualCamState {
     pub running: bool,
+    pub process_running: bool,
+    pub pipeline_ready: bool,
+    pub virtual_camera_ready: bool,
+    pub producer_state: String,
     pub host_running: bool,
     pub registered: bool,
     pub metrics: Option<VirtualCamMetrics>,
@@ -77,6 +123,7 @@ pub struct VirtualCamState {
     pub producer_pid: Option<u32>,
     pub last_error: Option<String>,
     pub last_metrics_time: Option<u64>,
+    pub last_event: Option<String>,
 }
 
 pub struct VirtualCamManager {
@@ -86,6 +133,8 @@ pub struct VirtualCamManager {
     producer_path: Mutex<Option<String>>,
     last_error: Mutex<Option<String>>,
     last_metrics_time: Mutex<Option<u64>>,
+    producer_state: Mutex<String>,
+    last_event: Mutex<Option<String>>,
 }
 
 impl VirtualCamManager {
@@ -97,6 +146,8 @@ impl VirtualCamManager {
             producer_path: Mutex::new(None),
             last_error: Mutex::new(None),
             last_metrics_time: Mutex::new(None),
+            producer_state: Mutex::new("STOPPED".to_string()),
+            last_event: Mutex::new(None),
         }
     }
 }
@@ -197,10 +248,11 @@ pub fn start_virtual_camera_feeder(
         println!(">>> [Tauri] Found existing producer (PID {}). Stopping it.", child.id());
         let _ = child.kill();
         let _ = child.wait();
-        *state.last_error.lock().unwrap() = Some(format!("Killed previous producer for restart"));
+        *state.last_error.lock().unwrap() = None;
         *state.metrics.lock().unwrap() = None;
         *state.last_metrics_time.lock().unwrap() = None;
     }
+    *state.producer_state.lock().unwrap() = "STARTING".to_string();
 
     let mut repo_root = std::env::current_dir().unwrap();
     while !repo_root.join("windows").exists() && repo_root.parent().is_some() {
@@ -277,22 +329,38 @@ pub fn start_virtual_camera_feeder(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let app_clone = app.clone();
-    let app_clone_err = app.clone();
 
     // STDOUT drain thread
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             if let Ok(line) = line {
-                if let Ok(metrics) = serde_json::from_str::<VirtualCamMetrics>(&line) {
-                    let state_manager = app_clone.state::<VirtualCamManager>();
-                    let mut metrics_guard = state_manager.metrics.lock().unwrap();
-                    *metrics_guard = Some(metrics);
-
-                    let mut time_guard = state_manager.last_metrics_time.lock().unwrap();
-                    *time_guard = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-                } else {
-                    println!(">>> [Producer STDOUT] {}", line);
+                let value = serde_json::from_str::<serde_json::Value>(&line).ok();
+                match value.as_ref().and_then(|v| v.get("type")).and_then(|v| v.as_str()) {
+                    Some("metrics") => {
+                        if let Ok(metrics) = serde_json::from_value::<VirtualCamMetrics>(value.unwrap()) {
+                            let state_manager = app_clone.state::<VirtualCamManager>();
+                            *state_manager.producer_state.lock().unwrap() = metrics.producer_state.clone();
+                            *state_manager.metrics.lock().unwrap() = Some(metrics);
+                            *state_manager.last_metrics_time.lock().unwrap() = Some(
+                                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+                            );
+                        }
+                    }
+                    Some("event") => {
+                        if let Ok(event) = serde_json::from_value::<ProducerEvent>(value.unwrap()) {
+                            let state_manager = app_clone.state::<VirtualCamManager>();
+                            if let Some(producer_state) = event.producer_state {
+                                *state_manager.producer_state.lock().unwrap() = producer_state;
+                            }
+                            *state_manager.last_event.lock().unwrap() = Some(format!("{}: {}", event.code, event.message));
+                            if event.severity == "error" {
+                                *state_manager.last_error.lock().unwrap() = Some(event.message.clone());
+                            }
+                            println!(">>> [Producer {}] {}: {}", event.severity, event.code, event.message);
+                        }
+                    }
+                    _ => println!(">>> [Producer STDOUT] {}", line),
                 }
             }
         }
@@ -305,23 +373,8 @@ pub fn start_virtual_camera_feeder(
         for line in reader.lines() {
             if let Ok(line) = line {
                 println!(">>> [Producer STDERR] {}", line);
-                // The producer prints benign informational lines to stderr at
-                // startup ("Framebuffer backend: ...", decoder selection notes).
-                // Treating those as last_error made every metrics line and
-                // the session log show a fake "err=..." forever. Real errors are
-                // already carried in the per-second metrics JSON (last_error) on
-                // stdout; only promote genuinely error-ish stderr lines here.
-                let l = line.trim_start();
-                let benign = l.is_empty()
-                    || l.starts_with("Framebuffer backend:")
-                    || l.starts_with("NOTE:")
-                    || l.starts_with("Resize backend preference:")
-                    || l.starts_with("JPEG decode preference:");
-                if !benign {
-                    let state_manager = app_clone_err.state::<VirtualCamManager>();
-                    let mut err_guard = state_manager.last_error.lock().unwrap();
-                    *err_guard = Some(line.clone());
-                }
+                // stderr is retained for developer logs only. Health is driven
+                // exclusively by structured stdout events with severity=error.
             }
         }
         println!(">>> [Tauri] STDERR thread exiting.");
@@ -329,12 +382,45 @@ pub fn start_virtual_camera_feeder(
 
     let mut path_guard = state.producer_path.lock().unwrap();
     *path_guard = Some(path_string);
+    drop(path_guard);
 
     let mut err_guard = state.last_error.lock().unwrap();
     *err_guard = None;
+    drop(err_guard);
 
     *child_guard = Some(child);
-    Ok(())
+    drop(child_guard);
+
+    // Process existence is not readiness. Wait until the producer has decoded
+    // and committed at least three frames to the ring.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(metrics) = state.metrics.lock().unwrap().as_ref() {
+            if metrics.producer_state == "WRITING_RING" && metrics.ring_frames_committed >= 3 {
+                return Ok(());
+            }
+        }
+        let current_error = { state.last_error.lock().unwrap().clone() };
+        if let Some(error) = current_error {
+            let _ = stop_virtual_camera_feeder(state);
+            return Err(error);
+        }
+        {
+            let mut guard = state.child.lock().unwrap();
+            if let Some(child) = guard.as_mut() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    *guard = None;
+                    return Err(format!("Producer exited before ring readiness: {status}"));
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let producer_state = state.producer_state.lock().unwrap().clone();
+            let _ = stop_virtual_camera_feeder(state);
+            return Err(format!("Producer readiness timed out in state {producer_state}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 #[tauri::command]
@@ -350,6 +436,7 @@ pub fn stop_virtual_camera_feeder(state: State<'_, VirtualCamManager>) -> Result
 
     let mut time_guard = state.last_metrics_time.lock().unwrap();
     *time_guard = None;
+    *state.producer_state.lock().unwrap() = "STOPPED".to_string();
 
     Ok(())
 }
@@ -358,7 +445,7 @@ pub fn stop_virtual_camera_feeder(state: State<'_, VirtualCamManager>) -> Result
 pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> VirtualCamState {
     let mut child_guard = state.child.lock().unwrap();
 
-    let mut running = false;
+    let mut process_running = false;
     let mut producer_pid = None;
 
     if let Some(child) = child_guard.as_mut() {
@@ -372,17 +459,18 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
                 }
                 *state.metrics.lock().unwrap() = None;
                 *state.last_metrics_time.lock().unwrap() = None;
+                *state.producer_state.lock().unwrap() = "FAILED".to_string();
             }
             Ok(None) => {
                 // Still running
-                running = true;
+                process_running = true;
                 producer_pid = Some(child.id());
             }
             Err(_) => {}
         }
     }
 
-    if !running && child_guard.is_some() {
+    if !process_running && child_guard.is_some() {
         *child_guard = None;
     }
 
@@ -406,19 +494,25 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
         }
         alive
     };
-    let mut metrics = state.metrics.lock().unwrap().clone();
+    let metrics = state.metrics.lock().unwrap().clone();
     let registered = check_virtual_camera_backend();
     let producer_path = state.producer_path.lock().unwrap().clone();
     let last_error = state.last_error.lock().unwrap().clone();
     let last_metrics_time = state.last_metrics_time.lock().unwrap().clone();
 
+    let mut metrics_fresh = false;
     if let Some(last_time) = last_metrics_time {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        if now > last_time + 3 {
-            metrics = None;
-            *state.metrics.lock().unwrap() = None;
+        metrics_fresh = now <= last_time + 3;
+        if !metrics_fresh && process_running {
+            *state.producer_state.lock().unwrap() = "STALLED".to_string();
         }
     }
+    let pipeline_ready = process_running && metrics_fresh && metrics.as_ref().is_some_and(|m|
+        m.producer_state == "WRITING_RING" && m.ring_frames_committed >= 3 && m.last_error.is_none());
+    let virtual_camera_ready = pipeline_ready && metrics.as_ref().is_some_and(|m| m.virtual_camera_ready);
+    let producer_state = state.producer_state.lock().unwrap().clone();
+    let last_event = state.last_event.lock().unwrap().clone();
 
     let mut repo_root = std::env::current_dir().unwrap();
     while !repo_root.join("windows").exists() && repo_root.parent().is_some() {
@@ -428,7 +522,11 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
     let producer_exists = exe_path_release.exists() || repo_root.join("windows/virtual-camera-mediafoundation/rust-frame-producer/target/debug/rust-frame-producer.exe").exists();
 
     VirtualCamState {
-        running,
+        running: pipeline_ready,
+        process_running,
+        pipeline_ready,
+        virtual_camera_ready,
+        producer_state,
         host_running,
         registered,
         metrics,
@@ -437,5 +535,6 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
         producer_pid,
         last_error,
         last_metrics_time,
+        last_event,
     }
 }

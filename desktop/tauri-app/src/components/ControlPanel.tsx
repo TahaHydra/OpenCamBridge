@@ -6,6 +6,9 @@ import { logEvent, logError, logTestMarker } from '../services/logging';
 import { invoke } from '@tauri-apps/api/core';
 
 interface VirtualCamMetrics {
+  type?: string;
+  producer_state?: string;
+  ring_frames_committed?: number;
   source: string;
   profile: string;
   source_width: number;
@@ -42,10 +45,37 @@ interface VirtualCamMetrics {
   fallback_reason?: string;
   rotation?: number;
   last_error: string | null;
+  virtual_camera_ready?: boolean;
+  ring?: RingDiagnostics;
+}
+
+interface RingDiagnostics {
+  consumer_attached: boolean;
+  consumer_pid: number;
+  consumer_heartbeat_qpc: number;
+  sample_requests: number;
+  ring_read_attempts: number;
+  ring_read_successes: number;
+  ring_validation_failures: number;
+  sample_copy_failures: number;
+  last_ring_error: number;
+  last_accepted_sequence: number;
+  negotiated_subtype: number;
+  negotiated_width: number;
+  negotiated_height: number;
+  negotiated_fps_num: number;
+  negotiated_fps_den: number;
+  installed_dll_build_hash: string;
+  producer_build_hash: string;
+  ring_abi_hash: number;
 }
 
 interface VirtualCamState {
   running: boolean;
+  process_running?: boolean;
+  pipeline_ready?: boolean;
+  virtual_camera_ready?: boolean;
+  producer_state?: string;
   host_running: boolean;
   registered: boolean;
   metrics: VirtualCamMetrics | null;
@@ -54,6 +84,7 @@ interface VirtualCamState {
   producer_pid?: number;
   last_error?: string;
   last_metrics_time?: number;
+  last_event?: string;
 }
 
 interface ControlPanelProps {
@@ -616,7 +647,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
       // Android streaming and the producer/virtual-camera are SEPARATE things.
       // The producer must never be started just because Android has frames.
-      const producerRunning = !!vcamState?.running;
+      const producerRunning = !!(vcamState?.process_running ?? vcamState?.running);
       const androidStreaming =
         androidStreamStatus === 'running' &&
         (Number(androidMetrics?.encodedWidth || 0) > 0 ||
@@ -867,7 +898,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
             <span style={{ color: 'var(--text-secondary)' }}>Producer:</span>
-            <span style={{ color: vcamState?.running ? '#51cf66' : '#ff6b6b' }}>{vcamState?.running ? 'Running' : 'Stopped'}</span>
+            <span style={{ color: vcamState?.process_running ? '#51cf66' : '#ff6b6b' }}>{vcamState?.process_running ? 'Running' : 'Stopped'}</span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
             <span style={{ color: 'var(--text-secondary)' }}>Profile:</span>
@@ -899,17 +930,21 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
             {/* Primary product control: ONE button starts the whole webcam
                 (Android stream + virtual camera host + producer to OBS). */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-              <button className="btn btn-primary" onClick={handleStartNativeCamera} disabled={!!(vcamState?.running && vcamState?.host_running)}>
+              <button className="btn btn-primary" onClick={handleStartNativeCamera} disabled={!!(vcamState?.process_running && vcamState?.host_running)}>
                 <Play size={16} style={{ marginRight: 6 }} /> Start Webcam
               </button>
-              <button className="btn btn-secondary" onClick={handleStopNativeCamera} disabled={!vcamState?.running && !vcamState?.host_running}>
+              <button className="btn btn-secondary" onClick={handleStopNativeCamera} disabled={!vcamState?.process_running && !vcamState?.host_running}>
                 <Square size={16} style={{ marginRight: 6 }} /> Stop Webcam
               </button>
             </div>
-            <p style={{ fontSize: '0.75rem', color: vcamState?.running ? '#51cf66' : '#ffb300', margin: 0 }}>
-              {vcamState?.running
-                ? "Sending to OBS — add a Video Capture Device and pick 'OpenCamBridge Camera'."
-                : 'Phone preview only — not sending to OBS. Press Start Webcam.'}
+            <p style={{ fontSize: '0.75rem', color: vcamState?.pipeline_ready ? '#51cf66' : '#ffb300', margin: 0 }}>
+              {vcamState?.virtual_camera_ready
+                ? "OBS is consuming frames from 'OpenCamBridge Camera'."
+                : vcamState?.pipeline_ready
+                  ? "Frames are ready; waiting for a virtual-camera consumer such as OBS."
+                  : vcamState?.process_running
+                    ? `Producer is ${vcamState.producer_state || 'starting'}; pipeline is not ready yet.`
+                    : 'Phone preview only — not sending to OBS. Press Start Webcam.'}
             </p>
 
             {/* Granular pipeline controls: developer mode only. */}
@@ -919,8 +954,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                 <div>
                   <div style={{ fontSize: '0.8rem', color: '#888', marginBottom: 6 }}>Phone stream only (feed):</div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                    <button className="btn btn-secondary" onClick={handleStartFeedOnly} disabled={vcamState?.running}><Play size={14} style={{ marginRight: 6 }} /> Start</button>
-                    <button className="btn btn-secondary" onClick={handleStopFeedOnly} disabled={!vcamState?.running}><Square size={14} style={{ marginRight: 6 }} /> Stop</button>
+                    <button className="btn btn-secondary" onClick={handleStartFeedOnly} disabled={vcamState?.process_running}><Play size={14} style={{ marginRight: 6 }} /> Start</button>
+                    <button className="btn btn-secondary" onClick={handleStopFeedOnly} disabled={!vcamState?.process_running}><Square size={14} style={{ marginRight: 6 }} /> Stop</button>
                   </div>
                 </div>
                 <div>
@@ -952,7 +987,9 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
           <div style={{ background: 'rgba(20,25,30,0.5)', padding: 12, borderRadius: 8, border: '1px solid #222', fontSize: '0.8rem', marginBottom: 12 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
               <span style={{ color: '#888' }}>Status</span>
-              <span style={{ color: vcamState.running ? '#51cf66' : '#888' }}>{vcamState.running ? 'Streaming' : 'Idle'}</span>
+              <span style={{ color: vcamState.pipeline_ready ? '#51cf66' : vcamState.process_running ? '#ffb300' : '#888' }}>
+                {vcamState.virtual_camera_ready ? 'Consumer active' : vcamState.pipeline_ready ? 'Frames ready' : vcamState.process_running ? vcamState.producer_state || 'Starting' : 'Idle'}
+              </span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
               <span style={{ color: '#888' }}>Unique FPS (camera / encode / decode / camera)</span>
@@ -995,8 +1032,16 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
             {/* Extended Status */}
             <div style={{ marginBottom: 8, paddingBottom: 8, borderBottom: '1px solid #222' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888' }}>
-                <span>Producer Running:</span>
-                <span style={{ color: vcamState.running ? '#51cf66' : '#ff6b6b' }}>{vcamState.running ? 'Yes' : 'No'}</span>
+                <span>Producer process:</span>
+                <span style={{ color: vcamState.process_running ? '#51cf66' : '#ff6b6b' }}>{vcamState.process_running ? 'Running' : 'Stopped'}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                <span>Producer state / pipeline:</span>
+                <span style={{ color: vcamState.pipeline_ready ? '#51cf66' : '#ffb300' }}>{vcamState.producer_state || 'Unknown'} / {vcamState.pipeline_ready ? 'Ready' : 'Not ready'}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                <span>Virtual-camera consumer:</span>
+                <span style={{ color: vcamState.virtual_camera_ready ? '#51cf66' : '#ffb300' }}>{vcamState.virtual_camera_ready ? 'Reading frames' : 'Not attached'}</span>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
                 <span>Producer Exists:</span>
@@ -1020,6 +1065,36 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                 <span>Last Error:</span>
                 <span style={{ textAlign: 'right', wordBreak: 'break-all', maxWidth: '70%' }}>{vcamState.last_error || 'None'}</span>
               </div>
+              {vcamState.last_event && (
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                  <span>Last producer event:</span>
+                  <span style={{ textAlign: 'right', wordBreak: 'break-all', maxWidth: '70%' }}>{vcamState.last_event}</span>
+                </div>
+              )}
+              {vcamState.metrics?.ring && (
+                <>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                    <span>Ring commits / reads / requests:</span>
+                    <span>{vcamState.metrics.ring_frames_committed ?? 0} / {vcamState.metrics.ring.ring_read_successes} / {vcamState.metrics.ring.sample_requests}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                    <span>Ring validation / copy failures:</span>
+                    <span style={{ color: (vcamState.metrics.ring.ring_validation_failures || vcamState.metrics.ring.sample_copy_failures) ? '#ff6b6b' : '#51cf66' }}>
+                      {vcamState.metrics.ring.ring_validation_failures} / {vcamState.metrics.ring.sample_copy_failures} (0x{(vcamState.metrics.ring.last_ring_error >>> 0).toString(16)})
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                    <span>Negotiated media type:</span>
+                    <span>{vcamState.metrics.ring.negotiated_width}x{vcamState.metrics.ring.negotiated_height} @ {vcamState.metrics.ring.negotiated_fps_num}/{vcamState.metrics.ring.negotiated_fps_den}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                    <span>Producer / DLL hashes:</span>
+                    <span title={`${vcamState.metrics.ring.producer_build_hash} / ${vcamState.metrics.ring.installed_dll_build_hash}`}>
+                      {vcamState.metrics.ring.producer_build_hash.slice(0, 12) || 'unknown'} / {vcamState.metrics.ring.installed_dll_build_hash.slice(0, 12) || 'unknown'}
+                    </span>
+                  </div>
+                </>
+              )}
             </div>
 
             {androidMetrics && (

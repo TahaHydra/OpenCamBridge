@@ -19,6 +19,12 @@ $targetDll = "$mfRoot\VirtualCamera_Installer\x64\Release\VirtualCameraMediaSour
 # desktop app launches it from the path below, so build it and put it there.
 $builtInstaller = "$mfRoot\x64\Release\VirtualCamera_Installer.exe"
 $targetInstaller = "$mfRoot\VirtualCamera_Installer\x64\Release\VirtualCamera_Installer.exe"
+$sourceCommit = (& git -C $root rev-parse HEAD).Trim()
+$abiVersion = 3
+$abiHash = "0x4f43425200030080"
+
+Write-Host "Source commit: $sourceCommit" -ForegroundColor Cyan
+Write-Host "Ring ABI: version=$abiVersion hash=$abiHash" -ForegroundColor Cyan
 
 $vsDevCmd = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
 
@@ -31,7 +37,6 @@ if (!$NoKill) {
 Write-Host "Stopping processes that can lock the DLL..." -ForegroundColor Yellow
 Stop-Process -Name obs64 -Force -ErrorAction SilentlyContinue
 Stop-Process -Name tauri-app -Force -ErrorAction SilentlyContinue
-Stop-Process -Name node -Force -ErrorAction SilentlyContinue
 Stop-Process -Name rust-frame-producer -Force -ErrorAction SilentlyContinue
 Stop-Process -Name VirtualCamera_Installer -Force -ErrorAction SilentlyContinue
 Stop-Service FrameServer -Force -ErrorAction SilentlyContinue
@@ -124,6 +129,13 @@ Get-Item $builtDll | Select-Object FullName,Length,LastWriteTime
 
 Write-Host "Installed DLL:" -ForegroundColor Green
 Get-Item $targetDll | Select-Object FullName,Length,LastWriteTime
+$builtDllHash = (Get-FileHash $builtDll -Algorithm SHA256).Hash
+$installedDllHash = (Get-FileHash $targetDll -Algorithm SHA256).Hash
+Write-Host "Built DLL SHA-256:     $builtDllHash" -ForegroundColor Cyan
+Write-Host "Installed DLL SHA-256: $installedDllHash" -ForegroundColor Cyan
+if ($builtDllHash -ne $installedDllHash) {
+    throw "Installed DLL hash does not match the built DLL. Refusing to report a successful camera build."
+}
 
 Write-Host "Virtual camera host exe:" -ForegroundColor Green
 Get-Item $targetInstaller | Select-Object FullName,Length,LastWriteTime
@@ -140,10 +152,22 @@ try {
         Write-Host "  registered: $registeredDll" -ForegroundColor Red
         Write-Host "  this build: $targetDll" -ForegroundColor Red
         Write-Host "The camera keeps loading the registered DLL - your rebuild will NOT take effect." -ForegroundColor Red
-        Write-Host "Fix: run windows\virtual-camera-mediafoundation\register_hklm.bat as Administrator, then restart the camera pipeline." -ForegroundColor Yellow
+        throw "Registered/loaded DLL path differs from this build. Run register_hklm.bat as Administrator."
+    } elseif ($registeredDll) {
+        $registeredHash = (Get-FileHash $registeredDll -Algorithm SHA256).Hash
+        Write-Host "Loaded DLL path: $registeredDll" -ForegroundColor Cyan
+        Write-Host "Loaded DLL SHA-256: $registeredHash" -ForegroundColor Cyan
+        if ($registeredHash -ne $builtDllHash) {
+            throw "Registered DLL hash differs from the built DLL."
+        }
     }
 } catch {
-    Write-Host "Note: virtual camera COM object not registered yet. Run windows\virtual-camera-mediafoundation\register_hklm.bat as Administrator once." -ForegroundColor Yellow
+    if ($_.Exception.Message -like "*Cannot find path*" -or $_.Exception.Message -like "*does not exist*") {
+        Write-Host "Loaded DLL path: NOT REGISTERED" -ForegroundColor Yellow
+        Write-Host "Run windows\virtual-camera-mediafoundation\register_hklm.bat as Administrator once." -ForegroundColor Yellow
+    } else {
+        throw
+    }
 }
 
 Write-Host "Media Foundation DLL + host build/copy done." -ForegroundColor Green
