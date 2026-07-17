@@ -31,4 +31,12 @@ class Nv21TransformTest {
         byteArrayOf(4, 8, 3, 7, 2, 6, 1, 5, 103, 104, 101, 102))
     @Test fun rotation270MirrorOn() = assertTransform(270, true, 2, 4,
         byteArrayOf(8, 4, 7, 3, 6, 2, 5, 1, 103, 104, 101, 102))
+
+    @Test
+    fun fullHdPostTransformDimensionsAreAuthoritative() {
+        assertEquals(Nv21Dimensions(1920, 1080), Nv21Transform.outputDimensions(1920, 1080, 0))
+        assertEquals(Nv21Dimensions(1920, 1080), Nv21Transform.outputDimensions(1920, 1080, 180))
+        assertEquals(Nv21Dimensions(1080, 1920), Nv21Transform.outputDimensions(1920, 1080, 90))
+        assertEquals(Nv21Dimensions(1080, 1920), Nv21Transform.outputDimensions(1920, 1080, 270))
+    }
 }

@@ -337,8 +337,13 @@ class MjpegStreamer(
             captureWindowFrames++
             if (captureNowNs - captureWindowStartNs >= 1_000_000_000L) {
                 StreamState.captureFps.set(captureWindowFrames)
+                StreamState.cameraSessionFps.set(captureWindowFrames)
+                val actualWidth = StreamState.encodedWidth.get().takeIf { it > 0 }
+                    ?: StreamState.selectedEffectiveWidth.get()
+                val actualHeight = StreamState.encodedHeight.get().takeIf { it > 0 }
+                    ?: StreamState.selectedEffectiveHeight.get()
                 StreamState.publishActualPipeline(
-                    activePipelineGeneration, StreamState.selectedEffectiveWidth.get(), StreamState.selectedEffectiveHeight.get(),
+                    activePipelineGeneration, actualWidth, actualHeight,
                     captureWindowFrames, StreamState.actualFps.get(), 0
                 )
                 captureWindowFrames = 0
@@ -475,7 +480,7 @@ class MjpegStreamer(
                     val count = StreamState.framesThisSecond.getAndSet(0)
                     StreamState.actualFps.set(count)
                     StreamState.publishActualPipeline(
-                        activePipelineGeneration, StreamState.selectedEffectiveWidth.get(), StreamState.selectedEffectiveHeight.get(),
+                        activePipelineGeneration, outW, outH,
                         StreamState.captureFps.get(), count, 0
                     )
                 }

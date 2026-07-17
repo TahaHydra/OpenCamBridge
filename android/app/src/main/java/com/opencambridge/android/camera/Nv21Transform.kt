@@ -6,6 +6,13 @@ internal data class Nv21Dimensions(val width: Int, val height: Int)
  * encoding. Rotation is clockwise and mirror is horizontal in the rotated
  * output coordinate system. Chroma VU pairs are never split. */
 internal object Nv21Transform {
+    fun outputDimensions(width: Int, height: Int, rotation: Int): Nv21Dimensions {
+        require(width > 0 && height > 0 && width % 2 == 0 && height % 2 == 0)
+        require(rotation in setOf(0, 90, 180, 270))
+        return if (rotation % 180 == 0) Nv21Dimensions(width, height)
+        else Nv21Dimensions(height, width)
+    }
+
     fun transform(
         src: ByteArray,
         dst: ByteArray,
@@ -21,14 +28,15 @@ internal object Nv21Transform {
         require(src.size >= size && dst.size >= size && scratch.size >= size)
         require(src !== dst && src !== scratch && dst !== scratch)
 
-        val rotatedWidth = if (rotation % 180 == 0) width else height
-        val rotatedHeight = if (rotation % 180 == 0) height else width
+        val dimensions = outputDimensions(width, height, rotation)
+        val rotatedWidth = dimensions.width
+        val rotatedHeight = dimensions.height
         val rotated = if (rotation == 0) src else scratch.also {
             rotate(src, it, width, height, rotation)
         }
         if (mirror) mirrorHorizontal(rotated, dst, rotatedWidth, rotatedHeight)
         else System.arraycopy(rotated, 0, dst, 0, size)
-        return Nv21Dimensions(rotatedWidth, rotatedHeight)
+        return dimensions
     }
 
     private fun mirrorHorizontal(src: ByteArray, dst: ByteArray, width: Int, height: Int) {

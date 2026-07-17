@@ -473,6 +473,7 @@ class StreamService : LifecycleService() {
     private fun resetPipelineMetrics() {
         StreamState.actualFps.set(0)
         StreamState.captureFps.set(0)
+        StreamState.cameraSessionFps.set(0)
         StreamState.encodedFps.set(0)
         StreamState.encodedBitrate.set(0)
         StreamState.gpuBridgeFps.set(0)

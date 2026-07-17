@@ -576,8 +576,8 @@ class ControlServer(
                         <input type="checkbox" id="torch-check" onchange="updateTorch()">
                       </div>
                       <div class="control-row">
-                        <label>Autofocus</label>
-                        <input type="checkbox" id="af-check" onchange="updateAf()">
+                        <label>Focus</label>
+                        <span style="font-size:12px;color:#888;text-align:right;">Continuous autofocus is automatic</span>
                       </div>
                     </div>
 
@@ -1055,7 +1055,6 @@ class ControlServer(
                         const res = await fetchWithAuth('/api/camera/controls');
                         const controls = await res.json();
                         document.getElementById('torch-check').checked = controls.torchEnabled;
-                        document.getElementById('af-check').checked = controls.autofocusEnabled;
                         if (!isDraggingZoom) {
                             document.getElementById('zoom-slider').value = controls.linearZoom * 100;
                             document.getElementById('zoom-val').innerText = controls.linearZoom.toFixed(2);
@@ -1113,14 +1112,6 @@ class ControlServer(
                     currentRevision = Number(result.revision ?? result.authoritativeState?.revision ?? currentRevision);
                     if (!response.ok) throw new Error(result.message || ('HTTP ' + response.status));
                     fetchControls();
-                }
-
-                async function updateAf() {
-                    const enabled = document.getElementById('af-check').checked;
-                    await fetchWithAuth('/api/camera/autofocus', {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ enabled })
-                    });
                 }
 
                 async function startStream() {
@@ -1246,8 +1237,8 @@ class ControlServer(
             CameraControlsDto(
                 hasTorch = StreamState.hasTorch.get(),
                 torchEnabled = StreamState.torchEnabled.get(),
-                autofocusSupported = false, // Simplified for MVP (CameraX defaults continuous)
-                autofocusEnabled = StreamState.autofocusEnabled.get(),
+                autofocusSupported = false,
+                autofocusEnabled = true,
                 zoomRatio = StreamState.zoomRatio.get(),
                 linearZoom = StreamState.linearZoom.get()
             )
@@ -1449,8 +1440,10 @@ class ControlServer(
             call.respond(HttpStatusCode.BadRequest, SimpleResult(false, "Invalid JSON"))
             return
         }
-        // Always return success: false because CameraX defaults continuous AF and we don't hack interop.
-        call.respond(SimpleResult(false, "Manual autofocus control not supported in MVP 1.6"))
+        call.respond(
+            HttpStatusCode.UnprocessableEntity,
+            SimpleResult(false, "Continuous autofocus is automatic; manual autofocus switching is not supported")
+        )
     }
 
     private suspend fun serveMjpeg(call: RoutingCall) {
@@ -1547,21 +1540,49 @@ class ControlServer(
     }
 
     private suspend fun serveStreamInfo(call: RoutingCall) {
-        val mode = StreamState.streamMode.get()
+        val status = StreamState.toStatusDto()
+        val snapshot = status.snapshot
+        val selected = snapshot.selected
+        val actual = snapshot.actual
+        val activeMode = selected?.streamMode ?: status.activeStreamMode
+        val activeWidth = actual?.width ?: selected?.width ?: snapshot.desired.width
+        val activeHeight = actual?.height ?: selected?.height ?: snapshot.desired.height
+        val activeFps = actual?.encodedFps?.takeIf { it > 0 }
+            ?: selected?.fps
+            ?: snapshot.desired.fps
         call.respond(
             StreamInfoDto(
-                mode = mode,
-                resolution = "${StreamState.width.get()}x${StreamState.height.get()}",
-                fps = StreamState.fps.get(),
-                h264Bitrate = StreamState.h264Bitrate.get(),
+                mode = activeMode,
+                resolution = "${activeWidth}x${activeHeight}",
+                fps = activeFps,
+                h264Bitrate = snapshot.desired.h264Bitrate,
+                desired = StreamModeInfoDto(
+                    mode = snapshot.desired.streamMode,
+                    width = snapshot.desired.width,
+                    height = snapshot.desired.height,
+                    fps = snapshot.desired.fps
+                ),
+                selected = selected?.let {
+                    StreamModeInfoDto(it.streamMode, it.width, it.height, it.fps)
+                },
+                actual = actual?.let {
+                    StreamActualInfoDto(
+                        mode = activeMode,
+                        width = it.width,
+                        height = it.height,
+                        fps = it.encodedFps.takeIf { fps -> fps > 0 } ?: it.captureFps,
+                        captureFps = it.captureFps,
+                        encodedFps = it.encodedFps
+                    )
+                },
                 // Honest transport metadata so consumers do not have to guess.
-                codec = if (mode == "h264") "h264-annexb-access-units" else "mjpeg",
-                container = if (mode == "h264") "OCB2 framed records" else "multipart/x-mixed-replace",
+                codec = if (activeMode == "h264") "h264-annexb-access-units" else "mjpeg",
+                container = if (activeMode == "h264") "OCB2 framed records" else "multipart/x-mixed-replace",
                 experimental = false,
-                notes = if (mode == "h264")
+                notes = if (activeMode == "h264")
                     "Each /stream.ocb2 video record contains one complete H.264 access unit with sequence and monotonic capture/encoder timestamps."
                 else
-                    "Stable path. Each part is a complete JPEG image."
+                    "Active compatibility path. Each part is a complete JPEG image."
             )
         )
     }
@@ -1572,7 +1593,7 @@ class ControlServer(
         val selected = status.snapshot.selected
         val actual = status.snapshot.actual
         val mode = selected?.streamMode ?: status.activeStreamMode
-        val config = StreamState.currentConfig()
+        val desired = status.snapshot.desired
         call.respond(
             PipelineMetricsDto(
                 generation = status.snapshot.generation,
@@ -1584,13 +1605,13 @@ class ControlServer(
                 capture = if (!active || selected == null || actual == null) null else CaptureMetricsDto(
                     engine = selected.captureEngine,
                     cameraId = selected.cameraId,
-                    requestedWidth = config.width,
-                    requestedHeight = config.height,
+                    requestedWidth = desired.width,
+                    requestedHeight = desired.height,
                     actualWidth = actual.width,
                     actualHeight = actual.height,
-                    requestedFps = config.fps,
+                    requestedFps = desired.fps,
                     selectedFps = selected.fps,
-                    cameraSessionFps = selected.fps,
+                    cameraSessionFps = status.cameraSessionFps.takeIf { it > 0 } ?: actual.captureFps,
                     actualFps = actual.captureFps,
                     gpuBridgeFps = StreamState.gpuBridgeFps.get().takeIf { mode == "h264" && selected.captureEngine == "HIGH_SPEED_GPU_BRIDGE" }
                 ),
@@ -1613,7 +1634,7 @@ class ControlServer(
                 ),
                 transport = TransportMetricsDto(
                     estimatedMbps = StreamState.estimatedMbps.get(),
-                    targetBandwidthMbps = config.targetBandwidthMbps
+                    targetBandwidthMbps = status.targetBandwidthMbps
                 ),
                 selection = SelectionMetricsDto(
                     requestedAspectRatio = StreamState.requestedAspectRatio.get(),
@@ -1746,10 +1767,31 @@ private data class StreamInfoDto(
     val resolution: String,
     val fps: Int,
     val h264Bitrate: Int,
+    val desired: StreamModeInfoDto,
+    val selected: StreamModeInfoDto?,
+    val actual: StreamActualInfoDto?,
     val codec: String = "mjpeg",
     val container: String = "multipart/x-mixed-replace",
     val experimental: Boolean = false,
     val notes: String = ""
+)
+
+@Serializable
+private data class StreamModeInfoDto(
+    val mode: String,
+    val width: Int,
+    val height: Int,
+    val fps: Int
+)
+
+@Serializable
+private data class StreamActualInfoDto(
+    val mode: String,
+    val width: Int,
+    val height: Int,
+    val fps: Int,
+    val captureFps: Int,
+    val encodedFps: Int
 )
 
 @Serializable
