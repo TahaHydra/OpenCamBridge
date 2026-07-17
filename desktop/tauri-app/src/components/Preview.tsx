@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { CameraOff, RefreshCw } from 'lucide-react';
 import { buildUrl } from '../services/api';
+import Ocb2Preview from './Ocb2Preview';
 
 interface PreviewProps {
   baseUrl: string;
@@ -146,11 +147,7 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
         </div>}
 
         {h264Primary ? (
-          <div className="preview-overlay">
-            <VideoMessage />
-            <div>Hardware H.264 is feeding the Windows virtual camera.</div>
-            <div style={{ fontSize: '0.75rem', opacity: 0.7 }}>Enable preview on the phone for a zero-copy Camera2 preview surface.</div>
-          </div>
+          <Ocb2Preview baseUrl={baseUrl} token={token} fitMode={effectiveFit} mirror={mirror} />
         ) : showOverlay && (
           <div className="preview-overlay">
             {rebinding ? <RefreshCw size={48} opacity={0.6} className="animate-spin" /> : <CameraOff size={48} opacity={0.5} />}
@@ -176,8 +173,4 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
       </div>
     </div>
   );
-}
-
-function VideoMessage() {
-  return <CameraOff size={48} opacity={0.5} />;
 }
