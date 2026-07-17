@@ -369,7 +369,7 @@ static HRESULT Nv12ToRgb32(const BYTE* nv12, DWORD width, DWORD height, LONG pit
             int yy = static_cast<int>(yPlane[static_cast<size_t>(y) * width + x]) - 16;
             int u = static_cast<int>(uvPlane[static_cast<size_t>(y / 2) * width + (x & ~1u)]) - 128;
             int v = static_cast<int>(uvPlane[static_cast<size_t>(y / 2) * width + (x & ~1u) + 1]) - 128;
-            int c = std::max(0, yy) * 298;
+            int c = (std::max)(0, yy) * 298;
             dst[x * 4] = ClampByte((c + 516 * u + 128) >> 8);
             dst[x * 4 + 1] = ClampByte((c - 100 * u - 208 * v + 128) >> 8);
             dst[x * 4 + 2] = ClampByte((c + 409 * v + 128) >> 8);

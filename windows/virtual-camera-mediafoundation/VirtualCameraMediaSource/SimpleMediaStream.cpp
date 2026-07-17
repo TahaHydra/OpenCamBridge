@@ -6,6 +6,73 @@
 
 namespace winrt::WindowsSample::implementation
 {
+    class MediaBufferWriteLock final
+    {
+    public:
+        HRESULT Lock(IMFMediaBuffer* buffer, UINT32 width, UINT32 height, GUID const& subtype)
+        {
+            RETURN_HR_IF_NULL(E_POINTER, buffer);
+            m_buffer = buffer;
+            if (SUCCEEDED(buffer->QueryInterface(IID_PPV_ARGS(&m_buffer2D2))))
+            {
+                RETURN_IF_FAILED(m_buffer2D2->Lock2DSize(
+                    MF2DBuffer_LockFlags_Write, &scanline, &pitch, &bufferStart, &bufferLength));
+                m_kind = Kind::Buffer2D2;
+                return S_OK;
+            }
+
+            if (SUCCEEDED(buffer->QueryInterface(IID_PPV_ARGS(&m_buffer2D))))
+            {
+                RETURN_IF_FAILED(m_buffer2D->Lock2D(&scanline, &pitch));
+                DWORD maxLength = 0;
+                RETURN_IF_FAILED(buffer->GetMaxLength(&maxLength));
+                bufferStart = pitch < 0
+                    ? scanline + static_cast<ptrdiff_t>(pitch) * (height - 1)
+                    : scanline;
+                bufferLength = maxLength;
+                m_kind = Kind::Buffer2D;
+                return S_OK;
+            }
+
+            DWORD currentLength = 0;
+            RETURN_IF_FAILED(buffer->Lock(&bufferStart, &bufferLength, &currentLength));
+            scanline = bufferStart;
+            pitch = subtype == MFVideoFormat_NV12
+                ? static_cast<LONG>(width)
+                : static_cast<LONG>(width * 4);
+            m_kind = Kind::Contiguous;
+            return S_OK;
+        }
+
+        HRESULT Unlock()
+        {
+            HRESULT result = S_OK;
+            switch (m_kind)
+            {
+            case Kind::Buffer2D2: result = m_buffer2D2->Unlock2D(); break;
+            case Kind::Buffer2D: result = m_buffer2D->Unlock2D(); break;
+            case Kind::Contiguous: result = m_buffer->Unlock(); break;
+            default: break;
+            }
+            m_kind = Kind::None;
+            return result;
+        }
+
+        ~MediaBufferWriteLock() { if (m_kind != Kind::None) (void)Unlock(); }
+
+        BYTE* scanline = nullptr;
+        BYTE* bufferStart = nullptr;
+        DWORD bufferLength = 0;
+        LONG pitch = 0;
+
+    private:
+        enum class Kind { None, Buffer2D2, Buffer2D, Contiguous };
+        Kind m_kind = Kind::None;
+        wil::com_ptr_nothrow<IMFMediaBuffer> m_buffer;
+        wil::com_ptr_nothrow<IMF2DBuffer2> m_buffer2D2;
+        wil::com_ptr_nothrow<IMF2DBuffer> m_buffer2D;
+    };
+
     HRESULT SimpleMediaStream::Initialize(
             _In_ SimpleMediaSource* pSource,
             _In_ DWORD dwStreamId,
@@ -37,7 +104,7 @@ namespace winrt::WindowsSample::implementation
             uint64_t bytesPerFrame = subtype == MFVideoFormat_NV12
                 ? static_cast<uint64_t>(width) * height * 3 / 2
                 : static_cast<uint64_t>(width) * height * 4;
-            uint32_t bitrate = static_cast<uint32_t>(min<uint64_t>(UINT32_MAX, bytesPerFrame * 8 * fps));
+            uint32_t bitrate = static_cast<uint32_t>((std::min<uint64_t>)(UINT32_MAX, bytesPerFrame * 8 * fps));
             spMediaType->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
             MFSetAttributeRatio(spMediaType.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
             spMediaType->SetUINT32(MF_MT_DEFAULT_STRIDE, subtype == MFVideoFormat_NV12 ? width : width * 4);
@@ -185,11 +252,7 @@ namespace winrt::WindowsSample::implementation
         winrt::slim_lock_guard lock(m_Lock);
         wil::com_ptr_nothrow<IMFSample> sample;
         wil::com_ptr_nothrow<IMFMediaBuffer> outputBuffer;
-        LONG pitch = 0;
-        BYTE* bufferStart = nullptr; // not used
-        DWORD bufferLength = 0;
-        BYTE* pbuf = nullptr;
-        wil::com_ptr_nothrow<IMF2DBuffer2> buffer2D;
+        MediaBufferWriteLock bufferLock;
 
         RETURN_IF_FAILED(_CheckShutdownRequiresLock());
 
@@ -201,13 +264,6 @@ namespace winrt::WindowsSample::implementation
 
         RETURN_IF_FAILED(m_spSampleAllocator->AllocateSample(&sample));
         RETURN_IF_FAILED(sample->GetBufferByIndex(0, &outputBuffer));
-        RETURN_IF_FAILED(outputBuffer->QueryInterface(IID_PPV_ARGS(&buffer2D)));
-        RETURN_IF_FAILED(buffer2D->Lock2DSize(MF2DBuffer_LockFlags_Write,
-            &pbuf,
-            &pitch,
-            &bufferStart,
-            &bufferLength));
-        
 
         UINT32 width = 1280, height = 720;
         GUID subtype = MFVideoFormat_NV12;
@@ -215,32 +271,36 @@ namespace winrt::WindowsSample::implementation
             MFGetAttributeSize(m_spMediaType.get(), MF_MT_FRAME_SIZE, &width, &height);
             m_spMediaType->GetGUID(MF_MT_SUBTYPE, &subtype);
         }
+        RETURN_IF_FAILED(bufferLock.Lock(outputBuffer.get(), width, height, subtype));
 
         UINT32 fpsNum = 30;
         UINT32 fpsDen = 1;
         if (m_spMediaType) MFGetAttributeRatio(m_spMediaType.get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen);
         HRESULT formatResult = m_shmClient.SetConsumerFormat(width, height, fpsNum, fpsDen, subtype);
         if (FAILED(formatResult)) {
-            (void)buffer2D->Unlock2D();
+            (void)bufferLock.Unlock();
             (void)m_shmClient.ReportSampleCopyFailure(formatResult);
             return formatResult;
         }
 
         OpenCamBridgeFrameMetadata metadata = {};
-        HRESULT hrFrame = m_shmClient.ReadFrame(pbuf, bufferStart, bufferLength, pitch, width, height, subtype, &metadata);
+        HRESULT hrFrame = m_shmClient.ReadFrame(
+            bufferLock.scanline, bufferLock.bufferStart, bufferLock.bufferLength,
+            bufferLock.pitch, width, height, subtype, &metadata);
         if (FAILED(hrFrame)) {
             // A deterministic neutral diagnostic frame keeps the sample fully
             // initialized, but it is never counted as a successful ring frame.
             // The shared failure counters and lastRingError remain authoritative.
-            HRESULT fallbackResult = m_spFrameGenerator->CreateFrame(pbuf, bufferLength, pitch, m_rgbMask);
+            HRESULT fallbackResult = m_spFrameGenerator->CreateFrame(
+                bufferLock.scanline, bufferLock.bufferLength, bufferLock.pitch, m_rgbMask);
             if (FAILED(fallbackResult)) {
-                (void)buffer2D->Unlock2D();
+                (void)bufferLock.Unlock();
                 (void)m_shmClient.ReportSampleCopyFailure(fallbackResult);
                 return fallbackResult;
             }
         }
         //RETURN_IF_FAILED(WriteSampleData(pbuf, bufferLength, pitch, width, height));
-        HRESULT unlockResult = buffer2D->Unlock2D();
+        HRESULT unlockResult = bufferLock.Unlock();
         if (FAILED(unlockResult)) {
             (void)m_shmClient.ReportSampleCopyFailure(unlockResult);
             return unlockResult;

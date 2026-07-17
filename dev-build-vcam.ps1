@@ -7,6 +7,17 @@ Write-Host "=== Build OpenCamBridge Media Foundation DLL ===" -ForegroundColor C
 
 $ErrorActionPreference = "Stop"
 
+# Some launchers inject both PATH and Path into the Windows environment block.
+# MSBuild/CL enumerates that block into a case-insensitive dictionary and then
+# fails with MSB6001 before compiling anything. Canonicalize to one Path entry.
+$pathLines = & "$env:SystemRoot\System32\cmd.exe" /c "set path" 2>$null
+$canonicalPath = ($pathLines | Where-Object { $_ -match '^(?i:path)=' } | Select-Object -Last 1) -replace '^[^=]*=', ''
+if ($canonicalPath) {
+    [Environment]::SetEnvironmentVariable('PATH', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('Path', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('Path', $canonicalPath, 'Process')
+}
+
 $root = $PSScriptRoot
 $mfRoot = "$root\windows\virtual-camera-mediafoundation"
 $vcxproj = "$mfRoot\VirtualCameraMediaSource\VirtualCameraMediaSource.vcxproj"
@@ -72,6 +83,7 @@ $vcrtTargets = "$mfRoot\packages\Microsoft.VCRTForwarders.140.$vcrtVer\build\nat
 if (!(Test-Path $cppwinrtExe) -or !(Test-Path $wilTargets) -or !(Test-Path $vcrtTargets)) {
     Write-Host "Restoring NuGet packages (CppWinRT $cppwinrtVer, WIL $wilVer, VCRTForwarders $vcrtVer)..." -ForegroundColor Yellow
     cmd /c "call `"$vsDevCmd`" -arch=amd64 && msbuild `"$vcxproj`" /t:Restore /p:RestorePackagesConfig=true /p:Configuration=Release /p:Platform=x64 $solutionDirArg /v:minimal && msbuild `"$installerProj`" /t:Restore /p:RestorePackagesConfig=true /p:Configuration=Release /p:Platform=x64 $solutionDirArg /v:minimal"
+    if ($LASTEXITCODE -ne 0) { throw "NuGet/MSBuild restore failed with exit code $LASTEXITCODE" }
     if (!(Test-Path $cppwinrtExe) -or !(Test-Path $wilTargets) -or !(Test-Path $vcrtTargets)) {
         Write-Host "NuGet restore failed: expected packages under $mfRoot\packages (needs network access on first build)." -ForegroundColor Red
         exit 1
@@ -85,6 +97,7 @@ Write-Host "Building VirtualCameraMediaSource.vcxproj with v143..." -ForegroundC
 $cmd = "call `"$vsDevCmd`" -arch=amd64 && msbuild `"$vcxproj`" /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 $solutionDirArg"
 
 cmd /c $cmd
+if ($LASTEXITCODE -ne 0) { throw "VirtualCameraMediaSource build failed with exit code $LASTEXITCODE" }
 
 if (!(Test-Path $builtDll)) {
     Write-Host "Build finished but DLL not found: $builtDll" -ForegroundColor Red
@@ -105,6 +118,7 @@ Write-Host "Building VirtualCamera_Installer.vcxproj (virtual camera host exe)..
 $cmdHost = "call `"$vsDevCmd`" -arch=amd64 && msbuild `"$installerProj`" /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 $solutionDirArg"
 
 cmd /c $cmdHost
+if ($LASTEXITCODE -ne 0) { throw "VirtualCamera host build failed with exit code $LASTEXITCODE" }
 
 if (!(Test-Path $builtInstaller)) {
     Write-Host "Build finished but host exe not found: $builtInstaller" -ForegroundColor Red
