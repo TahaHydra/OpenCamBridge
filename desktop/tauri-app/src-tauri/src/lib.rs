@@ -1,6 +1,7 @@
 mod adb;
 mod logger;
 mod nv12_preview;
+mod sync_state;
 mod virtualcam;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 
+use crate::sync_state::RecoverMutex;
+
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub struct VirtualCamMetrics {
     #[serde(default, rename = "type")]
@@ -163,6 +165,10 @@ pub struct BinaryIdentityStatus {
 }
 
 pub struct VirtualCamManager {
+    // Lock-order audit (2026-07-17): process handles are outer locks
+    // (`child` before `host_child` when both are needed); metrics/error/path
+    // locks are leaves and no path acquires a process lock while holding one.
+    // RecoverMutex changes poison behavior only and preserves this order.
     child: Mutex<Option<Child>>,
     host_child: Mutex<Option<Child>>,
     metrics: Mutex<Option<VirtualCamMetrics>>,
@@ -365,20 +371,11 @@ impl VirtualCamManager {
     }
 
     pub fn preview_identity(&self) -> (Option<u32>, u64, bool, Option<String>) {
-        let pid = self
-            .child
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|child| child.id()));
-        let streaming = pid.is_some()
-            && self
-                .producer_state
-                .lock()
-                .map(|s| s.as_str() == "WRITING_RING")
-                .unwrap_or(false);
-        let build_hash = self.metrics.lock().ok().and_then(|metrics| {
+        let pid = self.child.lock_recover().as_ref().map(|child| child.id());
+        let streaming =
+            pid.is_some() && self.producer_state.lock_recover().as_str() == "WRITING_RING";
+        let build_hash = self.metrics.lock_recover().as_ref().and_then(|metrics| {
             metrics
-                .as_ref()?
                 .ring
                 .as_ref()
                 .map(|ring| ring.producer_build_hash.clone())
@@ -416,7 +413,7 @@ pub fn get_virtual_camera_backend_details() -> Result<String, String> {
 
 #[tauri::command]
 pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<(), String> {
-    let mut host_guard = state.host_child.lock().unwrap();
+    let mut host_guard = state.host_child.lock_recover();
 
     // A stale handle to a dead host must not block a restart (this made the
     // Start button a silent no-op after the host crashed or failed to start).
@@ -440,7 +437,7 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
             "VirtualCamera_Installer.exe not found at {}. Run .\\dev-build-vcam.ps1 (it builds and copies the host exe).",
             exe_path_release.display()
         );
-        *state.last_error.lock().unwrap() = Some(msg.clone());
+        *state.last_error.lock_recover() = Some(msg.clone());
         return Err(msg);
     }
     let exe_path = std::fs::canonicalize(&exe_path_release).unwrap_or(exe_path_release);
@@ -460,7 +457,7 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
         .spawn()
         .map_err(|e| {
             let msg = format!("Failed to start virtual camera host: {}", e);
-            *state.last_error.lock().unwrap() = Some(msg.clone());
+            *state.last_error.lock_recover() = Some(msg.clone());
             msg
         })?;
 
@@ -521,7 +518,7 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
         state.host_activated.store(false, Ordering::Release);
         let message =
             activation_error.unwrap_or_else(|| "Virtual-camera host activation failed".into());
-        *state.last_error.lock().unwrap() = Some(message.clone());
+        *state.last_error.lock_recover() = Some(message.clone());
         return Err(message);
     }
 
@@ -537,7 +534,7 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
 #[tauri::command]
 pub fn stop_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<(), String> {
     state.host_activated.store(false, Ordering::Release);
-    let mut host_guard = state.host_child.lock().unwrap();
+    let mut host_guard = state.host_child.lock_recover();
     if let Some(mut child) = host_guard.take() {
         let _ = child.kill();
         let _ = child.wait();
@@ -574,7 +571,7 @@ pub fn start_virtual_camera_feeder(
         ">>> [Tauri] start_virtual_camera_feeder source={} source={}x{}@{} output={}x{}",
         source, source_width, source_height, source_fps, width, height
     );
-    let mut child_guard = state.child.lock().unwrap();
+    let mut child_guard = state.child.lock_recover();
     if let Some(mut child) = child_guard.take() {
         println!(
             ">>> [Tauri] Found existing producer (PID {}). Stopping it.",
@@ -582,11 +579,11 @@ pub fn start_virtual_camera_feeder(
         );
         let _ = child.kill();
         let _ = child.wait();
-        *state.last_error.lock().unwrap() = None;
-        *state.metrics.lock().unwrap() = None;
-        *state.last_metrics_time.lock().unwrap() = None;
+        *state.last_error.lock_recover() = None;
+        *state.metrics.lock_recover() = None;
+        *state.last_metrics_time.lock_recover() = None;
     }
-    *state.producer_state.lock().unwrap() = "STARTING".to_string();
+    *state.producer_state.lock_recover() = "STARTING".to_string();
 
     let repo_root = repository_root();
 
@@ -651,7 +648,7 @@ pub fn start_virtual_camera_feeder(
         Ok(c) => c,
         Err(e) => {
             println!(">>> [Tauri] Spawn failed: {}", e);
-            let mut err_guard = state.last_error.lock().unwrap();
+            let mut err_guard = state.last_error.lock_recover();
             *err_guard = Some(e.to_string());
             return Err(e.to_string());
         }
@@ -683,10 +680,10 @@ pub fn start_virtual_camera_feeder(
                             serde_json::from_value::<VirtualCamMetrics>(value.unwrap())
                         {
                             let state_manager = app_clone.state::<VirtualCamManager>();
-                            *state_manager.producer_state.lock().unwrap() =
+                            *state_manager.producer_state.lock_recover() =
                                 metrics.producer_state.clone();
-                            *state_manager.metrics.lock().unwrap() = Some(metrics);
-                            *state_manager.last_metrics_time.lock().unwrap() = Some(
+                            *state_manager.metrics.lock_recover() = Some(metrics);
+                            *state_manager.last_metrics_time.lock_recover() = Some(
                                 std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap()
@@ -698,12 +695,12 @@ pub fn start_virtual_camera_feeder(
                         if let Ok(event) = serde_json::from_value::<ProducerEvent>(value.unwrap()) {
                             let state_manager = app_clone.state::<VirtualCamManager>();
                             if let Some(producer_state) = event.producer_state {
-                                *state_manager.producer_state.lock().unwrap() = producer_state;
+                                *state_manager.producer_state.lock_recover() = producer_state;
                             }
-                            *state_manager.last_event.lock().unwrap() =
+                            *state_manager.last_event.lock_recover() =
                                 Some(format!("{}: {}", event.code, event.message));
                             if event.severity == "error" {
-                                *state_manager.last_error.lock().unwrap() =
+                                *state_manager.last_error.lock_recover() =
                                     Some(event.message.clone());
                             }
                             println!(
@@ -732,11 +729,11 @@ pub fn start_virtual_camera_feeder(
         println!(">>> [Tauri] STDERR thread exiting.");
     });
 
-    let mut path_guard = state.producer_path.lock().unwrap();
+    let mut path_guard = state.producer_path.lock_recover();
     *path_guard = Some(path_string);
     drop(path_guard);
 
-    let mut err_guard = state.last_error.lock().unwrap();
+    let mut err_guard = state.last_error.lock_recover();
     *err_guard = None;
     drop(err_guard);
 
@@ -747,18 +744,18 @@ pub fn start_virtual_camera_feeder(
     // and committed at least three frames to the ring.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
-        if let Some(metrics) = state.metrics.lock().unwrap().as_ref() {
+        if let Some(metrics) = state.metrics.lock_recover().as_ref() {
             if metrics.producer_state == "WRITING_RING" && metrics.ring_frames_committed >= 3 {
                 return Ok(());
             }
         }
-        let current_error = { state.last_error.lock().unwrap().clone() };
+        let current_error = { state.last_error.lock_recover().clone() };
         if let Some(error) = current_error {
             let _ = stop_virtual_camera_feeder(state);
             return Err(error);
         }
         {
-            let mut guard = state.child.lock().unwrap();
+            let mut guard = state.child.lock_recover();
             if let Some(child) = guard.as_mut() {
                 if let Ok(Some(status)) = child.try_wait() {
                     *guard = None;
@@ -767,7 +764,7 @@ pub fn start_virtual_camera_feeder(
             }
         }
         if std::time::Instant::now() >= deadline {
-            let producer_state = state.producer_state.lock().unwrap().clone();
+            let producer_state = state.producer_state.lock_recover().clone();
             let _ = stop_virtual_camera_feeder(state);
             return Err(format!(
                 "Producer readiness timed out in state {producer_state}"
@@ -780,25 +777,25 @@ pub fn start_virtual_camera_feeder(
 #[tauri::command]
 pub fn stop_virtual_camera_feeder(state: State<'_, VirtualCamManager>) -> Result<(), String> {
     state.producer_instance.fetch_add(1, Ordering::AcqRel);
-    let mut child_guard = state.child.lock().unwrap();
+    let mut child_guard = state.child.lock_recover();
     if let Some(mut child) = child_guard.take() {
         let _ = child.kill();
         let _ = child.wait();
     }
 
-    let mut metrics_guard = state.metrics.lock().unwrap();
+    let mut metrics_guard = state.metrics.lock_recover();
     *metrics_guard = None;
 
-    let mut time_guard = state.last_metrics_time.lock().unwrap();
+    let mut time_guard = state.last_metrics_time.lock_recover();
     *time_guard = None;
-    *state.producer_state.lock().unwrap() = "STOPPED".to_string();
+    *state.producer_state.lock_recover() = "STOPPED".to_string();
 
     Ok(())
 }
 
 #[tauri::command]
 pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> VirtualCamState {
-    let mut child_guard = state.child.lock().unwrap();
+    let mut child_guard = state.child.lock_recover();
 
     let mut process_running = false;
     let mut producer_pid = None;
@@ -807,14 +804,14 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
         match child.try_wait() {
             Ok(Some(status)) => {
                 // Process exited
-                let mut err_guard = state.last_error.lock().unwrap();
+                let mut err_guard = state.last_error.lock_recover();
                 let current_err = err_guard.clone().unwrap_or_default();
                 if !current_err.contains(&status.to_string()) {
                     *err_guard = Some(format!("Exited with {}. {}", status, current_err));
                 }
-                *state.metrics.lock().unwrap() = None;
-                *state.last_metrics_time.lock().unwrap() = None;
-                *state.producer_state.lock().unwrap() = "FAILED".to_string();
+                *state.metrics.lock_recover() = None;
+                *state.last_metrics_time.lock_recover() = None;
+                *state.producer_state.lock_recover() = "FAILED".to_string();
             }
             Ok(None) => {
                 // Still running
@@ -832,12 +829,12 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
     // Reap the host like the producer: a host that exited (crash, COM error)
     // must show as Stopped instead of a phantom "Running".
     let host_running = {
-        let mut host_guard = state.host_child.lock().unwrap();
+        let mut host_guard = state.host_child.lock_recover();
         let mut alive = false;
         if let Some(child) = host_guard.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    let mut err_guard = state.last_error.lock().unwrap();
+                    let mut err_guard = state.last_error.lock_recover();
                     *err_guard = Some(format!("Virtual camera host exited with {}", status));
                 }
                 Ok(None) => alive = true,
@@ -850,11 +847,11 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
         }
         alive
     };
-    let metrics = state.metrics.lock().unwrap().clone();
+    let metrics = state.metrics.lock_recover().clone();
     let registered = check_virtual_camera_backend();
-    let producer_path = state.producer_path.lock().unwrap().clone();
-    let last_error = state.last_error.lock().unwrap().clone();
-    let last_metrics_time = state.last_metrics_time.lock().unwrap().clone();
+    let producer_path = state.producer_path.lock_recover().clone();
+    let last_error = state.last_error.lock_recover().clone();
+    let last_metrics_time = state.last_metrics_time.lock_recover().clone();
 
     let mut metrics_fresh = false;
     if let Some(last_time) = last_metrics_time {
@@ -864,7 +861,7 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
             .as_secs();
         metrics_fresh = now <= last_time + 3;
         if !metrics_fresh && process_running {
-            *state.producer_state.lock().unwrap() = "STALLED".to_string();
+            *state.producer_state.lock_recover() = "STALLED".to_string();
         }
     }
     let producer_ready = process_running
@@ -884,8 +881,8 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
     );
     let virtual_camera_ready =
         pipeline_ready && metrics.as_ref().is_some_and(|m| m.virtual_camera_ready);
-    let producer_state = state.producer_state.lock().unwrap().clone();
-    let last_event = state.last_event.lock().unwrap().clone();
+    let producer_state = state.producer_state.lock_recover().clone();
+    let last_event = state.last_event.lock_recover().clone();
     let producer_instance = state.producer_instance.load(Ordering::Acquire);
 
     let mut repo_root = std::env::current_dir().unwrap();

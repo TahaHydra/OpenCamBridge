@@ -13,6 +13,8 @@ use windows::Win32::System::Memory::{
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY,
 };
 
+use crate::sync_state::RecoverMutex;
+
 const OCBR_MAGIC: u32 = 0x5242_434f;
 const RING_VERSION: u16 = 3;
 const RING_ABI_HASH: u64 = 0x4f43_4252_0003_0090;
@@ -318,10 +320,7 @@ pub fn get_nv12_preview_frame(
 ) -> Result<Response, String> {
     let (producer_pid, producer_instance, producer_streaming, expected_build_hash) =
         manager.preview_identity();
-    let mut reader = state
-        .state
-        .lock()
-        .map_err(|_| "NV12 preview lock poisoned")?;
+    let mut reader = state.state.lock_recover();
     if reader.producer_instance != producer_instance || reader.producer_pid != producer_pid {
         reader.mapping = None;
         reader.producer_instance = producer_instance;
