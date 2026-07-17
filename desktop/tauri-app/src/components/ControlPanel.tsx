@@ -4,6 +4,12 @@ import { connectAndSetupObs, ObsStatus } from '../services/obs';
 import { apiFetch, buildUrl } from '../services/api';
 import { logEvent, logError, logTestMarker } from '../services/logging';
 import { invoke } from '@tauri-apps/api/core';
+import {
+  buildProducerLaunchSpec,
+  buildSettingsMutation,
+  describeMutationRejection,
+  shouldImportAuthoritativeState
+} from '../services/pipelineSyncPolicy.js';
 
 interface VirtualCamMetrics {
   type?: string;
@@ -331,9 +337,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     }
   };
 
-  const importAuthoritativeState = useCallback((raw: any) => {
+  const importAuthoritativeState = useCallback((raw: any, force = false) => {
     const status = raw?.status || raw;
     if (!status) return;
+    if (!force && !shouldImportAuthoritativeState(
+      authoritativeRevisionRef.current, status.revision, isSyncingRef.current
+    )) return;
     authoritativeRevisionRef.current = Number(status.revision ?? 0);
     settingsHydratedRef.current = true;
     const current = settingsRef.current;
@@ -578,19 +587,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   const stopStream = () => pipelineCommand('/api/stream/stop');
 
   const handleStartProducer = async (s: any, actual?: any) => {
-    const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
-    const source = (actual?.activeStreamMode || s.streamMode) === 'h264' ? 'h264' : 'mjpeg';
-    const targetUrl = source === 'h264' ? `${base}/stream.ocb2` : `${base}/stream.mjpeg`;
-    // Android's selected/actual encoded tuple is the producer input. The
-    // Windows output canvas remains an independent consumer setting.
-    const sourceWidth = Number(actual?.encodedWidth || actual?.selectedEffectiveWidth || 0);
-    const sourceHeight = Number(actual?.encodedHeight || actual?.selectedEffectiveHeight || 0);
-    const sourceFps = Number(actual?.encodedFps || actual?.selectedFps || 0);
-    if (sourceWidth <= 0 || sourceHeight <= 0 || sourceFps <= 0) {
-      throw new Error('Android did not publish a valid selected/actual source tuple; refusing to launch the producer from desired defaults');
-    }
-    const outputWidth = Number(s.outputWidth || s.width);
-    const outputHeight = Number(s.outputHeight || s.height);
+    const { source, targetUrl, sourceWidth, sourceHeight, sourceFps, outputWidth, outputHeight } =
+      buildProducerLaunchSpec(s, actual, baseUrl);
     // jpegQuality is applied on the Android side; the producer no longer takes it.
     console.log('[Tauri UI] Calling start_virtual_camera_feeder with', {
       url: targetUrl, source,
@@ -701,27 +699,25 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     const response = await apiFetch(baseUrl, '/api/settings', token, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...patch,
-        baseRevision: authoritativeRevisionRef.current,
-        requestId: globalThis.crypto?.randomUUID?.() || `tauri-${Date.now()}`,
-        clientType: 'tauri',
-      })
+      body: JSON.stringify(buildSettingsMutation(
+        patch,
+        authoritativeRevisionRef.current,
+        globalThis.crypto?.randomUUID?.() || `tauri-${Date.now()}`,
+        'tauri'
+      ))
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok || body.success === false) {
-      if ((response.status === 409 || response.status === 422) && body.authoritativeState) {
-        importAuthoritativeState(body.authoritativeState);
+      const rejection = describeMutationRejection(response.status, body);
+      if (rejection.authoritativeState) {
+        importAuthoritativeState(rejection.authoritativeState, true);
       } else {
         fetchStatus();
       }
-      const requested = body.requested ? ` Requested: ${body.requested}.` : '';
-      const alternatives = Array.isArray(body.alternatives) && body.alternatives.length
-        ? ` Alternatives: ${body.alternatives.join(', ')}.` : '';
-      throw new Error(`${body.message || `HTTP ${response.status}`}.${requested}${alternatives}`);
+      throw new Error(rejection.message);
     }
     if (body.revision != null) authoritativeRevisionRef.current = Number(body.revision);
-    if (body.authoritativeState) importAuthoritativeState(body.authoritativeState);
+    if (body.authoritativeState) importAuthoritativeState(body.authoritativeState, true);
     return body;
   };
 
@@ -801,7 +797,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         }), headers: { 'Content-Type': 'application/json' }});
         const body = await res.json().catch(() => ({}));
         if (!res.ok) {
-          if (body.authoritativeState) importAuthoritativeState(body.authoritativeState); else fetchStatus();
+          if (body.authoritativeState) importAuthoritativeState(body.authoritativeState, true); else fetchStatus();
           addDiag('torch', `Torch ${value ? 'on' : 'off'} failed: HTTP ${res.status} ${body.message || ''}`);
           setVcamMessage(`Torch not available on this camera (HTTP ${res.status}).`);
         } else {
@@ -822,7 +818,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         }), headers: { 'Content-Type': 'application/json' }});
         const body = await res.json().catch(() => ({}));
         if (!res.ok) {
-          if (body.authoritativeState) importAuthoritativeState(body.authoritativeState); else fetchStatus();
+          if (body.authoritativeState) importAuthoritativeState(body.authoritativeState, true); else fetchStatus();
           addDiag('zoom', `Zoom failed: HTTP ${res.status}`);
         } else {
           if (body.revision != null) authoritativeRevisionRef.current = Number(body.revision);
