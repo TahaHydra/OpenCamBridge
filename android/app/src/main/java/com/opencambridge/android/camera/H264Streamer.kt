@@ -109,23 +109,22 @@ class H264Streamer(
             activeConfig = config
             activePipelineGeneration = StreamState.pipelineGeneration.get()
             val cameraId = config.cameraId
+            val desiredMode = H264ModeDto(config.width, config.height, config.fps)
             val requested = adaptiveMode
-            val candidates = H264Capabilities.selectCandidates(
-                context,
-                cameraId,
-                requested?.width ?: config.width,
-                requested?.height ?: config.height,
-                requested?.fps ?: config.fps,
-                includeAdaptiveFallbacks = requested == null && config.profile == "adaptive"
-            )
-            if (candidates.isEmpty()) {
-                val requestedMode = H264ModeDto(
-                    requested?.width ?: config.width,
-                    requested?.height ?: config.height,
-                    requested?.fps ?: config.fps
+            val candidateModes = when {
+                config.profile != "adaptive" -> listOf(desiredMode)
+                requested != null -> CapturePathPolicy.adaptiveSuffix(
+                    desiredMode, requested, H264Capabilities.preferredModes
                 )
-                val declared = H264Capabilities.inspectPathCapabilities(context, cameraId, requestedMode)
-                    .joinToString("; ") { "${it.engine}=${it.reason}" }
+                else -> CapturePathPolicy.adaptiveModes(desiredMode, H264Capabilities.preferredModes)
+            }
+            val candidates = H264Capabilities.selectCandidates(context, cameraId, candidateModes)
+            if (candidates.isEmpty()) {
+                val declared = candidateModes.joinToString(" | ") { mode ->
+                    val paths = H264Capabilities.inspectPathCapabilities(context, cameraId, mode)
+                        .joinToString("; ") { "${it.engine}=${it.reason}" }
+                    "${mode.width}x${mode.height}@${mode.fps}: $paths"
+                }
                 throw IllegalStateException("No declared hardware H.264 Camera2 path for camera $cameraId: $declared")
             }
 
@@ -702,6 +701,7 @@ class H264Streamer(
             if (timestamp - captureWindowStartNs >= 1_000_000_000L) {
                 StreamState.actualFps.set(captureWindowFrames)
                 StreamState.captureFps.set(captureWindowFrames)
+                StreamState.cameraSessionFps.set(captureWindowFrames)
                 selection?.mode?.let { mode ->
                     StreamState.publishActualPipeline(
                         activePipelineGeneration, mode.width, mode.height, captureWindowFrames,

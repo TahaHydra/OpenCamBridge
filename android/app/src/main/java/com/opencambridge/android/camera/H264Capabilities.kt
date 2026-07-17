@@ -69,8 +69,16 @@ object H264Capabilities {
         val requested = H264ModeDto(requestedWidth, requestedHeight, requestedFps)
         val modes = if (includeAdaptiveFallbacks) CapturePathPolicy.adaptiveModes(requested, preferredModes)
         else listOf(requested)
-        return modes.flatMap { selectionsForMode(context, cameraId, it) }
+        return selectCandidates(context, cameraId, modes)
     }
+
+    /** Resolve an already policy-ordered mode list into concrete candidates
+     * without rebuilding or reordering its adaptive ladder. */
+    fun selectCandidates(
+        context: Context,
+        cameraId: String,
+        modes: List<H264ModeDto>
+    ): List<H264EncoderSelection> = modes.flatMap { selectionsForMode(context, cameraId, it) }
 
     fun select(
         context: Context,

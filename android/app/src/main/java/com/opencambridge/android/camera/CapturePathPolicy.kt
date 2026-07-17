@@ -22,6 +22,19 @@ internal object CapturePathPolicy {
             }
         }.distinct()
 
+    /** Resume an adaptive ladder at [firstMode]. This remains based on the
+     * original desired tuple: 1080p60 -> 720p60 may continue to 1080p30 when
+     * the intermediate high-speed session is rejected at runtime. */
+    fun adaptiveSuffix(
+        requested: H264ModeDto,
+        firstMode: H264ModeDto,
+        preferred: List<H264ModeDto>
+    ): List<H264ModeDto> {
+        val modes = adaptiveModes(requested, preferred)
+        val firstIndex = modes.indexOf(firstMode)
+        return if (firstIndex >= 0) modes.drop(firstIndex) else emptyList()
+    }
+
     fun candidateModes(
         profile: String,
         requested: H264ModeDto,

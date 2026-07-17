@@ -81,6 +81,25 @@ class CapturePathPolicyTest {
     }
 
     @Test
+    fun rejectedIntermediateAdaptiveCandidateContinuesDownOriginalLadder() {
+        val requested = H264ModeDto(1920, 1080, 60)
+        val selectedDowngrade = H264ModeDto(1280, 720, 60)
+        val suffix = CapturePathPolicy.adaptiveSuffix(
+            requested, selectedDowngrade, H264Capabilities.preferredModes
+        )
+
+        assertEquals(
+            listOf(
+                H264ModeDto(1280, 720, 60),
+                H264ModeDto(1920, 1080, 30),
+                H264ModeDto(1280, 720, 30)
+            ),
+            suffix
+        )
+        assertEquals(H264ModeDto(1920, 1080, 30), suffix.drop(1).first())
+    }
+
+    @Test
     fun h264SixtyFallbackSelectsCanonicalMjpegThirty() {
         val selected = CapturePathPolicy.selectMjpegFallback(
             H264ModeDto(1920, 1080, 60),
