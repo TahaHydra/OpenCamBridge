@@ -169,7 +169,6 @@ class H264Streamer(
                     if (running.get()) broadcast(Ocb2.record(Ocb2.TYPE_HEARTBEAT, 0, currentSequence(), SystemClock.elapsedRealtimeNanos(), 0))
                 }
             }
-            StreamState.streaming.set(true)
             AppLogger.i(
                 "H264",
                 "${active.codecName}: ${active.mode.width}x${active.mode.height}@${active.mode.fps}, " +
@@ -208,7 +207,6 @@ class H264Streamer(
         oldCodecThread?.quitSafely(); codecThread = null; codecHandler = null
         if (oldCameraThread != null && oldCameraThread !== Thread.currentThread()) oldCameraThread.join(1_500)
         if (oldCodecThread != null && oldCodecThread !== Thread.currentThread()) oldCodecThread.join(1_500)
-        StreamState.streaming.set(false)
         clients.forEach { it.close() }
         clients.clear()
         StreamState.h264ClientCount.set(0)

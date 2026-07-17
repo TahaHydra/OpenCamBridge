@@ -10,85 +10,16 @@ namespace winrt::WindowsSample::implementation
     {
         RETURN_HR_IF_NULL(E_POINTER, ppv);
         *ppv = nullptr;
-
-        bool bIsWrappingCamera = false;
-        wil::unique_cotaskmem_string spwszPhysicalSymLink;
         UINT32 vCamKind = 0;
-        UINT32 cch = 0;
-        wil::com_ptr_nothrow<IMFCollection> spCollection;
-        wil::com_ptr_nothrow<IMFMediaSource> spMediaSource;
-
         if (m_spActivateAttributes)
         {
-            if (SUCCEEDED(m_spActivateAttributes->GetUINT32(VCAM_KIND, &vCamKind)))
-            {
-                DEBUG_MSG(L"Set VirtualCameraKind: %i", vCamKind);
-            }
-            if (SUCCEEDED(m_spActivateAttributes->GetUnknown(MF_VIRTUALCAMERA_ASSOCIATED_CAMERA_SOURCES, IID_PPV_ARGS(&spCollection))))
-            {
-                DEBUG_MSG(L"Initialize using the MF_VIRTUALCAMERA_ASSOCIATED_CAMERA_SOURCES");
-
-                DWORD cElementCount = 0;
-                wil::com_ptr_nothrow<IMFActivate> spActivate;
-                wil::com_ptr_nothrow<IUnknown> spUnknown;
-
-                // check if there is 1 and only 1 physical camera we are wrapping
-                RETURN_IF_FAILED(spCollection->GetElementCount(&cElementCount));
-                RETURN_HR_IF(MF_E_UNEXPECTED, cElementCount != 1);
-
-                RETURN_IF_FAILED(spCollection->GetElement(0, &spUnknown));
-                RETURN_IF_FAILED(spUnknown->QueryInterface(IID_PPV_ARGS(&spActivate)));
-                RETURN_IF_FAILED(spActivate->ActivateObject(IID_PPV_ARGS(&spMediaSource)));
-                bIsWrappingCamera = true;
-            }
-            else if(SUCCEEDED(m_spActivateAttributes->GetAllocatedString(VCAM_DEVICE_INFO, &spwszPhysicalSymLink, &cch)))
-            {
-                DEBUG_MSG(L"Initialize using the explicitly provided deviceSymLink: %s", spwszPhysicalSymLink.get());
-
-                // look at hardware camera specified and extract stream descriptors
-                wil::com_ptr_nothrow<IMFAttributes> spDeviceAttributes;
-                RETURN_IF_FAILED(MFCreateAttributes(&spDeviceAttributes, 2));
-                RETURN_IF_FAILED(spDeviceAttributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID));
-                RETURN_IF_FAILED(spDeviceAttributes->SetString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, spwszPhysicalSymLink.get()));
-                RETURN_IF_FAILED(MFCreateDeviceSource(spDeviceAttributes.get(), &spMediaSource));
-                bIsWrappingCamera = true;
-            }
+            RETURN_IF_FAILED(m_spActivateAttributes->GetUINT32(VCAM_KIND, &vCamKind));
         }
-
-        if (bIsWrappingCamera)
-        {
-            if (vCamKind == (UINT32)VirtualCameraKind::BasicCameraWrapper)
-            {
-                DEBUG_MSG(L"Activate HWMediaSource");
-                m_spHWMediaSrc = winrt::make_self<winrt::WindowsSample::implementation::HWMediaSource>();
-                RETURN_IF_FAILED(m_spHWMediaSrc->Initialize(this, spMediaSource.get()));
-                RETURN_IF_FAILED(m_spHWMediaSrc->QueryInterface(riid, ppv));
-            }
-            else if (vCamKind == (UINT32)VirtualCameraKind::AugmentedCameraWrapper)
-            {
-                DEBUG_MSG(L"Activate AugmentedMediaSource");
-                m_spAugmentedMediaSrc = winrt::make_self<winrt::WindowsSample::implementation::AugmentedMediaSource>();
-                RETURN_IF_FAILED(m_spAugmentedMediaSrc->Initialize(this, spMediaSource.get()));
-                RETURN_IF_FAILED(m_spAugmentedMediaSrc->QueryInterface(riid, ppv));
-            }
-            else
-            {
-                DEBUG_MSG(L"Attempting to activate virtual camera with an unknown virtual camera kind to wrap an existing camera");
-                return ERROR_BAD_CONFIGURATION;
-            }
-        }
-        else if (vCamKind == (UINT32)VirtualCameraKind::Synthetic)
-        {
-            DEBUG_MSG(L"Activate SimpleMediaSource");
-            m_spSimpleMediaSrc = winrt::make_self<winrt::WindowsSample::implementation::SimpleMediaSource>();
-            RETURN_IF_FAILED(m_spSimpleMediaSrc->Initialize(this));
-            RETURN_IF_FAILED(m_spSimpleMediaSrc->QueryInterface(riid, ppv));
-        }
-        else
-        {
-            return ERROR_BAD_CONFIGURATION;
-        }
-        return S_OK;
+        RETURN_HR_IF(ERROR_BAD_CONFIGURATION, vCamKind != static_cast<UINT32>(VirtualCameraKind::Synthetic));
+        DEBUG_MSG(L"Activate OpenCamBridge SimpleMediaSource");
+        m_spSimpleMediaSrc = winrt::make_self<winrt::WindowsSample::implementation::SimpleMediaSource>();
+        RETURN_IF_FAILED(m_spSimpleMediaSrc->Initialize(this));
+        return m_spSimpleMediaSrc->QueryInterface(riid, ppv);
     }
 
     IFACEMETHODIMP VirtualCameraMediaSourceActivate::ShutdownObject()
@@ -99,9 +30,6 @@ namespace winrt::WindowsSample::implementation
     IFACEMETHODIMP VirtualCameraMediaSourceActivate::DetachObject()
     {
         m_spSimpleMediaSrc = nullptr;
-        m_spHWMediaSrc = nullptr;
-        m_spAugmentedMediaSrc = nullptr;
-
         return S_OK;
     }
 
@@ -318,8 +246,6 @@ namespace winrt::WindowsSample::implementation
     // non interface method
     HRESULT VirtualCameraMediaSourceActivate::Initialize()
     {
-        RETURN_IF_FAILED(MFCreateAttributes(&m_spActivateAttributes, 3));
-        RETURN_IF_FAILED(m_spActivateAttributes->SetUINT32(MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES, 1));
-        return S_OK;
+        return MFCreateAttributes(&m_spActivateAttributes, 1);
     }
 }

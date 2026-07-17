@@ -227,7 +227,6 @@ class MjpegStreamer(
                         }
                     }
 
-                    StreamState.streaming.set(true)
                 } catch (e: Exception) {
                     android.util.Log.e("MjpegStreamer", "bindToLifecycle failed: ${e.message}")
                     // Surface the failure instead of silently reporting STREAMING.
@@ -245,7 +244,6 @@ class MjpegStreamer(
             currentCamera = null
             activeConfig = null
             activePipelineGeneration = -1
-            StreamState.streaming.set(false)
             StreamState.latestFrame.set(null)
         }
     }

@@ -37,18 +37,16 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="BufferLockFallback.h" />
+    <ClInclude Include="Nv12ResizeFallback.h" />
     <ClInclude Include="RingAbi.generated.h" />
     <None Include="packages.config" />
     <None Include="PropertySheet.props" />
     <None Include="VirtualCameraMediaSource.def" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="AugmentedMediaSource.cpp" />
-    <ClCompile Include="AugmentedMediaStream.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="EventHandler.cpp" />
-    <ClCompile Include="HWMediaSource.cpp" />
-    <ClCompile Include="HWMediaStream.cpp" />
     <ClCompile Include="pch.cpp" />
     <ClCompile Include="SimpleFrameGenerator.cpp" />
     <ClCompile Include="SharedMemoryClient.cpp" />
@@ -58,11 +56,7 @@
     <ClCompile Include="winrtCommon.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="AugmentedMediaSource.h" />
-    <ClInclude Include="AugmentedMediaStream.h" />
     <ClInclude Include="EventHandler.h" />
-    <ClInclude Include="HWMediaSource.h" />
-    <ClInclude Include="HWMediaStream.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="SimpleFrameGenerator.h" />
     <ClInclude Include="SharedMemoryClient.h" />

@@ -138,7 +138,6 @@ object StreamState {
     val phonePreviewActive = SnapshotReadValue { pipelineSnapshot.get().phonePreviewActive }
     val phonePreviewFailureReason = SnapshotReadValue { pipelineSnapshot.get().phonePreviewFailureReason }
 
-    val streaming = AtomicBoolean(false) // Deprecated, use lifecycleState
     val lifecycleState = SnapshotValue({ pipelineSnapshot.get().lifecycle }) { value ->
         updatePipelineSnapshot { it.copy(lifecycle = value) }
     }

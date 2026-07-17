@@ -296,7 +296,6 @@ class StreamService : LifecycleService() {
         if (currentState == LifecycleState.STREAMING) return pipelineResult("Camera is already streaming")
         StreamState.lifecycleState.set(LifecycleState.STARTING)
         StreamState.lastError.set("")
-        StreamState.streaming.set(false)
         beginPipelineGeneration()
         acquireStreamWakeLock()
         Log.d(TAG, "Camera STARTING")
@@ -304,7 +303,6 @@ class StreamService : LifecycleService() {
         return try {
             startSelectedPipeline()
             StreamState.lifecycleState.set(LifecycleState.STREAMING)
-            StreamState.streaming.set(true)
             AppLogger.i("Camera", "Camera streaming successfully")
             pipelineResult("Camera streaming")
         } catch (e: Exception) {
@@ -316,7 +314,6 @@ class StreamService : LifecycleService() {
     private suspend fun stopCameraNow(): PipelineResult {
         if (StreamState.lifecycleState.get() == LifecycleState.STOPPED) return pipelineResult("Camera is already stopped")
         StreamState.lifecycleState.set(LifecycleState.STOPPING)
-        StreamState.streaming.set(false)
         StreamState.pipelineGeneration.incrementAndGet()
         AppLogger.i("Camera", "Camera stopping")
         return try {
@@ -338,7 +335,6 @@ class StreamService : LifecycleService() {
             StreamState.lifecycleState.get() != LifecycleState.FAILED
         ) return pipelineResult("Settings saved; camera is not currently streaming")
         StreamState.lifecycleState.set(LifecycleState.RECONFIGURING)
-        StreamState.streaming.set(false)
         beginPipelineGeneration()
         acquireStreamWakeLock()
         AppLogger.i("Camera", "Camera rebinding: $reason")
@@ -347,7 +343,6 @@ class StreamService : LifecycleService() {
             h264Streamer.stop()
             startSelectedPipeline()
             StreamState.lifecycleState.set(LifecycleState.STREAMING)
-            StreamState.streaming.set(true)
             AppLogger.i("Camera", "Camera rebound successfully")
             pipelineResult("Settings applied and camera rebound")
         } catch (e: Exception) {
@@ -358,7 +353,6 @@ class StreamService : LifecycleService() {
     private suspend fun recoverCameraNow(): PipelineResult {
         AppLogger.i("Camera", "Camera recovery requested")
         StreamState.lifecycleState.set(LifecycleState.RECOVERING)
-        StreamState.streaming.set(false)
         acquireStreamWakeLock()
         return try {
             mjpegStreamer.stop()
@@ -367,7 +361,6 @@ class StreamService : LifecycleService() {
             beginPipelineGeneration()
             startSelectedPipeline()
             StreamState.lifecycleState.set(LifecycleState.STREAMING)
-            StreamState.streaming.set(true)
             pipelineResult("Camera recovered")
         } catch (e: Exception) {
             handleCameraError("Failed to recover camera", e)
@@ -377,7 +370,6 @@ class StreamService : LifecycleService() {
     private suspend fun switchToMjpegNow(reason: String): PipelineResult {
         if (StreamState.activeStreamMode.get() != "h264") return pipelineResult("H.264 fallback already inactive")
         StreamState.lifecycleState.set(LifecycleState.RECONFIGURING)
-        StreamState.streaming.set(false)
         beginPipelineGeneration()
         val desired = StreamState.currentConfig()
         val selected = selectCanonicalMjpegFallback(desired)
@@ -397,7 +389,6 @@ class StreamService : LifecycleService() {
             StreamState.activeStreamMode.set("mjpeg")
             StreamState.publishFallback(true, fallback)
             StreamState.lifecycleState.set(LifecycleState.STREAMING)
-            StreamState.streaming.set(true)
             pipelineResult(fallback)
         } catch (e: Exception) {
             handleCameraError("H.264 to MJPEG fallback failed", e)
@@ -428,7 +419,6 @@ class StreamService : LifecycleService() {
         AppLogger.e("Camera", "$message: $errText")
         StreamState.lastError.set(errText)
         StreamState.lifecycleState.set(LifecycleState.FAILED)
-        StreamState.streaming.set(false)
         releaseStreamWakeLock()
         return pipelineResult("$message: $errText", PipelineResultCode.FAILED)
     }

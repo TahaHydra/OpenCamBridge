@@ -15,7 +15,7 @@ class SettingsManager(context: Context) {
 
         var token = prefs.getString("accessToken", "") ?: ""
         if (token.isEmpty()) {
-            // Full 128-bit random token (UUID is backed by SecureRandom).
+            // UUIDv4 has 122 SecureRandom-backed random bits after version/variant bits.
             token = java.util.UUID.randomUUID().toString().replace("-", "")
             prefs.edit().putString("accessToken", token).apply()
         }
