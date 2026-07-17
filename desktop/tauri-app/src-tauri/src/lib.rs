@@ -1,5 +1,6 @@
 mod adb;
 mod logger;
+mod nv12_preview;
 mod virtualcam;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -10,6 +11,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(virtualcam::VirtualCamManager::new())
         .manage(logger::SessionLog::new())
+        .manage(nv12_preview::Nv12PreviewReader::new())
         .invoke_handler(tauri::generate_handler![
             adb::get_adb_status,
             adb::list_devices,
@@ -22,6 +24,7 @@ pub fn run() {
             virtualcam::start_virtual_camera_feeder,
             virtualcam::stop_virtual_camera_feeder,
             virtualcam::get_virtual_camera_status,
+            nv12_preview::get_nv12_preview_frame,
             logger::start_log_session,
             logger::append_log,
             logger::get_log_path,

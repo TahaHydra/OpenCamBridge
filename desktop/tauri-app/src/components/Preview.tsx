@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { CameraOff, RefreshCw } from 'lucide-react';
 import { buildUrl } from '../services/api';
-import Ocb2Preview from './Ocb2Preview';
+import Nv12RingPreview from './Nv12RingPreview';
 
 interface PreviewProps {
   baseUrl: string;
@@ -147,7 +147,7 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
         </div>}
 
         {h264Primary ? (
-          <Ocb2Preview baseUrl={baseUrl} token={token} fitMode={effectiveFit} mirror={mirror} />
+          <Nv12RingPreview fitMode={effectiveFit} mirror={mirror} />
         ) : showOverlay && (
           <div className="preview-overlay">
             {rebinding ? <RefreshCw size={48} opacity={0.6} className="animate-spin" /> : <CameraOff size={48} opacity={0.5} />}
