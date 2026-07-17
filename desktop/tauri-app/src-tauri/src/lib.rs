@@ -19,6 +19,8 @@ pub fn run() {
             adb::remove_forwards,
             virtualcam::check_virtual_camera_backend,
             virtualcam::register_virtual_camera_backend,
+            virtualcam::unregister_virtual_camera_backend,
+            virtualcam::get_virtual_camera_backend_details,
             virtualcam::start_virtual_camera_host,
             virtualcam::stop_virtual_camera_host,
             virtualcam::start_virtual_camera_feeder,

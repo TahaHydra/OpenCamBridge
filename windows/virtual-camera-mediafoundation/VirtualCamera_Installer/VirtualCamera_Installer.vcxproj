@@ -144,6 +144,7 @@
     <ClInclude Include="..\VirtualCameraTest\EVRHelper.h" />
     <ClInclude Include="..\VirtualCameraTest\SimpleMediaSourceUT.h" />
     <ClInclude Include="..\VirtualCameraTest\VCamUtils.h" />
+    <ClInclude Include="InstallerCli.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\VirtualCameraTest\AugmentedMediaSourceUT.cpp" />

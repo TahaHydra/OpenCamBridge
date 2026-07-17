@@ -23,6 +23,11 @@
 #include <d3d9types.h>
 
 #include <iostream>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <bcrypt.h>
 
 #define RESULT_DIAGNOSTICS_LEVEL 4 // include function name
 
@@ -62,6 +67,7 @@ using namespace winrt::Windows::ApplicationModel;
 
 #pragma comment(lib, "Cfgmgr32.lib")
 #pragma comment(lib, "Propsys.lib")
+#pragma comment(lib, "Bcrypt.lib")
  
 #include "Logger.h"
 

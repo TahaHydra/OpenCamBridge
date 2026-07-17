@@ -92,6 +92,22 @@ interface VirtualCamState {
   last_error?: string;
   last_metrics_time?: number;
   last_event?: string;
+  binary_identity: {
+    ready: boolean;
+    producer_path: string;
+    producer_file_hash: string;
+    producer_runtime_hash: string;
+    built_dll_path: string;
+    built_dll_hash: string;
+    installed_dll_path: string;
+    installed_dll_hash: string;
+    registered_dll_path: string;
+    registered_dll_hash: string;
+    loaded_dll_hash: string;
+    loaded_dll_current: boolean;
+    error?: string;
+    remediation: string;
+  };
 }
 
 interface ControlPanelProps {
@@ -529,7 +545,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     setVcamMessage('Registering...');
     try {
       const msg = await invoke<string>('register_virtual_camera_backend');
-      setVcamMessage(msg);
+      const details = await invoke<string>('get_virtual_camera_backend_details');
+      setVcamMessage(`${msg} ${details.split('\n')[0]}`);
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
     } catch (e: any) {
       setVcamMessage(e.toString());
@@ -543,6 +560,19 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     if (!response.ok || body.success === false) throw new Error(body.message || `HTTP ${response.status}`);
     if (body.revision != null) authoritativeRevisionRef.current = Number(body.revision);
     return body;
+  };
+
+  const handleUnregisterVcam = async () => {
+    setIsVcamRegistering(true);
+    setVcamMessage('Removing OpenCamBridge virtual camera...');
+    try {
+      const msg = await invoke<string>('unregister_virtual_camera_backend');
+      setVcamMessage(msg);
+      invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
+    } catch (e: any) {
+      setVcamMessage(e.toString());
+    }
+    setIsVcamRegistering(false);
   };
   const startStream = () => pipelineCommand('/api/stream/start');
   const stopStream = () => pipelineCommand('/api/stream/stop');
@@ -1073,6 +1103,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                     : 'Phone preview only — not sending to OBS. Press Start Webcam.'}
             </p>
 
+            {devMode && !vcamState?.process_running && !vcamState?.host_running && (
+              <button className="btn btn-secondary" onClick={handleUnregisterVcam} disabled={isVcamRegistering}>
+                Remove Virtual Camera Registration
+              </button>
+            )}
+
             {/* Granular pipeline controls: developer mode only. */}
             {devMode && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 4, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
@@ -1106,6 +1142,14 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
         {vcamMessage && (
           <p style={{ fontSize: '0.8rem', color: '#aaa', marginBottom: 12, fontStyle: 'italic' }}>{vcamMessage}</p>
+        )}
+
+        {vcamState?.binary_identity && !vcamState.binary_identity.ready && (
+          <div style={{ marginBottom: 12, padding: 12, borderRadius: 6, border: '2px solid #ff5252', background: 'rgba(255,82,82,0.12)', color: '#ff8a80' }}>
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>STALE OR MISMATCHED CAMERA BINARIES — webcam readiness is blocked</div>
+            <div style={{ fontSize: '0.78rem', marginBottom: 6 }}>{vcamState.binary_identity.error}</div>
+            <code style={{ display: 'block', whiteSpace: 'pre-wrap', userSelect: 'text', color: '#fff' }}>{vcamState.binary_identity.remediation}</code>
+          </div>
         )}
 
         {/* Compact product status (always visible) */}
@@ -1223,6 +1267,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                     <span>Producer / DLL hashes:</span>
                     <span title={`${vcamState.metrics.ring.producer_build_hash} / ${vcamState.metrics.ring.installed_dll_build_hash}`}>
                       {vcamState.metrics.ring.producer_build_hash.slice(0, 12) || 'unknown'} / {vcamState.metrics.ring.installed_dll_build_hash.slice(0, 12) || 'unknown'}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                    <span>Built / installed / registered / loaded DLL:</span>
+                    <span title={`${vcamState.binary_identity.built_dll_hash} / ${vcamState.binary_identity.installed_dll_hash} / ${vcamState.binary_identity.registered_dll_hash} / ${vcamState.binary_identity.loaded_dll_hash}`}>
+                      {vcamState.binary_identity.built_dll_hash.slice(0, 8) || 'n/a'} / {vcamState.binary_identity.installed_dll_hash.slice(0, 8) || 'n/a'} / {vcamState.binary_identity.registered_dll_hash.slice(0, 8) || 'n/a'} / {vcamState.binary_identity.loaded_dll_current ? (vcamState.binary_identity.loaded_dll_hash.slice(0, 8) || 'n/a') : 'not active'}
                     </span>
                   </div>
                 </>

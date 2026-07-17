@@ -14,8 +14,172 @@
 #include "AugmentedMediaSourceUT.h"
 #include "../VirtualCameraMediaSource/BufferLockFallback.h"
 #include "../VirtualCameraMediaSource/Nv12ResizeFallback.h"
+#include "InstallerCli.h"
 
 using namespace VirtualCameraTest::impl;
+
+namespace
+{
+    constexpr wchar_t OCB_CLSID_TEXT[] = L"{8CF75B14-3F68-46BC-80DF-5FB86AED931E}";
+    constexpr wchar_t OCB_FRIENDLY_NAME[] = L"OpenCamBridge Camera";
+    constexpr wchar_t OCB_REPAIR_COMMAND[] = L"Run from an elevated PowerShell: .\\windows\\virtual-camera-mediafoundation\\VirtualCamera_Installer\\x64\\Release\\VirtualCamera_Installer.exe --register";
+
+    std::filesystem::path ExecutablePath()
+    {
+        std::wstring path(32768, L'\0');
+        DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+        if (length == 0 || length >= path.size()) return {};
+        path.resize(length);
+        return std::filesystem::path(path);
+    }
+
+    std::wstring Sha256File(const std::filesystem::path& path)
+    {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) return L"UNAVAILABLE";
+
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        BCRYPT_HASH_HANDLE hash = nullptr;
+        DWORD objectSize = 0;
+        DWORD hashSize = 0;
+        DWORD resultSize = 0;
+        std::vector<UCHAR> object;
+        std::vector<UCHAR> digest;
+        std::wstring result = L"UNAVAILABLE";
+
+        if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) goto cleanup;
+        if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectSize), sizeof(objectSize), &resultSize, 0) < 0) goto cleanup;
+        if (BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashSize), sizeof(hashSize), &resultSize, 0) < 0) goto cleanup;
+        object.resize(objectSize);
+        digest.resize(hashSize);
+        if (BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0) < 0) goto cleanup;
+        {
+            std::vector<char> buffer(1024 * 1024);
+            while (input)
+            {
+                input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                const auto read = input.gcount();
+                if (read > 0 && BCryptHashData(hash, reinterpret_cast<PUCHAR>(buffer.data()), static_cast<ULONG>(read), 0) < 0) goto cleanup;
+            }
+        }
+        if (BCryptFinishHash(hash, digest.data(), hashSize, 0) < 0) goto cleanup;
+        {
+            std::wostringstream stream;
+            stream << std::hex << std::setfill(L'0');
+            for (UCHAR byte : digest) stream << std::setw(2) << static_cast<unsigned>(byte);
+            result = stream.str();
+        }
+
+    cleanup:
+        if (hash) BCryptDestroyHash(hash);
+        if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+        return result;
+    }
+
+    HRESULT ReadRegisteredDllPath(std::wstring& value)
+    {
+        value.clear();
+        constexpr wchar_t keyPath[] = L"Software\\Classes\\CLSID\\{8CF75B14-3F68-46BC-80DF-5FB86AED931E}\\InprocServer32";
+        DWORD bytes = 0;
+        LSTATUS status = RegGetValueW(HKEY_LOCAL_MACHINE, keyPath, nullptr, RRF_RT_REG_SZ, nullptr, nullptr, &bytes);
+        if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
+        std::vector<wchar_t> buffer(bytes / sizeof(wchar_t) + 1, L'\0');
+        status = RegGetValueW(HKEY_LOCAL_MACHINE, keyPath, nullptr, RRF_RT_REG_SZ, nullptr, buffer.data(), &bytes);
+        if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
+        value.assign(buffer.data());
+        return S_OK;
+    }
+
+    HRESULT RegisterComBackend(const std::filesystem::path& dllPath)
+    {
+        if (!std::filesystem::exists(dllPath)) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+        constexpr wchar_t clsidKey[] = L"Software\\Classes\\CLSID\\{8CF75B14-3F68-46BC-80DF-5FB86AED931E}";
+        constexpr wchar_t serverKey[] = L"Software\\Classes\\CLSID\\{8CF75B14-3F68-46BC-80DF-5FB86AED931E}\\InprocServer32";
+        wil::unique_hkey clsid;
+        wil::unique_hkey server;
+        LSTATUS status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, clsidKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, clsid.put(), nullptr);
+        if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
+        const std::wstring name = OCB_FRIENDLY_NAME;
+        status = RegSetValueExW(clsid.get(), nullptr, 0, REG_SZ, reinterpret_cast<const BYTE*>(name.c_str()), static_cast<DWORD>((name.size() + 1) * sizeof(wchar_t)));
+        if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
+        status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, serverKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, server.put(), nullptr);
+        if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
+        const std::wstring dll = std::filesystem::absolute(dllPath).wstring();
+        status = RegSetValueExW(server.get(), nullptr, 0, REG_SZ, reinterpret_cast<const BYTE*>(dll.c_str()), static_cast<DWORD>((dll.size() + 1) * sizeof(wchar_t)));
+        if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
+        constexpr wchar_t threading[] = L"Both";
+        status = RegSetValueExW(server.get(), L"ThreadingModel", 0, REG_SZ, reinterpret_cast<const BYTE*>(threading), sizeof(threading));
+        return HRESULT_FROM_WIN32(status);
+    }
+
+    bool IsOpenCamBridgeCameraRegistered(std::wstring* symbolicLink = nullptr)
+    {
+        std::vector<DeviceInformation> cameras;
+        if (FAILED(VCamUtils::GetVirtualCamera(cameras))) return false;
+        for (const auto& camera : cameras)
+        {
+            if (_wcsicmp(camera.Name().c_str(), OCB_FRIENDLY_NAME) == 0)
+            {
+                if (symbolicLink) *symbolicLink = camera.Id().c_str();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void PrintUsage()
+    {
+        std::wcout
+            << L"OpenCamBridge Virtual Camera Installer\n\n"
+            << L"Usage:\n"
+            << L"  VirtualCamera_Installer.exe --register\n"
+            << L"  VirtualCamera_Installer.exe --unregister\n"
+            << L"  VirtualCamera_Installer.exe --status\n"
+            << L"  VirtualCamera_Installer.exe --mode host\n"
+            << L"  VirtualCamera_Installer.exe --self-test-pipeline\n"
+            << L"  VirtualCamera_Installer.exe --dev-menu\n\n"
+            << L"Registration commands require an elevated terminal.\n";
+    }
+
+    HRESULT RegisterProductionCamera(wil::com_ptr_nothrow<IMFVirtualCamera>& camera)
+    {
+        const auto dllPath = ExecutablePath().parent_path() / L"VirtualCameraMediaSource.dll";
+        RETURN_IF_FAILED(RegisterComBackend(dllPath));
+        SimpleMediaSourceUT source;
+        RETURN_IF_FAILED(source.CreateVirtualCamera(MFVirtualCameraLifetime_System, MFVirtualCameraAccess_AllUsers, camera.put()));
+        return S_OK;
+    }
+
+    HRESULT UnregisterProductionCamera()
+    {
+        RETURN_IF_FAILED(VCamUtils::MSIUninstall(CLSID_VirtualCameraMediaSource));
+        constexpr wchar_t clsidKey[] = L"Software\\Classes\\CLSID\\{8CF75B14-3F68-46BC-80DF-5FB86AED931E}";
+        const LSTATUS status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, clsidKey);
+        if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND) return HRESULT_FROM_WIN32(status);
+        return S_OK;
+    }
+
+    void PrintStatus()
+    {
+        const auto exePath = ExecutablePath();
+        const auto installedDll = exePath.parent_path() / L"VirtualCameraMediaSource.dll";
+        std::wstring registeredDll;
+        const HRESULT registryResult = ReadRegisteredDllPath(registeredDll);
+        std::wstring symbolicLink;
+        const bool cameraRegistered = IsOpenCamBridgeCameraRegistered(&symbolicLink);
+        std::wcout << L"OpenCamBridge virtual-camera status\n";
+        std::wcout << L"OCB_VCAM_REGISTERED=" << (cameraRegistered ? L"true" : L"false") << L"\n";
+        std::wcout << L"cameraName=" << OCB_FRIENDLY_NAME << L"\n";
+        std::wcout << L"cameraClsid=" << OCB_CLSID_TEXT << L"\n";
+        std::wcout << L"cameraSymbolicLink=" << (symbolicLink.empty() ? L"NOT_REGISTERED" : symbolicLink) << L"\n";
+        std::wcout << L"installedDllPath=" << installedDll.wstring() << L"\n";
+        std::wcout << L"installedDllSha256=" << Sha256File(installedDll) << L"\n";
+        std::wcout << L"registeredDllPath=" << (SUCCEEDED(registryResult) ? registeredDll : L"NOT_REGISTERED") << L"\n";
+        std::wcout << L"registeredDllSha256=" << (SUCCEEDED(registryResult) ? Sha256File(registeredDll) : L"UNAVAILABLE") << L"\n";
+        std::wcout << L"installerSha256=" << Sha256File(exePath) << L"\n";
+        if (!cameraRegistered || FAILED(registryResult)) std::wcout << L"remediation=" << OCB_REPAIR_COMMAND << L"\n";
+    }
+}
 
 void __stdcall WilFailureLog(_In_ const wil::FailureInfo& failure) WI_NOEXCEPT
 {
@@ -375,26 +539,66 @@ int wmain(int argc, wchar_t* argv[])
     EnableVTMode();
     wil::SetResultLoggingCallback(WilFailureLog);
 
-    if (argc == 2 && _wcsicmp(argv[1], L"--self-test-pipeline") == 0)
+    const OcbInstallerArguments arguments = OcbParseInstallerArguments(argc, argv);
+    if (arguments.command == OcbInstallerCommand::Usage)
+    {
+        PrintUsage();
+        return 0;
+    }
+    if (arguments.command == OcbInstallerCommand::Invalid)
+    {
+        std::wcerr << L"ERROR: invalid OpenCamBridge installer arguments.\n";
+        PrintUsage();
+        return arguments.expectedExitCode;
+    }
+    if (arguments.command == OcbInstallerCommand::SelfTestPipeline)
     {
         const bool locksPassed = OcbRunBufferLockFallbackSelfTests();
         const bool resizePassed = OcbRunResizeFallbackSelfTests();
+        const bool cliPassed = OcbRunInstallerCliSelfTests();
         std::wcout << L"OCB_BUFFER_LOCK_FALLBACK_TEST=" << (locksPassed ? L"PASSED" : L"FAILED") << std::endl;
         std::wcout << L"OCB_NV12_RESIZE_FALLBACK_TEST=" << (resizePassed ? L"PASSED" : L"FAILED") << std::endl;
-        return locksPassed && resizePassed ? 0 : 1;
+        std::wcout << L"OCB_INSTALLER_CLI_TEST=" << (cliPassed ? L"PASSED" : L"FAILED") << std::endl;
+        return locksPassed && resizePassed && cliPassed ? 0 : 1;
     }
 
     LOG_COMMENT(L"Virtual Camera simple application !");
     RETURN_IF_FAILED(MFStartup(MF_VERSION));
 
-    bool isHostMode = false;
-    for (int i = 1; i < argc; i++) {
-        if (_wcsicmp(argv[i], L"--mode") == 0 && i + 1 < argc && _wcsicmp(argv[i+1], L"host") == 0) {
-            isHostMode = true;
-        }
+    if (arguments.command == OcbInstallerCommand::Status)
+    {
+        PrintStatus();
+        return 0;
     }
 
-    if (isHostMode)
+    if (arguments.command == OcbInstallerCommand::Register)
+    {
+        wil::com_ptr_nothrow<IMFVirtualCamera> camera;
+        const HRESULT hr = RegisterProductionCamera(camera);
+        if (FAILED(hr))
+        {
+            std::wcerr << L"ERROR: OpenCamBridge registration failed: 0x" << std::hex << static_cast<unsigned long>(hr) << L"\n";
+            if (OcbInstallerExitCode(hr) == 5) std::wcerr << OCB_REPAIR_COMMAND << L"\n";
+            return OcbInstallerExitCode(hr);
+        }
+        std::wcout << L"OpenCamBridge Camera registered (Synthetic/SimpleMediaSource).\n";
+        return 0;
+    }
+
+    if (arguments.command == OcbInstallerCommand::Unregister)
+    {
+        const HRESULT hr = UnregisterProductionCamera();
+        if (FAILED(hr))
+        {
+            std::wcerr << L"ERROR: OpenCamBridge removal failed: 0x" << std::hex << static_cast<unsigned long>(hr) << L"\n";
+            if (OcbInstallerExitCode(hr) == 5) std::wcerr << OCB_REPAIR_COMMAND << L"\n";
+            return OcbInstallerExitCode(hr);
+        }
+        std::wcout << L"OpenCamBridge Camera removed.\n";
+        return 0;
+    }
+
+    if (arguments.command == OcbInstallerCommand::Host)
     {
         LOG_COMMENT(L"Running in HOST mode for Tauri...");
         static wil::com_ptr_nothrow<IMFVirtualCamera> s_spVirtualCamera;
@@ -419,24 +623,11 @@ int wmain(int argc, wchar_t* argv[])
         return 0;
     }
 
-    if (argc == 2)
+    if (arguments.command == OcbInstallerCommand::DevMenu)
     {
-        if (_wcsicmp(argv[1], L"/Uninstall") == 0)
-        {
-            // MSI Uninstall mode
-            VCamAppUnInstall();
-            return 0;
-        }
-        else if (_wcsicmp(argv[1], L"/?") == 0)
-        {
-            LOG_COMMENT(L"\n default - Simple application to install//test//remove VirtualCamera, \n run  /uninstall  to test MIS uninstallation function.  ");
-        }
-    }
-    else
-    {
-        // VCam application
         RETURN_IF_FAILED(VCamApp());
+        return 0;
     }
 
-    return S_OK;
+    return 2;
 }

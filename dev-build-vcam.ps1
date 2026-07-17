@@ -190,4 +190,57 @@ try {
     }
 }
 
+# Cross-process identity validation. The registry path says what Windows will
+# load on the next activation; the live ring says what a currently attached
+# camera consumer actually loaded. Never label stale ring bytes as current.
+$producerExe = "$mfRoot\rust-frame-producer\target\release\rust-frame-producer.exe"
+$producerHash = if (Test-Path $producerExe) { (Get-FileHash $producerExe -Algorithm SHA256).Hash } else { "" }
+Write-Host "Producer executable: $producerExe" -ForegroundColor Cyan
+Write-Host "Producer SHA-256: $(if ($producerHash) { $producerHash } else { 'NOT BUILT' })" -ForegroundColor $(if ($producerHash) { 'Cyan' } else { 'Yellow' })
+
+$ringPath = "C:\ProgramData\OpenCamBridge\framebuffer.bin"
+$runtimeIdentityCurrent = $false
+$runtimeDllHash = ""
+$runtimeProducerHash = ""
+if (Test-Path $ringPath) {
+    try {
+        $header = New-Object byte[] 256
+        $stream = [System.IO.File]::Open($ringPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $read = $stream.Read($header, 0, $header.Length)
+        } finally {
+            $stream.Dispose()
+        }
+        if ($read -eq 256 -and [BitConverter]::ToUInt32($header, 0) -eq 0x5242434F -and [BitConverter]::ToUInt16($header, 4) -eq 3) {
+            $heartbeat = [BitConverter]::ToInt64($header, 40)
+            $heartbeatAge = ([Diagnostics.Stopwatch]::GetTimestamp() - $heartbeat) / [Diagnostics.Stopwatch]::Frequency
+            $runtimeIdentityCurrent = $heartbeat -gt 0 -and $heartbeatAge -ge 0 -and $heartbeatAge -lt 2.0
+            $runtimeDllHash = -join ($header[160..191] | ForEach-Object { $_.ToString('x2') })
+            $runtimeProducerHash = -join ($header[192..223] | ForEach-Object { $_.ToString('x2') })
+        }
+    } catch {
+        Write-Host "Runtime ring identity: UNAVAILABLE ($($_.Exception.Message))" -ForegroundColor Yellow
+    }
+}
+
+if ($runtimeIdentityCurrent) {
+    Write-Host "Loaded DLL SHA-256 (current ring): $runtimeDllHash" -ForegroundColor Cyan
+    Write-Host "Running producer SHA-256 (current ring): $runtimeProducerHash" -ForegroundColor Cyan
+    $identityErrors = @()
+    if ($runtimeDllHash -ne $builtDllHash.ToLowerInvariant()) {
+        $identityErrors += "loaded DLL differs from the built/installed DLL"
+    }
+    if ($producerHash -and $runtimeProducerHash -ne $producerHash.ToLowerInvariant()) {
+        $identityErrors += "running producer differs from the release producer executable"
+    }
+    if ($identityErrors.Count -gt 0) {
+        Write-Host "BINARY IDENTITY MISMATCH: $($identityErrors -join '; ')" -ForegroundColor Red
+        Write-Host "Remediation: stop camera consumers, run .\dev-build-vcam.ps1, then run the installer --register from an elevated PowerShell." -ForegroundColor Red
+        throw "OpenCamBridge built/installed/loaded identity mismatch"
+    }
+    Write-Host "Producer/built/installed/registered/loaded identities: PASSED" -ForegroundColor Green
+} else {
+    Write-Host "Loaded DLL/running producer identity: SKIPPED (no current ring heartbeat; not reported as ready)" -ForegroundColor Yellow
+}
+
 Write-Host "Media Foundation DLL + host build/copy done." -ForegroundColor Green

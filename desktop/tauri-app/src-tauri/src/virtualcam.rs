@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Read;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -137,6 +141,25 @@ pub struct VirtualCamState {
     pub last_error: Option<String>,
     pub last_metrics_time: Option<u64>,
     pub last_event: Option<String>,
+    pub binary_identity: BinaryIdentityStatus,
+}
+
+#[derive(Default, Serialize, Clone)]
+pub struct BinaryIdentityStatus {
+    pub ready: bool,
+    pub producer_path: String,
+    pub producer_file_hash: String,
+    pub producer_runtime_hash: String,
+    pub built_dll_path: String,
+    pub built_dll_hash: String,
+    pub installed_dll_path: String,
+    pub installed_dll_hash: String,
+    pub registered_dll_path: String,
+    pub registered_dll_hash: String,
+    pub loaded_dll_hash: String,
+    pub loaded_dll_current: bool,
+    pub error: Option<String>,
+    pub remediation: String,
 }
 
 pub struct VirtualCamManager {
@@ -159,6 +182,170 @@ fn complete_pipeline_ready(
     registered: bool,
 ) -> bool {
     producer_ready && host_running && host_activated && registered
+}
+
+fn repository_root() -> PathBuf {
+    let mut root = std::env::current_dir().unwrap_or_default();
+    while !root.join("windows").exists() && root.parent().is_some() {
+        root = root.parent().unwrap().to_path_buf();
+    }
+    root
+}
+
+fn virtual_camera_installer_path() -> PathBuf {
+    repository_root().join(
+        "windows/virtual-camera-mediafoundation/VirtualCamera_Installer/x64/Release/VirtualCamera_Installer.exe",
+    )
+}
+
+fn installer_remediation(command: &str) -> String {
+    format!(
+        "Run from an elevated PowerShell: & '{}\\windows\\virtual-camera-mediafoundation\\VirtualCamera_Installer\\x64\\Release\\VirtualCamera_Installer.exe' {command}",
+        repository_root().display()
+    )
+}
+
+fn run_installer_command(argument: &str) -> Result<String, String> {
+    let installer = virtual_camera_installer_path();
+    if !installer.exists() {
+        return Err(format!(
+            "VirtualCamera_Installer.exe is missing at {}. Run .\\dev-build-vcam.ps1 first.",
+            installer.display()
+        ));
+    }
+    let output = Command::new(&installer)
+        .arg(argument)
+        .output()
+        .map_err(|error| format!("Failed to launch {}: {error}", installer.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        return Ok(if stdout.is_empty() {
+            format!("OpenCamBridge installer completed {argument}")
+        } else {
+            stdout
+        });
+    }
+    let exit_code = output.status.code().unwrap_or(-1);
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    if exit_code == 5 {
+        return Err(format!(
+            "Administrator elevation is required. {}",
+            installer_remediation(argument)
+        ));
+    }
+    Err(format!(
+        "OpenCamBridge installer {argument} failed with exit code {exit_code}: {detail}. {}",
+        installer_remediation(argument)
+    ))
+}
+
+fn sha256_file(path: &std::path::Path) -> String {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return String::new(),
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => hasher.update(&buffer[..count]),
+            Err(_) => return String::new(),
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn registered_dll_path() -> String {
+    let hklm = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
+    let path = r#"Software\Classes\CLSID\{8CF75B14-3F68-46BC-80DF-5FB86AED931E}\InprocServer32"#;
+    hklm.open_subkey(path)
+        .ok()
+        .and_then(|key| key.get_value::<String, _>("").ok())
+        .unwrap_or_default()
+}
+
+fn evaluate_binary_identity(
+    producer_path: Option<&str>,
+    metrics: Option<&VirtualCamMetrics>,
+) -> BinaryIdentityStatus {
+    let root = repository_root();
+    let built_dll = root
+        .join("windows/virtual-camera-mediafoundation/x64/Release/VirtualCameraMediaSource.dll");
+    let installed_dll = root.join(
+        "windows/virtual-camera-mediafoundation/VirtualCamera_Installer/x64/Release/VirtualCameraMediaSource.dll",
+    );
+    let producer_path = producer_path.unwrap_or_default().to_string();
+    let producer_file_hash = if producer_path.is_empty() {
+        String::new()
+    } else {
+        sha256_file(std::path::Path::new(&producer_path))
+    };
+    let built_dll_hash = sha256_file(&built_dll);
+    let installed_dll_hash = sha256_file(&installed_dll);
+    let registered_dll_path = registered_dll_path();
+    let registered_dll_hash = if registered_dll_path.is_empty() {
+        String::new()
+    } else {
+        sha256_file(std::path::Path::new(&registered_dll_path))
+    };
+    let ring = metrics.and_then(|item| item.ring.as_ref());
+    let producer_runtime_hash = ring
+        .map(|item| item.producer_build_hash.to_ascii_lowercase())
+        .unwrap_or_default();
+    let loaded_dll_hash = ring
+        .map(|item| item.installed_dll_build_hash.to_ascii_lowercase())
+        .unwrap_or_default();
+    let loaded_dll_current = ring.is_some_and(|item| item.consumer_attached);
+    let mut mismatches = Vec::new();
+    if !built_dll_hash.is_empty()
+        && !installed_dll_hash.is_empty()
+        && built_dll_hash != installed_dll_hash
+    {
+        mismatches.push("built DLL differs from installed DLL");
+    }
+    if installed_dll_hash.is_empty() {
+        mismatches.push("installed DLL is missing");
+    }
+    if registered_dll_hash.is_empty() {
+        mismatches.push("registered DLL is missing or unreadable");
+    } else if !installed_dll_hash.is_empty() && registered_dll_hash != installed_dll_hash {
+        mismatches.push("registered DLL differs from installed DLL");
+    }
+    if !producer_runtime_hash.is_empty()
+        && !producer_file_hash.is_empty()
+        && producer_runtime_hash != producer_file_hash
+    {
+        mismatches.push("running producer differs from its on-disk executable");
+    }
+    if loaded_dll_current
+        && !loaded_dll_hash.is_empty()
+        && !registered_dll_hash.is_empty()
+        && loaded_dll_hash != registered_dll_hash
+    {
+        mismatches.push("loaded DLL differs from the registered DLL");
+    }
+    let remediation = format!(
+        "Stop camera consumers, then run .\\dev-build-vcam.ps1 and {}",
+        installer_remediation("--register")
+    );
+    BinaryIdentityStatus {
+        ready: mismatches.is_empty(),
+        producer_path,
+        producer_file_hash,
+        producer_runtime_hash,
+        built_dll_path: built_dll.display().to_string(),
+        built_dll_hash,
+        installed_dll_path: installed_dll.display().to_string(),
+        installed_dll_hash,
+        registered_dll_path,
+        registered_dll_hash,
+        loaded_dll_hash,
+        loaded_dll_current,
+        error: (!mismatches.is_empty()).then(|| mismatches.join("; ")),
+        remediation,
+    }
 }
 
 impl VirtualCamManager {
@@ -214,11 +401,17 @@ pub fn check_virtual_camera_backend() -> bool {
 
 #[tauri::command]
 pub fn register_virtual_camera_backend() -> Result<String, String> {
-    // Requires Admin, currently not supported from Tauri UI directly.
-    Err(
-        "Please use the VirtualCamera_Installer.exe to register the camera manually for the MVP."
-            .to_string(),
-    )
+    run_installer_command("--register")
+}
+
+#[tauri::command]
+pub fn unregister_virtual_camera_backend() -> Result<String, String> {
+    run_installer_command("--unregister")
+}
+
+#[tauri::command]
+pub fn get_virtual_camera_backend_details() -> Result<String, String> {
+    run_installer_command("--status")
 }
 
 #[tauri::command]
@@ -241,12 +434,7 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
         }
     }
 
-    let mut repo_root = std::env::current_dir().unwrap();
-    while !repo_root.join("windows").exists() && repo_root.parent().is_some() {
-        repo_root = repo_root.parent().unwrap().to_path_buf();
-    }
-
-    let exe_path_release = repo_root.join("windows/virtual-camera-mediafoundation/VirtualCamera_Installer/x64/Release/VirtualCamera_Installer.exe");
+    let exe_path_release = virtual_camera_installer_path();
     if !exe_path_release.exists() {
         let msg = format!(
             "VirtualCamera_Installer.exe not found at {}. Run .\\dev-build-vcam.ps1 (it builds and copies the host exe).",
@@ -400,10 +588,7 @@ pub fn start_virtual_camera_feeder(
     }
     *state.producer_state.lock().unwrap() = "STARTING".to_string();
 
-    let mut repo_root = std::env::current_dir().unwrap();
-    while !repo_root.join("windows").exists() && repo_root.parent().is_some() {
-        repo_root = repo_root.parent().unwrap().to_path_buf();
-    }
+    let repo_root = repository_root();
 
     let exe_path_release = repo_root.join("windows/virtual-camera-mediafoundation/rust-frame-producer/target/release/rust-frame-producer.exe");
     let exe_path_debug = repo_root.join("windows/virtual-camera-mediafoundation/rust-frame-producer/target/debug/rust-frame-producer.exe");
@@ -690,8 +875,13 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
                 && m.last_error.is_none()
         });
     let host_activated = host_running && state.host_activated.load(Ordering::Acquire);
-    let pipeline_ready =
-        complete_pipeline_ready(producer_ready, host_running, host_activated, registered);
+    let binary_identity = evaluate_binary_identity(producer_path.as_deref(), metrics.as_ref());
+    let pipeline_ready = complete_pipeline_ready(
+        producer_ready && binary_identity.ready,
+        host_running,
+        host_activated,
+        registered,
+    );
     let virtual_camera_ready =
         pipeline_ready && metrics.as_ref().is_some_and(|m| m.virtual_camera_ready);
     let producer_state = state.producer_state.lock().unwrap().clone();
@@ -723,6 +913,7 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
         last_error,
         last_metrics_time,
         last_event,
+        binary_identity,
     }
 }
 
