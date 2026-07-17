@@ -365,6 +365,9 @@ pub fn start_virtual_camera_feeder(
     width: u32,
     height: u32,
     fps: f64,
+    source_width: u32,
+    source_height: u32,
+    source_fps: f64,
     profile: Option<String>,
     token: Option<String>,
     source: Option<String>,
@@ -379,7 +382,10 @@ pub fn start_virtual_camera_feeder(
             ))
         }
     };
-    println!(">>> [Tauri] start_virtual_camera_feeder called with source={}, width={}, height={}, fps={}", source, width, height, fps);
+    println!(
+        ">>> [Tauri] start_virtual_camera_feeder source={} source={}x{}@{} output={}x{}",
+        source, source_width, source_height, source_fps, width, height
+    );
     let mut child_guard = state.child.lock().unwrap();
     if let Some(mut child) = child_guard.take() {
         println!(
@@ -431,7 +437,13 @@ pub fn start_virtual_camera_feeder(
         .arg("--height")
         .arg(height.to_string())
         .arg("--fps")
-        .arg(fps.to_string());
+        .arg(fps.round().max(1.0).to_string())
+        .arg("--source-width")
+        .arg(source_width.to_string())
+        .arg("--source-height")
+        .arg(source_height.to_string())
+        .arg("--source-fps")
+        .arg(source_fps.round().max(1.0).to_string());
 
     if let Some(p) = profile {
         cmd.arg("--profile").arg(p);

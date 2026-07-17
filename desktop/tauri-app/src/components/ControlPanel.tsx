@@ -551,16 +551,31 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
     const source = (actual?.activeStreamMode || s.streamMode) === 'h264' ? 'h264' : 'mjpeg';
     const targetUrl = source === 'h264' ? `${base}/stream.ocb2` : `${base}/stream.mjpeg`;
+    // Android's selected/actual encoded tuple is the producer input. The
+    // Windows output canvas remains an independent consumer setting.
+    const sourceWidth = Number(actual?.encodedWidth || actual?.selectedEffectiveWidth || 0);
+    const sourceHeight = Number(actual?.encodedHeight || actual?.selectedEffectiveHeight || 0);
+    const sourceFps = Number(actual?.encodedFps || actual?.selectedFps || 0);
+    if (sourceWidth <= 0 || sourceHeight <= 0 || sourceFps <= 0) {
+      throw new Error('Android did not publish a valid selected/actual source tuple; refusing to launch the producer from desired defaults');
+    }
+    const outputWidth = Number(s.outputWidth || s.width);
+    const outputHeight = Number(s.outputHeight || s.height);
     // jpegQuality is applied on the Android side; the producer no longer takes it.
     console.log('[Tauri UI] Calling start_virtual_camera_feeder with', {
-      url: targetUrl, source, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, profile: s.profile
+      url: targetUrl, source,
+      sourceWidth, sourceHeight, sourceFps,
+      outputWidth, outputHeight, profile: s.profile
     });
     await invoke('start_virtual_camera_feeder', {
       url: targetUrl,
       source,
-      width: s.outputWidth || s.width,
-      height: s.outputHeight || s.height,
-      fps: s.fps,
+      width: outputWidth,
+      height: outputHeight,
+      fps: sourceFps,
+      sourceWidth,
+      sourceHeight,
+      sourceFps,
       profile: s.profile,
       token: token || undefined
     });
@@ -1110,7 +1125,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
               <span style={{ color: '#888' }}>Output</span>
-              <span>{vcamState.metrics ? `${vcamState.metrics.output_width}x${vcamState.metrics.output_height} ${settings.streamMode.toUpperCase()}` : `${settings.width}x${settings.height}`}</span>
+              <span>{vcamState.metrics ? `${vcamState.metrics.output_width}x${vcamState.metrics.output_height} ${(androidMetrics?.activeStreamMode || settings.streamMode).toUpperCase()}` : `${settings.outputWidth}x${settings.outputHeight}`}</span>
             </div>
             {(vcamState.last_error || vcamState.metrics?.last_error) && (
               <div style={{ marginTop: 6, color: '#ff6b6b', fontSize: '0.75rem', wordBreak: 'break-all' }}>
@@ -1225,18 +1240,26 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                   <span style={{ color: androidMetrics.aspectRatioMatch ? '#51cf66' : '#ffb300' }}>{androidMetrics.selectedAspectRatio}</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Resolution requested / selected / actual:</span>
+                  <span>Source resolution desired / selected / actual:</span>
                   <span>{settings.width}x{settings.height} / {androidMetrics.selectedEffectiveWidth || 0}x{androidMetrics.selectedEffectiveHeight || 0} / {androidMetrics.encodedWidth}x{androidMetrics.encodedHeight}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                  <span>Source mode desired / active:</span>
+                  <span>{settings.streamMode.toUpperCase()} / {(androidMetrics.activeStreamMode || settings.streamMode).toUpperCase()}</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
                   <span>Rotation Resizing:</span>
                   <span style={{ color: androidMetrics.resizeNeeded ? '#ffb300' : '#51cf66' }}>{androidMetrics.resizeNeeded ? 'Required' : 'Native Match'}</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Capture FPS requested / selected / actual:</span>
-                  <span style={{ color: (androidMetrics.captureFps || androidMetrics.actualFps || androidMetrics.fps) >= settings.fps - 5 ? '#51cf66' : '#ffb300' }}>
-                    {settings.fps} / {androidMetrics.selectedFps || 0} / {androidMetrics.captureFps ?? androidMetrics.actualFps ?? androidMetrics.fps}
+                  <span>Source FPS desired / selected / encoded:</span>
+                  <span style={{ color: (androidMetrics.encodedFps || 0) >= settings.fps - 5 ? '#51cf66' : '#ffb300' }}>
+                    {settings.fps} / {androidMetrics.selectedFps || 0} / {androidMetrics.encodedFps || 0}
                   </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
+                  <span>Consumer output:</span>
+                  <span>{vcamState.metrics?.ring?.negotiated_width || vcamState.metrics?.output_width || settings.outputWidth}x{vcamState.metrics?.ring?.negotiated_height || vcamState.metrics?.output_height || settings.outputHeight} @ {vcamState.metrics?.ring?.negotiated_fps_num || '—'}/{vcamState.metrics?.ring?.negotiated_fps_den || '—'}</span>
                 </div>
                 {androidMetrics.capture && (
                   <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
