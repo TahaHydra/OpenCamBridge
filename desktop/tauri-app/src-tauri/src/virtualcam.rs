@@ -252,7 +252,10 @@ fn sha256_file(path: &std::path::Path) -> String {
         Err(_) => return String::new(),
     };
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
+    // Heap-allocate the read buffer: `get_virtual_camera_status` is a synchronous
+    // command that Tauri runs on the main thread, whose Windows stack defaults to
+    // 1 MiB. A 1 MiB stack array here overflowed it (STATUS_STACK_OVERFLOW).
+    let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         match file.read(&mut buffer) {
             Ok(0) => break,
