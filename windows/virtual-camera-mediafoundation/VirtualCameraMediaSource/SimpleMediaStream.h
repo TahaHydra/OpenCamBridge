@@ -10,6 +10,9 @@
 #include "SimpleFrameGenerator.h"
 #include "SharedMemoryClient.h"
 
+#include <atomic>
+#include <wil/resource.h>
+
 namespace winrt::WindowsSample::implementation
 {
     struct SimpleMediaStream : winrt::implements<SimpleMediaStream, IMFMediaStream2>
@@ -54,6 +57,12 @@ namespace winrt::WindowsSample::implementation
         _Requires_lock_held_(m_Lock) HRESULT StartInternal(bool bSendEvent, IMFMediaType* pNewMediaType);
         _Requires_lock_held_(m_Lock) HRESULT StopInternal(bool bSendEvent);
 
+        // Throttle sample delivery to the negotiated frame interval so the
+        // virtual camera behaves like a real device instead of serving a sample
+        // on every RequestSample spin (which drove ~340k requests for ~150
+        // frames and pegged CPU). Called without m_Lock held.
+        void PaceToFrameRate();
+
         winrt::slim_mutex  m_Lock;
 
         wil::com_ptr_nothrow<IMFMediaSource> m_parent;
@@ -73,6 +82,12 @@ namespace winrt::WindowsSample::implementation
         MFSampleAllocatorUsage m_allocatorUsage;
         SharedMemoryClient m_shmClient;
         LONGLONG m_nextSampleTime = 0;
+
+        // Frame-rate pacing state (accessed from RequestSample without m_Lock,
+        // reset from Start/Stop under m_Lock, hence atomic).
+        std::atomic<LONGLONG> m_frameDuration100ns{ 333333 }; // negotiated interval, 30 fps default
+        std::atomic<LONGLONG> m_lastDelivery100ns{ 0 };       // MFGetSystemTime() of last delivered sample
+        wil::unique_handle m_pacingTimer;                     // high-resolution waitable timer
     };
 }
 

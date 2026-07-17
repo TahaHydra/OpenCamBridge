@@ -123,6 +123,19 @@ namespace winrt::WindowsSample::implementation
         m_dwStreamId = dwStreamId;
         m_allocatorUsage = allocatorUsage;
 
+        // High-resolution waitable timer used to pace sample delivery. Falls back
+        // to a regular timer (or Sleep) if the high-resolution flag is
+        // unsupported. Failure here is non-fatal: pacing degrades, it never
+        // blocks stream creation.
+        m_pacingTimer.reset(::CreateWaitableTimerExW(
+            nullptr, nullptr,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS));
+        if (!m_pacingTimer)
+        {
+            m_pacingTimer.reset(::CreateWaitableTimerExW(
+                nullptr, nullptr, 0, TIMER_ALL_ACCESS));
+        }
+
         const uint32_t NUM_MEDIATYPES = 5;
         wil::unique_cotaskmem_array_ptr<wil::com_ptr_nothrow<IMFMediaType>> mediaTypeList = wilEx::make_unique_cotaskmem_array<wil::com_ptr_nothrow<IMFMediaType>>(NUM_MEDIATYPES);
 
@@ -282,6 +295,13 @@ namespace winrt::WindowsSample::implementation
             _In_ IUnknown* pToken
         )
     {
+        // Pace to the negotiated frame interval before doing any work (and
+        // before taking m_Lock, so a stop is never blocked by the wait). This
+        // makes the source behave like a real camera; without it the frame
+        // server spun RequestSample continuously (~340k requests served ~150
+        // real frames), pegging CPU and inflating repeated-frame counters.
+        PaceToFrameRate();
+
         winrt::slim_lock_guard lock(m_Lock);
         wil::com_ptr_nothrow<IMFSample> sample;
         wil::com_ptr_nothrow<IMFMediaBuffer> outputBuffer;
@@ -366,6 +386,47 @@ namespace winrt::WindowsSample::implementation
             sample.get()));
 
         return S_OK;
+    }
+
+    void SimpleMediaStream::PaceToFrameRate()
+    {
+        LONGLONG duration = m_frameDuration100ns.load(std::memory_order_relaxed);
+        if (duration <= 0)
+        {
+            return;
+        }
+        LONGLONG now = MFGetSystemTime();
+        LONGLONG last = m_lastDelivery100ns.load(std::memory_order_relaxed);
+        if (last != 0)
+        {
+            LONGLONG remaining = duration - (now - last);
+            // Never wait more than one frame interval; a larger value means the
+            // clock jumped or the consumer paused, and we should not stall.
+            if (remaining > duration)
+            {
+                remaining = duration;
+            }
+            if (remaining > 0)
+            {
+                bool waited = false;
+                if (m_pacingTimer)
+                {
+                    LARGE_INTEGER due;
+                    due.QuadPart = -remaining; // relative, 100ns units
+                    if (::SetWaitableTimer(m_pacingTimer.get(), &due, 0, nullptr, nullptr, FALSE))
+                    {
+                        ::WaitForSingleObject(m_pacingTimer.get(), INFINITE);
+                        waited = true;
+                    }
+                }
+                if (!waited)
+                {
+                    ::Sleep(static_cast<DWORD>(remaining / 10000));
+                }
+                now = MFGetSystemTime();
+            }
+        }
+        m_lastDelivery100ns.store(now, std::memory_order_relaxed);
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////
@@ -585,6 +646,17 @@ namespace winrt::WindowsSample::implementation
         m_streamState = MF_STREAM_STATE_RUNNING;
         m_nextSampleTime = MFGetSystemTime();
 
+        // Seed the pacing interval from the negotiated frame rate and start a
+        // fresh delivery clock so the first sample is not artificially delayed.
+        UINT32 fpsNum = 30, fpsDen = 1;
+        if (m_spMediaType)
+        {
+            MFGetAttributeRatio(m_spMediaType.get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen);
+        }
+        LONGLONG duration = (fpsNum > 0) ? (10'000'000LL * fpsDen) / fpsNum : 333333;
+        m_frameDuration100ns.store(duration, std::memory_order_relaxed);
+        m_lastDelivery100ns.store(0, std::memory_order_relaxed);
+
         return S_OK;
     }
 
@@ -594,6 +666,7 @@ namespace winrt::WindowsSample::implementation
         // Set stream state
         m_streamState = MF_STREAM_STATE_STOPPED;
         m_nextSampleTime = 0;
+        m_lastDelivery100ns.store(0, std::memory_order_relaxed);
         (void)m_shmClient.SetConsumerAttached(false);
 
         // NOTE: if implementation has sampleRequestQueue or sampleQueue, it must flush the queue on stopped.
