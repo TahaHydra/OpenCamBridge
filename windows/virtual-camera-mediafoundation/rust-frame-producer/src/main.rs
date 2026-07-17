@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::c_void;
 use std::io::Read;
@@ -124,6 +124,18 @@ struct Args {
 
     #[arg(long)]
     fps: Option<u32>,
+
+    /// Authoritative encoded source properties selected by Android. Width and
+    /// height are diagnostics until the first decoded frame/OCB2 stream-info;
+    /// source FPS controls MJPEG pacing and the ring's producer timing.
+    #[arg(long)]
+    source_width: Option<u32>,
+
+    #[arg(long)]
+    source_height: Option<u32>,
+
+    #[arg(long)]
+    source_fps: Option<u32>,
 
     #[arg(long, default_value = "custom")]
     profile: String,
@@ -856,6 +868,51 @@ fn bgra_to_nv12(src: &[u8], width: u32, height: u32, dst: &mut [u8]) {
 mod ring_tests {
     use super::*;
 
+    #[test]
+    fn h264_1080p60_fallback_selects_canonical_mjpeg_1080p30() {
+        let selected = select_canonical_mjpeg_fallback(
+            MjpegMode {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+            },
+            &[
+                MjpegMode {
+                    width: 1280,
+                    height: 720,
+                    fps: 30,
+                },
+                MjpegMode {
+                    width: 1920,
+                    height: 1080,
+                    fps: 30,
+                },
+            ],
+            &[],
+        );
+        assert_eq!(
+            selected,
+            Some(MjpegMode {
+                width: 1920,
+                height: 1080,
+                fps: 30
+            })
+        );
+    }
+
+    #[test]
+    fn unprocessable_alternatives_are_parsed_as_complete_tuples() {
+        assert_eq!(
+            parse_mjpeg_alternative("MJPEG 1920x1080@30"),
+            Some(MjpegMode {
+                width: 1920,
+                height: 1080,
+                fps: 30
+            })
+        );
+        assert_eq!(parse_mjpeg_alternative("not a mode"), None);
+    }
+
     fn readiness_ring(pid: u32, value: u64) -> RingDiagnostics {
         RingDiagnostics {
             consumer_attached: true,
@@ -1576,57 +1633,220 @@ enum V2Decoder {
     Software { decoder: Decoder, scratch: Vec<u8> },
 }
 
-fn request_phone_mjpeg_fallback(args: &Args) -> Result<(), String> {
-    let stream_url = args.url.as_ref().ok_or("missing stream URL")?;
-    let settings_url = stream_url.replace("/stream.ocb2", "/api/settings");
-    let status_url = stream_url.replace("/stream.ocb2", "/api/camera/status");
-    let client = build_http_client()?;
-    let mut status_request = client.get(status_url);
-    if let Some(token) = &args.token {
-        status_request = status_request.header("X-OpenCamBridge-Token", token);
-    }
-    let status_response = status_request
-        .send()
-        .map_err(|e| format!("could not read authoritative phone revision: {e}"))?;
-    let status_code = status_response.status();
-    let status_text = status_response
-        .text()
-        .map_err(|e| format!("could not read phone status body: {e}"))?;
-    if !status_code.is_success() {
-        return Err(format!("phone status rejected with HTTP {status_code}"));
-    }
-    let status: serde_json::Value = serde_json::from_str(&status_text)
-        .map_err(|e| format!("invalid phone status JSON: {e}"))?;
-    let revision = status
-        .get("revision")
-        .and_then(|v| v.as_u64())
-        .ok_or("phone status omitted authoritative revision")?;
-    let request_id = format!("producer-{}-{}", std::process::id(), monotonic_ns());
-    let body = serde_json::json!({
-        "streamMode": "mjpeg",
-        "clientType": "producer",
-        "baseRevision": revision,
-        "requestId": request_id
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+struct MjpegMode {
+    width: u32,
+    height: u32,
+    fps: u32,
+}
+
+fn select_canonical_mjpeg_fallback(
+    desired: MjpegMode,
+    supported: &[MjpegMode],
+    rejected: &[MjpegMode],
+) -> Option<MjpegMode> {
+    supported
+        .iter()
+        .copied()
+        .filter(|mode| {
+            mode.width <= desired.width
+                && mode.height <= desired.height
+                && mode.fps <= desired.fps
+                && !rejected.contains(mode)
+        })
+        .max_by_key(|mode| {
+            (
+                u8::from(mode.width == desired.width && mode.height == desired.height),
+                mode.width as u64 * mode.height as u64,
+                mode.fps,
+            )
+        })
+}
+
+fn parse_mjpeg_alternative(value: &str) -> Option<MjpegMode> {
+    let tuple = value.trim().strip_prefix("MJPEG ").unwrap_or(value.trim());
+    let (resolution, fps) = tuple.split_once('@')?;
+    let (width, height) = resolution.split_once('x')?;
+    Some(MjpegMode {
+        width: width.trim().parse().ok()?,
+        height: height.trim().parse().ok()?,
+        fps: fps.trim().parse().ok()?,
     })
-    .to_string();
-    let mut request = client
-        .post(settings_url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body);
-    if let Some(token) = &args.token {
+}
+
+fn phone_get_json(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let mut request = client.get(url);
+    if let Some(token) = token {
         request = request.header("X-OpenCamBridge-Token", token);
     }
     let response = request
         .send()
-        .map_err(|e| format!("could not request phone MJPEG fallback: {e}"))?;
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "phone rejected MJPEG fallback with HTTP {}",
-            response.status()
-        ))
+        .map_err(|e| format!("GET {url} failed: {e}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|e| format!("could not read {url} response: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("GET {url} rejected with HTTP {status}: {text}"));
     }
+    serde_json::from_str(&text).map_err(|e| format!("invalid JSON from {url}: {e}"))
+}
+
+fn pipeline_desired(status: &serde_json::Value) -> Result<(u64, String, MjpegMode), String> {
+    let revision = status
+        .get("revision")
+        .and_then(|v| v.as_u64())
+        .ok_or("phone status omitted authoritative revision")?;
+    let desired = status
+        .pointer("/snapshot/desired")
+        .ok_or("phone status omitted snapshot.desired")?;
+    let camera_id = desired
+        .get("cameraId")
+        .and_then(|v| v.as_str())
+        .ok_or("phone status omitted desired cameraId")?
+        .to_owned();
+    let mode = MjpegMode {
+        width: desired
+            .get("width")
+            .and_then(|v| v.as_u64())
+            .ok_or("phone status omitted desired width")? as u32,
+        height: desired
+            .get("height")
+            .and_then(|v| v.as_u64())
+            .ok_or("phone status omitted desired height")? as u32,
+        fps: desired
+            .get("fps")
+            .and_then(|v| v.as_u64())
+            .ok_or("phone status omitted desired fps")? as u32,
+    };
+    Ok((revision, camera_id, mode))
+}
+
+fn camera_mjpeg_modes(
+    capabilities: &serde_json::Value,
+    camera_id: &str,
+) -> Result<Vec<MjpegMode>, String> {
+    let cameras = capabilities
+        .get("cameras")
+        .and_then(|v| v.as_array())
+        .ok_or("pipeline capabilities omitted cameras")?;
+    let camera = cameras
+        .iter()
+        .find(|camera| camera.get("id").and_then(|v| v.as_str()) == Some(camera_id))
+        .ok_or_else(|| format!("camera {camera_id} is absent from pipeline capabilities"))?;
+    serde_json::from_value(camera.get("mjpegModes").cloned().unwrap_or_default())
+        .map_err(|e| format!("invalid canonical mjpegModes for camera {camera_id}: {e}"))
+}
+
+fn accepted_mjpeg_mode(response: &serde_json::Value) -> Option<MjpegMode> {
+    let state = response.get("authoritativeState").unwrap_or(response);
+    for path in ["/snapshot/selected", "/snapshot/desired"] {
+        let Some(mode) = state.pointer(path) else {
+            continue;
+        };
+        if mode.get("streamMode").and_then(|v| v.as_str()) != Some("mjpeg") {
+            continue;
+        }
+        return Some(MjpegMode {
+            width: mode.get("width")?.as_u64()? as u32,
+            height: mode.get("height")?.as_u64()? as u32,
+            fps: mode.get("fps")?.as_u64()? as u32,
+        });
+    }
+    None
+}
+
+fn request_phone_mjpeg_fallback(args: &Args) -> Result<MjpegMode, String> {
+    let stream_url = args.url.as_ref().ok_or("missing stream URL")?;
+    let base_url = stream_url
+        .strip_suffix("/stream.ocb2")
+        .ok_or("OCB2 URL does not end in /stream.ocb2")?;
+    let settings_url = format!("{base_url}/api/settings");
+    let status_url = format!("{base_url}/api/camera/status");
+    let capabilities_url = format!("{base_url}/api/pipeline/capabilities");
+    let client = build_http_client()?;
+    let mut rejected = Vec::new();
+    let mut alternatives: Option<Vec<MjpegMode>> = None;
+
+    for _ in 0..4 {
+        let status = phone_get_json(&client, &status_url, args.token.as_deref())?;
+        let capabilities = phone_get_json(&client, &capabilities_url, args.token.as_deref())?;
+        let (revision, camera_id, desired) = pipeline_desired(&status)?;
+        let canonical = camera_mjpeg_modes(&capabilities, &camera_id)?;
+        let eligible = alternatives
+            .take()
+            .map(|values| {
+                values
+                    .into_iter()
+                    .filter(|m| canonical.contains(m))
+                    .collect()
+            })
+            .unwrap_or_else(|| canonical.clone());
+        let selected =
+            select_canonical_mjpeg_fallback(desired, &eligible, &rejected).ok_or_else(|| {
+                format!(
+                    "camera {camera_id} has no canonical MJPEG fallback at or below {}x{}@{}",
+                    desired.width, desired.height, desired.fps
+                )
+            })?;
+        let request_id = format!("producer-{}-{}", std::process::id(), monotonic_ns());
+        let body = serde_json::json!({
+            "streamMode": "mjpeg",
+            "width": selected.width,
+            "height": selected.height,
+            "fps": selected.fps,
+            "clientType": "producer",
+            "baseRevision": revision,
+            "requestId": request_id
+        })
+        .to_string();
+        let mut request = client
+            .post(&settings_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        if let Some(token) = &args.token {
+            request = request.header("X-OpenCamBridge-Token", token);
+        }
+        let response = request
+            .send()
+            .map_err(|e| format!("could not request phone MJPEG fallback: {e}"))?;
+        let response_status = response.status();
+        let response_text = response
+            .text()
+            .map_err(|e| format!("could not read MJPEG fallback response: {e}"))?;
+        let response_json: serde_json::Value = serde_json::from_str(&response_text)
+            .unwrap_or_else(|_| serde_json::json!({"message": response_text}));
+        if response_status.is_success() {
+            return Ok(accepted_mjpeg_mode(&response_json).unwrap_or(selected));
+        }
+        match response_status.as_u16() {
+            409 => continue,
+            422 => {
+                rejected.push(selected);
+                let parsed: Vec<MjpegMode> = response_json
+                    .get("alternatives")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().and_then(parse_mjpeg_alternative))
+                    .collect();
+                if parsed.is_empty() {
+                    return Err(format!("phone rejected MJPEG fallback with HTTP 422 and no parseable alternatives: {response_text}"));
+                }
+                alternatives = Some(parsed);
+            }
+            _ => {
+                return Err(format!(
+                    "phone rejected MJPEG fallback with HTTP {response_status}: {response_text}"
+                ))
+            }
+        }
+    }
+    Err("phone MJPEG fallback did not converge after revision/alternative retries".into())
 }
 
 impl V2Decoder {
@@ -2356,7 +2576,7 @@ fn main() {
 
     let width = args.width.unwrap_or(defaults.0);
     let height = args.height.unwrap_or(defaults.1);
-    let fps = args.fps.unwrap_or(defaults.2).max(1);
+    let mut fps = args.source_fps.or(args.fps).unwrap_or(defaults.2).max(1);
 
     // Every V2 slot is sized for one 1920x1080 NV12 frame.
     let needed = (width as u64) * (height as u64) * 3 / 2;
@@ -2377,7 +2597,7 @@ fn main() {
 
     let ipc = SharedMemoryIpc::new().expect("Failed to initialize IPC");
     ipc.initialize_ring_if_needed();
-    ipc.set_source_fps(args.fps.unwrap_or(30), 1);
+    ipc.set_source_fps(fps, 1);
     emit_event(
         "info",
         "PRODUCER_BUILD",
@@ -2435,10 +2655,22 @@ fn main() {
                 "OCB2 H.264 pipeline unavailable ({e}); switching to MJPEG compatibility mode"
             );
             active_fallback_reason = format!("H.264 pipeline failed: {e}");
-            if let Err(fallback_error) = request_phone_mjpeg_fallback(&args) {
-                eprintln!("{fallback_error}");
-                std::process::exit(1);
-            }
+            let fallback = match request_phone_mjpeg_fallback(&args) {
+                Ok(selection) => selection,
+                Err(fallback_error) => {
+                    eprintln!("{fallback_error}");
+                    std::process::exit(1);
+                }
+            };
+            args.source_width = Some(fallback.width);
+            args.source_height = Some(fallback.height);
+            args.source_fps = Some(fallback.fps);
+            fps = fallback.fps.max(1);
+            ipc.set_source_fps(fps, 1);
+            active_fallback_reason = format!(
+                "{}; phone selected MJPEG {}x{}@{}",
+                active_fallback_reason, fallback.width, fallback.height, fallback.fps
+            );
             sleep(Duration::from_millis(500));
             args.source = "mjpeg".to_string();
             args.url = args
@@ -2494,8 +2726,8 @@ fn main() {
     let mut sum_write_ms = 0;
     let mut sum_total_ms = 0;
     let mut decoded_fps_counter = 0;
-    let mut source_w = 0;
-    let mut source_h = 0;
+    let mut source_w = args.source_width.unwrap_or(0);
+    let mut source_h = args.source_height.unwrap_or(0);
     let mut last_backend: &str = "skipped";
     let mut last_rotation: u32 = 0;
     let mut last_decode_backend: &str = "standard";
