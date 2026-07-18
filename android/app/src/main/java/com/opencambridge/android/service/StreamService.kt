@@ -41,6 +41,7 @@ class StreamService : LifecycleService() {
     private lateinit var h264Streamer: H264Streamer
     private lateinit var settingsManager: SettingsManager
     private var orientationListener: android.view.OrientationEventListener? = null
+    private var unlockReceiver: android.content.BroadcastReceiver? = null
     private var monitorJob: Job? = null
     private var lowH264Windows = 0
     private lateinit var pipelineController: PipelineController
@@ -147,6 +148,27 @@ class StreamService : LifecycleService() {
         } else {
             AppLogger.w("Rotation", "Device cannot detect orientation; stream stays upright only for the natural (vertical) position")
         }
+        // Locking the phone makes the platform/OEM revoke camera access
+        // (CameraDevice onDisconnected / disabled-by-policy), which we cannot
+        // prevent even as a camera-type foreground service. What we CAN do is
+        // resume automatically: the moment the screen turns on / the user
+        // unlocks, recover a pipeline that FAILED from that revocation instead
+        // of staying dead until a manual restart.
+        unlockReceiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val action = intent?.action ?: return
+                if (action != Intent.ACTION_USER_PRESENT && action != Intent.ACTION_SCREEN_ON) return
+                if (StreamState.lifecycleState.get() == LifecycleState.FAILED) {
+                    AppLogger.i("Power", "Screen on/unlock after camera loss -> recovering pipeline")
+                    pipelineController.enqueue(PipelineCommand.Recover())
+                }
+            }
+        }
+        registerReceiver(unlockReceiver, android.content.IntentFilter().apply {
+            addAction(Intent.ACTION_USER_PRESENT)
+            addAction(Intent.ACTION_SCREEN_ON)
+        })
+
         val power = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
         if (!power.isIgnoringBatteryOptimizations(packageName)) {
             AppLogger.w(
@@ -247,6 +269,8 @@ class StreamService : LifecycleService() {
         AppLogger.i("System", "StreamService stopping completely")
         ServiceBridge.clear()
         orientationListener?.disable()
+        unlockReceiver?.let { try { unregisterReceiver(it) } catch (_: Exception) {} }
+        unlockReceiver = null
         controlServer.stop()
         runBlocking(Dispatchers.IO) {
             try { pipelineController.submit(PipelineCommand.Stop()) } catch (_: Exception) {}
