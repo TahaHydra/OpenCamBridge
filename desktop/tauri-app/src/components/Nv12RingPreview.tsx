@@ -191,7 +191,7 @@ export default function Nv12RingPreview({ fitMode }: Props) {
       />
       {(!ready || error) && (
         <div className="preview-overlay">
-          {error || 'Start Webcam to publish decoded NV12 frames to the desktop preview ring…'}
+          {error || 'Starting desktop H.264 preview decoder…'}
         </div>
       )}
     </>

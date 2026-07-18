@@ -44,6 +44,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.opencambridge.android.camera.CameraInfoDto
 import com.opencambridge.android.camera.CapturePathPolicy
+import com.opencambridge.android.service.ServiceBridge
 import com.opencambridge.android.service.StreamService
 import com.opencambridge.android.state.AppLogger
 import com.opencambridge.android.state.LogEntry
@@ -213,7 +214,7 @@ class MainActivity : ComponentActivity() {
                     accessToken = accessToken,
                     streamMode = streamMode,
                     logs = logs,
-                    onStartStop = { if (isStreaming) viewModel.stopStream() else requestPermissionsAndStart() },
+                    onStartStop = { if (isStreaming) viewModel.stopStream() else startCameraOrService() },
                     onRetryStreamStart = { requestPermissionsAndStart() },
                     onCameraSelect = { viewModel.selectCamera(it) },
                     onResolutionSelect = { w, h -> viewModel.updateResolution(w, h) },
@@ -255,6 +256,18 @@ class MainActivity : ComponentActivity() {
             startStreamService()
         } else {
             permissionLauncher.launch(needed.toTypedArray())
+        }
+    }
+
+    private fun startCameraOrService() {
+        // Stop only tears down the camera pipeline; the foreground service and
+        // its HTTP control server deliberately stay alive. Restart that
+        // existing pipeline in-process instead of sending a second service
+        // start intent (which previously tried to bind port 8080 again).
+        if (ServiceBridge.isServiceRunning) {
+            viewModel.startStream()
+        } else {
+            requestPermissionsAndStart()
         }
     }
 

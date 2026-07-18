@@ -54,3 +54,37 @@ export function buildProducerLaunchSpec(settings, selectedActual, baseUrl) {
     outputHeight
   };
 }
+
+export function shouldStartH264PreviewProducer({
+  previewEnabled,
+  settingsHydrated,
+  lifecycleState,
+  activeStreamMode,
+  producerRunning,
+  sourceWidth,
+  sourceHeight,
+  sourceFps
+}) {
+  return Boolean(
+    previewEnabled &&
+    settingsHydrated &&
+    lifecycleState === 'STREAMING' &&
+    activeStreamMode === 'h264' &&
+    !producerRunning &&
+    Number(sourceWidth) > 0 &&
+    Number(sourceHeight) > 0 &&
+    Number(sourceFps) > 0
+  );
+}
+
+export function selectPipelineRestartScope({
+  streamImpacting,
+  producerRunning,
+  hostRunning,
+  hostActivated
+}) {
+  if (!streamImpacting) return 'settings';
+  if (producerRunning && hostRunning && hostActivated) return 'webcam';
+  if (producerRunning) return 'producer';
+  return 'android';
+}

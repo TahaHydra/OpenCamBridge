@@ -193,10 +193,14 @@ class StreamService : LifecycleService() {
             startForeground(NOTIFICATION_ID, buildNotification(ip))
         }
 
-        controlServer.start()
+        val serverStarted = controlServer.start()
         val port = StreamState.port.get()
-        Log.d(TAG, "StreamService started. Server on port $port.")
-        AppLogger.i("System", "StreamService started on port $port")
+        if (serverStarted) {
+            Log.d(TAG, "StreamService started. Server on port $port.")
+            AppLogger.i("System", "StreamService started on port $port")
+        } else {
+            Log.d(TAG, "StreamService start intent received; server on port $port is already active.")
+        }
 
         // Auto-start stream
         pipelineController.enqueue(PipelineCommand.Start())

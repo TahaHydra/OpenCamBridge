@@ -8,6 +8,8 @@ import {
   buildProducerLaunchSpec,
   buildSettingsMutation,
   describeMutationRejection,
+  selectPipelineRestartScope,
+  shouldStartH264PreviewProducer,
   shouldImportAuthoritativeState
 } from '../services/pipelineSyncPolicy.js';
 
@@ -125,6 +127,8 @@ interface ControlPanelProps {
   previewOff: boolean;
   setPreviewOff: (val: boolean) => void;
 }
+
+type ProducerPurpose = 'preview' | 'feed' | 'webcam';
 
 function normalizeAndroidMetrics(raw: any): any {
   if (!raw || !('capture' in raw)) return raw;
@@ -244,6 +248,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   const settingsRef = useRef(settings);
   const authoritativeRevisionRef = useRef<number | null>(null);
   const settingsHydratedRef = useRef(false);
+  const producerPurposeRef = useRef<ProducerPurpose | null>(null);
+  const previewProducerStartInFlightRef = useRef(false);
+  const previewProducerRetryAfterRef = useRef(0);
+  const previewAutoStartSuppressedRef = useRef(false);
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -593,7 +601,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   const startStream = () => pipelineCommand('/api/stream/start');
   const stopStream = () => pipelineCommand('/api/stream/stop');
 
-  const handleStartProducer = async (s: any, actual?: any) => {
+  const handleStartProducer = async (
+    s: any,
+    actual?: any,
+    purpose: ProducerPurpose = 'feed'
+  ) => {
     const { source, targetUrl, sourceWidth, sourceHeight, sourceFps, outputWidth, outputHeight } =
       buildProducerLaunchSpec(s, actual, baseUrl);
     // jpegQuality is applied on the Android side; the producer no longer takes it.
@@ -614,14 +626,67 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       profile: s.profile,
       token: token || undefined
     });
+    producerPurposeRef.current = purpose;
     console.log('[Tauri UI] start_virtual_camera_feeder completed');
   };
+
+  // The H.264 preview reads decoded NV12 frames from the producer's shared
+  // ring. Keep that decoder/feed independent from the Media Foundation camera
+  // host: opening the desktop app starts preview decoding, but it does not
+  // activate the webcam for OBS until the user presses Start Webcam.
+  useEffect(() => {
+    if (androidMetrics?.lifecycleState !== 'STREAMING') {
+      // An explicit Stop suppresses the preview producer while the local
+      // metrics sample is still stale. Once Android reports the stopped state,
+      // a later genuine stream start may auto-start H.264 preview again.
+      previewAutoStartSuppressedRef.current = false;
+    }
+    const sourceFps = Number(
+      androidMetrics?.selectedFps || androidMetrics?.encodedFps || settings.fps || 0
+    );
+    const shouldStart = shouldStartH264PreviewProducer({
+      previewEnabled: !previewOff,
+      settingsHydrated: settingsHydratedRef.current,
+      lifecycleState: androidMetrics?.lifecycleState,
+      activeStreamMode: androidMetrics?.activeStreamMode || settings.streamMode,
+      producerRunning: !!vcamState?.process_running,
+      sourceWidth: androidMetrics?.encodedWidth,
+      sourceHeight: androidMetrics?.encodedHeight,
+      sourceFps
+    });
+    if (!shouldStart || previewAutoStartSuppressedRef.current || isSyncingRef.current || previewProducerStartInFlightRef.current) return;
+    if (Date.now() < previewProducerRetryAfterRef.current) return;
+
+    previewProducerStartInFlightRef.current = true;
+    addDiag('h264Preview', 'Starting the desktop H.264 preview decoder');
+    void handleStartProducer(settingsRef.current, androidMetrics, 'preview')
+      .then(async () => {
+        previewProducerRetryAfterRef.current = 0;
+        setVcamMessage('');
+        const state = await invoke<VirtualCamState>('get_virtual_camera_status');
+        vcamStateRef.current = state;
+        setVcamState(state);
+        addDiag('h264Preview', 'Desktop H.264 preview decoder is ready');
+        window.dispatchEvent(new CustomEvent('reload-preview'));
+      })
+      .catch((error: any) => {
+        previewProducerRetryAfterRef.current = Date.now() + 5000;
+        const message = `H.264 preview decoder failed: ${String(error)}`;
+        setVcamMessage(message);
+        addDiag('h264Preview', message);
+      })
+      .finally(() => {
+        previewProducerStartInFlightRef.current = false;
+      });
+  }, [androidMetrics, previewOff, settings.fps, settings.streamMode, vcamState?.process_running, addDiag]);
 
   const handleStartNativeCamera = async () => {
     const s = settingsRef.current;
 
     setVcamMessage('Starting pipeline...');
     try {
+      previewAutoStartSuppressedRef.current = false;
+      await waitForPreviewProducerIdle();
       if (!vcamState?.host_running || !vcamState?.host_activated) {
         await invoke('start_virtual_camera_host');
       }
@@ -635,19 +700,23 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       setVcamMessage(`Error: ${e.toString()}`);
       // A producer that is alive but failed readiness must not leave the Start
       // button disabled. Keep the visible error and return to a retryable state.
-      try { await invoke('stop_virtual_camera_feeder'); } catch {}
+      try { await invoke('stop_virtual_camera_feeder'); producerPurposeRef.current = null; } catch {}
       try { setVcamState(await invoke<VirtualCamState>('get_virtual_camera_status')); } catch {}
     }
   };
 
   const handleStopNativeCamera = async () => {
     try {
+      previewAutoStartSuppressedRef.current = true;
+      await waitForPreviewProducerIdle();
       await invoke('stop_virtual_camera_feeder');
+      producerPurposeRef.current = null;
       await invoke('stop_virtual_camera_host');
       await stopStream();
       setVcamMessage('Stopped native pipeline.');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
     } catch (e: any) {
+      previewAutoStartSuppressedRef.current = false;
       setVcamMessage(`Error: ${e.toString()}`);
     }
   };
@@ -657,8 +726,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
     setVcamMessage('Starting feed...');
     try {
+      previewAutoStartSuppressedRef.current = false;
+      await waitForPreviewProducerIdle();
       const actual = await restartAndroidStreamWithSettings(s, []);
-      await handleStartProducer(s, actual);
+      await handleStartProducer(s, actual, 'feed');
 
       setVcamMessage('');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
@@ -674,16 +745,30 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
   const handleStopFeedOnly = async () => {
     try {
+      previewAutoStartSuppressedRef.current = true;
+      await waitForPreviewProducerIdle();
       await invoke('stop_virtual_camera_feeder');
+      producerPurposeRef.current = null;
       await stopStream();
       setVcamMessage('Stopped feed.');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
     } catch (e: any) {
+      previewAutoStartSuppressedRef.current = false;
       setVcamMessage(`Error: ${e.toString()}`);
     }
   };
 
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+  const waitForPreviewProducerIdle = async () => {
+    const deadline = Date.now() + 22_000;
+    while (previewProducerStartInFlightRef.current && Date.now() < deadline) {
+      await sleep(50);
+    }
+    if (previewProducerStartInFlightRef.current) {
+      throw new Error('Timed out waiting for H.264 preview decoder startup');
+    }
+  };
 
   const postSettingsToAndroid = async (s: any, keysChanged: string[]) => {
     if (keysChanged.length === 0) return null;
@@ -733,6 +818,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     isSyncingRef.current = true;
 
     try {
+      await waitForPreviewProducerIdle();
       // h264Bitrate and jpegQuality are intentionally absent: Android applies
       // both to the live pipeline without a rebind (bitrate via
       // MediaCodec.setParameters; JPEG quality is read per-frame). Restarting
@@ -740,24 +826,49 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       // repeated producer restarts.
       const streamImpacting = ['profile', 'width', 'height', 'fps', 'cameraId', 'streamMode', 'h264KeyframeInterval', 'displayRotation', 'mirror'].some(k => keysChanged.includes(k));
 
-      // Android streaming and the producer/virtual-camera are SEPARATE things.
-      // The producer must never be started just because Android has frames.
-      const producerRunning = !!(vcamState?.process_running ?? vcamState?.running);
+      // Android capture, the decoded producer feed, and the virtual-camera
+      // host are separate lifecycle layers. H.264 preview needs the producer,
+      // but only an activated host publishes that feed as a Windows camera.
+      const liveVcamState = vcamStateRef.current ?? vcamState;
+      const producerRunning = !!(liveVcamState?.process_running ?? liveVcamState?.running);
       const androidStreaming =
         androidStreamStatus === 'running' &&
         (Number(androidMetrics?.encodedWidth || 0) > 0 ||
           Number(androidMetrics?.fps || 0) > 0 ||
           Number(androidMetrics?.latestFrameRevision || 0) > 0);
 
-      if (streamImpacting && producerRunning) {
-        // Producer is feeding OBS: a resolution/fps/lens/codec change needs both
-        // the Android stream AND the producer restarted.
+      const restartScope = selectPipelineRestartScope({
+        streamImpacting,
+        producerRunning,
+        hostRunning: !!liveVcamState?.host_running,
+        hostActivated: !!liveVcamState?.host_activated
+      });
+
+      if (restartScope === 'webcam') {
+        // The complete webcam is active: preserve both its decoded feed and
+        // its activated Media Foundation host across the settings change.
         addDiag('apply', `[${keysChanged.join(',')}] -> full pipeline restart (Android + producer)`);
         await restartFullPipelineWithSettings(nextSettings, keysChanged);
-      } else if (streamImpacting && androidStreaming) {
-        // Only the phone stream/preview is live (producer OFF). Rebind Android
-        // alone — do NOT start the producer. Preview reconnects itself when
-        // frames resume (metrics-based recovery in Preview).
+      } else if (restartScope === 'producer') {
+        const previewOnly = producerPurposeRef.current === 'preview';
+        if (previewOnly && nextSettings.streamMode !== 'h264') {
+          // MJPEG renders directly in the WebView, so a producer that existed
+          // only for H.264 preview is no longer needed after this mode switch.
+          addDiag('apply', `[${keysChanged.join(',')}] -> Android rebind; release H.264 preview decoder`);
+          await invoke('stop_virtual_camera_feeder');
+          producerPurposeRef.current = null;
+          await restartAndroidStreamWithSettings(nextSettings, keysChanged);
+        } else {
+          addDiag('apply', `[${keysChanged.join(',')}] -> Android + decoded feed restart (webcam host off)`);
+          await restartProducerPipelineWithSettings(
+            nextSettings,
+            keysChanged,
+            producerPurposeRef.current || 'feed'
+          );
+        }
+      } else if (restartScope === 'android' && androidStreaming) {
+        // MJPEG preview does not need the decoded producer feed. H.264 will
+        // start its preview-only producer as soon as the rebind is complete.
         addDiag('apply', `[${keysChanged.join(',')}] -> Android rebind only (producer off)`);
         await restartAndroidStreamWithSettings(nextSettings, keysChanged);
       } else {
@@ -920,20 +1031,60 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     return metrics;
   };
 
+  const restartProducerPipelineWithSettings = async (
+    s: any,
+    keysChanged: string[],
+    purpose: ProducerPurpose
+  ) => {
+    // A preview/feed producer owns the same decoded NV12 ring as the complete
+    // webcam pipeline, but no virtual-camera host is active. Restart only the
+    // Android source and producer, and verify ring readiness without requiring
+    // COM registration or host activation.
+    try {
+      await invoke('stop_virtual_camera_feeder');
+      producerPurposeRef.current = null;
+      addDiag('pipeline', 'decoded feed stopped for reconfiguration');
+    } catch (error: any) {
+      addDiag('pipeline', `decoded feed stop failed: ${error}`);
+    }
+
+    const actual = await restartAndroidStreamWithSettings(s, keysChanged);
+    await handleStartProducer(s, actual, purpose);
+    const state = await invoke<VirtualCamState>('get_virtual_camera_status');
+    setVcamState(state);
+    const committed = Number(state.metrics?.ring_frames_committed || 0);
+    addDiag(
+      'pipeline',
+      `decodedFeedRunning=${!!state.process_running} state=${state.producer_state} committed=${committed}`
+    );
+    if (!state.process_running) throw new Error('Decoded frame producer exited during startup');
+    if (state.producer_state !== 'WRITING_RING') {
+      throw new Error(`Decoded frame producer is ${state.producer_state || 'not writing the ring'}`);
+    }
+    if (committed < 3) throw new Error(`Decoded frame producer committed only ${committed}/3 readiness frames`);
+
+    fetchStatus();
+    if (!previewOff) window.dispatchEvent(new CustomEvent('reload-preview'));
+  };
+
   const restartFullPipelineWithSettings = async (s: any, keysChanged: string[]) => {
     // This path is only taken when the producer was actually running (see
     // applySettingsAndRefreshPreview using vcamState.running), so it MUST end
     // with the producer running again. Verify it and surface a real error if not
     // — a settings change must never silently leave OBS with prod=off.
     addDiag('pipeline', 'full restart: producerWasRunning=true');
-    try { await invoke('stop_virtual_camera_feeder'); addDiag('pipeline', 'stopProducer ok'); }
+    try {
+      await invoke('stop_virtual_camera_feeder');
+      producerPurposeRef.current = null;
+      addDiag('pipeline', 'stopProducer ok');
+    }
     catch (e: any) { addDiag('pipeline', `stopProducer fail: ${e}`); }
 
     let actual: any = null;
     try { actual = await restartAndroidStreamWithSettings(s, keysChanged); addDiag('pipeline', `androidRebind ok (${actual?.activeStreamMode || s.streamMode})`); }
     catch (e: any) { addDiag('pipeline', `androidRebind fail: ${e}`); throw e; }
 
-    await handleStartProducer(s, actual);
+    await handleStartProducer(s, actual, 'webcam');
     const readinessDeadline = Date.now() + 12_000;
     let state = await invoke<VirtualCamState>('get_virtual_camera_status');
     while (Date.now() < readinessDeadline) {
@@ -1101,7 +1252,9 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                 ? "OBS is consuming frames from 'OpenCamBridge Camera'."
                 : vcamState?.pipeline_ready
                   ? "Frames are ready; waiting for a virtual-camera consumer such as OBS."
-                  : vcamState?.process_running
+                  : vcamState?.process_running && !vcamState?.host_running
+                    ? "Desktop preview decoder is running; not sending to OBS."
+                    : vcamState?.process_running
                     ? `Producer is ${vcamState.producer_state || 'starting'}; pipeline is not ready yet.`
                     : 'Phone preview only — not sending to OBS. Press Start Webcam.'}
             </p>

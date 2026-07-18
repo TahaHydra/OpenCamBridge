@@ -82,7 +82,18 @@ class ControlServer(
     @Volatile
     private var boundAuthentication = BoundAuthenticationSnapshot("usbOnly", null)
 
-    fun start() {
+    @Synchronized
+    fun start(): Boolean {
+        // Android may deliver another start intent to an already-running
+        // foreground service (for example when the Activity is reopened or a
+        // sticky service is restored). The existing Ktor engine already owns
+        // the configured port, so starting a second engine would crash the app
+        // with BindException: Address already in use.
+        if (engine != null) {
+            AppLogger.i("System", "Control server is already running; reusing the existing listener")
+            return false
+        }
+
         val port = StreamState.port.get()
         val accessMode = StreamState.accessMode.get()
         boundAuthentication = BoundAuthenticationSnapshot(accessMode, StreamState.accessToken.get())
@@ -171,8 +182,10 @@ class ControlServer(
                 get("/obs")                        { serveObs(call) }
             }
         }.start(wait = false)
+        return true
     }
 
+    @Synchronized
     fun stop() {
         engine?.stop(gracePeriodMillis = 500, timeoutMillis = 1000)
         engine = null

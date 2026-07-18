@@ -4,6 +4,8 @@ import {
   buildProducerLaunchSpec,
   buildSettingsMutation,
   describeMutationRejection,
+  selectPipelineRestartScope,
+  shouldStartH264PreviewProducer,
   shouldImportAuthoritativeState
 } from './pipelineSyncPolicy.js';
 
@@ -68,4 +70,33 @@ test('cross-client mutation identities and base revisions remain distinct', () =
   assert.deepEqual(web, { fps: 30, baseRevision: 12, requestId: 'web-request', clientType: 'web' });
   assert.deepEqual(tauri, { width: 1920, baseRevision: 13, requestId: 'tauri-request', clientType: 'tauri' });
   assert.notEqual(web.requestId, tauri.requestId);
+});
+
+test('H.264 preview starts a producer only for a ready live source', () => {
+  const ready = {
+    previewEnabled: true,
+    settingsHydrated: true,
+    lifecycleState: 'STREAMING',
+    activeStreamMode: 'h264',
+    producerRunning: false,
+    sourceWidth: 1920,
+    sourceHeight: 1080,
+    sourceFps: 30
+  };
+  assert.equal(shouldStartH264PreviewProducer(ready), true);
+  assert.equal(shouldStartH264PreviewProducer({ ...ready, activeStreamMode: 'mjpeg' }), false);
+  assert.equal(shouldStartH264PreviewProducer({ ...ready, producerRunning: true }), false);
+  assert.equal(shouldStartH264PreviewProducer({ ...ready, lifecycleState: 'STOPPED' }), false);
+  assert.equal(shouldStartH264PreviewProducer({ ...ready, sourceFps: 0 }), false);
+});
+
+test('settings restart preserves producer without requiring the webcam host', () => {
+  assert.equal(selectPipelineRestartScope({ streamImpacting: false }), 'settings');
+  assert.equal(selectPipelineRestartScope({ streamImpacting: true, producerRunning: false }), 'android');
+  assert.equal(selectPipelineRestartScope({
+    streamImpacting: true, producerRunning: true, hostRunning: false, hostActivated: false
+  }), 'producer');
+  assert.equal(selectPipelineRestartScope({
+    streamImpacting: true, producerRunning: true, hostRunning: true, hostActivated: true
+  }), 'webcam');
 });
