@@ -45,6 +45,16 @@ test('producer launch uses selected source tuple and independent output canvas',
   assert.equal(spec.targetUrl, 'http://127.0.0.1:8080/stream.mjpeg');
 });
 
+test('producer paces to the negotiated fps, not the transient cold-start encodedFps', () => {
+  const spec = buildProducerLaunchSpec(
+    { streamMode: 'mjpeg', width: 1920, height: 1080, outputWidth: 1920, outputHeight: 1080, fps: 30 },
+    // encodedFps is the phone's low, still-ramping measurement right after a rebind.
+    { activeStreamMode: 'mjpeg', encodedWidth: 1080, encodedHeight: 1920, selectedFps: 30, encodedFps: 9 },
+    'http://127.0.0.1:8080/'
+  );
+  assert.equal(spec.sourceFps, 30);
+});
+
 test('missing selected/actual tuple blocks producer start', () => {
   assert.throws(
     () => buildProducerLaunchSpec({ streamMode: 'h264', width: 1920, height: 1080 }, null, 'http://phone'),

@@ -31,7 +31,12 @@ export function buildProducerLaunchSpec(settings, selectedActual, baseUrl) {
   const source = (selectedActual?.activeStreamMode || settings?.streamMode) === 'h264' ? 'h264' : 'mjpeg';
   const sourceWidth = Number(selectedActual?.encodedWidth || selectedActual?.selectedEffectiveWidth || 0);
   const sourceHeight = Number(selectedActual?.encodedHeight || selectedActual?.selectedEffectiveHeight || 0);
-  const sourceFps = Number(selectedActual?.encodedFps || selectedActual?.selectedFps || 0);
+  // Pace to the NEGOTIATED source rate (stable from stream start), not the
+  // phone's transient measured `encodedFps`. `encodedFps` is low during the
+  // cold-start ramp right after a rebind; because the producer fixes its pacing
+  // interval once at launch, seeding it from that stale value permanently
+  // throttled MJPEG output to ~2-15 fps even after the phone ramped to ~26.
+  const sourceFps = Number(selectedActual?.selectedFps || selectedActual?.encodedFps || settings?.fps || 0);
   if (sourceWidth <= 0 || sourceHeight <= 0 || sourceFps <= 0) {
     throw new Error('Android did not publish a valid selected/actual source tuple; refusing to launch the producer from desired defaults');
   }
