@@ -171,7 +171,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     height: 1080,
     outputWidth: 1920,
     outputHeight: 1080,
-    fps: 60,
+    // Default to 30 fps: on many phones (e.g. OnePlus 9) 60 fps at 1080p/720p is
+    // only reachable via a constrained high-speed session that crops the sensor
+    // FOV (looks like a "lens switch") and AE-limits to ~15 fps in low light.
+    // 30 fps uses the full-FOV regular session; 60 remains an explicit preset.
+    fps: 30,
     jpegQuality: 85,
     displayRotation: '0',
     aspectRatio: '16:9',

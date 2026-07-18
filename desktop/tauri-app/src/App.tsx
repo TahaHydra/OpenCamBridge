@@ -256,7 +256,9 @@ export default function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [connectionInfo, setConnectionInfo] = useState<ConnectionInfo | null>(null);
   const [serverStatus, setServerStatus] = useState<any>(null);
-  const [fitMode, setFitMode] = useState('fill');
+  // Default to aspect-fit (letterbox) so the preview never crops or stretches
+  // the camera image; the user can switch to 'fill' (crop-to-fill) explicitly.
+  const [fitMode, setFitMode] = useState('fit');
   const [obsMode, setObsMode] = useState(false);
   const [previewOff, setPreviewOff] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
