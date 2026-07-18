@@ -15,6 +15,7 @@ import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
 import android.os.Bundle
@@ -292,20 +293,48 @@ class H264Streamer(
     }
 
     private fun configureCodec(chosen: H264EncoderSelection) {
-        val bitrate = boundedBitrate(activeConfig?.h264Bitrate ?: StreamState.h264Bitrate.get(), chosen)
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, chosen.mode.width, chosen.mode.height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, chosen.mode.fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, activeConfig?.h264KeyframeInterval ?: 1)
-            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
-            setInteger(MediaFormat.KEY_PRIORITY, 0)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-        }
-        val c = MediaCodec.createByCodecName(chosen.codecName)
+        // Raise the requested rate to a resolution/fps-appropriate target: the
+        // stored default is a flat 4 Mbps that starves 1080p (and especially
+        // 1080p60), which read as heavy blockiness. An explicitly higher user
+        // request is still honored; boundedBitrate keeps it under the cap.
+        val requested = activeConfig?.h264Bitrate ?: StreamState.h264Bitrate.get()
+        val bitrate = boundedBitrate(max(requested, recommendedBitrate(chosen.mode)), chosen)
+        val highProfileLevel = highProfileLevelFor(chosen.codecName)
+
+        fun buildFormat(withHighProfile: Boolean): MediaFormat =
+            MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, chosen.mode.width, chosen.mode.height).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, chosen.mode.fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, activeConfig?.h264KeyframeInterval ?: 1)
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                if (withHighProfile) {
+                    // Constant bitrate keeps quality/latency stable for a live
+                    // virtual camera; High profile improves quality-per-bit.
+                    setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+                    if (highProfileLevel != null) {
+                        setInteger(MediaFormat.KEY_PROFILE, highProfileLevel.first)
+                        setInteger(MediaFormat.KEY_LEVEL, highProfileLevel.second)
+                    }
+                }
+            }
+
+        var c = MediaCodec.createByCodecName(chosen.codecName)
         c.setCallback(codecCallback, codecHandler)
-        c.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        try {
+            c.configure(buildFormat(true), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        } catch (_: Exception) {
+            // Some encoders reject explicit High profile/level or CBR. Fall back
+            // to the minimal (still higher-bitrate) format so streaming never
+            // breaks; quality degrades gracefully instead of failing.
+            try { c.release() } catch (_: Exception) {}
+            c = MediaCodec.createByCodecName(chosen.codecName)
+            c.setCallback(codecCallback, codecHandler)
+            c.configure(buildFormat(false), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        }
         encoderSurface = c.createInputSurface()
         // Publish the generation before start(), because asynchronous format
         // and error callbacks are allowed as soon as the codec starts.
@@ -321,6 +350,31 @@ class H264Streamer(
         encodedWindowFrames = 0
         encodedWindowBytes = 0L
         encodedWindowStartNs = SystemClock.elapsedRealtimeNanos()
+    }
+
+    /** Quality-appropriate bitrate floor scaled by resolution and frame rate. */
+    private fun recommendedBitrate(mode: H264ModeDto): Int {
+        val pixels = mode.width.toLong() * mode.height.toLong()
+        return when {
+            pixels >= 1920L * 1080L -> if (mode.fps >= 50) 16_000_000 else 10_000_000
+            pixels >= 1280L * 720L -> if (mode.fps >= 50) 9_000_000 else 6_000_000
+            else -> 3_000_000
+        }
+    }
+
+    /** Highest AVC High-profile level the named encoder advertises, or null. */
+    private fun highProfileLevelFor(codecName: String): Pair<Int, Int>? {
+        return try {
+            val info = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+                .firstOrNull { it.isEncoder && it.name == codecName } ?: return null
+            val caps = info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            val best = caps.profileLevels
+                .filter { it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh }
+                .maxByOrNull { it.level } ?: return null
+            MediaCodecInfo.CodecProfileLevel.AVCProfileHigh to best.level
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private val codecCallback = object : MediaCodec.Callback() {
@@ -807,6 +861,24 @@ class H264Streamer(
             activePipelineGeneration, config.cameraId, "h264", chosen.captureEngine.name, m.width, m.height,
             m.fps, chosen.codecName, chosen.hardware
         )
+        streamInfo = buildStreamInfo(chosen, config, rejectedPaths)
+        lastRejectedPaths = rejectedPaths
+    }
+
+    private var lastRejectedPaths: List<String> = emptyList()
+
+    /**
+     * Build the OCB2 stream-info record (codec + geometry + rotation metadata)
+     * and publish the derived rotation into StreamState. Rotation is metadata
+     * only for H.264 (the Windows producer applies it), so this can be rebuilt
+     * mid-stream to update orientation without touching the codec or session.
+     */
+    private fun buildStreamInfo(
+        chosen: H264EncoderSelection,
+        config: StreamConfig,
+        rejectedPaths: List<String>
+    ): ByteArray {
+        val m = chosen.mode
         val chars = manager.getCameraCharacteristics(config.cameraId)
         val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
         val deviceRotation = FrameTransformPolicy.surfaceRotationDegrees(StreamState.deviceSurfaceRotation.get())
@@ -837,7 +909,29 @@ class H264Streamer(
             put("rejectedCapturePaths", rejectedPaths.joinToString(" | "))
             put("pixelFormat", "NV12")
         }.toString().toByteArray(Charsets.UTF_8)
-        streamInfo = Ocb2.record(Ocb2.TYPE_STREAM_INFO, Ocb2.FLAG_DISCONTINUITY, currentSequence(), SystemClock.elapsedRealtimeNanos(), 0, payload)
+        return Ocb2.record(Ocb2.TYPE_STREAM_INFO, Ocb2.FLAG_DISCONTINUITY, currentSequence(), SystemClock.elapsedRealtimeNanos(), 0, payload)
+    }
+
+    /**
+     * Re-emit rotation metadata to connected OCB2 clients after a device
+     * orientation change, WITHOUT restarting the camera/encoder. Previously every
+     * hand-held tilt across a rotation boundary triggered a full pipeline restart
+     * (Recover), which sent end-of-stream and froze the video while the producer
+     * reconnected. The producer applies rotation from stream-info, so pushing a
+     * fresh stream-info + keyframe keeps the stream live.
+     */
+    fun onDeviceOrientationChanged() {
+        if (!running.get()) return
+        val chosen = selection ?: return
+        val config = activeConfig ?: return
+        val record = try {
+            buildStreamInfo(chosen, config, lastRejectedPaths)
+        } catch (e: Exception) {
+            Log.w(TAG, "Rotation update failed", e); return
+        }
+        streamInfo = record
+        broadcast(record)
+        requestKeyFrame()
     }
 
     private fun boundedBitrate(requested: Int, chosen: H264EncoderSelection): Int {

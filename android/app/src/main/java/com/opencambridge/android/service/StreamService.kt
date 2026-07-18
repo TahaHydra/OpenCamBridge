@@ -132,7 +132,13 @@ class StreamService : LifecycleService() {
                     AppLogger.i("Rotation", "Device orientation changed -> targetRotation=$surfaceRotation")
                     if (StreamState.activeStreamMode.get() == "h264" &&
                         StreamState.lifecycleState.get() == LifecycleState.STREAMING
-                    ) pipelineController.enqueue(PipelineCommand.Recover())
+                    ) {
+                        // H.264 carries rotation as OCB2 metadata that the Windows
+                        // producer applies, so update it in place. A full pipeline
+                        // restart (Recover) on every hand-held tilt was the main
+                        // cause of the stream freezing/restarting on its own.
+                        h264Streamer.onDeviceOrientationChanged()
+                    }
                 }
             }
         }
