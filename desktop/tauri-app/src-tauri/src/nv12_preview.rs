@@ -15,6 +15,14 @@ use windows::Win32::System::Memory::{
 
 use crate::sync_state::RecoverMutex;
 
+// Desktop in-app preview only (never applied to the ring the virtual camera
+// reads). A raw NV12 frame at source resolution is large (e.g. ~3.1MB at
+// 1920x1080/1080x1920), and sending one over Tauri IPC every ~33ms is ~90MB/s
+// of JS<->Rust transfer -- a real bottleneck that made the preview's own frame
+// rate lag well behind the actual (fine) producer/ring rate. Downscaling here
+// cuts that transfer ~4x with a cheap nearest-neighbor sample.
+const PREVIEW_MAX_DIMENSION: usize = 960;
+
 const OCBR_MAGIC: u32 = 0x5242_434f;
 const RING_VERSION: u16 = 3;
 const FORMAT_NV12: u32 = 2;
@@ -86,6 +94,87 @@ struct SlotHeader {
 }
 
 include!("ring_abi_generated.rs");
+
+/// Scale down to at most `PREVIEW_MAX_DIMENSION` on the long edge, preserving
+/// aspect ratio, with both output dimensions kept even (required for 4:2:0).
+/// Returns the input unchanged if it is already within the cap.
+fn downscale_dimensions(width: usize, height: usize) -> (usize, usize) {
+    let max_dim = width.max(height);
+    if max_dim <= PREVIEW_MAX_DIMENSION {
+        return (width, height);
+    }
+    let scale = PREVIEW_MAX_DIMENSION as f64 / max_dim as f64;
+    let new_w = (((width as f64 * scale) as usize) & !1).max(2);
+    let new_h = (((height as f64 * scale) as usize) & !1).max(2);
+    (new_w, new_h)
+}
+
+/// Nearest-neighbor downsample of a tightly-packed NV12 frame (Y plane
+/// followed by interleaved UV) into `out`, which must be exactly
+/// `out_width*out_height + out_width*(out_height/2)` bytes. Output strides are
+/// equal to `out_width` (no padding) for both planes.
+unsafe fn downscale_nv12(
+    y_src: *const u8,
+    y_src_stride: usize,
+    uv_src: *const u8,
+    uv_src_stride: usize,
+    src_width: usize,
+    src_height: usize,
+    out_width: usize,
+    out_height: usize,
+    out: &mut [u8],
+) {
+    let y_out_len = out_width * out_height;
+    let (y_out, uv_out) = out.split_at_mut(y_out_len);
+    for oy in 0..out_height {
+        let sy = oy * src_height / out_height;
+        let src_row = y_src.add(sy * y_src_stride);
+        let dst_row = &mut y_out[oy * out_width..(oy + 1) * out_width];
+        for (ox, dst) in dst_row.iter_mut().enumerate() {
+            let sx = ox * src_width / out_width;
+            *dst = *src_row.add(sx);
+        }
+    }
+    let uv_out_height = out_height / 2;
+    let uv_out_pairs = out_width / 2;
+    let uv_src_height = src_height / 2;
+    let uv_src_pairs = src_width / 2;
+    for oy in 0..uv_out_height {
+        let sy = oy * uv_src_height / uv_out_height;
+        let src_row = uv_src.add(sy * uv_src_stride);
+        let dst_row = &mut uv_out[oy * out_width..(oy + 1) * out_width];
+        for ox_pair in 0..uv_out_pairs {
+            let sx_pair = ox_pair * uv_src_pairs / uv_out_pairs;
+            let src = src_row.add(sx_pair * 2);
+            dst_row[ox_pair * 2] = *src;
+            dst_row[ox_pair * 2 + 1] = *src.add(1);
+        }
+    }
+}
+
+/// Fill the 48-byte NVPR preview header (magic/version/geometry/timestamps),
+/// leaving the payload (already written at `PREVIEW_HEADER_SIZE`) untouched.
+fn write_preview_header(
+    response: &mut [u8],
+    metadata: &SlotHeader,
+    width: u32,
+    height: u32,
+    y_stride: u32,
+    uv_stride: u32,
+    payload_size: u32,
+) {
+    response[0..4].copy_from_slice(b"NVPR");
+    response[4..6].copy_from_slice(&1u16.to_le_bytes());
+    response[6..8].copy_from_slice(&(PREVIEW_HEADER_SIZE as u16).to_le_bytes());
+    response[8..16].copy_from_slice(&metadata.sequence.to_le_bytes());
+    response[16..24].copy_from_slice(&metadata.capture_timestamp_ns.to_le_bytes());
+    response[24..28].copy_from_slice(&width.to_le_bytes());
+    response[28..32].copy_from_slice(&height.to_le_bytes());
+    response[32..36].copy_from_slice(&y_stride.to_le_bytes());
+    response[36..40].copy_from_slice(&uv_stride.to_le_bytes());
+    response[40..44].copy_from_slice(&payload_size.to_le_bytes());
+    response[44..48].copy_from_slice(&metadata.flags.to_le_bytes());
+}
 
 struct Mapping {
     file: Option<HANDLE>,
@@ -260,23 +349,51 @@ impl Mapping {
             {
                 return Err("NV12 preview rejected invalid payload bounds".to_string());
             }
-            let mut response = vec![0u8; PREVIEW_HEADER_SIZE + expected];
-            response[0..4].copy_from_slice(b"NVPR");
-            response[4..6].copy_from_slice(&1u16.to_le_bytes());
-            response[6..8].copy_from_slice(&(PREVIEW_HEADER_SIZE as u16).to_le_bytes());
-            response[8..16].copy_from_slice(&metadata.sequence.to_le_bytes());
-            response[16..24].copy_from_slice(&metadata.capture_timestamp_ns.to_le_bytes());
-            response[24..28].copy_from_slice(&metadata.width.to_le_bytes());
-            response[28..32].copy_from_slice(&metadata.height.to_le_bytes());
-            response[32..36].copy_from_slice(&metadata.y_stride.to_le_bytes());
-            response[36..40].copy_from_slice(&metadata.uv_stride.to_le_bytes());
-            response[40..44].copy_from_slice(&metadata.payload_size.to_le_bytes());
-            response[44..48].copy_from_slice(&metadata.flags.to_le_bytes());
-            copy_nonoverlapping(
-                base.add(metadata.data_offset as usize),
-                response.as_mut_ptr().add(PREVIEW_HEADER_SIZE),
-                expected,
-            );
+            let (out_width, out_height) = downscale_dimensions(width, height);
+            let y_src = base.add(metadata.data_offset as usize);
+            let uv_src = y_src.add(y_stride * height);
+            let response = if out_width == width && out_height == height {
+                let mut response = vec![0u8; PREVIEW_HEADER_SIZE + expected];
+                copy_nonoverlapping(
+                    y_src,
+                    response.as_mut_ptr().add(PREVIEW_HEADER_SIZE),
+                    expected,
+                );
+                write_preview_header(
+                    &mut response,
+                    &metadata,
+                    width as u32,
+                    height as u32,
+                    y_stride as u32,
+                    uv_stride as u32,
+                    expected as u32,
+                );
+                response
+            } else {
+                let out_payload = out_width * out_height + out_width * (out_height / 2);
+                let mut response = vec![0u8; PREVIEW_HEADER_SIZE + out_payload];
+                downscale_nv12(
+                    y_src,
+                    y_stride,
+                    uv_src,
+                    uv_stride,
+                    width,
+                    height,
+                    out_width,
+                    out_height,
+                    &mut response[PREVIEW_HEADER_SIZE..],
+                );
+                write_preview_header(
+                    &mut response,
+                    &metadata,
+                    out_width as u32,
+                    out_height as u32,
+                    out_width as u32,
+                    out_width as u32,
+                    out_payload as u32,
+                );
+                response
+            };
             fence(Ordering::Acquire);
             let final_epoch = std::ptr::read_volatile(&(*slot_ptr).committed_epoch);
             if final_epoch != first_epoch {
@@ -390,5 +507,46 @@ mod tests {
         assert_eq!(std::mem::size_of::<SlotHeader>(), 128);
         assert_eq!(std::mem::offset_of!(RingHeader, consumer_attached), 80);
         assert_eq!(std::mem::offset_of!(RingHeader, producer_build_hash), 192);
+    }
+
+    #[test]
+    fn downscale_dimensions_preserves_aspect_and_caps_long_edge() {
+        assert_eq!(downscale_dimensions(1920, 1080), (960, 540));
+        assert_eq!(downscale_dimensions(1080, 1920), (540, 960));
+        assert_eq!(downscale_dimensions(1280, 720), (960, 540));
+        // Already within the cap: passed through unchanged.
+        assert_eq!(downscale_dimensions(640, 480), (640, 480));
+        assert_eq!(downscale_dimensions(960, 540), (960, 540));
+    }
+
+    #[test]
+    fn downscale_nv12_produces_tightly_packed_output_of_expected_size() {
+        // 4x4 source: solid Y=200, solid U=10,V=20. 2x2 downscale should
+        // preserve the flat colour exactly (nearest-neighbor on a uniform
+        // image can't introduce artifacts) and be tightly packed (stride ==
+        // out_width, no padding).
+        let src_w = 4usize;
+        let src_h = 4usize;
+        let y_src = vec![200u8; src_w * src_h];
+        let uv_src = vec![10u8, 20u8].repeat((src_w / 2) * (src_h / 2));
+        let out_w = 2usize;
+        let out_h = 2usize;
+        let mut out = vec![0u8; out_w * out_h + out_w * (out_h / 2)];
+        unsafe {
+            downscale_nv12(
+                y_src.as_ptr(),
+                src_w,
+                uv_src.as_ptr(),
+                src_w,
+                src_w,
+                src_h,
+                out_w,
+                out_h,
+                &mut out,
+            );
+        }
+        let y_len = out_w * out_h;
+        assert!(out[..y_len].iter().all(|&b| b == 200));
+        assert_eq!(&out[y_len..], &[10, 20]);
     }
 }
