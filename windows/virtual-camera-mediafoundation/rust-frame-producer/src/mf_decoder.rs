@@ -36,6 +36,13 @@ pub struct MfH264Decoder {
     transform: IMFTransform,
     width: u32,
     height: u32,
+    /// Coded (macroblock-aligned) surface size of the negotiated output type.
+    /// 1080p content decodes into a 1088-row surface; the UV plane starts at
+    /// `pitch * coded_height`, NOT `pitch * height`. Reading it 8 rows early
+    /// shifted all chroma and painted alignment garbage (green) into the last
+    /// rows — the visible green line along one edge of the H.264 image.
+    coded_width: u32,
+    coded_height: u32,
     fps: u32,
     input_sample: IMFSample,
     input_buffer: IMFMediaBuffer,
@@ -158,7 +165,7 @@ impl MfH264Decoder {
                 .SetInputType(0, &input_type, 0)
                 .map_err(err("decoder SetInputType"))?;
 
-            set_nv12_output_type(&transform, width, height, fps)?;
+            let (coded_width, coded_height) = set_nv12_output_type(&transform, width, height, fps)?;
             let output_info = transform
                 .GetOutputStreamInfo(0)
                 .map_err(err("decoder output stream info"))?;
@@ -194,6 +201,8 @@ impl MfH264Decoder {
                 transform,
                 width,
                 height,
+                coded_width,
+                coded_height,
                 fps: fps.max(1),
                 input_sample,
                 input_buffer,
@@ -317,7 +326,10 @@ impl MfH264Decoder {
                 } else if hr == MF_E_TRANSFORM_NEED_MORE_INPUT {
                     break;
                 } else if hr == MF_E_TRANSFORM_STREAM_CHANGE {
-                    set_nv12_output_type(&self.transform, self.width, self.height, self.fps)?;
+                    let (coded_width, coded_height) =
+                        set_nv12_output_type(&self.transform, self.width, self.height, self.fps)?;
+                    self.coded_width = coded_width;
+                    self.coded_height = coded_height;
                     continue;
                 } else {
                     return Err(format!(
@@ -355,8 +367,13 @@ impl MfH264Decoder {
                 let pitch = pitch as usize;
                 let width = self.width as usize;
                 let height = self.height as usize;
+                // The UV plane starts after the CODED (aligned) luma plane, not
+                // the display-cropped one: 1080p decodes into a 1088-row
+                // surface, so pitch*height lands 8 rows early — shifting chroma
+                // and leaking green alignment garbage into the bottom rows.
+                let coded_height = (self.coded_height as usize).max(height);
                 let required = pitch
-                    .checked_mul(height + height / 2)
+                    .checked_mul(coded_height + height / 2)
                     .ok_or("NV12 surface size overflow")?;
                 let scan_offset = scanline.offset_from(start);
                 if scan_offset < 0 || scan_offset as usize + required > length as usize {
@@ -369,7 +386,7 @@ impl MfH264Decoder {
                         width,
                     );
                 }
-                let src_uv = scanline.add(pitch * height);
+                let src_uv = scanline.add(pitch * coded_height);
                 let dst_uv = self.scratch.as_mut_ptr().add(width * height);
                 for row in 0..height / 2 {
                     std::ptr::copy_nonoverlapping(
@@ -390,8 +407,34 @@ impl MfH264Decoder {
             .Lock(&mut ptr, None, Some(&mut current))
             .map_err(err("NV12 buffer lock"))?;
         let exact = self.scratch.len();
-        let result = if current as usize >= exact {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let coded_width = (self.coded_width as usize).max(width);
+        let coded_height = (self.coded_height as usize).max(height);
+        let coded_size = coded_width * coded_height * 3 / 2;
+        let result = if current as usize == exact {
+            // Already display-cropped and tightly packed.
             std::ptr::copy_nonoverlapping(ptr, self.scratch.as_mut_ptr(), exact);
+            Ok(())
+        } else if current as usize >= coded_size {
+            // Contiguous copy of the CODED surface (e.g. 1920x1088 for 1080p):
+            // crop row-by-row and take the UV plane from the aligned offset.
+            for row in 0..height {
+                std::ptr::copy_nonoverlapping(
+                    ptr.add(row * coded_width),
+                    self.scratch.as_mut_ptr().add(row * width),
+                    width,
+                );
+            }
+            let src_uv = ptr.add(coded_width * coded_height);
+            let dst_uv = self.scratch.as_mut_ptr().add(width * height);
+            for row in 0..height / 2 {
+                std::ptr::copy_nonoverlapping(
+                    src_uv.add(row * coded_width),
+                    dst_uv.add(row * width),
+                    width,
+                );
+            }
             Ok(())
         } else {
             Err(format!("short NV12 output: {current} < {exact}"))
@@ -419,12 +462,15 @@ mod tests {
     }
 }
 
+/// Selects the decoder's native NV12 output type and returns its CODED frame
+/// size (macroblock-aligned, e.g. 1920x1088 for 1080p). The caller needs the
+/// coded height to locate the UV plane inside returned surfaces.
 unsafe fn set_nv12_output_type(
     transform: &IMFTransform,
-    _width: u32,
-    _height: u32,
+    width: u32,
+    height: u32,
     _fps: u32,
-) -> Result<(), String> {
+) -> Result<(u32, u32), String> {
     for index in 0..128u32 {
         let media_type = match transform.GetOutputAvailableType(0, index) {
             Ok(t) => t,
@@ -442,7 +488,11 @@ unsafe fn set_nv12_output_type(
         transform
             .SetOutputType(0, &media_type, 0)
             .map_err(err("decoder NV12 SetOutputType"))?;
-        return Ok(());
+        let coded = media_type
+            .GetUINT64(&MF_MT_FRAME_SIZE)
+            .map(|packed| ((packed >> 32) as u32, packed as u32))
+            .unwrap_or((width, height));
+        return Ok((coded.0.max(width), coded.1.max(height)));
     }
     Err("Media Foundation decoder exposes no NV12 output type".to_string())
 }

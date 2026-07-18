@@ -1590,8 +1590,8 @@ fn resize_authoritative_mjpeg_write(
     //    mismatch): aspect-fit with black bars (letterbox/pillarbox). This
     //    replaces the previous "same orientation -> stretch to fill", which
     //    squashed e.g. a 4:3 source into a 16:9 box.
-    let same_aspect = (oriented.width() as u64) * (out_h as u64)
-        == (out_w as u64) * (oriented.height() as u64);
+    let same_aspect =
+        (oriented.width() as u64) * (out_h as u64) == (out_w as u64) * (oriented.height() as u64);
     let (final_frame, resize_backend) = if oriented.width() == out_w && oriented.height() == out_h {
         (oriented.into_raw(), "skipped")
     } else if same_aspect {
