@@ -158,11 +158,13 @@ export default function Nv12RingPreview({ fitMode }: Props) {
         } catch (failure: any) {
           if (!stopped) setError(failure?.message || String(failure));
         }
-        // The virtual camera remains full-rate; desktop preview is deliberately
-        // capped at 30 Hz and always requests only the newest ring slot.
+        // The virtual camera remains full-rate; the preview polls at ~60 Hz and
+        // always requests only the newest ring slot. Polling at exactly the
+        // source rate (30 Hz vs 30 fps) beat against frame arrival and read as
+        // stutter; frames are downscaled Rust-side so the faster poll is cheap.
         if (!stopped) pollTimer = window.setTimeout(() => {
           animation = requestAnimationFrame(() => void drawNewest());
-        }, 33);
+        }, 16);
       };
       animation = requestAnimationFrame(() => void drawNewest());
       return () => {

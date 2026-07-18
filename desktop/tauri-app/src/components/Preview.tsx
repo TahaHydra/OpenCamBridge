@@ -146,7 +146,9 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
         </div>}
 
         {h264Primary ? (
-          <Nv12RingPreview fitMode={effectiveFit} />
+          // key: the Reload button bumps `timestamp`, remounting the NV12
+          // preview so a stale WebGL surface never survives a mode switch.
+          <Nv12RingPreview key={timestamp} fitMode={effectiveFit} />
         ) : showOverlay && (
           <div className="preview-overlay">
             {rebinding ? <RefreshCw size={48} opacity={0.6} className="animate-spin" /> : <CameraOff size={48} opacity={0.5} />}
@@ -159,7 +161,7 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
           </div>
         )}
 
-        {!h264Primary && !showOverlay && (
+        {(h264Primary || !showOverlay) && (
           <button
             className="btn btn-secondary"
             style={{ position: 'absolute', top: 16, right: 16, padding: '6px 12px', fontSize: '0.8rem', background: 'rgba(0,0,0,0.5)' }}
