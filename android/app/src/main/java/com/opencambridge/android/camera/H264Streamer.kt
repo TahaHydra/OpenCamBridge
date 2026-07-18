@@ -118,6 +118,13 @@ class H264Streamer(
                     desiredMode, requested, H264Capabilities.preferredModes
                 )
                 else -> CapturePathPolicy.adaptiveModes(desiredMode, H264Capabilities.preferredModes)
+            }.let { modes ->
+                // High-speed capture is disabled, so a requested 60 fps the regular
+                // session cannot provide must fall back to the regular rate for the
+                // same resolution rather than failing. Always offer a 30 fps
+                // same-size fallback (60-capable regular sessions still win first).
+                val fallback = H264ModeDto(desiredMode.width, desiredMode.height, 30)
+                if (modes.contains(fallback)) modes else modes + fallback
             }
             val candidates = H264Capabilities.selectCandidates(context, cameraId, candidateModes)
             if (candidates.isEmpty()) {

@@ -48,6 +48,15 @@ data class H264EncoderSelection(
  * a constrained high-speed SurfaceTexture rendered into the encoder surface.
  */
 object H264Capabilities {
+    // The constrained high-speed session (direct 60 fps surface, or the 120->60
+    // GPU bridge) is the only way to reach 60 fps on OEM-locked devices like the
+    // OnePlus 9, but it crops the sensor FOV (reads as a "lens switch"), AE-limits
+    // in low light, and forces a SESSION_HIGH_SPEED teardown. Disable it: use only
+    // the regular Camera2 session and honor whatever fps it natively provides (30
+    // or, on capable phones, 60). Requests the regular session cannot meet fall
+    // back to its available rate instead of engaging high-speed.
+    private const val HIGH_SPEED_ENABLED = false
+
     val preferredModes = listOf(
         H264ModeDto(1920, 1080, 60),
         H264ModeDto(1280, 720, 60),
@@ -182,16 +191,16 @@ object H264Capabilities {
             ),
             H264PathCapability(
                 H264CaptureEngine.HIGH_SPEED_SURFACE,
-                directReason.startsWith("declared"),
-                directReason,
+                HIGH_SPEED_ENABLED && directReason.startsWith("declared"),
+                if (HIGH_SPEED_ENABLED) directReason else "high-speed capture disabled; regular Camera2 session only",
                 directRange?.upper,
                 directRange?.lower,
                 directRange?.upper
             ),
             H264PathCapability(
                 H264CaptureEngine.HIGH_SPEED_GPU_BRIDGE,
-                bridgeReason.startsWith("declared"),
-                bridgeReason,
+                HIGH_SPEED_ENABLED && bridgeReason.startsWith("declared"),
+                if (HIGH_SPEED_ENABLED) bridgeReason else "high-speed capture disabled; regular Camera2 session only",
                 bridgeRange?.upper,
                 bridgeRange?.lower,
                 bridgeRange?.upper
