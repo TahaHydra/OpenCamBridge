@@ -1583,21 +1583,19 @@ fn resize_authoritative_mjpeg_write(
     //   a landscape box): fit while preserving aspect and pad with black.
     //   Stretching here is what produced the "vertically cropped"/squashed
     //   image; letterboxing rotates correctly without cropping.
-    let oriented_landscape = oriented.width() >= oriented.height();
-    let box_landscape = out_w >= out_h;
-    let (final_frame, resize_backend) = if oriented_landscape == box_landscape {
-        if oriented.width() != out_w || oriented.height() != out_h {
-            resize_rgba(&oriented, out_w, out_h, allow_simd)
-        } else {
-            // FAST PATH (the stable MJPEG/OBS case): the oriented frame already
-            // matches the output box exactly, so there is nothing to scale. This
-            // is reached when rotation was 0/360 (identity, so `oriented` is the
-            // untouched decoded frame) AND the decoded dimensions already equal
-            // out_w x out_h. In that situation we take a plain copy of the pixel
-            // buffer: NO resample, NO letterbox canvas allocation, NO black bars.
-            // Output is bit-for-bit the decoded (BGRA-swapped) frame.
-            (oriented.into_raw(), "skipped")
-        }
+    // Never distort the image. Only three cases produce a frame:
+    //  - exact match: bit-for-bit copy (fast path, the stable 16:9 MJPEG/OBS case)
+    //  - same aspect ratio: plain aspect-preserving scale, no bars
+    //  - different aspect ratio (either an orientation flip or a 16:9-vs-4:3
+    //    mismatch): aspect-fit with black bars (letterbox/pillarbox). This
+    //    replaces the previous "same orientation -> stretch to fill", which
+    //    squashed e.g. a 4:3 source into a 16:9 box.
+    let same_aspect = (oriented.width() as u64) * (out_h as u64)
+        == (out_w as u64) * (oriented.height() as u64);
+    let (final_frame, resize_backend) = if oriented.width() == out_w && oriented.height() == out_h {
+        (oriented.into_raw(), "skipped")
+    } else if same_aspect {
+        resize_rgba(&oriented, out_w, out_h, allow_simd)
     } else {
         letterbox_into(&oriented, out_w, out_h, allow_simd)
     };
