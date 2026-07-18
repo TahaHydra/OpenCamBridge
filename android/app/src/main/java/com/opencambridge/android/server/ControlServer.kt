@@ -220,7 +220,7 @@ class ControlServer(
                 function codec(bytes){for(let i=0;i+7<bytes.length;i++){let s=0;if(bytes[i]===0&&bytes[i+1]===0&&bytes[i+2]===1)s=i+3;else if(bytes[i]===0&&bytes[i+1]===0&&bytes[i+2]===0&&bytes[i+3]===1)s=i+4;if(s&&(bytes[s]&31)===7)return'avc1.'+[bytes[s+1],bytes[s+2],bytes[s+3]].map(v=>v.toString(16).padStart(2,'0')).join('').toUpperCase()}return'avc1.42E01E'}
                 function draw(frame){const r=Number(info.effectiveRotation||0),swap=r===90||r===270,w=frame.displayWidth||frame.codedWidth,h=frame.displayHeight||frame.codedHeight;canvas.width=swap?h:w;canvas.height=swap?w:h;const c=canvas.getContext('2d',{alpha:false,desynchronized:true});c.save();c.fillStyle='#000';c.fillRect(0,0,canvas.width,canvas.height);c.translate(canvas.width/2,canvas.height/2);c.rotate(r*Math.PI/180);c.scale(info.mirror?-1:1,1);c.drawImage(frame,-w/2,-h/2,w,h);c.restore();frame.close();errorBox.style.display='none'}
                 async function configure(){if(decoder||!configBytes.length)return;const c={codec:codec(configBytes),codedWidth:Number(info.width||1280),codedHeight:Number(info.height||720),optimizeForLatency:true,hardwareAcceleration:'prefer-hardware'};const support=await VideoDecoder.isConfigSupported(c);if(!support.supported)throw new Error('Browser cannot decode '+c.codec);decoder=new VideoDecoder({output:draw,error:e=>fail('H.264 decoder failed: '+e.message)});decoder.configure(c)}
-                async function run(){if(!('VideoDecoder'in window)||!('EncodedVideoChunk'in window)){fail('H.264 OBS preview unavailable: this browser lacks WebCodecs. Select MJPEG compatibility mode.');return}try{const u=new URL('/stream.ocb2',location.origin);if(tokenRequired&&token)u.searchParams.set('token',token);const response=await fetch(u);if(!response.ok||!response.body)throw new Error('OCB2 HTTP '+response.status);const reader=response.body.getReader(),parser=new Ocb2Browser.Parser();while(true){const n=await reader.read();if(n.done)throw new Error('stream ended');parser.push(n.value);for(let record;(record=parser.next())!==null;){const t=record.type,f=record.flags,ts=Number(record.encoderTimestampUs),p=record.payload;if(t===1){info=JSON.parse(new TextDecoder().decode(p));if(decoder){decoder.close();decoder=null}configBytes=new Uint8Array(0);lastTs=-1}else if(t===2&&(f&1)){configBytes=p;await configure()}else if(t===3){await configure();if(decoder){const key=!!(f&2);let d=p;if(key&&configBytes.length){d=new Uint8Array(configBytes.length+p.length);d.set(configBytes);d.set(p,configBytes.length)}const stamp=Math.max(lastTs+1,ts);lastTs=stamp;decoder.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:stamp,data:d}))}}else if(t===5||(f&8))throw new Error('stream ended');else if(t===6)throw new Error(new TextDecoder().decode(p));}}}catch(e){fail('H.264 OBS preview unavailable: '+(e.message||String(e)))}}
+                async function run(){if(!('VideoDecoder'in window)||!('EncodedVideoChunk'in window)){fail('H.264 OBS preview unavailable: this browser lacks WebCodecs. Select MJPEG compatibility mode.');return}try{const u=new URL('/stream.ocb2',location.origin);if(tokenRequired&&token)u.searchParams.set('token',token);const response=await fetch(u);if(!response.ok||!response.body)throw new Error('OCB2 HTTP '+response.status);const reader=response.body.getReader(),parser=new Ocb2Browser.Parser();while(true){const n=await reader.read();if(n.done)throw new Error('stream ended');parser.push(n.value);for(let record;(record=parser.next())!==null;){const t=record.type,f=record.flags,ts=Number(record.encoderTimestampUs),p=record.payload;if(t===1){const next=JSON.parse(new TextDecoder().decode(p)),changed=!info.width||info.width!==next.width||info.height!==next.height||info.fpsNumerator!==next.fpsNumerator||info.fpsDenominator!==next.fpsDenominator;info=next;if(changed){if(decoder){decoder.close();decoder=null}configBytes=new Uint8Array(0);lastTs=-1}}else if(t===2&&(f&1)){configBytes=p;await configure()}else if(t===3){await configure();if(decoder){const key=!!(f&2);let d=p;if(key&&configBytes.length){d=new Uint8Array(configBytes.length+p.length);d.set(configBytes);d.set(p,configBytes.length)}const stamp=Math.max(lastTs+1,ts);lastTs=stamp;decoder.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:stamp,data:d}))}}else if(t===5||(f&8))throw new Error('stream ended');else if(t===6)throw new Error(new TextDecoder().decode(p));}}}catch(e){fail('H.264 OBS preview unavailable: '+(e.message||String(e)))}}
                 run();</script></body></html>
                 """.trimIndent()
             }
@@ -801,6 +801,7 @@ class ControlServer(
                         if (start && (bytes[start] & 31) === 7 && start + 3 < bytes.length) {
                             return 'avc1.' + [bytes[start+1], bytes[start+2], bytes[start+3]]
                                 .map(v => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+                        }
                     }
                     return 'avc1.42E01E';
                 }
@@ -873,9 +874,20 @@ class ControlServer(
                                 const encoderTimestamp = Number(record.encoderTimestampUs);
                                 const payload = record.payload;
                                 if (type === 1) {
-                                    h264Info = JSON.parse(new TextDecoder().decode(payload));
-                                    if (h264Decoder) { h264Decoder.close(); h264Decoder = null; }
-                                    h264Config = new Uint8Array(0); h264LastTimestamp = -1;
+                                    const nextInfo = JSON.parse(new TextDecoder().decode(payload));
+                                    const decodeFormatChanged = !h264Info.width
+                                        || h264Info.width !== nextInfo.width
+                                        || h264Info.height !== nextInfo.height
+                                        || h264Info.fpsNumerator !== nextInfo.fpsNumerator
+                                        || h264Info.fpsDenominator !== nextInfo.fpsDenominator;
+                                    h264Info = nextInfo;
+                                    // Rotation/mirror updates are canvas transforms. Preserve
+                                    // WebCodecs and timestamp continuity unless the coded format
+                                    // itself changed.
+                                    if (decodeFormatChanged) {
+                                        if (h264Decoder) { h264Decoder.close(); h264Decoder = null; }
+                                        h264Config = new Uint8Array(0); h264LastTimestamp = -1;
+                                    }
                                 } else if (type === 2 && (flags & 1)) {
                                     h264Config = payload;
                                     await configureH264Decoder();
