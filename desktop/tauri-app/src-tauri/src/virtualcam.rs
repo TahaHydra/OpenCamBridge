@@ -226,7 +226,18 @@ fn repository_root() -> PathBuf {
 }
 
 fn virtual_camera_installer_path() -> PathBuf {
-    repository_root().join(
+    let root = repository_root();
+    // Prefer the canonical solution output during development. The copied
+    // installer-folder executable can be locked by an elevated/orphaned host,
+    // which previously made a successful rebuild impossible to exercise until
+    // reboot. Packaged/source-only layouts still use the retained fallback.
+    let built = root.join(
+        "windows/virtual-camera-mediafoundation/x64/Release/VirtualCamera_Installer.exe",
+    );
+    if built.exists() {
+        return built;
+    }
+    root.join(
         "windows/virtual-camera-mediafoundation/VirtualCamera_Installer/x64/Release/VirtualCamera_Installer.exe",
     )
 }

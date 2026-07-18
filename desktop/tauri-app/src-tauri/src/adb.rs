@@ -77,6 +77,16 @@ fn resolve_serial(adb: &str, selected: Option<&str>) -> Result<String, String> {
     }
 }
 
+fn has_exact_forward(list: &str, serial: &str, local: &str, remote: &str) -> bool {
+    list.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some(serial)
+            && fields.next() == Some(local)
+            && fields.next() == Some(remote)
+            && fields.next().is_none()
+    })
+}
+
 #[tauri::command]
 pub fn get_adb_status() -> Result<String, String> {
     let adb = get_adb_path();
@@ -103,8 +113,26 @@ pub fn list_devices() -> Result<Vec<AdbDevice>, String> {
 pub fn forward_port(port: u16, serial: Option<String>) -> Result<String, String> {
     let adb = get_adb_path();
     let port_str = format!("tcp:{}", port);
-    let mut cmd = Command::new(&adb);
     let serial = resolve_serial(&adb, serial.as_deref())?;
+
+    // The USB watchdog calls this periodically so it can restore a forward
+    // after a cable cycle. Re-issuing `adb forward` for an already healthy
+    // mapping can rebind the listener and disturb the long-lived H.264 HTTP
+    // connection, so first make this operation an idempotent ensure.
+    let list_output = Command::new(&adb)
+        .args(["forward", "--list"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("Failed to list ADB forwards: {e}"))?;
+    if !list_output.status.success() {
+        return Err(String::from_utf8_lossy(&list_output.stderr).to_string());
+    }
+    let forwards = String::from_utf8_lossy(&list_output.stdout);
+    if has_exact_forward(&forwards, &serial, &port_str, &port_str) {
+        return Ok("ADB forward already active".to_string());
+    }
+
+    let mut cmd = Command::new(&adb);
     cmd.args(["-s", &serial]);
     let output = cmd
         .args(["forward", &port_str, &port_str])
@@ -116,6 +144,42 @@ pub fn forward_port(port: u16, serial: Option<String>) -> Result<String, String>
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_exact_forward;
+
+    #[test]
+    fn recognizes_only_the_exact_device_and_port_mapping() {
+        let forwards = "phone-a tcp:8080 tcp:8080\nphone-b tcp:9090 tcp:9090\n";
+
+        assert!(has_exact_forward(
+            forwards, "phone-a", "tcp:8080", "tcp:8080"
+        ));
+        assert!(!has_exact_forward(
+            forwards, "phone-b", "tcp:8080", "tcp:8080"
+        ));
+        assert!(!has_exact_forward(
+            forwards, "phone-a", "tcp:8080", "tcp:9090"
+        ));
+    }
+
+    #[test]
+    fn accepts_adb_whitespace_but_rejects_extra_fields() {
+        assert!(has_exact_forward(
+            "phone-a   tcp:8080\ttcp:8080\r\n",
+            "phone-a",
+            "tcp:8080",
+            "tcp:8080"
+        ));
+        assert!(!has_exact_forward(
+            "phone-a tcp:8080 tcp:8080 unexpected",
+            "phone-a",
+            "tcp:8080",
+            "tcp:8080"
+        ));
     }
 }
 

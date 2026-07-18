@@ -220,9 +220,23 @@ int wmain(int argc, wchar_t* argv[])
     }
     else if (arguments.command == OcbInstallerCommand::Host)
     {
+        // --register creates the production camera with System/AllUsers
+        // lifetime so it survives reboots. Trying to create a second camera
+        // with Session/CurrentUser but the same friendly name and media-source
+        // CLSID is not a reopen: Windows treats it as a conflicting identity
+        // and Start returns MF_E_INVALIDREQUEST (0xc00d36b2). Reuse the
+        // persistent camera when it is already enumerable. The session camera
+        // remains a useful non-elevated fallback for development when only the
+        // COM backend has been registered.
+        bool found = false;
+        std::wstring symbolicLink;
         wil::com_ptr_nothrow<IMFVirtualCamera> camera;
-        const HRESULT result = OcbCreateAndStartCamera(
-            MFVirtualCameraLifetime_Session, MFVirtualCameraAccess_CurrentUser, camera);
+        HRESULT result = OcbFindProductionCamera(found, symbolicLink);
+        if (SUCCEEDED(result) && !found)
+        {
+            result = OcbCreateAndStartCamera(
+                MFVirtualCameraLifetime_Session, MFVirtualCameraAccess_CurrentUser, camera);
+        }
         if (FAILED(result)) exitCode = ReportFailure(L"host activation", result);
         else
         {

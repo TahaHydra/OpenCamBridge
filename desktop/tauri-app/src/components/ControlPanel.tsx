@@ -376,7 +376,9 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       linearZoom: status.linearZoom ?? current.linearZoom,
       targetBandwidthMbps: status.targetBandwidthMbps ?? current.targetBandwidthMbps,
       h264Bitrate: status.h264Bitrate ?? current.h264Bitrate,
-      h264KeyframeInterval: status.h264KeyframeInterval ?? current.h264KeyframeInterval
+      // v2 fixes this at one second. Normalize legacy phone state here so an
+      // old persisted value cannot poison unrelated desktop controls.
+      h264KeyframeInterval: 1
     };
     settingsRef.current = next;
     setSettings(next);
@@ -486,7 +488,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       if (ratio < 0.7) {
         if (fpsLowSinceRef.current === 0) fpsLowSinceRef.current = Date.now();
         if (Date.now() - fpsLowSinceRef.current > 5000) {
-          addDiag('fpsDrift', `FPS running low: ${out}/${m.fps_target} (camera AE/encode limited, not the PC)`);
+          const androidFps = androidMetricsRef.current?.actualFps ?? 0;
+          const cause = androidFps >= m.fps_target * 0.8
+            ? 'desktop decode/processing limited'
+            : 'phone capture/encode limited';
+          addDiag('fpsDrift', `FPS running low: ${out}/${m.fps_target} (${cause})`);
         }
       } else {
         fpsLowSinceRef.current = 0;
@@ -525,10 +531,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         `androidFps=${am?.actualFps ?? '?'}`,
         // Android per-stage profiling (ms): YUV->NV21, rotate, JPEG encode, total.
         am ? `android[yuv=${(am.yuvMsAvg ?? 0).toFixed?.(1) ?? am.yuvMsAvg} rot=${(am.rotateMsAvg ?? 0).toFixed?.(1) ?? am.rotateMsAvg} jpeg=${(am.jpegMsAvg ?? 0).toFixed?.(1) ?? am.jpegMsAvg} enc=${(am.androidEncodeMsAvg ?? 0).toFixed?.(1) ?? am.androidEncodeMsAvg}]` : '',
-        // recv = JPEGs the producer pulled off the wire; written = distinct
-        // frames it published to the ring. recv >> written means the producer
-        // is the bottleneck (starved/too slow), not the phone or the transport.
-        m ? `recv=${m.http_jpeg_fps} decoded=${m.decoded_fps} written=${m.written_fps} paceFps=${m.fps_target}` : 'prod=off (producer not started — OBS is not receiving frames)',
+        // transport = complete JPEGs or H.264 access units received; written =
+        // distinct decoded frames published to the ring. A large gap identifies
+        // the desktop decode/processing stage rather than the phone transport.
+        m ? `transport=${m.transport_fps ?? m.http_jpeg_fps} decoded=${m.decoded_fps} written=${m.written_fps} paceFps=${m.fps_target}` : 'prod=off (producer not started — OBS is not receiving frames)',
         // Producer per-stage profiling (ms) + which optimized paths ran.
         m ? `prod[decode=${m.decode_ms_avg}(${m.decode_backend ?? '?'}) rot=${m.rotate_ms_avg} resize=${m.resize_ms_avg}(${m.resize_backend ?? '?'}) write=${m.write_ms_avg}]` : '',
         m ? `mbps=${m.estimated_mbps} lat=${m.total_pipeline_ms}ms drop=${m.dropped_jpegs} q=${m.jpeg_queue_len}` : '',
@@ -784,6 +790,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     for (const key of directKeys) {
       if (keysChanged.includes(key)) patch[key] = s[key];
     }
+    // Always repair legacy Android builds that persisted 2s before the webcam
+    // recovery contract was fixed at one second. Without this, even an MJPEG
+    // resolution edit can be rejected because the phone merges the stale value.
+    patch.h264KeyframeInterval = 1;
     if (keysChanged.includes('width') || keysChanged.includes('height')) {
       patch.outputWidth = s.outputWidth;
       patch.outputHeight = s.outputHeight;
@@ -1318,7 +1328,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
               </span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-              <span style={{ color: '#888' }}>Unique FPS (camera / encode / decode / camera)</span>
+              <span style={{ color: '#888' }}>Unique FPS (capture / encode / decode / virtual camera)</span>
               <span style={{ color: (vcamState.metrics && (vcamState.metrics.virtual_camera_unique_fps ?? vcamState.metrics.written_fps) >= settings.fps - 5) ? '#51cf66' : '#ffb300' }}>
                 {androidMetrics?.captureFps ?? androidMetrics?.actualFps ?? '—'} / {androidMetrics?.encodedFps ?? '—'} / {vcamState.metrics?.decoded_unique_fps ?? vcamState.metrics?.decoded_fps ?? '—'} / {vcamState.metrics?.virtual_camera_unique_fps ?? vcamState.metrics?.written_fps ?? '—'}
               </span>

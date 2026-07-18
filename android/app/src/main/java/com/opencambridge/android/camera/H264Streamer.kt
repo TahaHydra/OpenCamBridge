@@ -52,6 +52,16 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
+ * Keep enough complete access units to ride through short USB scheduling or
+ * connector stalls without dropping inter-frame references. The two extra
+ * slots are reserved for stream-info and codec-config records sent when a
+ * client subscribes. Sustained slow clients are still disconnected rather
+ * than allowed to build unbounded latency.
+ */
+internal fun h264ClientQueueCapacity(fps: Int): Int =
+    ((fps.coerceAtLeast(1) + 1) / 2 + 2).coerceIn(10, 32)
+
+/**
  * Zero-copy H.264 capture path: Camera2 writes directly into a hardware
  * MediaCodec input Surface. Kotlin never sees or converts a YUV camera frame.
  */
@@ -262,7 +272,10 @@ class H264Streamer(
     fun subscribe(): Channel<ByteArray> {
         // Access units are indivisible. If a client cannot keep up, disconnect
         // it and reconnect at a fresh config+IDR instead of dropping references.
-        val channel = Channel<ByteArray>(capacity = 3)
+        // A half-second bounded cushion prevents normal USB jitter from being
+        // mistaken for a slow client while keeping glass-to-glass latency low.
+        val fps = selection?.mode?.fps ?: activeConfig?.fps ?: 30
+        val channel = Channel<ByteArray>(capacity = h264ClientQueueCapacity(fps))
         clients.add(channel)
         StreamState.h264ClientCount.set(clients.size)
         streamInfo?.let(channel::trySend)

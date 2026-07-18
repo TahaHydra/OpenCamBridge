@@ -815,6 +815,24 @@ fn validate_nv12_metadata(
     }
 }
 
+/// H.264 decoder continuity only depends on the encoded picture geometry and
+/// cadence. Rotation and mirroring are post-decode NV12 transforms, so a phone
+/// orientation update must not flush a healthy decoder or pause until the next
+/// IDR frame.
+fn h264_decode_format_changed(
+    previous: Option<&ocb2::StreamInfo>,
+    next: &ocb2::StreamInfo,
+) -> bool {
+    previous
+        .map(|old| {
+            old.width != next.width
+                || old.height != next.height
+                || old.fps_numerator != next.fps_numerator
+                || old.fps_denominator != next.fps_denominator
+        })
+        .unwrap_or(true)
+}
+
 fn monotonic_ns() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     START
@@ -869,6 +887,43 @@ mod ring_tests {
     use super::*;
     use std::io::Write;
     use std::net::{TcpListener, TcpStream};
+
+    fn test_stream_info(rotation: u32) -> ocb2::StreamInfo {
+        ocb2::StreamInfo {
+            codec: "H264".into(),
+            framing: "annex-b-access-units".into(),
+            width: 1920,
+            height: 1080,
+            fps_numerator: 60,
+            fps_denominator: 1,
+            bitrate: 16_000_000,
+            camera_id: "0".into(),
+            encoder_name: "test".into(),
+            hardware_encoder: true,
+            pixel_format: "NV12".into(),
+            effective_rotation: rotation,
+            mirror: false,
+            sensor_orientation: 90,
+            device_rotation: rotation,
+        }
+    }
+
+    #[test]
+    fn h264_transform_metadata_preserves_decoder_continuity() {
+        let old = test_stream_info(0);
+        let rotated = test_stream_info(90);
+        assert!(!h264_decode_format_changed(Some(&old), &rotated));
+    }
+
+    #[test]
+    fn h264_geometry_change_requires_decoder_restart() {
+        let old = test_stream_info(0);
+        let mut resized = test_stream_info(0);
+        resized.width = 1280;
+        resized.height = 720;
+        assert!(h264_decode_format_changed(Some(&old), &resized));
+        assert!(h264_decode_format_changed(None, &resized));
+    }
 
     #[test]
     fn h264_1080p60_fallback_selects_canonical_mjpeg_1080p30() {
@@ -2222,6 +2277,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
     let mut decode_ms_sum = 0u64;
     let mut latency_ms_sum = 0u64;
     let mut latency_samples = 0u64;
+    let mut first_ring_frame_emitted = false;
     let mut low_software_windows = 0u32;
     let mut capture_clock_offset: Option<i128> = None;
     let mut last_error: Option<String> = None;
@@ -2318,32 +2374,32 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                             )
                                             .is_some() =>
                                     {
-                                        let changed = stream_info
-                                            .as_ref()
-                                            .map(|old| {
-                                                old.width != info.width
-                                                    || old.height != info.height
-                                                    || old.fps_numerator != info.fps_numerator
-                                                    || old.fps_denominator != info.fps_denominator
-                                            })
-                                            .unwrap_or(true);
+                                        let decode_format_changed =
+                                            h264_decode_format_changed(stream_info.as_ref(), &info);
                                         ipc.set_source_fps(
                                             info.fps_numerator,
                                             info.fps_denominator,
                                         );
                                         stream_info = Some(info);
-                                        consumer_readiness.reset();
-                                        if changed {
+                                        if decode_format_changed {
+                                            consumer_readiness.reset();
                                             decoder = None;
                                             codec_config.clear();
+                                            waiting_for_keyframe = true;
+                                            emit_event(
+                                                "info",
+                                                "PRODUCER_STATE",
+                                                "Stream information accepted",
+                                                Some("WAITING_FOR_CODEC_CONFIG"),
+                                            );
+                                        } else {
+                                            emit_event(
+                                                "info",
+                                                "STREAM_METADATA_UPDATED",
+                                                "Transform metadata updated without interrupting H.264 decode",
+                                                None,
+                                            );
                                         }
-                                        waiting_for_keyframe = true;
-                                        emit_event(
-                                            "info",
-                                            "PRODUCER_STATE",
-                                            "Stream information accepted",
-                                            Some("WAITING_FOR_CODEC_CONFIG"),
-                                        );
                                     }
                                     Ok(_) => {
                                         last_error =
@@ -2462,13 +2518,14 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                                 record.flags,
                                                 pixels,
                                             ) {
-                                                if decoded_unique == 0 {
+                                                if !first_ring_frame_emitted {
                                                     emit_event(
                                                         "info",
                                                         "FIRST_RING_FRAME",
                                                         "First decoded keyframe committed to NV12 ring",
                                                         Some("WRITING_RING"),
                                                     );
+                                                    first_ring_frame_emitted = true;
                                                 }
                                                 last_published_sequence = sequence;
                                                 ring_frames_committed += 1;
@@ -2522,6 +2579,15 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                                     record.flags,
                                                     pixels,
                                                 ) {
+                                                    if !first_ring_frame_emitted {
+                                                        emit_event(
+                                                            "info",
+                                                            "FIRST_RING_FRAME",
+                                                            "First decoded keyframe committed to NV12 ring",
+                                                            Some("WRITING_RING"),
+                                                        );
+                                                        first_ring_frame_emitted = true;
+                                                    }
                                                     last_published_sequence = record.sequence;
                                                     ring_frames_committed += 1;
                                                     decoded_unique += 1;

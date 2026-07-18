@@ -21,6 +21,7 @@ import com.opencambridge.android.camera.CameraRepository
 import com.opencambridge.android.server.ControlServer
 import com.opencambridge.android.server.UpdateSettingsRequest
 import com.opencambridge.android.state.AppLogger
+import com.opencambridge.android.state.H264SettingsPolicy
 import com.opencambridge.android.state.LifecycleState
 import com.opencambridge.android.state.SettingsManager
 import com.opencambridge.android.state.StreamState
@@ -582,7 +583,9 @@ class StreamService : LifecycleService() {
             accessToken = req.accessToken ?: previous.accessToken,
             streamMode = req.streamMode ?: previous.streamMode,
             h264Bitrate = req.h264Bitrate ?: previous.h264Bitrate,
-            h264KeyframeInterval = req.h264KeyframeInterval ?: previous.h264KeyframeInterval,
+            h264KeyframeInterval = H264SettingsPolicy.normalizeKeyframeInterval(
+                req.h264KeyframeInterval ?: previous.h264KeyframeInterval
+            ),
             cameraId = req.cameraId ?: previous.cameraId,
             width = req.width ?: previous.width,
             height = req.height ?: previous.height,
@@ -612,9 +615,6 @@ class StreamService : LifecycleService() {
         }
         if (next.port !in 1024..65535) {
             return rememberRequest(req.requestId, pipelineResult("Port ${next.port} is outside 1024..65535", PipelineResultCode.UNPROCESSABLE))
-        }
-        if (next.h264KeyframeInterval != 1) {
-            return rememberRequest(req.requestId, pipelineResult("Webcam H.264 keyframe interval must be one second", PipelineResultCode.UNPROCESSABLE))
         }
         val captureChanged = previous.cameraId != next.cameraId || previous.streamMode != next.streamMode ||
             previous.width != next.width || previous.height != next.height || previous.fps != next.fps ||

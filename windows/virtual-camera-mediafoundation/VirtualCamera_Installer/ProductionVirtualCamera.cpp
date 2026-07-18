@@ -35,7 +35,17 @@ HRESULT OcbCreateAndStartCamera(
 {
     RETURN_IF_FAILED(CreateCamera(lifetime, access, camera));
     RETURN_HR_IF_NULL(E_POINTER, camera.get());
-    RETURN_IF_FAILED(camera->SetUINT32(OCB_VCAM_KIND, OCB_VCAM_KIND_SYNTHETIC));
+    const HRESULT configurationResult =
+        camera->SetUINT32(OCB_VCAM_KIND, OCB_VCAM_KIND_SYNTHETIC);
+    // A same-parameter MFCreateVirtualCamera call reopens an existing camera.
+    // Its attributes are immutable once that camera has started, but Start is
+    // explicitly valid again (for example to register another callback). An
+    // elevated orphaned host can therefore make SetUINT32 report
+    // MF_E_INVALIDREQUEST even though the camera is healthy and reusable.
+    if (FAILED(configurationResult) && configurationResult != MF_E_INVALIDREQUEST)
+    {
+        return configurationResult;
+    }
     return camera->Start(nullptr);
 }
 
@@ -81,7 +91,14 @@ HRESULT OcbFindProductionCamera(bool& found, std::wstring& symbolicLink)
         {
             continue;
         }
-        if (_wcsicmp(friendlyName.get(), OCB_CAMERA_FRIENDLY_NAME) != 0) continue;
+        // Media Foundation appends a localized/OS-version-specific virtual
+        // camera suffix to the supplied friendly name. Match our unique base
+        // name as a prefix instead of requiring one English expansion.
+        const size_t baseNameLength = wcslen(OCB_CAMERA_FRIENDLY_NAME);
+        if (_wcsnicmp(friendlyName.get(), OCB_CAMERA_FRIENDLY_NAME, baseNameLength) != 0)
+        {
+            continue;
+        }
 
         wil::unique_cotaskmem_string link;
         UINT32 linkLength = 0;

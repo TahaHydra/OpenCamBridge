@@ -23,7 +23,15 @@ class SettingsManager(context: Context) {
 
         StreamState.streamMode.set(prefs.getString("streamMode", "h264") ?: "h264")
         StreamState.h264Bitrate.set(prefs.getInt("h264Bitrate", 4000000))
-        StreamState.h264KeyframeInterval.set(prefs.getInt("h264KeyframeInterval", 1))
+        val savedKeyframeInterval = prefs.getInt(
+            "h264KeyframeInterval",
+            H264SettingsPolicy.KEYFRAME_INTERVAL_SECONDS
+        )
+        val keyframeInterval = H264SettingsPolicy.normalizeKeyframeInterval(savedKeyframeInterval)
+        StreamState.h264KeyframeInterval.set(keyframeInterval)
+        if (savedKeyframeInterval != keyframeInterval) {
+            prefs.edit().putInt("h264KeyframeInterval", keyframeInterval).apply()
+        }
 
         StreamState.cameraId.set(prefs.getString("cameraId", "0") ?: "0")
         StreamState.width.set(prefs.getInt("width", 1920))
