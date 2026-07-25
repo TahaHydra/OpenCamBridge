@@ -21,7 +21,7 @@ data class StreamConfig(
     val accessToken: String = "",
     val streamMode: String = "h264",
     val h264Bitrate: Int = 4_000_000,
-    val h264KeyframeInterval: Int = 1,
+    val h264KeyframeInterval: Int = H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS,
     val cameraId: String = "0",
     val width: Int = 1920,
     val height: Int = 1080,
@@ -155,7 +155,7 @@ object StreamState {
 
     val streamMode = AtomicReference("h264") // h264 preferred; mjpeg compatibility
     val h264Bitrate = AtomicInteger(4000000)
-    val h264KeyframeInterval = AtomicInteger(1)
+    val h264KeyframeInterval = AtomicInteger(H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS)
     val activeStreamMode = AtomicReference("mjpeg")
     val fallbackReason = AtomicReference("")
     val h264Failed = AtomicBoolean(false)
@@ -217,6 +217,11 @@ object StreamState {
     val hasTorch = AtomicBoolean(false)
     val rotationDegrees = AtomicInteger(0)
     val sensorOrientation = AtomicInteger(0)
+    /** Sensor/device correction without the manual offset; decides the shape of
+     *  the picture the camera surface presents to the local preview. */
+    val autoRotation = AtomicInteger(0)
+    /** Rotation that makes the camera buffer upright on THIS phone's screen. */
+    val previewRotation = AtomicInteger(0)
     val frameWidth = AtomicInteger(0)
     val frameHeight = AtomicInteger(0)
     val encodedWidth = AtomicInteger(0)

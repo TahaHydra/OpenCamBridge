@@ -1,4 +1,19 @@
 <resources>
-    <!-- Base application theme. Material3 with no action bar. -->
-    <style name="Theme.OpenCamBridge" parent="android:Theme.Material.Light.NoActionBar" />
+    <!--
+      The app is dark-only by design: it is a viewfinder, and a bright panel beside
+      a camera preview is both unpleasant and bad for judging exposure. The parent
+      used to be android:Theme.Material.Light.NoActionBar, which left the system
+      status bar painted light grey above an otherwise black interface.
+
+      System bars are transparent with their icons forced light, so the Compose
+      content decides what appears behind them. windowBackground matches the app's
+      void colour so launch shows no white flash.
+    -->
+    <style name="Theme.OpenCamBridge" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowBackground">@color/ocb_void</item>
+    </style>
 </resources>

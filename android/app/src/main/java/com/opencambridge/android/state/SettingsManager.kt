@@ -7,6 +7,11 @@ import android.content.SharedPreferences
  * Persists application settings to SharedPreferences and applies them to StreamState.
  */
 class SettingsManager(context: Context) {
+    private companion object {
+        /** Set once the legacy one-second keyframe clamp has been migrated. */
+        const val KEYFRAME_MIGRATION_KEY = "h264KeyframeIntervalMigratedV2"
+    }
+
     private val prefs: SharedPreferences = context.getSharedPreferences("OpenCamBridgeSettings", Context.MODE_PRIVATE)
 
     fun load() {
@@ -25,12 +30,25 @@ class SettingsManager(context: Context) {
         StreamState.h264Bitrate.set(prefs.getInt("h264Bitrate", 4000000))
         val savedKeyframeInterval = prefs.getInt(
             "h264KeyframeInterval",
-            H264SettingsPolicy.KEYFRAME_INTERVAL_SECONDS
+            H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS
         )
-        val keyframeInterval = H264SettingsPolicy.normalizeKeyframeInterval(savedKeyframeInterval)
+        // Builds before the interval became a real setting coerced it to exactly
+        // one second, so a stored 1 is an artefact of that clamp rather than a
+        // choice, and leaving it would mean nobody benefits from the longer GOP
+        // without discovering a slider they never had. Rewrite it once, keyed off
+        // a migration marker, so a deliberate 1 chosen afterwards still sticks.
+        val alreadyMigrated = prefs.getBoolean(KEYFRAME_MIGRATION_KEY, false)
+        val keyframeInterval = if (!alreadyMigrated && savedKeyframeInterval <= 1) {
+            H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS
+        } else {
+            H264SettingsPolicy.normalizeKeyframeInterval(savedKeyframeInterval)
+        }
         StreamState.h264KeyframeInterval.set(keyframeInterval)
-        if (savedKeyframeInterval != keyframeInterval) {
-            prefs.edit().putInt("h264KeyframeInterval", keyframeInterval).apply()
+        if (savedKeyframeInterval != keyframeInterval || !alreadyMigrated) {
+            prefs.edit()
+                .putInt("h264KeyframeInterval", keyframeInterval)
+                .putBoolean(KEYFRAME_MIGRATION_KEY, true)
+                .apply()
         }
 
         StreamState.cameraId.set(prefs.getString("cameraId", "0") ?: "0")

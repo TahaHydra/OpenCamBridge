@@ -155,7 +155,12 @@ impl MfH264Decoder {
             input_type
                 .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
                 .map_err(err("input interlace"))?;
-            input_type.SetUINT32(&MF_NALU_LENGTH_SET, 0).ok(); // Annex B
+            // Annex-B input is established by supplying MF_MT_MPEG_SEQUENCE_HEADER
+            // below and letting the MFT detect the framing; MF_NALU_LENGTH_SET is
+            // an ENCODER attribute and the decoder ignores it. Kept (best-effort,
+            // hence `.ok()`) only as an explicit statement of intent — do not
+            // "fix" Annex-B handling here, it is not what makes it work.
+            input_type.SetUINT32(&MF_NALU_LENGTH_SET, 0).ok();
             if !codec_config.is_empty() {
                 input_type
                     .SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, codec_config)
@@ -492,7 +497,20 @@ unsafe fn set_nv12_output_type(
             .GetUINT64(&MF_MT_FRAME_SIZE)
             .map(|packed| ((packed >> 32) as u32, packed as u32))
             .unwrap_or((width, height));
-        return Ok((coded.0.max(width), coded.1.max(height)));
+        // The coded surface is the display size rounded UP to macroblocks, so it
+        // can never legitimately be smaller. Clamping with .max() here used to
+        // hide a genuine mismatch — the phone claiming 1080p in stream-info while
+        // the elementary stream is 720p — and it surfaced later as an opaque
+        // "NV12 surface metadata exceeds locked buffer" from copy_nv12_sample.
+        // Report the disagreement where it is detectable instead.
+        if coded.0 < width || coded.1 < height {
+            return Err(format!(
+                "decoder negotiated a {}x{} NV12 surface, smaller than the requested {}x{}: \
+                 the stream-info geometry does not match the encoded stream",
+                coded.0, coded.1, width, height
+            ));
+        }
+        return Ok(coded);
     }
     Err("Media Foundation decoder exposes no NV12 output type".to_string())
 }

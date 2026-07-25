@@ -63,6 +63,12 @@ Record types:
 Flags are `codec configuration = 1`, `keyframe = 2`, `discontinuity = 4`, and
 `end of stream = 8`.
 
+The discontinuity flag is a property of the stream, not of one record type, and
+is meaningful on any record. A heartbeat may carry it as a bare marker: Android
+sends one after discarding a slow client's queued records, so the client resets
+in place instead of the connection being closed. A video access unit always
+carries one complete access unit and is never used as an empty marker.
+
 The stream-information JSON contains `codec`, `framing`, `width`, `height`,
 `fpsNumerator`, `fpsDenominator`, `bitrate`, `cameraId`, `encoderName`,
 `hardwareEncoder`, and `pixelFormat`. V2 currently requires H.264,

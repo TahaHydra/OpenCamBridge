@@ -42,6 +42,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
@@ -227,6 +228,7 @@ class H264Streamer(
         if (oldCodecThread != null && oldCodecThread !== Thread.currentThread()) oldCodecThread.join(1_500)
         clients.forEach { it.close() }
         clients.clear()
+        clientOverflowBudget.clear()
         StreamState.h264ClientCount.set(0)
     }
 
@@ -289,6 +291,7 @@ class H264Streamer(
 
     fun unsubscribe(channel: Channel<ByteArray>) {
         clients.remove(channel)
+        clientOverflowBudget.remove(channel)
         StreamState.h264ClientCount.set(clients.size)
         channel.close()
     }
@@ -320,50 +323,82 @@ class H264Streamer(
         val requested = activeConfig?.h264Bitrate ?: StreamState.h264Bitrate.get()
         val bitrate = boundedBitrate(max(requested, recommendedBitrate(chosen.mode)), chosen)
         val highProfileLevel = highProfileLevelFor(chosen.codecName)
+        val keyframeInterval = keyframeIntervalSeconds()
 
-        fun buildFormat(withHighProfile: Boolean): MediaFormat =
+        // Profile/level and bitrate mode are INDEPENDENT capabilities, so they
+        // are negotiated as separate rungs. Bundling them meant that an encoder
+        // rejecting explicit High profile also silently lost CBR and reverted to
+        // the implementation default (usually VBR), which for a live virtual
+        // camera shows up as a bitrate that wanders.
+        fun buildFormat(withHighProfile: Boolean, withCbr: Boolean): MediaFormat =
             MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, chosen.mode.width, chosen.mode.height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, chosen.mode.fps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, activeConfig?.h264KeyframeInterval ?: 1)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, keyframeInterval)
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
                 setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
                 setInteger(MediaFormat.KEY_PRIORITY, 0)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-                if (withHighProfile) {
-                    // Constant bitrate keeps quality/latency stable for a live
-                    // virtual camera; High profile improves quality-per-bit.
+                // Tell the encoder it is running in realtime so it does not clock
+                // itself down to a power-saving rate under thermal pressure.
+                setInteger(MediaFormat.KEY_OPERATING_RATE, chosen.mode.fps)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                    // Independent of KEY_LOW_LATENCY: several encoders honor this
+                    // to cap how many frames they hold before emitting output.
+                    setInteger(MediaFormat.KEY_LATENCY, 1)
+                }
+                if (withCbr) {
                     setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-                    if (highProfileLevel != null) {
-                        setInteger(MediaFormat.KEY_PROFILE, highProfileLevel.first)
-                        setInteger(MediaFormat.KEY_LEVEL, highProfileLevel.second)
-                    }
+                }
+                if (withHighProfile && highProfileLevel != null) {
+                    // High profile improves quality-per-bit at the same rate.
+                    setInteger(MediaFormat.KEY_PROFILE, highProfileLevel.first)
+                    setInteger(MediaFormat.KEY_LEVEL, highProfileLevel.second)
                 }
             }
 
-        var c = MediaCodec.createByCodecName(chosen.codecName)
-        c.setCallback(codecCallback, codecHandler)
-        try {
-            c.configure(buildFormat(true), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        } catch (_: Exception) {
-            // Some encoders reject explicit High profile/level or CBR. Fall back
-            // to the minimal (still higher-bitrate) format so streaming never
-            // breaks; quality degrades gracefully instead of failing.
-            try { c.release() } catch (_: Exception) {}
-            c = MediaCodec.createByCodecName(chosen.codecName)
-            c.setCallback(codecCallback, codecHandler)
-            c.configure(buildFormat(false), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        // Each rung drops exactly one requirement, so a picky encoder loses as
+        // little as possible instead of falling all the way to defaults.
+        val ladder = listOf(
+            "High profile + CBR" to buildFormat(withHighProfile = true, withCbr = true),
+            "CBR" to buildFormat(withHighProfile = false, withCbr = true),
+            "baseline format" to buildFormat(withHighProfile = false, withCbr = false)
+        )
+        var selected: MediaCodec? = null
+        var selectedDescription: String? = null
+        var lastFailure: Exception? = null
+        for ((description, format) in ladder) {
+            val candidate = MediaCodec.createByCodecName(chosen.codecName)
+            candidate.setCallback(codecCallback, codecHandler)
+            try {
+                candidate.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                selected = candidate
+                selectedDescription = description
+                break
+            } catch (e: Exception) {
+                lastFailure = e
+                AppLogger.w("H264", "Encoder rejected $description: ${e.javaClass.simpleName}: ${e.message}")
+                try { candidate.release() } catch (_: Exception) {}
+            }
         }
-        encoderSurface = c.createInputSurface()
+        val encoder = selected
+            ?: throw IllegalStateException(
+                "Encoder ${chosen.codecName} rejected every AVC format: " +
+                    "${lastFailure?.javaClass?.simpleName}: ${lastFailure?.message}"
+            )
+        if (selectedDescription != ladder.first().first) {
+            AppLogger.w("H264", "Encoder configured with reduced settings: $selectedDescription")
+        }
+        encoderSurface = encoder.createInputSurface()
         // Publish the generation before start(), because asynchronous format
         // and error callbacks are allowed as soon as the codec starts.
-        codec = c
+        codec = encoder
         try {
-            c.start()
+            encoder.start()
         } catch (e: Exception) {
-            if (codec === c) codec = null
-            try { c.release() } catch (_: Exception) {}
+            if (codec === encoder) codec = null
+            try { encoder.release() } catch (_: Exception) {}
             throw e
         }
         StreamState.actualBitrate.set(bitrate)
@@ -371,6 +406,26 @@ class H264Streamer(
         encodedWindowBytes = 0L
         encodedWindowStartNs = SystemClock.elapsedRealtimeNanos()
     }
+
+    /**
+     * Seconds between automatic IDR frames.
+     *
+     * Nothing in this system waits for a PERIODIC keyframe: `subscribe()` asks
+     * for one whenever a client connects, `onDeviceOrientationChanged()` pushes
+     * one with fresh stream-info, discontinuity handling on both sides re-arms
+     * the wait, and any producer-side decoder reset ends in a reconnect — which
+     * is a new `subscribe()`, which requests an IDR. A one-second GOP therefore
+     * bought no recovery latency that on-demand IDRs do not already provide,
+     * while at 60 fps CBR it forced the rate controller to fit an IDR (plus
+     * SPS/PPS, because PREPEND_HEADER_TO_SYNC_FRAMES is set) into the budget
+     * every single second. That reads as periodic "breathing" in the image.
+     *
+     * A multi-second interval is still short enough to act as a safety net if a
+     * consumer somehow misses every explicit request.
+     */
+    private fun keyframeIntervalSeconds(): Int =
+        (activeConfig?.h264KeyframeInterval ?: StreamState.h264KeyframeInterval.get())
+            .coerceIn(1, 30)
 
     /** Quality-appropriate bitrate floor scaled by resolution and frame rate. */
     private fun recommendedBitrate(mode: H264ModeDto): Int {
@@ -513,15 +568,61 @@ class H264Streamer(
             message.toByteArray(Charsets.UTF_8)))
     }
 
+    /**
+     * Overflow budget before a client is treated as genuinely too slow.
+     *
+     * A full queue means the desktop did not drain the socket in time. One
+     * occurrence is ordinary jitter — a GPU hiccup, a scheduling gap — and used
+     * to cost a disconnect, which is far more disruptive than the stall it was
+     * reacting to: the producer has to re-open the HTTP stream, re-subscribe and
+     * wait for a fresh config plus IDR. Recover in place instead, and only give
+     * up on a client that keeps overflowing.
+     */
+    private val clientOverflowBudget = ConcurrentHashMap<Channel<ByteArray>, Int>()
+
     private fun broadcast(record: ByteArray) {
         StreamState.bytesSentThisSecond.addAndGet(record.size.toLong())
+        var recoveredClient = false
         for (client in clients) {
-            val result = client.trySend(record)
-            if (result.isFailure) {
+            if (client.trySend(record).isSuccess) {
+                clientOverflowBudget.remove(client)
+                continue
+            }
+            val strikes = (clientOverflowBudget[client] ?: 0) + 1
+            if (strikes > MAX_CLIENT_OVERFLOWS) {
+                AppLogger.w("H264", "Disconnecting a client that overflowed $strikes times in a row")
+                clientOverflowBudget.remove(client)
                 clients.remove(client)
                 client.close()
+                continue
             }
+            clientOverflowBudget[client] = strikes
+            // Access units are indivisible and inter-frame references matter, so
+            // there is no useful way to deliver a partial backlog. Discard what
+            // the client has not consumed and restart it at the next IDR: one
+            // visible blip instead of a multi-hundred-millisecond outage.
+            var discarded = 0
+            while (client.tryReceive().isSuccess) discarded++
+            // A heartbeat is the record type whose payload is legitimately empty,
+            // so it is what carries the discontinuity: a type-3 record must hold
+            // a complete access unit and cannot be used as a bare marker. The
+            // client flushes its decoder and waits for the next keyframe.
+            val restarted = client.trySend(
+                Ocb2.record(
+                    Ocb2.TYPE_HEARTBEAT, Ocb2.FLAG_DISCONTINUITY,
+                    currentSequence(), SystemClock.elapsedRealtimeNanos(), 0
+                )
+            ).isSuccess
+            AppLogger.w(
+                "H264",
+                "Client queue overflowed (strike $strikes); dropped $discarded queued records" +
+                    if (restarted) " and requested a fresh keyframe" else ""
+            )
+            recoveredClient = true
         }
+        // Only one IDR is needed no matter how many clients recovered, and it must
+        // be requested after the queues have been drained so it is not discarded.
+        if (recoveredClient) requestKeyFrame()
         StreamState.h264ClientCount.set(clients.size)
     }
 
@@ -859,6 +960,22 @@ class H264Streamer(
     private fun publishSelection(chosen: H264EncoderSelection, rejectedPaths: List<String>) {
         val m = chosen.mode
         val config = activeConfig ?: StreamState.currentConfig()
+        // Torch availability was only ever published by MjpegStreamer, via CameraX's
+        // hasFlashUnit(). On this path CameraX never binds, so StreamState.hasTorch
+        // stayed false for the whole session and the phone's torch control was
+        // permanently disabled even on a lens that has a flash. Publish it from the
+        // Camera2 characteristics of the lens actually in use.
+        try {
+            val chars = manager.getCameraCharacteristics(config.cameraId)
+            val hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            StreamState.hasTorch.set(hasFlash)
+            if (!hasFlash && StreamState.torchEnabled.get()) {
+                StreamState.torchEnabled.set(false)
+                StreamState.torchRequested.set(false)
+            }
+        } catch (e: Exception) {
+            AppLogger.w("H264", "Could not read flash availability: ${e.javaClass.simpleName}")
+        }
         StreamState.encoderName.set(chosen.codecName)
         StreamState.hardwareEncoder.set(chosen.hardware)
         StreamState.captureEngine.set(chosen.captureEngine.name)
@@ -911,6 +1028,8 @@ class H264Streamer(
         )
         StreamState.sensorOrientation.set(transform.sensorOrientation)
         StreamState.rotationDegrees.set(transform.effectiveRotation)
+        StreamState.autoRotation.set(transform.autoRotation)
+        StreamState.previewRotation.set(transform.previewRotation)
         val payload = JSONObject().apply {
             put("codec", "H264")
             put("framing", "annex-b-access-units")
@@ -1033,5 +1152,10 @@ class H264Streamer(
         return Rect(left, top, left + w, top + h)
     }
 
-    companion object { private const val TAG = "H264Streamer" }
+    companion object {
+        private const val TAG = "H264Streamer"
+
+        /** Consecutive queue overflows tolerated before a client is dropped. */
+        internal const val MAX_CLIENT_OVERFLOWS = 3
+    }
 }

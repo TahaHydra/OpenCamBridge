@@ -78,6 +78,52 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private val _streamMode = MutableStateFlow("h264")
     val streamMode: StateFlow<String> = _streamMode.asStateFlow()
 
+    private val _h264Bitrate = MutableStateFlow(4_000_000)
+    val h264Bitrate: StateFlow<Int> = _h264Bitrate.asStateFlow()
+
+    private val _h264KeyframeInterval = MutableStateFlow(
+        com.opencambridge.android.state.H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS
+    )
+    val h264KeyframeInterval: StateFlow<Int> = _h264KeyframeInterval.asStateFlow()
+
+    // ---- Pipeline truth -----------------------------------------------------
+    // The phone could previously only report "streaming" or "stopped", which says
+    // nothing about whether the desktop is actually receiving anything. These are
+    // the measurements that answer that, and they are what the Stream tab shows.
+
+    /** Desktop clients currently subscribed to the active transport. */
+    private val _clientCount = MutableStateFlow(0)
+    val clientCount: StateFlow<Int> = _clientCount.asStateFlow()
+
+    /** Frames the encoder emitted in the last one-second window. */
+    private val _encodedFps = MutableStateFlow(0)
+    val encodedFps: StateFlow<Int> = _encodedFps.asStateFlow()
+
+    private val _encodedBitrate = MutableStateFlow(0)
+    val encodedBitrate: StateFlow<Int> = _encodedBitrate.asStateFlow()
+
+    private val _encoderName = MutableStateFlow("")
+    val encoderName: StateFlow<String> = _encoderName.asStateFlow()
+
+    private val _hardwareEncoder = MutableStateFlow(false)
+    val hardwareEncoder: StateFlow<Boolean> = _hardwareEncoder.asStateFlow()
+
+    private val _captureEngine = MutableStateFlow("")
+    val captureEngine: StateFlow<String> = _captureEngine.asStateFlow()
+
+    /** What the pipeline actually settled on, which can differ from the request. */
+    private val _activeStreamMode = MutableStateFlow("h264")
+    val activeStreamMode: StateFlow<String> = _activeStreamMode.asStateFlow()
+
+    private val _fallbackReason = MutableStateFlow("")
+    val fallbackReason: StateFlow<String> = _fallbackReason.asStateFlow()
+
+    private val _encodedWidth = MutableStateFlow(0)
+    val encodedWidth: StateFlow<Int> = _encodedWidth.asStateFlow()
+
+    private val _encodedHeight = MutableStateFlow(0)
+    val encodedHeight: StateFlow<Int> = _encodedHeight.asStateFlow()
+
     // Security
     private val _accessMode = MutableStateFlow("usbOnly")
     val accessMode: StateFlow<String> = _accessMode.asStateFlow()
@@ -130,6 +176,29 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private val _rotationDegrees = MutableStateFlow(0)
     val rotationDegrees: StateFlow<Int> = _rotationDegrees.asStateFlow()
 
+    // The inputs to the rotation transform, exposed so the Logs tab can show
+    // WHY the effective rotation is what it is. Deriving it from sensor
+    // orientation, physical device rotation and the manual offset is not
+    // guessable from the outside, which made orientation reports hard to act on.
+    private val _sensorOrientation = MutableStateFlow(0)
+    val sensorOrientation: StateFlow<Int> = _sensorOrientation.asStateFlow()
+
+    private val _deviceSurfaceRotation = MutableStateFlow(0)
+    val deviceSurfaceRotation: StateFlow<Int> = _deviceSurfaceRotation.asStateFlow()
+
+    /** Sensor/device correction alone. Decides whether the picture the camera
+     *  surface hands to the local preview is landscape or portrait. */
+    private val _autoRotation = MutableStateFlow(0)
+    val autoRotation: StateFlow<Int> = _autoRotation.asStateFlow()
+
+    /**
+     * Rotation for THIS phone's preview: the sensor/device correction without
+     * the manual offset. Distinct from [rotationDegrees], which is what the
+     * desktop applies and therefore includes the offset.
+     */
+    private val _previewRotation = MutableStateFlow(0)
+    val previewRotation: StateFlow<Int> = _previewRotation.asStateFlow()
+
     // Live measured FPS (frames encoded in the last 1s window).
     private val _actualFps = MutableStateFlow(0)
     val actualFps: StateFlow<Int> = _actualFps.asStateFlow()
@@ -172,7 +241,30 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 _hasTorch.value = StreamState.hasTorch.get()
                 _linearZoom.value = StreamState.linearZoom.get()
                 _rotationDegrees.value = StreamState.rotationDegrees.get()
+                _sensorOrientation.value = StreamState.sensorOrientation.get()
+                _deviceSurfaceRotation.value = StreamState.deviceSurfaceRotation.get()
+                _autoRotation.value = StreamState.autoRotation.get()
+                _previewRotation.value = StreamState.previewRotation.get()
                 _actualFps.value = StreamState.actualFps.get()
+                _h264Bitrate.value = config.h264Bitrate
+                _h264KeyframeInterval.value = config.h264KeyframeInterval
+                val active = StreamState.activeStreamMode.get()
+                _activeStreamMode.value = active
+                // Count only the transport that is actually carrying video, so an
+                // idle subscriber on the other endpoint cannot read as "connected".
+                _clientCount.value = if (active == "h264") {
+                    StreamState.h264ClientCount.get()
+                } else {
+                    StreamState.mjpegClientCount.get()
+                }
+                _encodedFps.value = StreamState.encodedFps.get()
+                _encodedBitrate.value = StreamState.encodedBitrate.get()
+                _encoderName.value = StreamState.encoderName.get() ?: ""
+                _hardwareEncoder.value = StreamState.hardwareEncoder.get()
+                _captureEngine.value = StreamState.captureEngine.get() ?: ""
+                _fallbackReason.value = StreamState.fallbackReason.get() ?: ""
+                _encodedWidth.value = StreamState.encodedWidth.get()
+                _encodedHeight.value = StreamState.encodedHeight.get()
                 _developerMode.value = StreamState.developerMode.get()
                 _accessMode.value = config.accessMode
                 _port.value = config.port
@@ -230,6 +322,9 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     fun updateDisplayRotation(rotation: String) = controlPatch(UpdateSettingsRequest(displayRotation = rotation, clientType = "phone"))
     fun updateMirror(mirror: Boolean) = controlPatch(UpdateSettingsRequest(mirror = mirror, clientType = "phone"))
     fun updateStreamMode(mode: String) = controlPatch(UpdateSettingsRequest(streamMode = mode, clientType = "phone"))
+    fun updateH264Bitrate(bitrate: Int) = controlPatch(UpdateSettingsRequest(h264Bitrate = bitrate, clientType = "phone"))
+    fun updateH264KeyframeInterval(seconds: Int) =
+        controlPatch(UpdateSettingsRequest(h264KeyframeInterval = seconds, clientType = "phone"))
     fun updateAccessMode(mode: String) = controlPatch(UpdateSettingsRequest(accessMode = mode, clientType = "phone"))
     fun updatePort(p: Int) = controlPatch(UpdateSettingsRequest(port = p, clientType = "phone"))
 

@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react';
-import { Camera, Unplug, Zap, Monitor, Usb, Wifi, ShieldCheck, FileText } from 'lucide-react';
+import { Camera, Unplug, Zap, Monitor, Usb, Wifi, ShieldCheck, FileText, AlertTriangle } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import Preview from './components/Preview';
 import ControlPanel from './components/ControlPanel';
 import LogsView from './components/LogsView';
+import { Lamp, Meter } from './components/ui';
+import type { Health } from './components/ui';
 import { apiFetch } from './services/api';
 import { startSession, logEvent } from './services/logging';
 import './App.css';
@@ -130,121 +132,84 @@ function ConnectionScreen({ onConnect }: ConnectionScreenProps) {
     }
   };
 
-  const tabStyle = (active: boolean): React.CSSProperties => ({
-    flex: 1,
-    padding: '10px 12px',
-    borderRadius: 8,
-    border: active ? '1px solid var(--accent, #4dabf7)' : '1px solid rgba(255,255,255,0.1)',
-    background: active ? 'rgba(77, 171, 247, 0.15)' : 'transparent',
-    color: active ? '#4dabf7' : 'var(--text-secondary, #aaa)',
-    cursor: 'pointer',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-    fontWeight: 600,
-    fontSize: '0.9rem',
-  });
-
   return (
     <div className="connection-screen">
-      <div className="connection-card glass-panel animate-fade">
+      <div className="connection-card panel animate-fade">
         <div className="brand-hero">
-          <Camera size={64} />
-          <h1>OpenCamBridge</h1>
-          <p>Use your Android phone as a webcam</p>
+          <div className="brand-hero__mark"><Camera size={24} /></div>
+          <h1>Open<span>Cam</span>Bridge</h1>
+          <p>Your phone, wired in as a Windows camera. No cloud, no account.</p>
         </div>
 
-        <div style={{ display: 'flex', gap: 8, width: '100%', marginBottom: 16 }}>
-          <button type="button" style={tabStyle(mode === 'usb')} onClick={() => { setMode('usb'); setError(''); setInfo(''); }}>
-            <Usb size={16} /> USB (Recommended)
-          </button>
-          <button type="button" style={tabStyle(mode === 'lan')} onClick={() => { setMode('lan'); setError(''); setInfo(''); }}>
-            <Wifi size={16} /> Wi-Fi (LAN)
-          </button>
-        </div>
+        <div className="form">
+          <div className="seg">
+            <button type="button" className={`seg__btn${mode === 'usb' ? ' is-active' : ''}`} onClick={() => { setMode('usb'); setError(''); setInfo(''); }}>
+              <Usb size={14} /> USB
+            </button>
+            <button type="button" className={`seg__btn${mode === 'lan' ? ' is-active' : ''}`} onClick={() => { setMode('lan'); setError(''); setInfo(''); }}>
+              <Wifi size={14} /> Wi-Fi
+            </button>
+          </div>
 
-        {mode === 'usb' ? (
-          <form onSubmit={handleUsbConnect} style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {error && <div className="error-banner">{error}</div>}
-            {info && !error && <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{info}</div>}
+          {mode === 'usb' ? (
+            <form onSubmit={handleUsbConnect} className="stack stack--14">
+              {error && <div className="error-banner"><AlertTriangle size={15} /><span>{error}</span></div>}
+              {info && !error && <p className="hint" style={{ marginTop: 0 }}>{info}</p>}
 
-            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textAlign: 'left', margin: 0, lineHeight: 1.5 }}>
-              Private and stable: video never leaves the USB cable. Connect the phone via USB,
-              enable USB debugging, and keep the phone in <strong>USB Only</strong> access mode (the default).
-            </p>
+              <p className="form__lede">
+                Recommended. Video stays inside the cable and never touches your network. Connect the phone,
+                enable USB debugging, and leave the phone in <strong>USB Only</strong> access mode.
+              </p>
 
-            <div style={{ textAlign: 'left' }}>
-              <label style={{ display: 'block', marginBottom: 8, fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Port</label>
-              <input
-                type="text"
-                className="input-control"
-                value={port}
-                onChange={(e) => setPort(e.target.value)}
-                placeholder="8080"
-                required
-              />
-            </div>
-
-            {adbDevices.length > 0 && (
-              <div style={{ textAlign: 'left' }}>
-                <label style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                  <span>Android device{adbDevices.length > 1 ? ' (required)' : ''}</span>
-                  <button type="button" onClick={refreshAdbDevices} style={{ border: 0, background: 'transparent', color: '#4dabf7', cursor: 'pointer' }}>Refresh</button>
-                </label>
-                <select className="input-control" value={selectedSerial} onChange={e => setSelectedSerial(e.target.value)} required={adbDevices.length > 1}>
-                  {adbDevices.length > 1 && <option value="">Select a phone…</option>}
-                  {adbDevices.map(device => <option key={device.serial} value={device.serial}>{device.model || 'Android device'} — {device.serial}</option>)}
-                </select>
+              <div className="field">
+                <span className="field__label">Port</span>
+                <input type="text" className="input-control" value={port} onChange={(e) => setPort(e.target.value)} placeholder="8080" required />
               </div>
-            )}
 
-            <button type="submit" className="btn btn-primary" style={{ width: '100%', padding: '14px', marginTop: 8 }} disabled={isConnecting}>
-              {isConnecting ? <Zap size={18} /> : <Usb size={18} />}
-              {isConnecting ? 'Connecting...' : 'Set up USB & Connect'}
-            </button>
-          </form>
-        ) : (
-          <form onSubmit={handleLanConnect} style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {error && <div className="error-banner">{error}</div>}
+              {adbDevices.length > 0 && (
+                <div className="field">
+                  <span className="field__label">
+                    Android device{adbDevices.length > 1 ? ' — required' : ''}
+                    <button type="button" className="btn btn--sm" onClick={refreshAdbDevices}>Refresh</button>
+                  </span>
+                  <select className="input-control" value={selectedSerial} onChange={e => setSelectedSerial(e.target.value)} required={adbDevices.length > 1}>
+                    {adbDevices.length > 1 && <option value="">Select a phone…</option>}
+                    {adbDevices.map(device => <option key={device.serial} value={device.serial}>{device.model || 'Android device'} — {device.serial}</option>)}
+                  </select>
+                </div>
+              )}
 
-            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textAlign: 'left', margin: 0, lineHeight: 1.5 }}>
-              On the phone: open OpenCamBridge &gt; Security, switch to <strong>LAN Token</strong> mode,
-              then copy the URL and access token shown there.
-            </p>
+              <button type="submit" className="btn btn-primary btn--lg btn--block" disabled={isConnecting}>
+                {isConnecting ? <Zap size={16} /> : <Usb size={16} />}
+                {isConnecting ? 'Connecting…' : 'Set up USB & connect'}
+              </button>
+            </form>
+          ) : (
+            <form onSubmit={handleLanConnect} className="stack stack--14">
+              {error && <div className="error-banner"><AlertTriangle size={15} /><span>{error}</span></div>}
 
-            <div style={{ textAlign: 'left' }}>
-              <label style={{ display: 'block', marginBottom: 8, fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Phone URL</label>
-              <input
-                type="text"
-                className="input-control"
-                value={lanUrl}
-                onChange={(e) => setLanUrl(e.target.value)}
-                placeholder="http://192.168.1.10:8080"
-                required
-              />
-            </div>
+              <p className="form__lede">
+                On the phone open OpenCamBridge &gt; Security, switch to <strong>LAN Token</strong> mode, then copy
+                the URL and access token it shows.
+              </p>
 
-            <div style={{ textAlign: 'left' }}>
-              <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                <ShieldCheck size={14} /> Access Token (required for LAN)
-              </label>
-              <input
-                type="password"
-                className="input-control"
-                value={lanToken}
-                onChange={(e) => setLanToken(e.target.value)}
-                placeholder="Token from the phone's Security tab"
-                required
-              />
-            </div>
+              <div className="field">
+                <span className="field__label">Phone URL</span>
+                <input type="text" className="input-control" value={lanUrl} onChange={(e) => setLanUrl(e.target.value)} placeholder="http://192.168.1.10:8080" required />
+              </div>
 
-            <button type="submit" className="btn btn-primary" style={{ width: '100%', padding: '14px', marginTop: 8 }} disabled={isConnecting}>
-              {isConnecting ? <Zap size={18} /> : <Unplug size={18} />}
-              {isConnecting ? 'Connecting...' : 'Connect over Wi-Fi'}
-            </button>
-          </form>
-        )}
+              <div className="field">
+                <span className="field__label"><span className="row"><ShieldCheck size={12} /> Access token</span></span>
+                <input type="password" className="input-control" value={lanToken} onChange={(e) => setLanToken(e.target.value)} placeholder="From the phone's Security tab" required />
+              </div>
+
+              <button type="submit" className="btn btn-primary btn--lg btn--block" disabled={isConnecting}>
+                {isConnecting ? <Zap size={16} /> : <Unplug size={16} />}
+                {isConnecting ? 'Connecting…' : 'Connect over Wi-Fi'}
+              </button>
+            </form>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -358,9 +323,22 @@ export default function App() {
     }} />;
   }
 
-  const stateClass = serverStatus?.lifecycleState?.toLowerCase() || 'stopped';
-  const isError = serverStatus?.lifecycleState === 'FAILED' || serverStatus?.lifecycleState === 'OFFLINE';
+  const lifecycle: string = serverStatus?.lifecycleState || 'UNKNOWN';
+  const isError = lifecycle === 'FAILED' || lifecycle === 'OFFLINE';
   const transportLabel = token ? 'LAN' : 'USB';
+  // The header lamp reports the phone's camera lifecycle only. Whether frames
+  // reach Windows is the rail's tally lamp; conflating the two is how "a
+  // process is alive" gets mistaken for "the webcam works".
+  const lifecycleLamp: Health =
+    lifecycle === 'STREAMING' ? 'ok'
+      : isError ? 'down'
+      : lifecycle === 'STARTING' || lifecycle === 'RECONFIGURING' || lifecycle === 'RECOVERING' ? 'busy'
+      : 'idle';
+  const sourceLabel = serverStatus?.encodedWidth
+    ? `${serverStatus.encodedWidth}×${serverStatus.encodedHeight}`
+    : '—';
+  const rateValue = serverStatus?.fps ?? '—';
+  const codecLabel = (serverStatus?.activeStreamMode || serverStatus?.streamMode || '—').toString().toUpperCase();
 
   if (obsMode) {
     return (
@@ -368,10 +346,11 @@ export default function App() {
         <style>{`.preview-stage { border-radius: 0 !important; background: transparent !important; }`}</style>
         <Preview baseUrl={baseUrl} token={token} fitMode={fitMode} serverStatus={serverStatus} />
         <button
+          className="btn btn--sm"
           onClick={() => setObsMode(false)}
-          style={{ position: 'absolute', top: 16, right: 16, zIndex: 9999, background: 'rgba(0,0,0,0.7)', color: 'white', border: '1px solid #444', padding: '8px 16px', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', gap: 8 }}
+          style={{ position: 'absolute', top: 16, right: 16, zIndex: 9999 }}
         >
-          <Unplug size={16} /> Exit OBS Mode (Esc)
+          <Unplug size={13} /> Exit clean feed (Esc)
         </button>
       </div>
     );
@@ -380,43 +359,60 @@ export default function App() {
   return (
     <div className="app-container animate-fade">
       <header className="header">
-        <div className="header-brand">
-          <Camera size={24} /> OpenCamBridge
+        <div className="header__brand">
+          <div className="header__mark"><Camera size={16} /></div>
+          <div className="header__word"><b>Open</b><span>Cam</span><b>Bridge</b></div>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-          <div className="status-badge" title={token ? 'Connected over Wi-Fi with token auth' : 'Connected over USB (adb forward)'}>
-            {token ? <Wifi size={14} /> : <Usb size={14} />}
-            <span style={{ textTransform: 'uppercase', letterSpacing: 1 }}>{transportLabel}</span>
-          </div>
-          <div className="status-badge">
-            <div className={`status-dot ${stateClass}`}></div>
-            <span style={{ textTransform: 'uppercase', letterSpacing: 1 }}>{serverStatus?.lifecycleState || 'UNKNOWN'}</span>
-          </div>
-          <button className="btn btn-secondary" onClick={() => setShowLogs(true)} style={{ padding: '6px 12px', fontSize: '0.8rem' }} title="Session logs">
-            <FileText size={14} /> Logs
+        <div className="chip" title={token ? 'Connected over Wi-Fi with token authentication' : 'Connected over USB with an adb forward'}>
+          {token ? <Wifi size={12} /> : <Usb size={12} />}
+          {transportLabel}
+        </div>
+
+        <div className="chip">
+          <Lamp state={lifecycleLamp} />
+          {lifecycle}
+        </div>
+
+        <div className="header__spacer" />
+
+        <div className="header__meters">
+          <Meter label="Source" value={sourceLabel} tone="plain" title="Resolution the phone is encoding right now" />
+          <Meter label="Rate" value={rateValue} unit="fps" tone="plain" title="Frame rate requested from the phone camera" />
+          <Meter label="Codec" value={codecLabel} tone={codecLabel === 'H264' ? 'ok' : 'warn'} title="Active transport codec" />
+        </div>
+
+        <div className="header__actions">
+          <button className="btn btn--sm" onClick={() => setShowLogs(true)} title="Session logs">
+            <FileText size={13} /> Logs
           </button>
-          <button className="btn btn-secondary" onClick={() => { setIsConnected(false); setToken(''); setConnectionInfo(null); }} style={{ padding: '6px 12px', fontSize: '0.8rem' }}>
-            <Unplug size={14} /> Disconnect
+          <button className="btn btn--sm" onClick={() => { setIsConnected(false); setToken(''); setConnectionInfo(null); }}>
+            <Unplug size={13} /> Disconnect
           </button>
         </div>
       </header>
 
       <main className="main-content">
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16, height: '100%', overflow: 'hidden' }}>
+        <div className="stack stack--14" style={{ height: '100%', minHeight: 0 }}>
           {isError && serverStatus?.lastError && (
-            <div className="error-banner animate-fade" style={{ margin: 0 }}>
-              <strong>Camera Error:</strong> {serverStatus.lastError}
+            <div className="error-banner animate-fade">
+              <AlertTriangle size={15} />
+              <span><strong>Camera error:</strong> {serverStatus.lastError}</span>
             </div>
           )}
           {!previewOff ? (
             <Preview baseUrl={baseUrl} token={token} fitMode={fitMode} serverStatus={serverStatus} />
           ) : (
-            <div className="preview-stage glass-panel" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-              <div style={{ textAlign: 'center', color: '#888' }}>
-                <Monitor size={48} style={{ opacity: 0.5, marginBottom: 16 }} />
-                <p>Preview Disabled for Performance Diagnostics</p>
-                <p style={{ fontSize: '0.8rem', marginTop: 8 }}>Frames are still being captured and sent to the Virtual Camera.</p>
+            <div className="preview-wrapper">
+              <div className="preview-stage layout-landscape">
+                <div className="preview-overlay">
+                  <Monitor size={40} />
+                  <div>Desktop preview is off</div>
+                  <p className="hint" style={{ maxWidth: 320, textAlign: 'center' }}>
+                    Capture and delivery to the virtual camera continue as normal — only this window stopped
+                    decoding, to keep it out of the frame budget.
+                  </p>
+                </div>
               </div>
             </div>
           )}

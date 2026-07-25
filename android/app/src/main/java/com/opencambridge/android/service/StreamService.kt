@@ -144,9 +144,12 @@ class StreamService : LifecycleService() {
                 }
             }
         }
-        if (orientationListener?.canDetectOrientation() == true) {
-            orientationListener?.enable()
-        } else {
+        // Deliberately NOT enabled here. An OrientationEventListener polls the
+        // accelerometer continuously, and the rotation it reports is only used while
+        // the camera is streaming. Leaving it running whenever the service existed
+        // was a background drain for no benefit; it is enabled and disabled with the
+        // pipeline instead (see setOrientationTracking).
+        if (orientationListener?.canDetectOrientation() != true) {
             AppLogger.w("Rotation", "Device cannot detect orientation; stream stays upright only for the natural (vertical) position")
         }
         // Locking the phone makes the platform/OEM revoke camera access
@@ -333,6 +336,7 @@ class StreamService : LifecycleService() {
         StreamState.lastError.set("")
         beginPipelineGeneration()
         acquireStreamWakeLock()
+        setOrientationTracking(true)
         Log.d(TAG, "Camera STARTING")
         AppLogger.i("Camera", "Camera starting (generation ${StreamState.pipelineGeneration.get()})")
         return try {
@@ -357,10 +361,12 @@ class StreamService : LifecycleService() {
             resetPipelineMetrics()
             transitionLifecycle(LifecycleState.STOPPED)
             releaseStreamWakeLock()
+            setOrientationTracking(false)
             AppLogger.i("Camera", "Camera stopped cleanly")
             pipelineResult("Camera stopped")
         } catch (e: Exception) {
             releaseStreamWakeLock()
+            setOrientationTracking(false)
             handleCameraError("Failed to stop camera cleanly", e)
         }
     }
@@ -464,6 +470,20 @@ class StreamService : LifecycleService() {
             "Invalid pipeline lifecycle transition $current -> $target"
         }
         StreamState.lifecycleState.set(target)
+    }
+
+    /**
+     * Enables accelerometer-based orientation tracking only while it is needed.
+     * The reported rotation is consumed exclusively by the streaming pipeline, so
+     * polling it while stopped costs battery and buys nothing.
+     */
+    private fun setOrientationTracking(enabled: Boolean) {
+        val listener = orientationListener ?: return
+        if (enabled) {
+            if (listener.canDetectOrientation()) listener.enable()
+        } else {
+            listener.disable()
+        }
     }
 
     private fun acquireStreamWakeLock() {

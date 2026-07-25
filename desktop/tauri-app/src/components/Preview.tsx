@@ -162,13 +162,25 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
         )}
 
         {(h264Primary || !showOverlay) && (
-          <button
-            className="btn btn-secondary"
-            style={{ position: 'absolute', top: 16, right: 16, padding: '6px 12px', fontSize: '0.8rem', background: 'rgba(0,0,0,0.5)' }}
-            onClick={reloadPreview}
-          >
-            <RefreshCw size={14} /> Reload
-          </button>
+          <div className="vf-actions">
+            <button className="btn btn--sm" onClick={reloadPreview}>
+              <RefreshCw size={12} /> Reload
+            </button>
+          </div>
+        )}
+
+        {/* Viewfinder readout: what is actually being encoded, on the glass
+            where the operator is already looking. */}
+        {(h264Primary || !showOverlay) && (
+          <div className="vf-hud">
+            <b>{serverStatus?.encodedWidth || '—'}×{serverStatus?.encodedHeight || '—'}</b>
+            <i>/</i>
+            <b>{serverStatus?.fps ?? '—'}</b> fps
+            <i>/</i>
+            <b>{(serverStatus?.activeStreamMode || serverStatus?.streamMode || '—').toString().toUpperCase()}</b>
+            {serverStatus?.mirror && <><i>/</i>MIRROR</>}
+            {Number(serverStatus?.rotationDegrees) > 0 && <><i>/</i>{serverStatus.rotationDegrees}°</>}
+          </div>
         )}
 
       </div>
