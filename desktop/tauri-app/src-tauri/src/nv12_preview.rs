@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::ipc::Response;
 use windows::core::w;
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -11,6 +12,10 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY,
+};
+
+use ocb_playout::{
+    profile_from_name, PlayoutAction, PlayoutCandidate, PlayoutScheduler, PlayoutTiming,
 };
 
 use crate::sync_state::RecoverMutex;
@@ -202,6 +207,21 @@ fn write_preview_header(
     response[44..48].copy_from_slice(&metadata.flags.to_le_bytes());
 }
 
+/// Host QPC time in nanoseconds — the clock domain the producer stamps
+/// `ring_write_timestamp_ns` in, and the one the scheduler reasons about.
+fn qpc_ns() -> u64 {
+    let mut counter = 0i64;
+    let mut frequency = 0i64;
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut counter);
+        let _ = QueryPerformanceFrequency(&mut frequency);
+    }
+    if frequency <= 0 {
+        return 0;
+    }
+    ((counter as i128 * 1_000_000_000i128) / frequency as i128) as u64
+}
+
 struct Mapping {
     file: Option<HANDLE>,
     mapping: HANDLE,
@@ -317,35 +337,81 @@ impl Mapping {
         }
     }
 
-    fn read_latest(
+    /// Read the frame the preview's own playout schedule says is due.
+    ///
+    /// Returns an empty response when nothing new is due, which the frontend renders as
+    /// "keep showing the current frame". That is the preview's natural form of a repeat and
+    /// it costs nothing: re-sending identical pixels over the IPC bridge would just burn
+    /// bandwidth for the same picture.
+    fn read_scheduled(
         &self,
         after_sequence: u64,
-        cursor: &mut PreviewCursor,
+        playout: &mut PreviewPlayout,
     ) -> Result<Vec<u8>, String> {
         unsafe {
             let base = self.view.Value as *const u8;
             let ring = &*(base as *const RingHeader);
             self.validate_header(ring)?;
-            let published_sequence = ring.published_sequence.load(Ordering::Acquire);
-            if published_sequence <= after_sequence {
+            let write_sequence = ring.ring_write_sequence.load(Ordering::Acquire);
+
+            // Build candidates from STABLE snapshots: read the epoch, copy the header, read
+            // the epoch again, and accept only if nothing moved. A header torn by a
+            // concurrent write would otherwise feed the scheduler a capture timestamp from
+            // one frame and a slot from another.
+            let mut candidates: Vec<PlayoutCandidate> = Vec::with_capacity(SLOT_COUNT);
+            for index in 0..SLOT_COUNT {
+                let offset = RING_HEADER_SIZE + index * SLOT_SIZE;
+                let slot = base.add(offset) as *const SlotHeader;
+                let before = std::ptr::read_volatile(&(*slot).committed_epoch);
+                fence(Ordering::Acquire);
+                let header = std::ptr::read(slot);
+                fence(Ordering::Acquire);
+                let after = std::ptr::read_volatile(&(*slot).committed_epoch);
+                if before == 0
+                    || before != after
+                    || before != header.write_epoch
+                    || header.ring_sequence == 0
+                    || header.pixel_format != FORMAT_NV12
+                {
+                    continue;
+                }
+                candidates.push(PlayoutCandidate {
+                    ring_sequence: header.ring_sequence,
+                    capture_timestamp_ns: header.capture_timestamp_ns,
+                    stream_generation: header.stream_generation,
+                    ring_write_timestamp_ns: header.ring_write_timestamp_ns,
+                    slot_index: index as u32,
+                });
+            }
+
+            // The preview shows every source frame once, so its output cadence IS the
+            // source cadence. The frontend's polling rate only has to keep up with it.
+            let fps_num = ring.producer_fps_num.load(Ordering::Acquire).max(1) as u64;
+            let fps_den = ring.producer_fps_den.load(Ordering::Acquire).max(1) as u64;
+            let source_interval_ns = (1_000_000_000 * fps_den) / fps_num;
+            let timing = PlayoutTiming {
+                output_interval_ns: source_interval_ns,
+                source_interval_ns,
+                slot_count: SLOT_COUNT as u64,
+            };
+
+            let decision = playout
+                .scheduler
+                .peek(qpc_ns(), &candidates, timing);
+            if decision.action != PlayoutAction::Release {
+                // Prefilling, or nothing new is due yet. Commit so the schedule advances,
+                // then let the frontend hold the frame it already has.
+                playout.scheduler.commit(&decision, timing);
                 return Ok(Vec::new());
             }
-            // Slot choice comes from the monotonic write sequence rather than
-            // `published_slot`. Both name the same slot while the preview still takes
-            // the newest frame; the difference is that the write sequence also says
-            // what came before it, which is what the cursor accounting needs.
-            let write_sequence = ring.ring_write_sequence.load(Ordering::Acquire);
-            let generation = ring.stream_generation.load(Ordering::Acquire);
-            let Some(selection) = ring_select_newest(
-                cursor.next,
-                cursor.generation,
-                write_sequence,
-                generation,
-                SLOT_COUNT as u64,
-            ) else {
-                return Ok(Vec::new());
-            };
-            let slot_index = selection.slot_index;
+            let _ = after_sequence;
+            // Frames destroyed before the preview reached them: the ring was too short for
+            // this consumer, as distinct from it having chosen to skip.
+            let oldest_live = write_sequence.saturating_sub(SLOT_COUNT as u64 - 2);
+            if decision.ring_sequence < oldest_live {
+                playout.overwritten += 1;
+            }
+            let slot_index = decision.slot_index as usize;
             if slot_index >= SLOT_COUNT {
                 return Err("NV12 preview rejected published slot index".to_string());
             }
@@ -357,12 +423,13 @@ impl Mapping {
             if first_epoch == 0
                 || first_epoch != metadata.write_epoch
                 || first_epoch & 1 == 0
-                // The slot must still hold the write the cursor selected; if not, the
-                // producer lapped us and the next poll picks up the newer frame.
-                || metadata.ring_sequence != selection.ring_sequence
-                || metadata.sequence != published_sequence
+                // The slot must still hold the frame the scheduler chose. If the producer
+                // lapped us it does not, and the decision is CANCELLED rather than
+                // committed, so the next poll retries instead of treating it as shown.
+                || metadata.ring_sequence != decision.ring_sequence
                 || metadata.pixel_format != FORMAT_NV12
             {
+                playout.scheduler.cancel(&decision);
                 return Ok(Vec::new());
             }
             let width = metadata.width as usize;
@@ -445,21 +512,13 @@ impl Mapping {
             fence(Ordering::Acquire);
             let final_epoch = std::ptr::read_volatile(&(*slot_ptr).committed_epoch);
             if final_epoch != first_epoch {
+                // Torn mid-copy: cancel so the frame stays selectable.
+                playout.scheduler.cancel(&decision);
                 return Ok(Vec::new());
             }
-            // Advance only after the frame is known good, so a torn read is retried
-            // rather than silently counted as consumed.
-            if selection.generation_changed {
-                cursor.generation = generation;
-                cursor.resets += 1;
-            } else {
-                cursor.skipped += selection.skipped;
-                cursor.overwritten += selection.overwritten;
-                // Counted locally and deliberately NOT written back into the ring: this
-                // mapping is PAGE_READONLY/FILE_MAP_READ, so any store here would fault.
-                // The virtual camera, which maps read/write, owns the shared counter.
-            }
-            cursor.next = selection.ring_sequence + 1;
+            // Committed only now that the frame is known good, so a failed copy costs a
+            // poll rather than a frame.
+            playout.scheduler.commit(&decision, timing);
             Ok(response)
         }
     }
@@ -469,20 +528,37 @@ pub struct Nv12PreviewReader {
     state: Mutex<ReaderState>,
 }
 
-/// This consumer's own place in the history ring.
+/// The preview's own playout state.
 ///
-/// Local, not shared: the preview and the virtual camera read at different rates, and
-/// neither may disturb the other's accounting. The counters answer a question the
-/// existing rate figures cannot — whether a hitch was this consumer reading at the
-/// wrong moment (`skipped`) or the ring being too short to hold the frame at all
-/// (`overwritten`).
-#[derive(Default)]
-struct PreviewCursor {
-    next: u64,
-    generation: u64,
-    skipped: u64,
+/// A separate instance from the virtual camera's, deliberately. The two consumers poll on
+/// unrelated clocks and at different rates; one shared scheduler would have each of them
+/// consuming the other's frames.
+///
+/// Before this existed the preview simply took whichever frame was newest at the instant
+/// the frontend happened to poll (~60 Hz), which is precisely the aliasing the virtual
+/// camera was fixed for: uneven arrivals became the same frame twice, then a skip. Deepening
+/// the camera's buffer could never have fixed the preview, because the preview never looked
+/// at it.
+struct PreviewPlayout {
+    scheduler: PlayoutScheduler,
+    /// Ring writes destroyed before the preview reached them.
     overwritten: u64,
-    resets: u64,
+}
+
+impl PreviewPlayout {
+    fn new() -> Self {
+        let profile = profile_from_name(
+            &std::env::var("OCB_PLAYOUT_PROFILE").unwrap_or_default(),
+        );
+        let mut scheduler = PlayoutScheduler::new(profile);
+        scheduler.servo_enabled = std::env::var("OCB_PLAYOUT_SERVO")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        Self {
+            scheduler,
+            overwritten: 0,
+        }
+    }
 }
 
 struct ReaderState {
@@ -492,7 +568,7 @@ struct ReaderState {
     last_sequence: u64,
     last_heartbeat: u64,
     last_progress: Instant,
-    cursor: PreviewCursor,
+    playout: PreviewPlayout,
 }
 
 impl Nv12PreviewReader {
@@ -505,26 +581,32 @@ impl Nv12PreviewReader {
                 last_sequence: 0,
                 last_heartbeat: 0,
                 last_progress: Instant::now(),
-                cursor: PreviewCursor::default(),
+                playout: PreviewPlayout::new(),
             }),
         }
     }
 }
 
-/// Preview-side ring cursor accounting, for diagnosing a hitch in the preview
-/// specifically rather than in the virtual camera.
+/// Preview-side playout telemetry, for diagnosing a hitch in the PREVIEW specifically
+/// rather than in the virtual camera. The two pace independently, so they can differ.
 #[derive(serde::Serialize)]
 pub struct Nv12PreviewCursorStats {
-    /// Ring writes the preview never rendered.
-    pub skipped: u64,
-    /// Of those, how many the ring had already destroyed. A non-zero value here means
-    /// the ring is too short for this consumer's polling interval; `skipped` alone only
-    /// means it polled at the wrong moments.
+    pub target_delay_ms: u64,
+    pub buffer_depth_ms: u64,
+    pub clock_ppm: i64,
+    /// Duplicates required by frame-rate conversion. Not a fault.
+    pub planned_repeats: u64,
+    /// Repeats caused by a frame that should have arrived and had not.
+    pub underrun_repeats: u64,
+    /// Frames skipped by frame-rate conversion. Not a fault.
+    pub planned_drops: u64,
+    /// Frames skipped because they reached the ring past their deadline.
+    pub late_drops: u64,
+    pub unique_frames: u64,
+    pub scheduler_resets: u64,
+    pub copy_failures: u64,
+    /// Frames destroyed before the preview reached them: the ring was too short.
     pub overwritten: u64,
-    /// Producer restarts observed.
-    pub resets: u64,
-    /// Next ring write sequence the preview has not yet rendered.
-    pub cursor: u64,
 }
 
 #[tauri::command]
@@ -532,11 +614,19 @@ pub fn get_nv12_preview_cursor_stats(
     state: tauri::State<'_, Nv12PreviewReader>,
 ) -> Nv12PreviewCursorStats {
     let reader = state.state.lock_recover();
+    let scheduler = &reader.playout.scheduler;
     Nv12PreviewCursorStats {
-        skipped: reader.cursor.skipped,
-        overwritten: reader.cursor.overwritten,
-        resets: reader.cursor.resets,
-        cursor: reader.cursor.next,
+        target_delay_ms: scheduler.target_delay_ms(),
+        buffer_depth_ms: scheduler.buffer_depth_ns / 1_000_000,
+        clock_ppm: scheduler.clock_correction_ppm(),
+        planned_repeats: scheduler.planned_repeats,
+        underrun_repeats: scheduler.underrun_repeats,
+        planned_drops: scheduler.planned_drops,
+        late_drops: scheduler.late_drops,
+        unique_frames: scheduler.output_unique_frames,
+        scheduler_resets: scheduler.scheduler_resets,
+        copy_failures: scheduler.copy_failures,
+        overwritten: reader.playout.overwritten,
     }
 }
 
@@ -556,8 +646,8 @@ pub fn get_nv12_preview_frame(
         reader.last_sequence = 0;
         reader.last_heartbeat = 0;
         reader.last_progress = Instant::now();
-        // A different producer means a different ring; the cursor cannot carry over.
-        reader.cursor = PreviewCursor::default();
+        // A different producer means a different ring; playout state cannot carry over.
+        reader.playout = PreviewPlayout::new();
     }
     if reader.mapping.is_none() {
         match Mapping::open() {
@@ -593,8 +683,8 @@ pub fn get_nv12_preview_frame(
         reader.last_progress = Instant::now();
         return Ok(Response::new(Vec::new()));
     }
-    let ReaderState { mapping, cursor, .. } = &mut *reader;
-    match mapping.as_ref().unwrap().read_latest(after_sequence, cursor) {
+    let ReaderState { mapping, playout, .. } = &mut *reader;
+    match mapping.as_ref().unwrap().read_scheduled(after_sequence, playout) {
         Ok(bytes) => Ok(Response::new(bytes)),
         Err(error) => {
             reader.mapping = None;
@@ -614,7 +704,7 @@ mod tests {
 
     #[test]
     fn ring_abi_layout_matches_producer_and_virtual_camera() {
-        assert_eq!(std::mem::size_of::<RingHeader>(), 256);
+        assert_eq!(std::mem::size_of::<RingHeader>(), RING_HEADER_SIZE);
         assert_eq!(std::mem::size_of::<SlotHeader>(), 128);
         assert_eq!(std::mem::offset_of!(RingHeader, consumer_attached), 80);
         assert_eq!(std::mem::offset_of!(RingHeader, producer_build_hash), 192);

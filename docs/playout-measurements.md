@@ -59,7 +59,7 @@ about whether they arrived.
 scheduler lives in the virtual-camera DLL, which only runs once an application opens the
 camera. Exercising it on-device needs a camera consumer attached.
 
-The scheduler itself is covered by the deterministic simulations in `playout_tests.rs`,
+The scheduler itself is covered by the deterministic simulations in `playout/src/tests.rs`,
 which reach conditions a short live capture cannot — an hour of clock drift at ±100 and
 ±200 ppm, 29.97 into 30 fps, stalls on both sides of the buffer depth, and timestamp
 rewinds.
@@ -67,3 +67,41 @@ rewinds.
 One thing to watch when a consumer does attach: `negotiated_fps_num` defaults to 60
 while the source runs at 30, so until a consumer negotiates 30 the scheduler will
 correctly repeat every other frame.
+
+## Simulation findings that changed the design
+
+Three bugs were found by the deterministic suite, not by inspection, and each one had
+already survived a round of reasoning that said it was fine.
+
+**A PI controller on buffer depth oscillates.** The mapping already integrates — a rate
+offset applied to elapsed source time accumulates — so the plant is an integrator, and a
+PI controller driving an integrator is third order. It hunted between 66 ms and 133 ms
+around an 80 ms target and dropped a quarter of all frames at the top of every swing.
+
+**Phase correction alone cannot track a rate error.** Replacing the PI loop with a bounded
+phase nudge fixed the oscillation but not the underlying slope. Sustained +200 ppm needs
+0.72 s of cumulative pullback over an hour; the anchor is a host timestamp that cannot go
+below zero and only had ~95 ms of headroom. It ground down, every frame's due time landed
+in the future forever, and playout stalled dead after 43 minutes with 30015 consecutive
+underruns. The slope is now *measured* from `ring_write_timestamp_ns` against
+`capture_timestamp_ns`, which is a direct observation rather than a control loop.
+
+**Lateness measured against a moving anchor fights the servo.** The servo moves the anchor
+to drain a deep buffer, and while draining, punctual arrivals sit "after" their due time.
+That read as lateness, raised the target, pushed the anchor forward, and cancelled the
+drain — the pair deadlocked with depth pinned at the full ring and the servo saturated.
+Lateness is now only counted when the buffer is *below* target, since a frame cannot be
+meaningfully late when there is more buffered ahead of it than was asked for.
+
+Also worth recording: the measurement baseline must keep growing rather than restarting
+each update. A short baseline makes the estimate a hostage to arrival jitter — measuring
+across two clustered burst arrivals reads as a huge spurious rate error, which turned
+smooth playback into 66 ms output gaps.
+
+## Frame-rate conversion is not jitter
+
+The single largest scheduler bug was classifying planned conversion as failure. At 30 fps
+in and 60 fps out every second request must repeat, and the old code counted each one an
+underrun worth +10 ms of latency, so the buffer walked to its ceiling within a second of
+streaming. Conversion now produces `RepeatPlanned` and `planned_drops`, neither of which
+touches the target; only `RepeatUnderrun` and genuine late arrivals do.

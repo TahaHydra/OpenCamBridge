@@ -12,9 +12,6 @@ use std::thread::{sleep, spawn};
 use std::time::{Duration, Instant};
 mod mf_decoder;
 mod ocb2;
-mod playout;
-#[cfg(test)]
-mod playout_tests;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Authorization::{
@@ -30,7 +27,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
 };
-use windows::Win32::System::Performance::QueryPerformanceCounter;
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 const OCBR_MAGIC: u32 = 0x5242434F; // "OCBR"
 const RING_VERSION: u16 = 4;
@@ -540,7 +537,12 @@ impl SharedMemoryIpc {
             std::ptr::write_volatile(&mut (*slot).write_epoch, epoch);
             (*slot).ring_sequence = write_sequence;
             (*slot).stream_generation = generation;
-            (*slot).ring_write_timestamp_ns = monotonic_ns();
+            // QPC, deliberately NOT monotonic_ns(): that is an Instant epoch private to
+            // this process, so a consumer comparing it against its own clock would be
+            // comparing two unrelated origins. The playout scheduler uses this value to
+            // tell a frame that arrived late from one skipped by rate conversion, which
+            // only works in a shared clock domain.
+            (*slot).ring_write_timestamp_ns = qpc_ns();
             (*slot).send_delta_us = send_delta_us;
             (*slot).reserved_tail = 0;
             (*slot).sequence = sequence;
@@ -955,6 +957,24 @@ fn h264_decode_format_changed(
                 || old.fps_denominator != next.fps_denominator
         })
         .unwrap_or(true)
+}
+
+/// Host QPC time in nanoseconds.
+///
+/// The one clock both processes can read. `monotonic_ns` below is fine for intervals
+/// inside this process but its epoch is private, so anything a consumer must compare
+/// against its own clock has to come from here.
+fn qpc_ns() -> u64 {
+    let mut counter = 0i64;
+    let mut frequency = 0i64;
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut counter);
+        let _ = QueryPerformanceFrequency(&mut frequency);
+    }
+    if frequency <= 0 {
+        return 0;
+    }
+    ((counter as i128 * 1_000_000_000i128) / frequency as i128) as u64
 }
 
 fn monotonic_ns() -> u64 {

@@ -7,6 +7,8 @@
 
 namespace winrt::WindowsSample::implementation
 {
+    // Upper bound on the retained repeat frame: 1920x1080 RGB32.
+    constexpr DWORD OCB_LAST_GOOD_FRAME_LIMIT = 1920u * 1080u * 4u;
     class MediaBufferWriteLock final
     {
     public:
@@ -341,16 +343,34 @@ namespace winrt::WindowsSample::implementation
             bufferLock.scanline, bufferLock.bufferStart, bufferLock.bufferLength,
             bufferLock.pitch, width, height, subtype, &metadata);
         if (FAILED(hrFrame)) {
-            // A deterministic neutral diagnostic frame keeps the sample fully
-            // initialized, but it is never counted as a successful ring frame.
-            // The shared failure counters and lastRingError remain authoritative.
-            HRESULT fallbackResult = m_spFrameGenerator->CreateFrame(
-                bufferLock.scanline, bufferLock.bufferLength, bufferLock.pitch, m_rgbMask);
-            if (FAILED(fallbackResult)) {
-                (void)bufferLock.Unlock();
-                (void)m_shmClient.ReportSampleCopyFailure(fallbackResult);
-                return fallbackResult;
+            // Once real video has been delivered, a transient ring failure must show the
+            // LAST GOOD FRAME again, not a synthetic pattern. A diagnostic frame dropped
+            // into the middle of a live stream is a visible flash - worse than the
+            // momentary freeze it replaces, and indistinguishable from a real fault.
+            bool repeated = false;
+            if (m_lastGoodFrameLength > 0 && m_lastGoodFrameLength <= bufferLock.bufferLength) {
+                memcpy(bufferLock.bufferStart, m_lastGoodFrame.data(), m_lastGoodFrameLength);
+                repeated = true;
             }
+            if (!repeated) {
+                // Nothing valid has ever been shown, so there is nothing to repeat. Only
+                // here is a neutral diagnostic frame right: this is startup, not an
+                // interruption. It is never counted as a successful ring frame.
+                HRESULT fallbackResult = m_spFrameGenerator->CreateFrame(
+                    bufferLock.scanline, bufferLock.bufferLength, bufferLock.pitch, m_rgbMask);
+                if (FAILED(fallbackResult)) {
+                    (void)bufferLock.Unlock();
+                    (void)m_shmClient.ReportSampleCopyFailure(fallbackResult);
+                    return fallbackResult;
+                }
+            }
+        } else if (bufferLock.bufferLength > 0 && bufferLock.bufferLength <= OCB_LAST_GOOD_FRAME_LIMIT) {
+            // Keep a copy so the branch above has something to repeat.
+            if (m_lastGoodFrame.size() < bufferLock.bufferLength) {
+                m_lastGoodFrame.resize(bufferLock.bufferLength);
+            }
+            memcpy(m_lastGoodFrame.data(), bufferLock.bufferStart, bufferLock.bufferLength);
+            m_lastGoodFrameLength = bufferLock.bufferLength;
         }
         HRESULT lengthResult = bufferLock.CommitLength(width, height, subtype);
         if (FAILED(lengthResult)) {
@@ -369,31 +389,34 @@ namespace winrt::WindowsSample::implementation
         if (fpsNum > 0) {
             duration = (10'000'000LL * fpsDen) / fpsNum;
         }
-        // Prefer the playout scheduler's presentation time over a synthetic timeline.
+        // ONE timeline, taken straight from the playout schedule.
         //
-        // A counter of our own that merely advances by `duration` is unrelated to the
-        // source: it drifts away from the phone's capture timeline for as long as the
-        // stream runs, and it describes an even cadence even on samples that were in
-        // fact a repeat or a jump. Stamping what the scheduler actually decided is what
-        // makes the timestamps mean something downstream.
-        //
-        // Fall back to the synthetic timeline when there is no scheduled frame — the
-        // ring-read failure path above fills a diagnostic frame and leaves sampleTimeNs
-        // at zero.
-        LONGLONG scheduled = 0;
+        // The previous version kept a synthetic m_nextSampleTime alongside the scheduled
+        // value and used max() of the two. That silently discarded any correction wanting
+        // to move presentation EARLIER, which is half of what the clock servo does, so the
+        // servo was fighting a counter it could not influence. There is now a single
+        // series: the scheduler timestamps, rebased to a stream-relative epoch.
         if (metadata.sampleTimeNs != 0) {
-            scheduled = static_cast<LONGLONG>(metadata.sampleTimeNs / 100ULL);
+            const LONGLONG scheduled100ns = static_cast<LONGLONG>(metadata.sampleTimeNs / 100ULL);
+            if (m_streamEpoch100ns == 0) {
+                // The first scheduled frame defines zero. The schedule is anchored on QPC
+                // while Media Foundation expects a stream-relative timeline, so that offset
+                // is removed once here instead of being carried forever.
+                m_streamEpoch100ns = scheduled100ns;
+            }
+            LONGLONG relative = scheduled100ns - m_streamEpoch100ns;
+            if (relative < 0) relative = 0;
+            // Media Foundation requires strictly increasing sample times.
+            if (relative <= m_lastSampleTime100ns) relative = m_lastSampleTime100ns + 1;
+            m_lastSampleTime100ns = relative;
             if (metadata.durationNs != 0) {
                 duration = static_cast<LONGLONG>(metadata.durationNs / 100ULL);
             }
+        } else {
+            // No scheduled frame, because the ring read failed. Keep the series continuous.
+            m_lastSampleTime100ns += duration;
         }
-        if (m_nextSampleTime == 0) m_nextSampleTime = MFGetSystemTime();
-        // Media Foundation requires strictly increasing sample times, and the scheduler
-        // is anchored on QPC while this timeline started from MFGetSystemTime, so the
-        // two need not agree at the first sample. Never go backwards.
-        if (scheduled > m_nextSampleTime) m_nextSampleTime = scheduled;
-        RETURN_IF_FAILED(sample->SetSampleTime(m_nextSampleTime));
-        m_nextSampleTime += duration;
+        RETURN_IF_FAILED(sample->SetSampleTime(m_lastSampleTime100ns));
 
         RETURN_IF_FAILED(sample->SetSampleDuration(duration));
         if (metadata.flags & (1u << 2)) sample->SetUINT32(MFSampleExtension_Discontinuity, TRUE);
@@ -417,38 +440,57 @@ namespace winrt::WindowsSample::implementation
         {
             return;
         }
-        LONGLONG now = MFGetSystemTime();
-        LONGLONG last = m_lastDelivery100ns.load(std::memory_order_relaxed);
-        if (last != 0)
+        const LONGLONG now = MFGetSystemTime();
+        LONGLONG deadline = m_nextDeadline100ns.load(std::memory_order_relaxed);
+        if (deadline == 0)
         {
-            LONGLONG remaining = duration - (now - last);
-            // Never wait more than one frame interval; a larger value means the
-            // clock jumped or the consumer paused, and we should not stall.
-            if (remaining > duration)
+            // First sample of the stream establishes the deadline series.
+            m_nextDeadline100ns.store(now + duration, std::memory_order_relaxed);
+            return;
+        }
+
+        // ABSOLUTE deadlines, advanced by exactly one interval each time.
+        //
+        // The previous version waited `duration - (now - lastDelivery)` and then recorded
+        // the wake-up time as the new base. Every timer overshoot therefore became the
+        // starting point for the next interval and the error accumulated: a nominal
+        // 0/33.3/66.6/99.9 series drifted to 0/34.1/68.4/102.7. Advancing a fixed series
+        // instead means an overshoot is absorbed by the following wait rather than pushing
+        // everything after it.
+        LONGLONG remaining = deadline - now;
+        if (remaining > duration)
+        {
+            // The clock jumped backwards, or the consumer paused. Resynchronise once.
+            m_nextDeadline100ns.store(now + duration, std::memory_order_relaxed);
+            return;
+        }
+        if (remaining < -duration)
+        {
+            // More than a whole interval behind. Resynchronise ONCE to the current time
+            // rather than issuing a burst of catch-up samples to close the gap, which is
+            // exactly the visible jump this pipeline exists to avoid.
+            m_nextDeadline100ns.store(now + duration, std::memory_order_relaxed);
+            return;
+        }
+        if (remaining > 0)
+        {
+            bool waited = false;
+            if (m_pacingTimer)
             {
-                remaining = duration;
+                LARGE_INTEGER due;
+                due.QuadPart = -remaining; // relative wait to an absolute target
+                if (::SetWaitableTimer(m_pacingTimer.get(), &due, 0, nullptr, nullptr, FALSE))
+                {
+                    ::WaitForSingleObject(m_pacingTimer.get(), INFINITE);
+                    waited = true;
+                }
             }
-            if (remaining > 0)
+            if (!waited)
             {
-                bool waited = false;
-                if (m_pacingTimer)
-                {
-                    LARGE_INTEGER due;
-                    due.QuadPart = -remaining; // relative, 100ns units
-                    if (::SetWaitableTimer(m_pacingTimer.get(), &due, 0, nullptr, nullptr, FALSE))
-                    {
-                        ::WaitForSingleObject(m_pacingTimer.get(), INFINITE);
-                        waited = true;
-                    }
-                }
-                if (!waited)
-                {
-                    ::Sleep(static_cast<DWORD>(remaining / 10000));
-                }
-                now = MFGetSystemTime();
+                ::Sleep(static_cast<DWORD>(remaining / 10000));
             }
         }
-        m_lastDelivery100ns.store(now, std::memory_order_relaxed);
+        m_nextDeadline100ns.store(deadline + duration, std::memory_order_relaxed);
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////
@@ -666,7 +708,8 @@ namespace winrt::WindowsSample::implementation
 
         // Set stream state
         m_streamState = MF_STREAM_STATE_RUNNING;
-        m_nextSampleTime = MFGetSystemTime();
+        m_streamEpoch100ns = 0;
+        m_lastSampleTime100ns = 0;
 
         // Seed the pacing interval from the negotiated frame rate and start a
         // fresh delivery clock so the first sample is not artificially delayed.
@@ -677,7 +720,7 @@ namespace winrt::WindowsSample::implementation
         }
         LONGLONG duration = (fpsNum > 0) ? (10'000'000LL * fpsDen) / fpsNum : 333333;
         m_frameDuration100ns.store(duration, std::memory_order_relaxed);
-        m_lastDelivery100ns.store(0, std::memory_order_relaxed);
+        m_nextDeadline100ns.store(0, std::memory_order_relaxed);
 
         return S_OK;
     }
@@ -687,8 +730,9 @@ namespace winrt::WindowsSample::implementation
     {
         // Set stream state
         m_streamState = MF_STREAM_STATE_STOPPED;
-        m_nextSampleTime = 0;
-        m_lastDelivery100ns.store(0, std::memory_order_relaxed);
+        m_streamEpoch100ns = 0;
+        m_lastSampleTime100ns = 0;
+        m_nextDeadline100ns.store(0, std::memory_order_relaxed);
         (void)m_shmClient.SetConsumerAttached(false);
 
         // NOTE: if implementation has sampleRequestQueue or sampleQueue, it must flush the queue on stopped.

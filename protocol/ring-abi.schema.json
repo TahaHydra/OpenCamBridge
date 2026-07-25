@@ -4,7 +4,7 @@
   "packing": 8,
   "headerSize": 320,
   "slotHeaderSize": 128,
-  "slotCount": 8,
+  "slotCount": 16,
   "header": [
     { "name": "magic", "cpp": "magic", "type": "u32", "offset": 0, "size": 4 },
     { "name": "version", "cpp": "version", "type": "u16", "offset": 4, "size": 2 },

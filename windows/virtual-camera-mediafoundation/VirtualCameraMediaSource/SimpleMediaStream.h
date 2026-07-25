@@ -81,12 +81,20 @@ namespace winrt::WindowsSample::implementation
         DWORD m_dwStreamId = 0;
         MFSampleAllocatorUsage m_allocatorUsage;
         SharedMemoryClient m_shmClient;
-        LONGLONG m_nextSampleTime = 0;
+                // Single presentation series, rebased from the playout schedule.
+                LONGLONG m_streamEpoch100ns = 0;
+                LONGLONG m_lastSampleTime100ns = 0;
+                // Last successfully delivered pixels, repeated on a transient ring
+                // failure so a hiccup never becomes a visible flash.
+                std::vector<BYTE> m_lastGoodFrame;
+                DWORD m_lastGoodFrameLength = 0;
 
         // Frame-rate pacing state (accessed from RequestSample without m_Lock,
         // reset from Start/Stop under m_Lock, hence atomic).
         std::atomic<LONGLONG> m_frameDuration100ns{ 333333 }; // negotiated interval, 30 fps default
-        std::atomic<LONGLONG> m_lastDelivery100ns{ 0 };       // MFGetSystemTime() of last delivered sample
+        // Absolute deadline for the NEXT sample, advanced by exactly one interval each
+        // time so timer overshoot cannot accumulate across frames.
+                std::atomic<LONGLONG> m_nextDeadline100ns{ 0 };       // MFGetSystemTime() of last delivered sample
         wil::unique_handle m_pacingTimer;                     // high-resolution waitable timer
     };
 }

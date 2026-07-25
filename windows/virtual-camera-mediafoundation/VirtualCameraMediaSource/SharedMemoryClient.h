@@ -172,6 +172,7 @@ private:
     // because the two consumers (this camera and the desktop preview) read at
     // different rates and neither may disturb the other's accounting.
     OcbPlayoutScheduler m_playout;
+    bool m_playoutConfigured = false;
     uint64_t m_cursorNext = 0;
     uint64_t m_cursorGeneration = 0;
     // Selection-cadence trace; see TraceSelection. Off unless OCB_VCAM_TRACE is set.
