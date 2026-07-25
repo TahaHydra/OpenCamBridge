@@ -369,7 +369,29 @@ namespace winrt::WindowsSample::implementation
         if (fpsNum > 0) {
             duration = (10'000'000LL * fpsDen) / fpsNum;
         }
+        // Prefer the playout scheduler's presentation time over a synthetic timeline.
+        //
+        // A counter of our own that merely advances by `duration` is unrelated to the
+        // source: it drifts away from the phone's capture timeline for as long as the
+        // stream runs, and it describes an even cadence even on samples that were in
+        // fact a repeat or a jump. Stamping what the scheduler actually decided is what
+        // makes the timestamps mean something downstream.
+        //
+        // Fall back to the synthetic timeline when there is no scheduled frame — the
+        // ring-read failure path above fills a diagnostic frame and leaves sampleTimeNs
+        // at zero.
+        LONGLONG scheduled = 0;
+        if (metadata.sampleTimeNs != 0) {
+            scheduled = static_cast<LONGLONG>(metadata.sampleTimeNs / 100ULL);
+            if (metadata.durationNs != 0) {
+                duration = static_cast<LONGLONG>(metadata.durationNs / 100ULL);
+            }
+        }
         if (m_nextSampleTime == 0) m_nextSampleTime = MFGetSystemTime();
+        // Media Foundation requires strictly increasing sample times, and the scheduler
+        // is anchored on QPC while this timeline started from MFGetSystemTime, so the
+        // two need not agree at the first sample. Never go backwards.
+        if (scheduled > m_nextSampleTime) m_nextSampleTime = scheduled;
         RETURN_IF_FAILED(sample->SetSampleTime(m_nextSampleTime));
         m_nextSampleTime += duration;
 

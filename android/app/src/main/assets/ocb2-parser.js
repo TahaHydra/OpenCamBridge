@@ -56,6 +56,9 @@
         sequence: Number(view.getBigUint64(16, true)),
         captureTimestampNs: view.getBigUint64(24, true),
         encoderTimestampUs: view.getBigInt64(32, true),
+        // Reserved through version 2, so senders that predate it write zero and zero
+        // means "unknown". Read without a version gate for that reason.
+        sendDeltaUs: view.getUint32(44, true),
         payload: this.buffer.slice(HEADER_SIZE, total)
       };
       this.buffer = this.buffer.slice(total);

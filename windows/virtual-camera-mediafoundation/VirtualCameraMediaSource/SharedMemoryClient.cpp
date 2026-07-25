@@ -299,6 +299,48 @@ void SharedMemoryClient::UpdateConsumerHeartbeat(OpenCamBridgeRingHeader* ring)
     InterlockedExchange64(&ring->consumerHeartbeatQpc, qpc.QuadPart);
 }
 
+// Which ring frame this consumer picked, and how long since it last picked one.
+//
+// This is the aliasing point of the whole pipeline: Media Foundation pulls samples
+// on ITS OWN fixed cadence and takes whatever the ring has published at that
+// instant. So when frames arrive in bursts, some pulls land on a sequence already
+// served (isNew=0, a repeat) and others skip past one that was never served — which
+// is seen as a freeze followed by a jump even though no frame was lost in transport.
+// The always-on ring counters give the totals; this gives the per-sample ordering
+// needed to tell a repeat apart from a skip.
+//
+// Off unless OCB_VCAM_TRACE is set. This DLL is loaded into the Windows frame server,
+// which does not inherit a shell environment, so set the variable machine-wide for a
+// debugging session and read it with a debug-output viewer.
+void SharedMemoryClient::TraceSelection(uint64_t sequence, bool isNew, LONG publishedSlot,
+    const OpenCamBridgeRingSelection& selection, const OcbPlayoutDecision& decision)
+{
+    static const bool enabled = GetEnvironmentVariableW(L"OCB_VCAM_TRACE", nullptr, 0) != 0;
+    if (!enabled) return;
+
+    LARGE_INTEGER qpc = {};
+    LARGE_INTEGER frequency = {};
+    QueryPerformanceCounter(&qpc);
+    QueryPerformanceFrequency(&frequency);
+    LONG64 selectDeltaUs = 0;
+    if (m_lastSelectQpc != 0 && frequency.QuadPart != 0) {
+        selectDeltaUs = ((qpc.QuadPart - m_lastSelectQpc) * 1000000) / frequency.QuadPart;
+    }
+    m_lastSelectQpc = qpc.QuadPart;
+    // skipped counts ring writes this consumer passed over; overwritten is the part
+    // of that which the ring had already destroyed, so no pacing could have saved it.
+    DEBUG_MSG(L"OCB-VCAM-TRACE seq=%llu ring_seq=%llu new=%d slot=%ld select_dus=%lld "
+        L"overwritten=%llu depth_ms=%llu target_ms=%llu ppm=%lld late=%llu",
+        static_cast<unsigned long long>(sequence),
+        static_cast<unsigned long long>(decision.ringSequence),
+        isNew ? 1 : 0, publishedSlot, static_cast<long long>(selectDeltaUs),
+        static_cast<unsigned long long>(selection.overwritten),
+        static_cast<unsigned long long>(decision.bufferDepthNs / 1000000ULL),
+        static_cast<unsigned long long>(m_playout.TargetDelayNs() / 1000000ULL),
+        static_cast<long long>(m_playout.ClockCorrectionPpm()),
+        static_cast<unsigned long long>(decision.lateDropped));
+}
+
 HRESULT SharedMemoryClient::PublishDllIdentity()
 {
     if (m_identityPublished) return S_OK;
@@ -468,8 +510,64 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
         ring->slotSize >= OCBR_SLOT_HEADER_SIZE && ringBytes <= m_viewSize;
     if (!ringValid) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
 
+    // Enumerate every committed slot, then ask the playout scheduler which one is due.
+    //
+    // This is the change that removes the freeze-then-jump: instead of taking whatever
+    // is newest at the instant Media Foundation happens to ask, each frame is released
+    // against its own capture timestamp from a bounded buffer. Scanning eight 128-byte
+    // slot headers per request is nothing next to copying a frame.
+    const uint64_t writeSequence =
+        static_cast<uint64_t>(InterlockedCompareExchange64(&ring->ringWriteSequence, 0, 0));
+    const uint64_t generation =
+        static_cast<uint64_t>(InterlockedCompareExchange64(&ring->streamGeneration, 0, 0));
+
+    OcbPlayoutCandidate candidates[OCBR_SLOT_COUNT] = {};
+    size_t candidateCount = 0;
+    for (uint32_t index = 0; index < ring->slotCount && index < OCBR_SLOT_COUNT; ++index) {
+        const uint64_t offset = ring->headerSize + static_cast<uint64_t>(index) * ring->slotSize;
+        if (offset + sizeof(OpenCamBridgeSlotHeader) > m_viewSize) continue;
+        auto* candidateSlot = reinterpret_cast<OpenCamBridgeSlotHeader*>(
+            static_cast<BYTE*>(m_pMappedView) + offset);
+        const LONG64 candidateEpoch = InterlockedCompareExchange64(&candidateSlot->writeEpoch, 0, 0);
+        const LONG64 candidateCommitted = InterlockedCompareExchange64(&candidateSlot->committedEpoch, 0, 0);
+        MemoryBarrier();
+        // Half-written slots are simply not offered; the scheduler never sees them.
+        if (candidateEpoch == 0 || candidateEpoch != candidateCommitted) continue;
+        if (candidateSlot->pixelFormat != OCBR_FORMAT_NV12) continue;
+        if (candidateSlot->ringSequence == 0) continue;
+        candidates[candidateCount].ringSequence = candidateSlot->ringSequence;
+        candidates[candidateCount].captureTimestampNs = candidateSlot->captureTimestampNs;
+        candidates[candidateCount].streamGeneration = candidateSlot->streamGeneration;
+        candidates[candidateCount].slotIndex = index;
+        candidateCount++;
+    }
+
+    const DWORD fpsNumerator = static_cast<DWORD>((std::max<LONG>)(1,
+        InterlockedCompareExchange(&ring->consumerFpsNum, 0, 0)));
+    const DWORD fpsDenominator = static_cast<DWORD>((std::max<LONG>)(1,
+        InterlockedCompareExchange(&ring->consumerFpsDen, 0, 0)));
+    const uint64_t intervalNs = (1000000000ULL * fpsDenominator) / fpsNumerator;
+
+    LARGE_INTEGER qpc = {}, qpf = {};
+    QueryPerformanceCounter(&qpc);
+    QueryPerformanceFrequency(&qpf);
+    const uint64_t nowNs = qpf.QuadPart > 0
+        ? static_cast<uint64_t>((static_cast<double>(qpc.QuadPart) / qpf.QuadPart) * 1000000000.0)
+        : 0;
+
+    // Scheduled ONCE, outside the retry loop: retrying would advance the playout state
+    // twice for a single sample request and corrupt the timeline.
+    const OcbPlayoutDecision decision =
+        m_playout.Schedule(nowNs, candidates, candidateCount, intervalNs);
+    if (decision.action == OcbPlayoutAction::Starve) return HRESULT_FROM_WIN32(ERROR_RETRY);
+
+    // Frames destroyed before playout reached them. Distinct from the scheduler's own
+    // late-drop count: this one says the ring was too short, not that we chose to skip.
+    const OpenCamBridgeRingSelection selection = OcbSelectNewestRingFrame(
+        m_cursorNext, m_cursorGeneration, writeSequence, generation, ring->slotCount);
+
     for (int attempt = 0; attempt < 3; ++attempt) {
-        const LONG published = InterlockedCompareExchange(&ring->publishedSlot, 0, 0);
+        const LONG published = static_cast<LONG>(decision.slotIndex);
         if (published < 0 || published >= static_cast<LONG>(ring->slotCount)) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
         const uint64_t slotOffset = ring->headerSize + static_cast<uint64_t>(published) * ring->slotSize;
         if (slotOffset + sizeof(OpenCamBridgeSlotHeader) > m_viewSize) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
@@ -485,6 +583,10 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
         const uint64_t expectedUv = static_cast<uint64_t>(local.uvStride) * (local.height / 2);
         const uint64_t expectedPayload = expectedY + expectedUv;
         const bool valid = epoch != 0 && epoch == committed && local.writeEpoch == local.committedEpoch &&
+            // The slot must still hold the frame the scheduler chose. If the producer
+            // has lapped us it does not, and this sample is failed rather than showing
+            // a frame from the wrong point in the timeline.
+            local.ringSequence == decision.ringSequence &&
             local.pixelFormat == OCBR_FORMAT_NV12 && local.width > 0 && local.height > 0 &&
             local.width <= ring->maxWidth && local.height <= ring->maxHeight &&
             (local.width % 2) == 0 && (local.height % 2) == 0 &&
@@ -575,13 +677,39 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
         metadata->receiveTimestampNs = local.receiveTimestampNs;
         metadata->decodeTimestampNs = local.decodeTimestampNs;
         metadata->flags = local.flags;
-        metadata->isNew = local.sequence != m_lastSequence;
+        metadata->sampleTimeNs = decision.sampleTimeNs;
+        metadata->durationNs = decision.durationNs;
+        // isNew now comes from the SCHEDULER rather than from comparing phone sequences.
+        // A repeat is a decision it made deliberately — because nothing was due yet —
+        // not something inferred after the fact from two identical sequence numbers.
+        metadata->isNew = decision.action == OcbPlayoutAction::Release;
+        m_lastSequence = local.sequence;
         if (metadata->isNew) {
-            m_lastSequence = local.sequence;
             InterlockedIncrement64(&ring->virtualCameraUniqueFrames);
         } else {
             InterlockedIncrement64(&ring->repeatedVirtualCameraSamples);
         }
+
+        if (selection.generationChanged) {
+            // A restart: adopt the new generation and start counting from this frame.
+            // Frames from the previous stream are not losses.
+            m_cursorGeneration = generation;
+        } else if (selection.overwritten > 0) {
+            InterlockedExchangeAdd64(&ring->ringFramesOverwritten,
+                static_cast<LONG64>(selection.overwritten));
+        }
+        m_cursorNext = decision.ringSequence + 1;
+        // Publish playout telemetry for the producer to report. Relaxed stores: these are
+        // diagnostics read at human timescales, never used to make a decision.
+        InterlockedExchange64(&ring->playoutBufferDepthNs, static_cast<LONG64>(decision.bufferDepthNs));
+        InterlockedExchange64(&ring->playoutTargetDelayNs, static_cast<LONG64>(m_playout.TargetDelayNs()));
+        InterlockedExchange64(&ring->playoutLateDropped, static_cast<LONG64>(m_playout.SourceFramesLateDropped()));
+        InterlockedExchange64(&ring->playoutUnderruns, static_cast<LONG64>(m_playout.Underruns()));
+        InterlockedExchange64(&ring->playoutSchedulerResets, static_cast<LONG64>(m_playout.SchedulerResets()));
+        InterlockedExchange(&ring->playoutClockPpm, static_cast<LONG>(m_playout.ClockCorrectionPpm()));
+        InterlockedExchange(&ring->playoutMaxOutputGapMs,
+            static_cast<LONG>(m_playout.MaxOutputGapNs() / 1000000ULL));
+        TraceSelection(local.sequence, metadata->isNew, published, selection, decision);
         return S_OK;
     }
     return HRESULT_FROM_WIN32(ERROR_RETRY);

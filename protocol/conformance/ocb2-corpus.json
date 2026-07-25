@@ -93,6 +93,18 @@
         {"hex": "4f43423202003000030000000000000001000000000000007b00000000000000c8010000000000000100000100000000"}
       ],
       "expectedError": "PAYLOAD_TOO_LARGE"
+    },
+    {
+      "id": "send_delta_is_read_from_the_former_reserved_field",
+      "actions": [
+        {"hex": "4f4342320200300003000000020000002900000000000000d2040000000000002e1600000000000003000000000000006b65794f4342320200300003000000000000002a00000000000000ba08000000000000e99700000000000004000000578200006c6174654f4342320200300003000000000000002b00000000000000a20c0000000000001e1a01000000000007000000000000006e6f64656c7461"}
+      ],
+      "expectedRecords": [
+        {"type": 3, "flags": 2, "sequence": 41, "sendDeltaUs": 0, "payloadHex": "6b6579"},
+        {"type": 3, "flags": 0, "sequence": 42, "sendDeltaUs": 33367, "payloadHex": "6c617465"},
+        {"type": 3, "flags": 0, "sequence": 43, "sendDeltaUs": 0, "payloadHex": "6e6f64656c7461"}
+      ],
+      "acceptedVideoSequences": [41, 42, 43]
     }
   ]
 }

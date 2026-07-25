@@ -30,6 +30,18 @@ object Ocb2 {
         val sequence: Long,
         val captureTimestampNs: Long,
         val encoderTimestampUs: Long,
+        /**
+         * Microseconds between this record being queued for transmission and the
+         * previous video record. Zero when unknown.
+         *
+         * This is a SENDER-SIDE CADENCE measurement, deliberately not an absolute
+         * timestamp: the phone's capture clock and the desktop's clock have no
+         * fixed relationship, but a delta is comparable across machines. Holding
+         * Android's send deltas next to the desktop's arrival deltas is what
+         * distinguishes "the encoder emitted late" from "the transport batched" —
+         * the question a smoothness complaint cannot otherwise answer.
+         */
+        val sendDeltaUs: Int,
         val payload: ByteArray
     )
 
@@ -80,6 +92,9 @@ object Ocb2 {
             if (payloadLength > MAX_PAYLOAD_SIZE) {
                 throw ParseException("PAYLOAD_TOO_LARGE", "OCB2 payload exceeds canonical limit")
             }
+            // Diagnostics only, and zero on builds that predate it, so it is read
+            // without any version gate.
+            val sendDeltaUs = header.int
             val total = HEADER_SIZE.toLong() + payloadLength
             if (total > Int.MAX_VALUE || length.toLong() < total) return null
             val totalInt = total.toInt()
@@ -87,7 +102,9 @@ object Ocb2 {
             val remaining = length - totalInt
             if (remaining > 0) bytes.copyInto(bytes, 0, totalInt, length)
             length = remaining
-            return Record(type, flags, sequence, captureTimestampNs, encoderTimestampUs, payload)
+            return Record(
+                type, flags, sequence, captureTimestampNs, encoderTimestampUs, sendDeltaUs, payload
+            )
         }
 
         private fun ensureCapacity(required: Int) {
@@ -104,7 +121,8 @@ object Ocb2 {
         sequence: Long,
         captureTimestampNs: Long,
         encoderTimestampUs: Long,
-        payload: ByteArray = ByteArray(0)
+        payload: ByteArray = ByteArray(0),
+        sendDeltaUs: Int = 0
     ): ByteArray {
         require(payload.size <= MAX_PAYLOAD_SIZE) { "OCB2 payload is too large" }
         val out = ByteBuffer.allocate(HEADER_SIZE.toInt() + payload.size)
@@ -119,7 +137,10 @@ object Ocb2 {
         out.putLong(captureTimestampNs)
         out.putLong(encoderTimestampUs)
         out.putInt(payload.size)
-        out.putInt(0)
+        // Was a reserved zero. Now carries the sender-side cadence delta, which
+        // keeps HEADER_SIZE and the protocol version unchanged: readers that
+        // ignore it see exactly what they saw before.
+        out.putInt(sendDeltaUs)
         out.put(payload)
         return out.array()
     }

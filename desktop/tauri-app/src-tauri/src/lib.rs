@@ -29,6 +29,7 @@ pub fn run() {
             virtualcam::stop_virtual_camera_feeder,
             virtualcam::get_virtual_camera_status,
             nv12_preview::get_nv12_preview_frame,
+            nv12_preview::get_nv12_preview_cursor_stats,
             logger::start_log_session,
             logger::append_log,
             logger::get_log_path,

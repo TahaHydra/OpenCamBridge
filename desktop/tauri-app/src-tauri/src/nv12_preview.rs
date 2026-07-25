@@ -24,7 +24,7 @@ use crate::sync_state::RecoverMutex;
 const PREVIEW_MAX_DIMENSION: usize = 960;
 
 const OCBR_MAGIC: u32 = 0x5242_434f;
-const RING_VERSION: u16 = 3;
+const RING_VERSION: u16 = 4;
 const FORMAT_NV12: u32 = 2;
 const MAX_NV12_SIZE: usize = 1920 * 1080 * 3 / 2;
 const SLOT_SIZE: usize = SLOT_HEADER_SIZE + MAX_NV12_SIZE;
@@ -70,7 +70,25 @@ struct RingHeader {
     producer_fps_den: AtomicU32,
     resize_backend: AtomicU32,
     resize_failures: AtomicU32,
-    reserved: [u8; 16],
+    /// Monotonic count of ring writes; a frame lands in
+    /// `ring_write_sequence % slot_count`. This is what lets a consumer holding a
+    /// cursor read frames in order and know when one it wanted was overwritten;
+    /// `published_slot` only ever names the newest.
+    ring_write_sequence: AtomicU64,
+    /// Bumped on stream restart or geometry change, so the cursor resets rather
+    /// than reading the discontinuity as loss.
+    stream_generation: AtomicU64,
+    ring_frames_overwritten: AtomicU64,
+    /// Playout telemetry, written by the virtual camera. These answer WHY a correction
+    /// happened, which the unique/repeated counters alone cannot.
+    playout_buffer_depth_ns: AtomicU64,
+    playout_target_delay_ns: AtomicU64,
+    playout_late_dropped: AtomicU64,
+    playout_underruns: AtomicU64,
+    playout_scheduler_resets: AtomicU64,
+    playout_clock_ppm: AtomicI32,
+    playout_max_output_gap_ms: AtomicU32,
+    reserved: [u64; 1],
 }
 
 #[repr(C)]
@@ -89,7 +107,15 @@ struct SlotHeader {
     payload_size: u32,
     flags: u32,
     data_offset: u32,
-    reserved: [u64; 6],
+    /// The `ring_write_sequence` this slot was written under; compared against the
+    /// index a cursor derived, so a mismatch is an overwrite.
+    ring_sequence: u64,
+    stream_generation: u64,
+    ring_write_timestamp_ns: u64,
+    /// Sender cadence carried through from the OCB2 header; 0 when unknown.
+    send_delta_us: u32,
+    reserved_tail: u32,
+    reserved: [u64; 2],
     committed_epoch: u64,
 }
 
@@ -291,7 +317,11 @@ impl Mapping {
         }
     }
 
-    fn read_latest(&self, after_sequence: u64) -> Result<Vec<u8>, String> {
+    fn read_latest(
+        &self,
+        after_sequence: u64,
+        cursor: &mut PreviewCursor,
+    ) -> Result<Vec<u8>, String> {
         unsafe {
             let base = self.view.Value as *const u8;
             let ring = &*(base as *const RingHeader);
@@ -300,7 +330,22 @@ impl Mapping {
             if published_sequence <= after_sequence {
                 return Ok(Vec::new());
             }
-            let slot_index = ring.published_slot.load(Ordering::Acquire) as usize;
+            // Slot choice comes from the monotonic write sequence rather than
+            // `published_slot`. Both name the same slot while the preview still takes
+            // the newest frame; the difference is that the write sequence also says
+            // what came before it, which is what the cursor accounting needs.
+            let write_sequence = ring.ring_write_sequence.load(Ordering::Acquire);
+            let generation = ring.stream_generation.load(Ordering::Acquire);
+            let Some(selection) = ring_select_newest(
+                cursor.next,
+                cursor.generation,
+                write_sequence,
+                generation,
+                SLOT_COUNT as u64,
+            ) else {
+                return Ok(Vec::new());
+            };
+            let slot_index = selection.slot_index;
             if slot_index >= SLOT_COUNT {
                 return Err("NV12 preview rejected published slot index".to_string());
             }
@@ -312,6 +357,9 @@ impl Mapping {
             if first_epoch == 0
                 || first_epoch != metadata.write_epoch
                 || first_epoch & 1 == 0
+                // The slot must still hold the write the cursor selected; if not, the
+                // producer lapped us and the next poll picks up the newer frame.
+                || metadata.ring_sequence != selection.ring_sequence
                 || metadata.sequence != published_sequence
                 || metadata.pixel_format != FORMAT_NV12
             {
@@ -399,6 +447,19 @@ impl Mapping {
             if final_epoch != first_epoch {
                 return Ok(Vec::new());
             }
+            // Advance only after the frame is known good, so a torn read is retried
+            // rather than silently counted as consumed.
+            if selection.generation_changed {
+                cursor.generation = generation;
+                cursor.resets += 1;
+            } else {
+                cursor.skipped += selection.skipped;
+                cursor.overwritten += selection.overwritten;
+                // Counted locally and deliberately NOT written back into the ring: this
+                // mapping is PAGE_READONLY/FILE_MAP_READ, so any store here would fault.
+                // The virtual camera, which maps read/write, owns the shared counter.
+            }
+            cursor.next = selection.ring_sequence + 1;
             Ok(response)
         }
     }
@@ -408,6 +469,22 @@ pub struct Nv12PreviewReader {
     state: Mutex<ReaderState>,
 }
 
+/// This consumer's own place in the history ring.
+///
+/// Local, not shared: the preview and the virtual camera read at different rates, and
+/// neither may disturb the other's accounting. The counters answer a question the
+/// existing rate figures cannot — whether a hitch was this consumer reading at the
+/// wrong moment (`skipped`) or the ring being too short to hold the frame at all
+/// (`overwritten`).
+#[derive(Default)]
+struct PreviewCursor {
+    next: u64,
+    generation: u64,
+    skipped: u64,
+    overwritten: u64,
+    resets: u64,
+}
+
 struct ReaderState {
     mapping: Option<Mapping>,
     producer_instance: u64,
@@ -415,6 +492,7 @@ struct ReaderState {
     last_sequence: u64,
     last_heartbeat: u64,
     last_progress: Instant,
+    cursor: PreviewCursor,
 }
 
 impl Nv12PreviewReader {
@@ -427,8 +505,38 @@ impl Nv12PreviewReader {
                 last_sequence: 0,
                 last_heartbeat: 0,
                 last_progress: Instant::now(),
+                cursor: PreviewCursor::default(),
             }),
         }
+    }
+}
+
+/// Preview-side ring cursor accounting, for diagnosing a hitch in the preview
+/// specifically rather than in the virtual camera.
+#[derive(serde::Serialize)]
+pub struct Nv12PreviewCursorStats {
+    /// Ring writes the preview never rendered.
+    pub skipped: u64,
+    /// Of those, how many the ring had already destroyed. A non-zero value here means
+    /// the ring is too short for this consumer's polling interval; `skipped` alone only
+    /// means it polled at the wrong moments.
+    pub overwritten: u64,
+    /// Producer restarts observed.
+    pub resets: u64,
+    /// Next ring write sequence the preview has not yet rendered.
+    pub cursor: u64,
+}
+
+#[tauri::command]
+pub fn get_nv12_preview_cursor_stats(
+    state: tauri::State<'_, Nv12PreviewReader>,
+) -> Nv12PreviewCursorStats {
+    let reader = state.state.lock_recover();
+    Nv12PreviewCursorStats {
+        skipped: reader.cursor.skipped,
+        overwritten: reader.cursor.overwritten,
+        resets: reader.cursor.resets,
+        cursor: reader.cursor.next,
     }
 }
 
@@ -448,6 +556,8 @@ pub fn get_nv12_preview_frame(
         reader.last_sequence = 0;
         reader.last_heartbeat = 0;
         reader.last_progress = Instant::now();
+        // A different producer means a different ring; the cursor cannot carry over.
+        reader.cursor = PreviewCursor::default();
     }
     if reader.mapping.is_none() {
         match Mapping::open() {
@@ -483,7 +593,8 @@ pub fn get_nv12_preview_frame(
         reader.last_progress = Instant::now();
         return Ok(Response::new(Vec::new()));
     }
-    match reader.mapping.as_ref().unwrap().read_latest(after_sequence) {
+    let ReaderState { mapping, cursor, .. } = &mut *reader;
+    match mapping.as_ref().unwrap().read_latest(after_sequence, cursor) {
         Ok(bytes) => Ok(Response::new(bytes)),
         Err(error) => {
             reader.mapping = None;

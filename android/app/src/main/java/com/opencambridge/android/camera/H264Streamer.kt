@@ -108,6 +108,8 @@ class H264Streamer(
     private var captureWindowStartNs = 0L
     private var captureWindowFrames = 0
     private var encodedWindowStartNs = 0L
+    /** Monotonic time the previous video record was queued, for send cadence. */
+    private var lastVideoSendNs = 0L
     private var encodedWindowFrames = 0
     private var encodedWindowBytes = 0L
     private var bridgeWindowStartNs = 0L
@@ -360,6 +362,9 @@ class H264Streamer(
 
         // Each rung drops exactly one requirement, so a picky encoder loses as
         // little as possible instead of falling all the way to defaults.
+        // Intra refresh was tried here and removed: the encoder accepted
+        // KEY_INTRA_REFRESH_PERIOD and produced identical IDR sizes and cadence, so
+        // it bought nothing. KEY_I_FRAME_INTERVAL wins on this encoder.
         val ladder = listOf(
             "High profile + CBR" to buildFormat(withHighProfile = true, withCbr = true),
             "CBR" to buildFormat(withHighProfile = false, withCbr = true),
@@ -404,6 +409,7 @@ class H264Streamer(
         StreamState.actualBitrate.set(bitrate)
         encodedWindowFrames = 0
         encodedWindowBytes = 0L
+        lastVideoSendNs = 0L
         encodedWindowStartNs = SystemClock.elapsedRealtimeNanos()
     }
 
@@ -543,7 +549,22 @@ class H264Streamer(
         }
         val flags = if (keyframe) Ocb2.FLAG_KEYFRAME else 0
         val captureNs = max(0L, presentationTimeUs * 1000L)
-        broadcast(Ocb2.record(Ocb2.TYPE_VIDEO_ACCESS_UNIT, flags, nextFrameSequence(), captureNs, presentationTimeUs, data))
+        // Sender-side cadence, measured on this phone's monotonic clock right before
+        // the record is queued. The desktop compares these deltas against its own
+        // arrival deltas to tell an encoder that emitted late from a transport that
+        // batched — the two look identical in a frame-rate average.
+        val queuedAtNs = SystemClock.elapsedRealtimeNanos()
+        val sendDeltaUs = lastVideoSendNs
+            .takeIf { it != 0L }
+            ?.let { ((queuedAtNs - it) / 1_000L).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt() }
+            ?: 0
+        lastVideoSendNs = queuedAtNs
+        broadcast(
+            Ocb2.record(
+                Ocb2.TYPE_VIDEO_ACCESS_UNIT, flags, nextFrameSequence(), captureNs,
+                presentationTimeUs, data, sendDeltaUs
+            )
+        )
         val now = SystemClock.elapsedRealtimeNanos()
         encodedWindowFrames++
         encodedWindowBytes += data.size

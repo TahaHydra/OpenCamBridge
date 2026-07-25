@@ -22,8 +22,135 @@ $rustTypes = @{
     atomic_u32 = "std::sync::atomic::AtomicU32";
     atomic_i32 = "std::sync::atomic::AtomicI32";
     atomic_u64 = "std::sync::atomic::AtomicU64";
-    bytes16 = "[u8; 16]"; bytes32 = "[u8; 32]"; u64x6 = "[u64; 6]"
+    bytes16 = "[u8; 16]"; bytes32 = "[u8; 32]";
+    u64x1 = "[u64; 1]"; u64x2 = "[u64; 2]"; u64x6 = "[u64; 6]"; u64x7 = "[u64; 7]"
 }
+
+# The cursor arithmetic is emitted rather than hand-written in each language.
+# Three consumers need it (the producer's own accounting, the C++ virtual camera and
+# the Tauri preview) and they must agree exactly on which slot holds a given write, or
+# one of them reads a different frame than the one it reports. The Rust copy carries
+# the tests; this generator is what keeps the others identical to it.
+#
+# The window is deliberately one slot shorter than slotCount, because the producer's
+# next write targets the oldest slot and a cursor must never point at it.
+$rustSelection = @'
+
+/// What a consumer holding a cursor should read from the history ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct RingSelection {
+    /// Ring write sequence to read.
+    pub ring_sequence: u64,
+    /// Slot holding it.
+    pub slot_index: usize,
+    /// Ring writes between the cursor and this one that the consumer never saw.
+    pub skipped: u64,
+    /// How many of `skipped` the ring had already destroyed, so no amount of catching
+    /// up could have recovered them. Separates "the ring is too short" from "this
+    /// consumer read at the wrong moment".
+    pub overwritten: u64,
+    /// The producer restarted or changed geometry; cursor state is meaningless, so
+    /// losses are reported as zero rather than as an enormous bogus figure.
+    pub generation_changed: bool,
+    /// False when the consumer has already seen this frame, so delivering it is a
+    /// repeat. A caught-up consumer still gets a selection: Media Foundation must be
+    /// handed a sample for every request, so "nothing new" has to mean "send the last
+    /// one again", never "fail the request".
+    pub fresh: bool,
+}
+
+/// Pick the newest committed frame and account for what the cursor missed.
+///
+/// This still selects the NEWEST frame, exactly as the pre-cursor code did, so what
+/// the user sees is unchanged. What is new is the accounting, which makes "this
+/// consumer skipped two frames" and "this frame was destroyed before anyone read it"
+/// separately countable. Reading in cursor order instead of newest-first is a later
+/// change, not this one.
+#[allow(dead_code)]
+pub fn ring_select_newest(
+    cursor_next: u64,
+    cursor_generation: u64,
+    write_sequence: u64,
+    generation: u64,
+    slot_count: u64,
+) -> Option<RingSelection> {
+    if slot_count < 2 || write_sequence == 0 {
+        return None;
+    }
+    let slot_index = ((write_sequence - 1) % slot_count) as usize;
+    if generation != cursor_generation {
+        return Some(RingSelection {
+            ring_sequence: write_sequence,
+            slot_index,
+            skipped: 0,
+            overwritten: 0,
+            generation_changed: true,
+            fresh: true,
+        });
+    }
+    let fresh = cursor_next <= write_sequence;
+    let oldest_safe = write_sequence.saturating_sub(slot_count - 2).max(1);
+    let skipped = write_sequence.saturating_sub(cursor_next);
+    let overwritten = if fresh {
+        oldest_safe.saturating_sub(cursor_next)
+    } else {
+        0
+    };
+    Some(RingSelection {
+        ring_sequence: write_sequence,
+        slot_index,
+        skipped,
+        overwritten,
+        generation_changed: false,
+        fresh,
+    })
+}
+'@
+
+$cppSelection = @'
+
+// What a consumer holding a cursor should read from the history ring. See the Rust
+// `ring_select_newest`, which carries the tests for this arithmetic.
+struct OpenCamBridgeRingSelection {
+    uint64_t ringSequence;
+    uint32_t slotIndex;
+    // Ring writes between the cursor and this one that this consumer never saw.
+    uint64_t skipped;
+    // How many of `skipped` the ring had already destroyed.
+    uint64_t overwritten;
+    // The producer restarted or changed geometry; cursor state is meaningless.
+    bool generationChanged;
+    // False when this consumer has already seen the frame, so delivering it is a
+    // repeat. A caught-up consumer still receives a selection, because Media
+    // Foundation must be handed a sample for every request it makes.
+    bool fresh;
+    bool valid;
+};
+
+inline OpenCamBridgeRingSelection OcbSelectNewestRingFrame(
+    uint64_t cursorNext, uint64_t cursorGeneration,
+    uint64_t writeSequence, uint64_t generation, uint64_t slotCount)
+{
+    OpenCamBridgeRingSelection selection = {};
+    if (slotCount < 2 || writeSequence == 0) return selection;
+    selection.valid = true;
+    selection.ringSequence = writeSequence;
+    selection.slotIndex = static_cast<uint32_t>((writeSequence - 1) % slotCount);
+    if (generation != cursorGeneration) {
+        selection.generationChanged = true;
+        selection.fresh = true;
+        return selection;
+    }
+    selection.fresh = cursorNext <= writeSequence;
+    const uint64_t window = slotCount - 2;
+    const uint64_t oldestSafe = writeSequence > window ? writeSequence - window : 1;
+    selection.skipped = writeSequence > cursorNext ? writeSequence - cursorNext : 0;
+    selection.overwritten =
+        (selection.fresh && oldestSafe > cursorNext) ? oldestSafe - cursorNext : 0;
+    return selection;
+}
+'@
 
 function Rust-Assertions([string]$headerType, [string]$slotType) {
     $lines = [Collections.Generic.List[string]]::new()
@@ -48,6 +175,7 @@ function Rust-Assertions([string]$headerType, [string]$slotType) {
         $lines.Add("const _: () = assert!(std::mem::offset_of!($slotType, $($field.name)) == $($field.offset));")
         $lines.Add("const _: () = assert!(std::mem::size_of::<$type>() == $($field.size));")
     }
+    $lines.Add($rustSelection.Replace("`r`n", "`n"))
     return ($lines -join "`n") + "`n"
 }
 
@@ -67,6 +195,7 @@ foreach ($field in $schema.slotHeader) {
     $cpp.Add("static_assert(offsetof(OpenCamBridgeSlotHeader, $($field.cpp)) == $($field.offset), `"slot field offset changed: $($field.cpp)`" );")
     $cpp.Add("static_assert(sizeof(((OpenCamBridgeSlotHeader*)0)->$($field.cpp)) == $($field.size), `"slot field size changed: $($field.cpp)`" );")
 }
+$cpp.Add($cppSelection.Replace("`r`n", "`n"))
 $cppContent = ($cpp -join "`n") + "`n"
 
 $outputs = @{

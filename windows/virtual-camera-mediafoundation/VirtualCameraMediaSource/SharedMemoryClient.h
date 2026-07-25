@@ -7,12 +7,12 @@
 #include <vector>
 
 #define OCBR_MAGIC 0x5242434F
-#define OCBR_VERSION 3
+#define OCBR_VERSION 4
 #define OCBR_FORMAT_NV12 2
 #define OCBR_FORMAT_RGB32 3
-#define OCBR_HEADER_SIZE 256
+#define OCBR_HEADER_SIZE 320
 #define OCBR_SLOT_HEADER_SIZE 128
-#define OCBR_SLOT_COUNT 3
+#define OCBR_SLOT_COUNT 8
 
 // ABI source of truth: protocol/ring-abi.schema.json. The generated C++
 // assertions below and the two Rust generated files must move together.
@@ -54,7 +54,27 @@ struct OpenCamBridgeRingHeader {
     volatile LONG producerFpsDen;
     volatile LONG resizeBackend;
     volatile LONG resizeFailures;
-    uint8_t reserved[16];
+    // Monotonic count of ring writes; the slot a frame lands in is
+    // ringWriteSequence % slotCount. A consumer holding a cursor can therefore
+    // work out which slots are still live and whether the frame it wanted has
+    // been overwritten. publishedSlot cannot answer that: it names the newest
+    // frame and says nothing about the ones before it.
+    volatile LONG64 ringWriteSequence;
+    // Bumped on stream restart or geometry change, so a consumer resets its
+    // cursor instead of reading the sequence discontinuity as dropped frames.
+    volatile LONG64 streamGeneration;
+    // Frames overwritten before any consumer read them.
+    volatile LONG64 ringFramesOverwritten;
+    // Playout telemetry, written by this consumer. These answer WHY a correction
+    // happened, which the unique/repeated counters alone cannot.
+    volatile LONG64 playoutBufferDepthNs;
+    volatile LONG64 playoutTargetDelayNs;
+    volatile LONG64 playoutLateDropped;
+    volatile LONG64 playoutUnderruns;
+    volatile LONG64 playoutSchedulerResets;
+    volatile LONG playoutClockPpm;
+    volatile LONG playoutMaxOutputGapMs;
+    uint64_t reserved[1];
 };
 
 struct OpenCamBridgeSlotHeader {
@@ -71,12 +91,23 @@ struct OpenCamBridgeSlotHeader {
     uint32_t payloadSize;
     uint32_t flags;
     uint32_t dataOffset;
-    uint64_t reserved[6];
+    // The ringWriteSequence this slot was written under. A consumer compares it
+    // against the slot index it derived from its own cursor; a mismatch means the
+    // frame it wanted is gone.
+    uint64_t ringSequence;
+    uint64_t streamGeneration;
+    // Producer-clock commit time, which makes ring residency measurable.
+    uint64_t ringWriteTimestampNs;
+    // Sender cadence carried through from the OCB2 header; 0 when unknown.
+    uint32_t sendDeltaUs;
+    uint32_t reservedTail;
+    uint64_t reserved[2];
     volatile LONG64 committedEpoch;
 };
 #pragma pack(pop)
 
 #include "RingAbi.generated.h"
+#include "PlayoutScheduler.h"
 
 struct OpenCamBridgeFrameMetadata {
     uint64_t sequence = 0;
@@ -85,6 +116,12 @@ struct OpenCamBridgeFrameMetadata {
     uint64_t decodeTimestampNs = 0;
     uint32_t flags = 0;
     bool isNew = false;
+    // Presentation time chosen by the playout scheduler, on the host clock. This is
+    // what the sample must be stamped with: a synthetic timeline of its own would drift
+    // away from the source and defeat the whole point of scheduling against capture
+    // timestamps. Always strictly increasing.
+    uint64_t sampleTimeNs = 0;
+    uint64_t durationNs = 0;
 };
 
 class SharedMemoryClient {
@@ -122,12 +159,23 @@ private:
     HRESULT PublishDllIdentity();
     void UpdateConsumerHeartbeat(OpenCamBridgeRingHeader* ring);
     void ResetGpuResizeResources();
+    void TraceSelection(uint64_t sequence, bool isNew, LONG publishedSlot,
+        const OpenCamBridgeRingSelection& selection, const OcbPlayoutDecision& decision);
 
     HANDLE m_hFile;
     HANDLE m_hMapFile;
     void* m_pMappedView;
     SIZE_T m_viewSize;
     uint64_t m_lastSequence;
+    // Consumer-local read cursor over the history ring: the next ring write sequence
+    // this consumer has not yet seen, and the stream generation it belongs to. Local
+    // because the two consumers (this camera and the desktop preview) read at
+    // different rates and neither may disturb the other's accounting.
+    OcbPlayoutScheduler m_playout;
+    uint64_t m_cursorNext = 0;
+    uint64_t m_cursorGeneration = 0;
+    // Selection-cadence trace; see TraceSelection. Off unless OCB_VCAM_TRACE is set.
+    LONG64 m_lastSelectQpc = 0;
     std::vector<BYTE> m_nv12Scratch;
     ID3D11Device* m_d3dDevice = nullptr;
     ID3D11DeviceContext* m_d3dContext = nullptr;

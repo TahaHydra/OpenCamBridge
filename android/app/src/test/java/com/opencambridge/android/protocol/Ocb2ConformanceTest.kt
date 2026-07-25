@@ -66,6 +66,14 @@ class Ocb2ConformanceTest {
                 assertEquals(id, item.getValue("type").jsonPrimitive.int.toShort(), actual.type)
                 assertEquals(id, item.getValue("flags").jsonPrimitive.int, actual.flags)
                 assertEquals(id, item.getValue("sequence").jsonPrimitive.long, actual.sequence)
+                // Absent on the cases written before the field existed, and those
+                // headers carry the old reserved zero, so defaulting to 0 is the
+                // backward-compatibility assertion rather than a way to skip it.
+                assertEquals(
+                    "$id send delta",
+                    item["sendDeltaUs"]?.jsonPrimitive?.int ?: 0,
+                    actual.sendDeltaUs
+                )
                 assertArrayEquals(id, decodeHex(item.getValue("payloadHex").jsonPrimitive.content), actual.payload)
             }
             assertEquals(

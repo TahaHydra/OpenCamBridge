@@ -46,6 +46,9 @@ for (const fixture of corpus.cases) {
     assert.equal(actual.type, expected.type, fixture.id);
     assert.equal(actual.flags, expected.flags, fixture.id);
     assert.equal(actual.sequence, expected.sequence, fixture.id);
+    // Defaults to 0 for the cases predating the field, whose headers carry the old
+    // reserved zero — so this asserts backward compatibility rather than skipping it.
+    assert.equal(actual.sendDeltaUs, expected.sendDeltaUs ?? 0, fixture.id + ' send delta');
     assert.equal(Buffer.from(actual.payload).toString('hex'), expected.payloadHex, fixture.id);
   });
   let waitingForKeyframe = true;

@@ -1,10 +1,10 @@
 {
   "name": "OpenCamBridge NV12 ring ABI",
-  "version": 3,
+  "version": 4,
   "packing": 8,
-  "headerSize": 256,
+  "headerSize": 320,
   "slotHeaderSize": 128,
-  "slotCount": 3,
+  "slotCount": 8,
   "header": [
     { "name": "magic", "cpp": "magic", "type": "u32", "offset": 0, "size": 4 },
     { "name": "version", "cpp": "version", "type": "u16", "offset": 4, "size": 2 },
@@ -41,7 +41,17 @@
     { "name": "producer_fps_den", "cpp": "producerFpsDen", "type": "atomic_u32", "offset": 228, "size": 4 },
     { "name": "resize_backend", "cpp": "resizeBackend", "type": "atomic_u32", "offset": 232, "size": 4 },
     { "name": "resize_failures", "cpp": "resizeFailures", "type": "atomic_u32", "offset": 236, "size": 4 },
-    { "name": "reserved", "cpp": "reserved", "type": "bytes16", "offset": 240, "size": 16 }
+    { "name": "ring_write_sequence", "cpp": "ringWriteSequence", "type": "atomic_u64", "offset": 240, "size": 8 },
+    { "name": "stream_generation", "cpp": "streamGeneration", "type": "atomic_u64", "offset": 248, "size": 8 },
+    { "name": "ring_frames_overwritten", "cpp": "ringFramesOverwritten", "type": "atomic_u64", "offset": 256, "size": 8 },
+    { "name": "playout_buffer_depth_ns", "cpp": "playoutBufferDepthNs", "type": "atomic_u64", "offset": 264, "size": 8 },
+    { "name": "playout_target_delay_ns", "cpp": "playoutTargetDelayNs", "type": "atomic_u64", "offset": 272, "size": 8 },
+    { "name": "playout_late_dropped", "cpp": "playoutLateDropped", "type": "atomic_u64", "offset": 280, "size": 8 },
+    { "name": "playout_underruns", "cpp": "playoutUnderruns", "type": "atomic_u64", "offset": 288, "size": 8 },
+    { "name": "playout_scheduler_resets", "cpp": "playoutSchedulerResets", "type": "atomic_u64", "offset": 296, "size": 8 },
+    { "name": "playout_clock_ppm", "cpp": "playoutClockPpm", "type": "atomic_i32", "offset": 304, "size": 4 },
+    { "name": "playout_max_output_gap_ms", "cpp": "playoutMaxOutputGapMs", "type": "atomic_u32", "offset": 308, "size": 4 },
+    { "name": "reserved", "cpp": "reserved", "type": "u64x1", "offset": 312, "size": 8 }
   ],
   "slotHeader": [
     { "name": "write_epoch", "cpp": "writeEpoch", "type": "u64", "offset": 0, "size": 8 },
@@ -57,7 +67,12 @@
     { "name": "payload_size", "cpp": "payloadSize", "type": "u32", "offset": 60, "size": 4 },
     { "name": "flags", "cpp": "flags", "type": "u32", "offset": 64, "size": 4 },
     { "name": "data_offset", "cpp": "dataOffset", "type": "u32", "offset": 68, "size": 4 },
-    { "name": "reserved", "cpp": "reserved", "type": "u64x6", "offset": 72, "size": 48 },
+    { "name": "ring_sequence", "cpp": "ringSequence", "type": "u64", "offset": 72, "size": 8 },
+    { "name": "stream_generation", "cpp": "streamGeneration", "type": "u64", "offset": 80, "size": 8 },
+    { "name": "ring_write_timestamp_ns", "cpp": "ringWriteTimestampNs", "type": "u64", "offset": 88, "size": 8 },
+    { "name": "send_delta_us", "cpp": "sendDeltaUs", "type": "u32", "offset": 96, "size": 4 },
+    { "name": "reserved_tail", "cpp": "reservedTail", "type": "u32", "offset": 100, "size": 4 },
+    { "name": "reserved", "cpp": "reserved", "type": "u64x2", "offset": 104, "size": 16 },
     { "name": "committed_epoch", "cpp": "committedEpoch", "type": "u64", "offset": 120, "size": 8 }
   ]
 }

@@ -12,6 +12,9 @@ use std::thread::{sleep, spawn};
 use std::time::{Duration, Instant};
 mod mf_decoder;
 mod ocb2;
+mod playout;
+#[cfg(test)]
+mod playout_tests;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Authorization::{
@@ -30,7 +33,7 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Performance::QueryPerformanceCounter;
 
 const OCBR_MAGIC: u32 = 0x5242434F; // "OCBR"
-const RING_VERSION: u16 = 3;
+const RING_VERSION: u16 = 4;
 const FORMAT_NV12: u32 = 2;
 const MAX_NV12_SIZE: usize = 1920 * 1080 * 3 / 2;
 const SLOT_SIZE: usize = SLOT_HEADER_SIZE + MAX_NV12_SIZE;
@@ -75,7 +78,29 @@ struct OpenCamBridgeRingHeader {
     producer_fps_den: std::sync::atomic::AtomicU32,
     resize_backend: std::sync::atomic::AtomicU32,
     resize_failures: std::sync::atomic::AtomicU32,
-    reserved: [u8; 16],
+    /// Monotonic count of ring writes. The slot a frame lands in is
+    /// `ring_write_sequence % slot_count`, so a consumer holding a cursor can work
+    /// out exactly which slots are still live and whether its own next frame has
+    /// already been overwritten. `published_slot` alone cannot answer that: it says
+    /// where the newest frame is and nothing about the ones before it.
+    ring_write_sequence: std::sync::atomic::AtomicU64,
+    /// Bumped whenever the stream restarts or its geometry changes. Consumers reset
+    /// their cursor on a change instead of reading the sequence discontinuity as
+    /// dropped frames.
+    stream_generation: std::sync::atomic::AtomicU64,
+    /// Frames the producer overwrote that no consumer had read. Distinguishes "the
+    /// ring is too short" from "the consumer is reading at the wrong time".
+    ring_frames_overwritten: std::sync::atomic::AtomicU64,
+    /// Playout telemetry, written by the virtual camera. These answer WHY a correction
+    /// happened, which the unique/repeated counters alone cannot.
+    playout_buffer_depth_ns: std::sync::atomic::AtomicU64,
+    playout_target_delay_ns: std::sync::atomic::AtomicU64,
+    playout_late_dropped: std::sync::atomic::AtomicU64,
+    playout_underruns: std::sync::atomic::AtomicU64,
+    playout_scheduler_resets: std::sync::atomic::AtomicU64,
+    playout_clock_ppm: std::sync::atomic::AtomicI32,
+    playout_max_output_gap_ms: std::sync::atomic::AtomicU32,
+    reserved: [u64; 1],
 }
 
 #[repr(C)]
@@ -94,7 +119,18 @@ struct OpenCamBridgeSlotHeader {
     payload_size: u32,
     flags: u32,
     data_offset: u32,
-    reserved: [u64; 6],
+    /// The `ring_write_sequence` value this slot was written under. A consumer that
+    /// computed a slot index from its own cursor compares this: a mismatch means the
+    /// frame it wanted is gone, which is overwrite detection.
+    ring_sequence: u64,
+    stream_generation: u64,
+    /// Producer-clock time the frame was committed. Phase 3's playout schedule is
+    /// built from this; on its own it makes ring residency measurable.
+    ring_write_timestamp_ns: u64,
+    /// Sender-side cadence carried through from the OCB2 header; 0 when unknown.
+    send_delta_us: u32,
+    reserved_tail: u32,
+    reserved: [u64; 2],
     committed_epoch: u64,
 }
 
@@ -464,6 +500,7 @@ impl SharedMemoryIpc {
         y_stride: u32,
         uv_stride: u32,
         flags: u32,
+        send_delta_us: u32,
         data: &[u8],
     ) -> bool {
         let Some(payload_size) =
@@ -483,15 +520,29 @@ impl SharedMemoryIpc {
 
         unsafe {
             let ring = &*(self.p_map as *const OpenCamBridgeRingHeader);
-            let current = ring
-                .published_slot
-                .load(std::sync::atomic::Ordering::Acquire) as usize;
-            let slot_index = (current + 1) % SLOT_COUNT;
+            // Slot choice comes from the monotonic write sequence, not from
+            // `published_slot`. Both pick the same slot, but only the counter tells a
+            // consumer WHICH frames the ring currently holds, which is what reading in
+            // order (rather than always taking the newest) requires. 1-based, so a
+            // `ring_sequence` of 0 still means "never written".
+            let write_sequence = ring
+                .ring_write_sequence
+                .load(std::sync::atomic::Ordering::Acquire)
+                + 1;
+            let generation = ring
+                .stream_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let slot_index = ((write_sequence - 1) % SLOT_COUNT as u64) as usize;
             let slot_base = (self.p_map as *mut u8).add(RING_HEADER_SIZE + slot_index * SLOT_SIZE);
             let slot = slot_base as *mut OpenCamBridgeSlotHeader;
-            let epoch = sequence.wrapping_mul(2) | 1;
+            let epoch = write_sequence.wrapping_mul(2) | 1;
             std::ptr::write_volatile(&mut (*slot).committed_epoch, 0);
             std::ptr::write_volatile(&mut (*slot).write_epoch, epoch);
+            (*slot).ring_sequence = write_sequence;
+            (*slot).stream_generation = generation;
+            (*slot).ring_write_timestamp_ns = monotonic_ns();
+            (*slot).send_delta_us = send_delta_us;
+            (*slot).reserved_tail = 0;
             (*slot).sequence = sequence;
             (*slot).capture_timestamp_ns = capture_timestamp_ns;
             (*slot).receive_timestamp_ns = receive_timestamp_ns;
@@ -517,8 +568,30 @@ impl SharedMemoryIpc {
                 .store(slot_index as u32, std::sync::atomic::Ordering::Release);
             ring.published_sequence
                 .store(sequence, std::sync::atomic::Ordering::Release);
+            // Published last, and only after the slot is committed, so
+            // `ring_write_sequence` is exactly "how many frames are fully written".
+            // A consumer can then treat
+            // `(ring_write_sequence - slot_count, ring_write_sequence]` as the live
+            // window without ever racing a half-written slot.
+            ring.ring_write_sequence
+                .store(write_sequence, std::sync::atomic::Ordering::Release);
         }
         true
+    }
+
+    /// Invalidate every consumer cursor, because frame sequences are about to
+    /// restart or the geometry is about to change.
+    ///
+    /// Without this a consumer cannot tell a restart from catastrophic loss: both
+    /// look like the sequence jumping backwards or far forwards. A generation bump
+    /// says "reset, this is a new stream" instead.
+    fn bump_stream_generation(&self) {
+        self.initialize_ring_if_needed();
+        unsafe {
+            let ring = &*(self.p_map as *const OpenCamBridgeRingHeader);
+            ring.stream_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
     }
 
     /// Compatibility path: MJPEG/test-pattern pixels are converted once to the
@@ -544,6 +617,8 @@ impl SharedMemoryIpc {
                 height,
                 width,
                 width,
+                0,
+                // No OCB2 sender cadence on this path.
                 0,
                 &nv12,
             );
@@ -631,6 +706,38 @@ impl SharedMemoryIpc {
                 resize_failures: ring
                     .resize_failures
                     .load(std::sync::atomic::Ordering::Acquire),
+                ring_write_sequence: ring
+                    .ring_write_sequence
+                    .load(std::sync::atomic::Ordering::Acquire),
+                stream_generation: ring
+                    .stream_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+                ring_frames_overwritten: ring
+                    .ring_frames_overwritten
+                    .load(std::sync::atomic::Ordering::Acquire),
+                playout_buffer_depth_ms: ring
+                    .playout_buffer_depth_ns
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    / 1_000_000,
+                playout_target_delay_ms: ring
+                    .playout_target_delay_ns
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    / 1_000_000,
+                playout_late_dropped: ring
+                    .playout_late_dropped
+                    .load(std::sync::atomic::Ordering::Acquire),
+                playout_underruns: ring
+                    .playout_underruns
+                    .load(std::sync::atomic::Ordering::Acquire),
+                playout_scheduler_resets: ring
+                    .playout_scheduler_resets
+                    .load(std::sync::atomic::Ordering::Acquire),
+                playout_clock_ppm: ring
+                    .playout_clock_ppm
+                    .load(std::sync::atomic::Ordering::Acquire),
+                playout_max_output_gap_ms: ring
+                    .playout_max_output_gap_ms
+                    .load(std::sync::atomic::Ordering::Acquire),
                 installed_dll_build_hash: hex_hash(&ring.installed_dll_build_hash),
                 producer_build_hash: self.producer_hash_hex.clone(),
                 ring_abi_hash: ring.ring_abi_hash,
@@ -681,6 +788,23 @@ struct RingDiagnostics {
     source_fps_den: u32,
     resize_backend: String,
     resize_failures: u32,
+    /// Monotonic ring writes so far; the newest frame is this sequence.
+    ring_write_sequence: u64,
+    /// Incremented on every stream restart or geometry change.
+    stream_generation: u64,
+    /// Frames a consumer found already overwritten when it came to read them.
+    /// Separates "the ring is too short" from "the consumer read at the wrong
+    /// moment", which the skipped-frame counters alone cannot.
+    ring_frames_overwritten: u64,
+    /// Playout scheduler telemetry, written by the virtual camera. The unique and
+    /// repeated counters say THAT a correction happened; these say why.
+    playout_buffer_depth_ms: u64,
+    playout_target_delay_ms: u64,
+    playout_late_dropped: u64,
+    playout_underruns: u64,
+    playout_scheduler_resets: u64,
+    playout_clock_ppm: i32,
+    playout_max_output_gap_ms: u32,
     installed_dll_build_hash: String,
     producer_build_hash: String,
     ring_abi_hash: u64,
@@ -1182,6 +1306,16 @@ mod ring_tests {
             source_fps_den: 1,
             resize_backend: "native-match".into(),
             resize_failures: 0,
+            ring_write_sequence: value,
+            stream_generation: 1,
+            ring_frames_overwritten: 0,
+            playout_buffer_depth_ms: 80,
+            playout_target_delay_ms: 80,
+            playout_late_dropped: 0,
+            playout_underruns: 0,
+            playout_scheduler_resets: 1,
+            playout_clock_ppm: 0,
+            playout_max_output_gap_ms: 33,
             installed_dll_build_hash: "a".repeat(64),
             producer_build_hash: "b".repeat(64),
             ring_abi_hash: RING_ABI_HASH,
@@ -1322,9 +1456,9 @@ mod ring_tests {
     }
 
     #[test]
-    fn ring_v3_diagnostic_layout_is_stable() {
-        assert_eq!(RING_VERSION, 3);
-        assert_eq!(std::mem::size_of::<OpenCamBridgeRingHeader>(), 256);
+    fn ring_v4_diagnostic_layout_is_stable() {
+        assert_eq!(RING_VERSION, 4);
+        assert_eq!(std::mem::size_of::<OpenCamBridgeRingHeader>(), 320);
         assert_eq!(
             std::mem::offset_of!(OpenCamBridgeRingHeader, consumer_attached),
             80
@@ -1481,6 +1615,148 @@ mod ring_tests {
     }
 
     #[test]
+    fn a_clean_restart_reconnects_without_the_failure_backoff() {
+        // The regression this pins: the phone rebinds its camera routinely (the
+        // adaptive watchdog downgrades a profile that cannot hold its rate) and
+        // announces end of stream. Pacing that like a failure put a full second of
+        // nothing into the NV12 ring, which both the desktop preview and the virtual
+        // camera render as a freeze followed by a burst of catch-up frames.
+        assert!(
+            reconnect_delay(true, 0) <= Duration::from_millis(100),
+            "a clean restart must reconnect promptly"
+        );
+        // A clean restart must stay prompt even if failures were counted earlier,
+        // because the counter is reset rather than consulted.
+        assert!(reconnect_delay(true, 7) <= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn a_failed_connection_still_backs_off() {
+        // The other half: a phone that is genuinely gone must not be hammered.
+        assert!(reconnect_delay(false, 1) >= Duration::from_secs(1));
+        assert!(reconnect_delay(false, 9) >= Duration::from_secs(1));
+        // ...and the wait stays bounded so recovery is not left to a long sleep.
+        assert!(reconnect_delay(false, 9) <= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_ring_cursor_maps_write_sequences_onto_slots_the_producer_actually_used() {
+        // The one invariant every consumer depends on: the slot the producer chose for
+        // write N and the slot a consumer derives for write N must be the same, or the
+        // consumer reads a different frame than the one it is accounting for.
+        for write_sequence in 1u64..=(SLOT_COUNT as u64 * 3) {
+            let producer_slot = ((write_sequence - 1) % SLOT_COUNT as u64) as usize;
+            let selection =
+                ring_select_newest(write_sequence, 0, write_sequence, 0, SLOT_COUNT as u64)
+                    .expect("a committed write is always readable");
+            assert_eq!(
+                producer_slot, selection.slot_index,
+                "write {write_sequence} slot"
+            );
+            assert_eq!(0, selection.skipped);
+            assert_eq!(0, selection.overwritten);
+        }
+    }
+
+    #[test]
+    fn a_caught_up_cursor_still_gets_the_newest_frame_marked_as_a_repeat() {
+        // Media Foundation must be handed a sample for every request, so a caught-up
+        // consumer has to receive the previous frame again rather than an error. Only
+        // `fresh` distinguishes the two, and only fresh frames may count as losses.
+        let repeat = ring_select_newest(11, 0, 10, 0, SLOT_COUNT as u64).unwrap();
+        assert!(!repeat.fresh);
+        assert_eq!(10, repeat.ring_sequence);
+        assert_eq!(0, repeat.skipped);
+        assert_eq!(0, repeat.overwritten);
+        // An empty ring genuinely has nothing to hand over.
+        assert_eq!(None, ring_select_newest(1, 0, 0, 0, SLOT_COUNT as u64));
+    }
+
+    #[test]
+    fn the_ring_cursor_separates_frames_skipped_from_frames_destroyed() {
+        let slots = SLOT_COUNT as u64;
+        // One frame behind: one skipped, still recoverable, so nothing was destroyed.
+        let one_behind = ring_select_newest(10, 0, 11, 0, slots).unwrap();
+        assert_eq!(1, one_behind.skipped);
+        assert_eq!(0, one_behind.overwritten);
+
+        // Far behind: every frame outside the window is gone for good. This is the
+        // number that says "the ring is too short", as opposed to skipped, which says
+        // "this consumer read at the wrong moment".
+        let far_behind = ring_select_newest(1, 0, 100, 0, slots).unwrap();
+        assert_eq!(99, far_behind.skipped);
+        let oldest_safe = 100 - (slots - 2);
+        assert_eq!(oldest_safe - 1, far_behind.overwritten);
+        assert!(
+            far_behind.overwritten < far_behind.skipped,
+            "frames still inside the window must not be counted as destroyed"
+        );
+
+        // Exactly at the oldest safe frame: nothing destroyed yet.
+        assert_eq!(
+            0,
+            ring_select_newest(oldest_safe, 0, 100, 0, slots)
+                .unwrap()
+                .overwritten
+        );
+        // One older than that: exactly one destroyed. This is the boundary that
+        // decides whether the window is off by one.
+        assert_eq!(
+            1,
+            ring_select_newest(oldest_safe - 1, 0, 100, 0, slots)
+                .unwrap()
+                .overwritten
+        );
+    }
+
+    #[test]
+    fn a_generation_change_resets_the_cursor_instead_of_reporting_mass_loss() {
+        // A restart makes the phone's sequence begin again. Without the generation
+        // check the cursor would read that as thousands of lost frames and the metrics
+        // would blame the ring for a reconnect.
+        let restarted = ring_select_newest(9_000, 3, 5, 4, SLOT_COUNT as u64).unwrap();
+        assert!(restarted.generation_changed);
+        assert_eq!(0, restarted.skipped);
+        assert_eq!(0, restarted.overwritten);
+        assert_eq!(5, restarted.ring_sequence);
+        // A stale cursor from a PREVIOUS generation must still be honoured as a reset
+        // even when its sequence looks plausible.
+        assert!(
+            ring_select_newest(4, 1, 5, 2, SLOT_COUNT as u64)
+                .unwrap()
+                .generation_changed
+        );
+    }
+
+    #[test]
+    fn the_frame_trace_is_silent_until_asked_and_honours_the_gap_threshold() {
+        let mut trace = FrameTrace::from_env();
+        // Default must be off: this runs per frame at 30fps and stderr is shared with
+        // the desktop's event stream.
+        trace.every_frame = false;
+        trace.gap_threshold_us = None;
+        assert!(!trace.enabled());
+        assert!(!trace.should_report());
+
+        // Threshold mode reports only the late arrivals, which is what makes a long
+        // capture readable.
+        trace.gap_threshold_us = Some(50_000);
+        assert!(trace.enabled());
+        trace.arrival_delta_us = 49_999;
+        assert!(!trace.should_report());
+        trace.arrival_delta_us = 50_001;
+        assert!(trace.should_report());
+
+        // The first frame of a session has no predecessor, so its delta is zero and
+        // must not be mistaken for an arrival that beat the threshold.
+        trace.arrival_delta_us = 0;
+        assert!(!trace.should_report());
+
+        trace.every_frame = true;
+        assert!(trace.should_report());
+    }
+
+    #[test]
     fn orientation_rejects_unsupported_angles_and_oversized_output() {
         let input = orientation_fixture(8, 4, 8, 8);
         let mut output = Vec::new();
@@ -1613,6 +1889,162 @@ fn set_error(slot: &Arc<Mutex<Option<String>>>, msg: String) {
 
 fn clear_error(slot: &Arc<Mutex<Option<String>>>) {
     *slot.lock().unwrap() = None;
+}
+
+/// Per-frame timing trace across every stage the pipeline owns.
+///
+/// A smoothness complaint cannot be answered from frame-rate averages: a run of
+/// frames arriving in a burst and a run arriving evenly both average to the same
+/// rate. This records, for each access unit, where in the chain its time went, so
+/// the stage responsible is read off data rather than argued about.
+///
+/// Opt-in and silent by default:
+///   `OCB_TRACE_FRAMES=1`  every frame
+///   `OCB_AU_GAP_MS=<ms>`  only frames whose ARRIVAL gap exceeded the threshold
+///
+/// Written to stderr, because stdout carries the metrics JSON the desktop parses.
+///
+/// The pairing that matters is `send_dus` against `arrive_dus`: the phone's own
+/// send cadence versus our arrival cadence. Even send deltas with uneven arrivals
+/// means the transport batched; uneven send deltas means it left the phone that
+/// way.
+struct FrameTrace {
+    every_frame: bool,
+    gap_threshold_us: Option<u64>,
+    sequence: u64,
+    keyframe: bool,
+    bytes: usize,
+    capture_pts_us: i64,
+    send_delta_us: u32,
+    arrival_delta_us: u64,
+    received_at: Option<Instant>,
+}
+
+/// What one access unit cost inside the producer, in microseconds.
+struct FrameStages {
+    decode_us: u64,
+    rotate_us: u64,
+    write_us: u64,
+    /// Frames the decoder emitted for this access unit. Zero is normal while the
+    /// MFT builds its pipeline, and a persistent zero is itself the finding.
+    outputs: u32,
+}
+
+impl FrameTrace {
+    fn from_env() -> Self {
+        Self {
+            every_frame: std::env::var("OCB_TRACE_FRAMES")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
+            gap_threshold_us: std::env::var("OCB_AU_GAP_MS")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|ms| (ms * 1000.0) as u64),
+            sequence: 0,
+            keyframe: false,
+            bytes: 0,
+            capture_pts_us: 0,
+            send_delta_us: 0,
+            arrival_delta_us: 0,
+            received_at: None,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.every_frame || self.gap_threshold_us.is_some()
+    }
+
+    fn should_report(&self) -> bool {
+        self.every_frame
+            || self
+                .gap_threshold_us
+                .is_some_and(|threshold| self.arrival_delta_us > threshold)
+    }
+
+    fn begin(&mut self, record: &ocb2::Record, arrival_delta_us: u64) {
+        if !self.enabled() {
+            return;
+        }
+        self.sequence = record.sequence;
+        self.keyframe = record.is_keyframe();
+        self.bytes = record.payload.len();
+        self.capture_pts_us = record.encoder_timestamp_us;
+        self.send_delta_us = record.send_delta_us;
+        self.arrival_delta_us = arrival_delta_us;
+        self.received_at = Some(Instant::now());
+    }
+
+    /// Called when an access unit is discarded before reaching the decoder.
+    ///
+    /// Worth a line of its own: discarding everything up to the next IDR is how a
+    /// reconnect turns into a visible freeze, and that is invisible in the rate
+    /// counters because the frames never became decode attempts.
+    fn skipped(&mut self, reason: &str) {
+        if !self.enabled() || self.received_at.take().is_none() {
+            return;
+        }
+        if self.should_report() {
+            eprintln!(
+                "OCB2-TRACE seq={} key={} bytes={} arrive_dus={} skipped={}",
+                self.sequence,
+                u8::from(self.keyframe),
+                self.bytes,
+                self.arrival_delta_us,
+                reason
+            );
+        }
+    }
+
+    /// Called once the access unit has been decoded, oriented and offered to the ring.
+    fn finish(&mut self, stages: &FrameStages) {
+        if !self.enabled() {
+            return;
+        }
+        let Some(received) = self.received_at.take() else {
+            return;
+        };
+        // `total` is wall time held by this access unit; the three stage figures sum
+        // to it, so a gap between them and `total` is time spent somewhere not yet
+        // instrumented, which is worth seeing.
+        let total_us = received.elapsed().as_micros() as u64;
+        if !self.should_report() {
+            return;
+        }
+        eprintln!(
+            "OCB2-TRACE seq={} key={} bytes={} pts_us={} send_dus={} arrive_dus={} \
+             decode_dus={} rotate_dus={} write_dus={} total_dus={} outputs={}",
+            self.sequence,
+            u8::from(self.keyframe),
+            self.bytes,
+            self.capture_pts_us,
+            self.send_delta_us,
+            self.arrival_delta_us,
+            stages.decode_us,
+            stages.rotate_us,
+            stages.write_us,
+            total_us,
+            stages.outputs
+        );
+    }
+}
+
+/// How long to wait before re-opening the OCB2 stream.
+///
+/// A clean restart is NOT a failure and must not be paced like one. The phone
+/// rebinds its camera routinely — the adaptive watchdog downgrades a profile that
+/// cannot hold its frame rate, and a rebind announces end of stream — and applying
+/// the failure backoff to that put a full second of nothing into the NV12 ring.
+/// Both the desktop preview and the virtual camera read that ring, so it showed up
+/// on both as a freeze followed by a burst of catch-up frames, while the phone's
+/// own preview stayed smooth because it never leaves the phone.
+fn reconnect_delay(clean: bool, consecutive_failures: u32) -> Duration {
+    if clean {
+        // Long enough not to spin if the phone is briefly not accepting, short
+        // enough to cost a frame or two rather than a visible stall.
+        Duration::from_millis(50)
+    } else {
+        Duration::from_secs(backoff_secs(consecutive_failures).min(2))
+    }
 }
 
 fn backoff_secs(consecutive_failures: u32) -> u64 {
@@ -2498,8 +2930,13 @@ const READER_QUEUE_DEPTH: usize = 4;
 
 enum ReaderEvent {
     Record(ocb2::Record),
-    /// The connection ended or produced an unusable byte stream.
-    Ended(String),
+    /// The connection ended. `expected` distinguishes a clean close — the phone
+    /// rebinding its camera, which it does routinely — from a genuine failure.
+    /// Reconnect pacing depends on which it was.
+    Ended {
+        reason: String,
+        expected: bool,
+    },
 }
 
 /// Aligns the phone's capture clock to this machine's monotonic clock.
@@ -2597,13 +3034,18 @@ fn spawn_ocb2_reader(
             }
             let count = match response.read(&mut network_buffer) {
                 Ok(0) => {
-                    let _ = events.send(ReaderEvent::Ended(
-                        "OCB2 connection ended; reconnecting at a keyframe".into(),
-                    ));
+                    // The phone closed the stream. Normal during a rebind.
+                    let _ = events.send(ReaderEvent::Ended {
+                        reason: "OCB2 connection ended; reconnecting at a keyframe".into(),
+                        expected: true,
+                    });
                     return;
                 }
                 Err(e) => {
-                    let _ = events.send(ReaderEvent::Ended(format!("OCB2 read failed: {e}")));
+                    let _ = events.send(ReaderEvent::Ended {
+                        reason: format!("OCB2 read failed: {e}"),
+                        expected: false,
+                    });
                     return;
                 }
                 Ok(count) => count,
@@ -2621,8 +3063,10 @@ fn spawn_ocb2_reader(
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        let _ = events
-                            .send(ReaderEvent::Ended(format!("Malformed OCB2 record: {e:?}")));
+                        let _ = events.send(ReaderEvent::Ended {
+                            reason: format!("Malformed OCB2 record: {e:?}"),
+                            expected: false,
+                        });
                         return;
                     }
                 }
@@ -2669,11 +3113,24 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
     let mut phone_encoder_error: bool;
     let (mut last_vcam_unique, mut last_vcam_repeated) = ipc.virtual_camera_counters();
     let mut consumer_readiness = ConsumerReadiness::new();
+    // Per-frame stage timing; see FrameTrace. Silent unless OCB_TRACE_FRAMES or
+    // OCB_AU_GAP_MS is set.
+    //
+    // This is how the "freezes then jumps" report was diagnosed: it showed that
+    // frames are not lost (transport and decoded rates both hold, replaced stays
+    // zero) but ARRIVE IN BURSTS of two or three, so every second or third access
+    // unit shows a ~75ms gap while the ones between arrive back to back. Keep it
+    // for the next time a smoothness complaint needs evidence rather than theory.
+    let mut last_au_instant: Option<Instant> = None;
+    let mut frame_trace = FrameTrace::from_env();
 
     loop {
         consumer_readiness.reset();
         waiting_for_keyframe = true;
         phone_encoder_error = false;
+        // Each connection restarts the phone's frame sequence, so retire every
+        // consumer cursor before the first frame of the new one lands.
+        ipc.bump_stream_generation();
         if let Some(V2Decoder::MediaFoundation(d)) = decoder.as_mut() {
             let _ = d.flush();
         }
@@ -2720,6 +3177,12 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
         let (recycle_tx, recycle_rx) = sync_channel::<Vec<u8>>(READER_QUEUE_DEPTH * 2);
         spawn_ocb2_reader(response, event_tx, recycle_rx, Arc::clone(&bytes_received));
 
+        // Set when the disconnect was the phone restarting cleanly rather than a
+        // failure. Backing off a full second on a clean restart was the visible
+        // freeze: the adaptive watchdog rebinds, the phone announces end of stream,
+        // and the ring then received nothing for a second before frames resumed in
+        // a burst.
+        let mut clean_disconnect = false;
         'connection: loop {
             // The metrics tick runs before the record wait, so a pipeline that is
             // starved — waiting for a keyframe, or receiving nothing at all —
@@ -2857,8 +3320,9 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
 
             let record = match event_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(ReaderEvent::Record(record)) => record,
-                Ok(ReaderEvent::Ended(reason)) => {
+                Ok(ReaderEvent::Ended { reason, expected }) => {
                     last_error = Some(reason);
+                    clean_disconnect = expected;
                     break 'connection;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue 'connection,
@@ -2905,6 +3369,10 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                             stream_info = Some(info);
                             if decode_format_changed {
                                 consumer_readiness.reset();
+                                // New geometry means the frames already in the ring
+                                // describe a different picture; cursors must not carry
+                                // across it.
+                                ipc.bump_stream_generation();
                                 decoder = None;
                                 codec_config.clear();
                                 waiting_for_keyframe = true;
@@ -2947,12 +3415,19 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                 }
                 ocb2::TYPE_VIDEO_ACCESS_UNIT => {
                     received_frames += 1;
+                    let arrival_delta_us = last_au_instant
+                        .map(|previous: Instant| previous.elapsed().as_micros() as u64)
+                        .unwrap_or(0);
+                    last_au_instant = Some(Instant::now());
+                    frame_trace.begin(&record, arrival_delta_us);
                     // A discontinuity on this record was already handled above.
                     if waiting_for_keyframe && !record.is_keyframe() {
+                        frame_trace.skipped("waiting_for_keyframe");
                         let _ = recycle_tx.try_send(record.payload);
                         continue;
                     }
                     if stream_info.is_none() {
+                        frame_trace.skipped("no_stream_info");
                         let _ = recycle_tx.try_send(record.payload);
                         continue;
                     }
@@ -3048,6 +3523,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                     output_y_stride,
                                     output_uv_stride,
                                     record.flags,
+                                    record.send_delta_us,
                                     pixels,
                                 );
                                 write_ns_this_au += write_start.elapsed().as_nanos() as u64;
@@ -3122,6 +3598,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                                     output_width,
                                                     output_width,
                                                     record.flags,
+                                                    record.send_delta_us,
                                                     pixels,
                                                 );
                                                 write_ns_this_au +=
@@ -3159,9 +3636,17 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                         }
                     };
                     let total_ns = start.elapsed().as_nanos() as u64;
-                    decode_ns_sum += total_ns.saturating_sub(rotate_ns_this_au + write_ns_this_au);
+                    let decode_only_ns =
+                        total_ns.saturating_sub(rotate_ns_this_au + write_ns_this_au);
+                    decode_ns_sum += decode_only_ns;
                     rotate_ns_sum += rotate_ns_this_au;
                     write_ns_sum += write_ns_this_au;
+                    frame_trace.finish(&FrameStages {
+                        decode_us: decode_only_ns / 1_000,
+                        rotate_us: rotate_ns_this_au / 1_000,
+                        write_us: write_ns_this_au / 1_000,
+                        outputs: decoded_this_au,
+                    });
                     match decode_result {
                         Ok(_) => {
                             consecutive_decode_errors = 0;
@@ -3196,6 +3681,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                     }
                     last_error =
                         Some("Phone restarted the OCB2 stream; reconnecting at a keyframe".into());
+                    clean_disconnect = true;
                     break 'connection;
                 }
                 ocb2::TYPE_ERROR => {
@@ -3211,6 +3697,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                 if phone_encoder_error {
                     return Err("phone marked the OCB2 stream ended after an encoder error".into());
                 }
+                clean_disconnect = true;
                 break 'connection;
             }
             let _ = recycle_tx.try_send(record.payload);
@@ -3220,8 +3707,15 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
         // connection the phone has already abandoned, and TCP keepalive is what
         // bounds that. A new connection gets a new reader.
         drop(event_rx);
-        failures = failures.saturating_add(1);
-        sleep(Duration::from_secs(backoff_secs(failures).min(2)));
+        if clean_disconnect {
+            // Not a failure, so do not accumulate one. The stream is already coming
+            // back; reconnect at once and let the keyframe the phone sends on
+            // subscribe close the gap.
+            failures = 0;
+        } else {
+            failures = failures.saturating_add(1);
+        }
+        sleep(reconnect_delay(clean_disconnect, failures));
     }
 }
 
@@ -3475,6 +3969,8 @@ fn main() {
                     height,
                     width,
                     width,
+                    0,
+                    // Locally generated, so there is no sender cadence to report.
                     0,
                     &test_nv12,
                 );

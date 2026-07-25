@@ -24,6 +24,11 @@ pub struct Record {
     pub sequence: u64,
     pub capture_timestamp_ns: u64,
     pub encoder_timestamp_us: i64,
+    /// Microseconds between the phone queueing this record and the previous
+    /// video record; zero when the phone does not report it. Diagnostics only:
+    /// comparing the phone's send cadence with our arrival cadence is what
+    /// separates a late encoder from a batching transport.
+    pub send_delta_us: u32,
     pub payload: Vec<u8>,
 }
 
@@ -141,6 +146,9 @@ impl Parser {
         let capture_timestamp_ns = u64::from_le_bytes(available[24..32].try_into().unwrap());
         let encoder_timestamp_us = i64::from_le_bytes(available[32..40].try_into().unwrap());
         let payload_len = u32::from_le_bytes(available[40..44].try_into().unwrap()) as usize;
+        // Previously a reserved zero, so old senders read as "unknown" (0) and no
+        // version gate is needed.
+        let send_delta_us = u32::from_le_bytes(available[44..48].try_into().unwrap());
         if payload_len > MAX_PAYLOAD {
             return Err(ParseError::PayloadTooLarge(payload_len));
         }
@@ -164,6 +172,7 @@ impl Parser {
             sequence,
             capture_timestamp_ns,
             encoder_timestamp_us,
+            send_delta_us,
             payload,
         }))
     }
@@ -209,6 +218,10 @@ mod tests {
         flags: u32,
         sequence: u64,
         payload_hex: String,
+        /// Absent on the cases written before the field existed, which is itself the
+        /// backward-compatibility check: those headers carry a reserved zero.
+        #[serde(default)]
+        send_delta_us: u32,
     }
 
     fn encoded(record_type: u16, flags: u32, sequence: u64, payload: &[u8]) -> Vec<u8> {
@@ -345,6 +358,11 @@ mod tests {
                 assert_eq!(expected.record_type, actual.record_type, "{}", case.id);
                 assert_eq!(expected.flags, actual.flags, "{}", case.id);
                 assert_eq!(expected.sequence, actual.sequence, "{}", case.id);
+                assert_eq!(
+                    expected.send_delta_us, actual.send_delta_us,
+                    "{} send delta",
+                    case.id
+                );
                 assert_eq!(
                     decode_hex(&expected.payload_hex),
                     actual.payload,
