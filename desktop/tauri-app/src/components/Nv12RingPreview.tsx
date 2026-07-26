@@ -107,6 +107,9 @@ export default function Nv12RingPreview({ fitMode }: Props) {
       configureTexture(gl.TEXTURE1, uvTexture, 'uvPlane');
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
+      // True once pixels have been uploaded at least once, so the redraw below has
+      // something valid to show.
+      let hasFrame = false;
       const drawNewest = async () => {
         try {
           const raw = await invoke<ArrayBuffer | Uint8Array>('get_nv12_preview_frame', { afterSequence });
@@ -151,6 +154,18 @@ export default function Nv12RingPreview({ fitMode }: Props) {
             else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, uvStride / 2, height / 2, gl.RG, gl.UNSIGNED_BYTE, uv);
             gl.uniform1f(gl.getUniformLocation(program, 'yScale'), width / yStride);
             gl.uniform1f(gl.getUniformLocation(program, 'uvScale'), width / uvStride);
+            hasFrame = true;
+          }
+          // Redraw EVERY poll, not only when new pixels arrived.
+          //
+          // The context is created with the default preserveDrawingBuffer:false, so the
+          // drawing buffer is cleared once it has been composited. Skipping the draw call
+          // therefore does not leave the previous picture on screen -- it leaves BLACK.
+          // That was invisible while the backend returned the newest frame on every poll,
+          // but the playout scheduler deliberately returns nothing until a frame is due,
+          // so most polls now have no new pixels and the canvas blacked out between them.
+          // Re-issuing the draw costs nothing: the textures are already uploaded.
+          if (hasFrame) {
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
             setReady(true);
             setError('');
