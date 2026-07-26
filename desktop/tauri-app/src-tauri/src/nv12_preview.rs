@@ -4,7 +4,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::ipc::Response;
 use windows::core::w;
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -12,10 +11,6 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY,
-};
-
-use ocb_playout::{
-    profile_from_name, PlayoutAction, PlayoutCandidate, PlayoutScheduler, PlayoutTiming,
 };
 
 use crate::sync_state::RecoverMutex;
@@ -126,6 +121,16 @@ struct SlotHeader {
 
 include!("ring_abi_generated.rs");
 
+struct PreviewRead {
+    bytes: Vec<u8>,
+    frame_sequence: Option<u64>,
+    stream_generation: u64,
+    ring_write_sequence: u64,
+    width: u32,
+    height: u32,
+    torn_slots_rejected: u64,
+}
+
 /// Scale down to at most `PREVIEW_MAX_DIMENSION` on the long edge, preserving
 /// aspect ratio, with both output dimensions kept even (required for 4:2:0).
 /// Returns the input unchanged if it is already within the cap.
@@ -205,21 +210,6 @@ fn write_preview_header(
     response[36..40].copy_from_slice(&uv_stride.to_le_bytes());
     response[40..44].copy_from_slice(&payload_size.to_le_bytes());
     response[44..48].copy_from_slice(&metadata.flags.to_le_bytes());
-}
-
-/// Host QPC time in nanoseconds — the clock domain the producer stamps
-/// `ring_write_timestamp_ns` in, and the one the scheduler reasons about.
-fn qpc_ns() -> u64 {
-    let mut counter = 0i64;
-    let mut frequency = 0i64;
-    unsafe {
-        let _ = QueryPerformanceCounter(&mut counter);
-        let _ = QueryPerformanceFrequency(&mut frequency);
-    }
-    if frequency <= 0 {
-        return 0;
-    }
-    ((counter as i128 * 1_000_000_000i128) / frequency as i128) as u64
 }
 
 struct Mapping {
@@ -305,22 +295,24 @@ impl Mapping {
         }
     }
 
-    fn progress(&self) -> Result<(u64, u64, [u8; 32]), String> {
+    fn progress(&self) -> Result<(u64, u64, u64, u64, [u8; 32]), String> {
         unsafe {
             let ring = &*(self.view.Value as *const RingHeader);
-            self.validate_header(ring)?;
+            Self::validate_header(ring)?;
             if ring.producer_build_hash.iter().all(|value| *value == 0) {
                 return Err("NV12 preview rejected ring without producer build hash".into());
             }
             Ok((
                 ring.published_sequence.load(Ordering::Acquire),
                 ring.producer_heartbeat_qpc.load(Ordering::Acquire),
+                ring.ring_write_sequence.load(Ordering::Acquire),
+                ring.stream_generation.load(Ordering::Acquire),
                 ring.producer_build_hash,
             ))
         }
     }
 
-    fn validate_header(&self, ring: &RingHeader) -> Result<(), String> {
+    fn validate_header(ring: &RingHeader) -> Result<(), String> {
         if ring.magic != OCBR_MAGIC
             || ring.version != RING_VERSION
             || ring.header_size as usize != RING_HEADER_SIZE
@@ -337,228 +329,209 @@ impl Mapping {
         }
     }
 
-    /// Read the frame the preview's own playout schedule says is due.
-    ///
-    /// Returns an empty response when nothing new is due, which the frontend renders as
-    /// "keep showing the current frame". That is the preview's natural form of a repeat and
-    /// it costs nothing: re-sending identical pixels over the IPC bridge would just burn
-    /// bandwidth for the same picture.
-    fn read_scheduled(
+    /// Read the newest committed frame without participating in virtual-camera
+    /// playout. The in-app preview is an observer: it never advances consumer
+    /// state and it returns empty only when the newest source sequence was
+    /// already returned to this frontend.
+    fn read_newest(
         &self,
         after_sequence: u64,
-        playout: &mut PreviewPlayout,
-    ) -> Result<Vec<u8>, String> {
+        last_returned_generation: u64,
+    ) -> Result<PreviewRead, String> {
         unsafe {
-            let base = self.view.Value as *const u8;
-            let ring = &*(base as *const RingHeader);
-            self.validate_header(ring)?;
-            let write_sequence = ring.ring_write_sequence.load(Ordering::Acquire);
-
-            // Build candidates from STABLE snapshots: read the epoch, copy the header, read
-            // the epoch again, and accept only if nothing moved. A header torn by a
-            // concurrent write would otherwise feed the scheduler a capture timestamp from
-            // one frame and a slot from another.
-            let mut candidates: Vec<PlayoutCandidate> = Vec::with_capacity(SLOT_COUNT);
-            for index in 0..SLOT_COUNT {
-                let offset = RING_HEADER_SIZE + index * SLOT_SIZE;
-                let slot = base.add(offset) as *const SlotHeader;
-                let before = std::ptr::read_volatile(&(*slot).committed_epoch);
-                fence(Ordering::Acquire);
-                let header = std::ptr::read(slot);
-                fence(Ordering::Acquire);
-                let after = std::ptr::read_volatile(&(*slot).committed_epoch);
-                if before == 0
-                    || before != after
-                    || before != header.write_epoch
-                    || header.ring_sequence == 0
-                    || header.pixel_format != FORMAT_NV12
-                {
-                    continue;
-                }
-                candidates.push(PlayoutCandidate {
-                    ring_sequence: header.ring_sequence,
-                    capture_timestamp_ns: header.capture_timestamp_ns,
-                    stream_generation: header.stream_generation,
-                    ring_write_timestamp_ns: header.ring_write_timestamp_ns,
-                    slot_index: index as u32,
-                });
-            }
-
-            // The preview shows every source frame once, so its output cadence IS the
-            // source cadence. The frontend's polling rate only has to keep up with it.
-            let fps_num = ring.producer_fps_num.load(Ordering::Acquire).max(1) as u64;
-            let fps_den = ring.producer_fps_den.load(Ordering::Acquire).max(1) as u64;
-            let source_interval_ns = (1_000_000_000 * fps_den) / fps_num;
-            let timing = PlayoutTiming {
-                output_interval_ns: source_interval_ns,
-                source_interval_ns,
-                slot_count: SLOT_COUNT as u64,
-            };
-
-            let decision = playout
-                .scheduler
-                .peek(qpc_ns(), &candidates, timing);
-            if decision.action != PlayoutAction::Release {
-                // Prefilling, or nothing new is due yet. Commit so the schedule advances,
-                // then let the frontend hold the frame it already has.
-                playout.scheduler.commit(&decision, timing);
-                return Ok(Vec::new());
-            }
-            let _ = after_sequence;
-            // Frames destroyed before the preview reached them: the ring was too short for
-            // this consumer, as distinct from it having chosen to skip.
-            let oldest_live = write_sequence.saturating_sub(SLOT_COUNT as u64 - 2);
-            if decision.ring_sequence < oldest_live {
-                playout.overwritten += 1;
-            }
-            let slot_index = decision.slot_index as usize;
-            if slot_index >= SLOT_COUNT {
-                return Err("NV12 preview rejected published slot index".to_string());
-            }
-            let slot_offset = RING_HEADER_SIZE + slot_index * SLOT_SIZE;
-            let slot_ptr = base.add(slot_offset) as *const SlotHeader;
-            let first_epoch = std::ptr::read_volatile(&(*slot_ptr).committed_epoch);
-            fence(Ordering::Acquire);
-            let metadata = std::ptr::read(slot_ptr);
-            if first_epoch == 0
-                || first_epoch != metadata.write_epoch
-                || first_epoch & 1 == 0
-                // The slot must still hold the frame the scheduler chose. If the producer
-                // lapped us it does not, and the decision is CANCELLED rather than
-                // committed, so the next poll retries instead of treating it as shown.
-                || metadata.ring_sequence != decision.ring_sequence
-                || metadata.pixel_format != FORMAT_NV12
-            {
-                playout.scheduler.cancel(&decision);
-                return Ok(Vec::new());
-            }
-            let width = metadata.width as usize;
-            let height = metadata.height as usize;
-            let y_stride = metadata.y_stride as usize;
-            let uv_stride = metadata.uv_stride as usize;
-            if width == 0
-                || height == 0
-                || width > 1920
-                || height > 1920
-                || width & 1 != 0
-                || height & 1 != 0
-                || y_stride < width
-                || uv_stride < width
-                || y_stride > 8192
-                || uv_stride > 8192
-            {
-                return Err("NV12 preview rejected invalid dimensions or strides".to_string());
-            }
-            let expected = y_stride
-                .checked_mul(height)
-                .and_then(|y| {
-                    uv_stride
-                        .checked_mul(height / 2)
-                        .and_then(|uv| y.checked_add(uv))
-                })
-                .ok_or("NV12 preview frame size overflow")?;
-            if expected != metadata.payload_size as usize
-                || expected > MAX_NV12_SIZE
-                || metadata.data_offset as usize != slot_offset + SLOT_HEADER_SIZE
-                || metadata.data_offset as usize + expected > MAPPING_SIZE
-            {
-                return Err("NV12 preview rejected invalid payload bounds".to_string());
-            }
-            let (out_width, out_height) = downscale_dimensions(width, height);
-            let y_src = base.add(metadata.data_offset as usize);
-            let uv_src = y_src.add(y_stride * height);
-            let response = if out_width == width && out_height == height {
-                let mut response = vec![0u8; PREVIEW_HEADER_SIZE + expected];
-                copy_nonoverlapping(
-                    y_src,
-                    response.as_mut_ptr().add(PREVIEW_HEADER_SIZE),
-                    expected,
-                );
-                write_preview_header(
-                    &mut response,
-                    &metadata,
-                    width as u32,
-                    height as u32,
-                    y_stride as u32,
-                    uv_stride as u32,
-                    expected as u32,
-                );
-                response
-            } else {
-                let out_payload = out_width * out_height + out_width * (out_height / 2);
-                let mut response = vec![0u8; PREVIEW_HEADER_SIZE + out_payload];
-                downscale_nv12(
-                    y_src,
-                    y_stride,
-                    uv_src,
-                    uv_stride,
-                    width,
-                    height,
-                    out_width,
-                    out_height,
-                    &mut response[PREVIEW_HEADER_SIZE..],
-                );
-                write_preview_header(
-                    &mut response,
-                    &metadata,
-                    out_width as u32,
-                    out_height as u32,
-                    out_width as u32,
-                    out_width as u32,
-                    out_payload as u32,
-                );
-                response
-            };
-            fence(Ordering::Acquire);
-            let final_epoch = std::ptr::read_volatile(&(*slot_ptr).committed_epoch);
-            if final_epoch != first_epoch {
-                // Torn mid-copy: cancel so the frame stays selectable.
-                playout.scheduler.cancel(&decision);
-                return Ok(Vec::new());
-            }
-            // Committed only now that the frame is known good, so a failed copy costs a
-            // poll rather than a frame.
-            playout.scheduler.commit(&decision, timing);
-            Ok(response)
+            read_newest_from_base(
+                self.view.Value as *const u8,
+                after_sequence,
+                last_returned_generation,
+            )
         }
     }
+}
+
+unsafe fn read_newest_from_base(
+    base: *const u8,
+    after_sequence: u64,
+    last_returned_generation: u64,
+) -> Result<PreviewRead, String> {
+    let ring = &*(base as *const RingHeader);
+    Mapping::validate_header(ring)?;
+    let ring_write_sequence = ring.ring_write_sequence.load(Ordering::Acquire);
+    let stream_generation = ring.stream_generation.load(Ordering::Acquire);
+    let mut newest: Option<(usize, SlotHeader, u64)> = None;
+    let mut torn_slots_rejected = 0u64;
+
+    // Select from stable header snapshots. Scanning all slots is deliberate:
+    // `published_slot` is only a hint and a concurrent producer can move it
+    // while this observer is choosing a frame.
+    for index in 0..SLOT_COUNT {
+        let slot_offset = RING_HEADER_SIZE + index * SLOT_SIZE;
+        let slot_ptr = base.add(slot_offset) as *const SlotHeader;
+        let before = std::ptr::read_volatile(&(*slot_ptr).committed_epoch);
+        fence(Ordering::Acquire);
+        let metadata = std::ptr::read(slot_ptr);
+        fence(Ordering::Acquire);
+        let after = std::ptr::read_volatile(&(*slot_ptr).committed_epoch);
+        if before == 0 {
+            continue;
+        }
+        if before != after || before != metadata.write_epoch || before & 1 == 0 {
+            torn_slots_rejected += 1;
+            continue;
+        }
+        if metadata.ring_sequence == 0
+            || metadata.ring_sequence > ring_write_sequence
+            || metadata.stream_generation != stream_generation
+            || metadata.pixel_format != FORMAT_NV12
+            || ((metadata.ring_sequence - 1) % SLOT_COUNT as u64) as usize != index
+        {
+            continue;
+        }
+        if newest
+            .as_ref()
+            .map(|(_, current, _)| metadata.ring_sequence > current.ring_sequence)
+            .unwrap_or(true)
+        {
+            newest = Some((index, metadata, before));
+        }
+    }
+
+    let Some((slot_index, metadata, first_epoch)) = newest else {
+        return Ok(PreviewRead {
+            bytes: Vec::new(),
+            frame_sequence: None,
+            stream_generation,
+            ring_write_sequence,
+            width: 0,
+            height: 0,
+            torn_slots_rejected,
+        });
+    };
+
+    // Source sequence numbers may restart when generation changes. The first
+    // valid frame of the new generation must therefore bypass after_sequence.
+    if metadata.stream_generation == last_returned_generation && metadata.sequence == after_sequence
+    {
+        return Ok(PreviewRead {
+            bytes: Vec::new(),
+            frame_sequence: None,
+            stream_generation,
+            ring_write_sequence,
+            width: 0,
+            height: 0,
+            torn_slots_rejected,
+        });
+    }
+
+    let width = metadata.width as usize;
+    let height = metadata.height as usize;
+    let y_stride = metadata.y_stride as usize;
+    let uv_stride = metadata.uv_stride as usize;
+    if width == 0
+        || height == 0
+        || width > 1920
+        || height > 1920
+        || width & 1 != 0
+        || height & 1 != 0
+        || y_stride < width
+        || uv_stride < width
+        || y_stride > 8192
+        || uv_stride > 8192
+    {
+        return Err("NV12 preview rejected invalid dimensions or strides".to_string());
+    }
+    let expected = y_stride
+        .checked_mul(height)
+        .and_then(|y| {
+            uv_stride
+                .checked_mul(height / 2)
+                .and_then(|uv| y.checked_add(uv))
+        })
+        .ok_or("NV12 preview frame size overflow")?;
+    let slot_offset = RING_HEADER_SIZE + slot_index * SLOT_SIZE;
+    if expected != metadata.payload_size as usize
+        || expected > MAX_NV12_SIZE
+        || metadata.data_offset as usize != slot_offset + SLOT_HEADER_SIZE
+        || metadata.data_offset as usize + expected > MAPPING_SIZE
+    {
+        return Err("NV12 preview rejected invalid payload bounds".to_string());
+    }
+
+    let (out_width, out_height) = downscale_dimensions(width, height);
+    let y_src = base.add(metadata.data_offset as usize);
+    let uv_src = y_src.add(y_stride * height);
+    let response = if out_width == width && out_height == height {
+        let mut response = vec![0u8; PREVIEW_HEADER_SIZE + expected];
+        copy_nonoverlapping(
+            y_src,
+            response.as_mut_ptr().add(PREVIEW_HEADER_SIZE),
+            expected,
+        );
+        write_preview_header(
+            &mut response,
+            &metadata,
+            width as u32,
+            height as u32,
+            y_stride as u32,
+            uv_stride as u32,
+            expected as u32,
+        );
+        response
+    } else {
+        let out_payload = out_width * out_height + out_width * (out_height / 2);
+        let mut response = vec![0u8; PREVIEW_HEADER_SIZE + out_payload];
+        downscale_nv12(
+            y_src,
+            y_stride,
+            uv_src,
+            uv_stride,
+            width,
+            height,
+            out_width,
+            out_height,
+            &mut response[PREVIEW_HEADER_SIZE..],
+        );
+        write_preview_header(
+            &mut response,
+            &metadata,
+            out_width as u32,
+            out_height as u32,
+            out_width as u32,
+            out_width as u32,
+            out_payload as u32,
+        );
+        response
+    };
+
+    fence(Ordering::Acquire);
+    let slot_ptr = base.add(slot_offset) as *const SlotHeader;
+    let final_epoch = std::ptr::read_volatile(&(*slot_ptr).committed_epoch);
+    let final_generation = ring.stream_generation.load(Ordering::Acquire);
+    if final_epoch != first_epoch || final_generation != stream_generation {
+        torn_slots_rejected += 1;
+        return Ok(PreviewRead {
+            bytes: Vec::new(),
+            frame_sequence: None,
+            stream_generation: final_generation,
+            ring_write_sequence: ring.ring_write_sequence.load(Ordering::Acquire),
+            width: 0,
+            height: 0,
+            torn_slots_rejected,
+        });
+    }
+
+    Ok(PreviewRead {
+        bytes: response,
+        frame_sequence: Some(metadata.sequence),
+        stream_generation,
+        ring_write_sequence,
+        width: out_width as u32,
+        height: out_height as u32,
+        torn_slots_rejected,
+    })
 }
 
 pub struct Nv12PreviewReader {
     state: Mutex<ReaderState>,
-}
-
-/// The preview's own playout state.
-///
-/// A separate instance from the virtual camera's, deliberately. The two consumers poll on
-/// unrelated clocks and at different rates; one shared scheduler would have each of them
-/// consuming the other's frames.
-///
-/// Before this existed the preview simply took whichever frame was newest at the instant
-/// the frontend happened to poll (~60 Hz), which is precisely the aliasing the virtual
-/// camera was fixed for: uneven arrivals became the same frame twice, then a skip. Deepening
-/// the camera's buffer could never have fixed the preview, because the preview never looked
-/// at it.
-struct PreviewPlayout {
-    scheduler: PlayoutScheduler,
-    /// Ring writes destroyed before the preview reached them.
-    overwritten: u64,
-}
-
-impl PreviewPlayout {
-    fn new() -> Self {
-        let profile = profile_from_name(
-            &std::env::var("OCB_PLAYOUT_PROFILE").unwrap_or_default(),
-        );
-        let mut scheduler = PlayoutScheduler::new(profile);
-        scheduler.servo_enabled = std::env::var("OCB_PLAYOUT_SERVO")
-            .map(|value| value != "0")
-            .unwrap_or(true);
-        Self {
-            scheduler,
-            overwritten: 0,
-        }
-    }
 }
 
 struct ReaderState {
@@ -568,7 +541,18 @@ struct ReaderState {
     last_sequence: u64,
     last_heartbeat: u64,
     last_progress: Instant,
-    playout: PreviewPlayout,
+    last_returned_generation: u64,
+    ring_write_sequence: u64,
+    stream_generation: u64,
+    preview_command_calls: u64,
+    non_empty_responses: u64,
+    empty_responses: u64,
+    last_returned_sequence: u64,
+    last_ipc_payload_bytes: usize,
+    last_width: u32,
+    last_height: u32,
+    torn_slots_rejected: u64,
+    last_error: String,
 }
 
 impl Nv12PreviewReader {
@@ -581,52 +565,58 @@ impl Nv12PreviewReader {
                 last_sequence: 0,
                 last_heartbeat: 0,
                 last_progress: Instant::now(),
-                playout: PreviewPlayout::new(),
+                last_returned_generation: 0,
+                ring_write_sequence: 0,
+                stream_generation: 0,
+                preview_command_calls: 0,
+                non_empty_responses: 0,
+                empty_responses: 0,
+                last_returned_sequence: 0,
+                last_ipc_payload_bytes: 0,
+                last_width: 0,
+                last_height: 0,
+                torn_slots_rejected: 0,
+                last_error: String::new(),
             }),
         }
     }
 }
 
-/// Preview-side playout telemetry, for diagnosing a hitch in the PREVIEW specifically
-/// rather than in the virtual camera. The two pace independently, so they can differ.
 #[derive(serde::Serialize)]
-pub struct Nv12PreviewCursorStats {
-    pub target_delay_ms: u64,
-    pub buffer_depth_ms: u64,
-    pub clock_ppm: i64,
-    /// Duplicates required by frame-rate conversion. Not a fault.
-    pub planned_repeats: u64,
-    /// Repeats caused by a frame that should have arrived and had not.
-    pub underrun_repeats: u64,
-    /// Frames skipped by frame-rate conversion. Not a fault.
-    pub planned_drops: u64,
-    /// Frames skipped because they reached the ring past their deadline.
-    pub late_drops: u64,
-    pub unique_frames: u64,
-    pub scheduler_resets: u64,
-    pub copy_failures: u64,
-    /// Frames destroyed before the preview reached them: the ring was too short.
-    pub overwritten: u64,
+pub struct Nv12PreviewDiagnostics {
+    pub ring_alive: bool,
+    pub ring_write_sequence: u64,
+    pub stream_generation: u64,
+    pub preview_command_calls: u64,
+    pub non_empty_responses: u64,
+    pub empty_responses: u64,
+    pub last_returned_sequence: u64,
+    pub last_ipc_payload_bytes: usize,
+    pub last_width: u32,
+    pub last_height: u32,
+    pub torn_slots_rejected: u64,
+    pub last_error: String,
 }
 
 #[tauri::command]
-pub fn get_nv12_preview_cursor_stats(
+pub fn get_nv12_preview_diagnostics(
     state: tauri::State<'_, Nv12PreviewReader>,
-) -> Nv12PreviewCursorStats {
+) -> Nv12PreviewDiagnostics {
     let reader = state.state.lock_recover();
-    let scheduler = &reader.playout.scheduler;
-    Nv12PreviewCursorStats {
-        target_delay_ms: scheduler.target_delay_ms(),
-        buffer_depth_ms: scheduler.buffer_depth_ns / 1_000_000,
-        clock_ppm: scheduler.clock_correction_ppm(),
-        planned_repeats: scheduler.planned_repeats,
-        underrun_repeats: scheduler.underrun_repeats,
-        planned_drops: scheduler.planned_drops,
-        late_drops: scheduler.late_drops,
-        unique_frames: scheduler.output_unique_frames,
-        scheduler_resets: scheduler.scheduler_resets,
-        copy_failures: scheduler.copy_failures,
-        overwritten: reader.playout.overwritten,
+    Nv12PreviewDiagnostics {
+        ring_alive: reader.mapping.is_some()
+            && reader.last_progress.elapsed() < Duration::from_secs(2),
+        ring_write_sequence: reader.ring_write_sequence,
+        stream_generation: reader.stream_generation,
+        preview_command_calls: reader.preview_command_calls,
+        non_empty_responses: reader.non_empty_responses,
+        empty_responses: reader.empty_responses,
+        last_returned_sequence: reader.last_returned_sequence,
+        last_ipc_payload_bytes: reader.last_ipc_payload_bytes,
+        last_width: reader.last_width,
+        last_height: reader.last_height,
+        torn_slots_rejected: reader.torn_slots_rejected,
+        last_error: reader.last_error.clone(),
     }
 }
 
@@ -646,22 +636,45 @@ pub fn get_nv12_preview_frame(
         reader.last_sequence = 0;
         reader.last_heartbeat = 0;
         reader.last_progress = Instant::now();
-        // A different producer means a different ring; playout state cannot carry over.
-        reader.playout = PreviewPlayout::new();
+        reader.last_returned_generation = 0;
+        reader.ring_write_sequence = 0;
+        reader.stream_generation = 0;
+        reader.preview_command_calls = 0;
+        reader.non_empty_responses = 0;
+        reader.empty_responses = 0;
+        reader.last_returned_sequence = 0;
+        reader.last_ipc_payload_bytes = 0;
+        reader.last_width = 0;
+        reader.last_height = 0;
+        reader.torn_slots_rejected = 0;
+        reader.last_error.clear();
     }
+    reader.preview_command_calls += 1;
     if reader.mapping.is_none() {
         match Mapping::open() {
-            Ok(opened) => reader.mapping = Some(opened),
-            Err(_) => return Ok(Response::new(Vec::new())),
+            Ok(opened) => {
+                reader.mapping = Some(opened);
+                reader.last_error.clear();
+            }
+            Err(error) => {
+                reader.empty_responses += 1;
+                reader.last_ipc_payload_bytes = 0;
+                reader.last_error = error;
+                return Ok(Response::new(Vec::new()));
+            }
         }
     }
-    let (sequence, heartbeat, build_hash) = match reader.mapping.as_ref().unwrap().progress() {
-        Ok(progress) => progress,
-        Err(error) => {
-            reader.mapping = None;
-            return Err(error);
-        }
-    };
+    let (sequence, heartbeat, ring_write_sequence, stream_generation, build_hash) =
+        match reader.mapping.as_ref().unwrap().progress() {
+            Ok(progress) => progress,
+            Err(error) => {
+                reader.mapping = None;
+                reader.last_error = error.clone();
+                return Err(error);
+            }
+        };
+    reader.ring_write_sequence = ring_write_sequence;
+    reader.stream_generation = stream_generation;
     if let Some(expected) = expected_build_hash.filter(|value| !value.is_empty()) {
         let actual: String = build_hash
             .iter()
@@ -669,25 +682,52 @@ pub fn get_nv12_preview_frame(
             .collect();
         if !actual.eq_ignore_ascii_case(&expected) {
             reader.mapping = None;
-            return Err("NV12 preview rejected ring from a different producer build".into());
+            let error = "NV12 preview rejected ring from a different producer build".to_string();
+            reader.last_error = error.clone();
+            return Err(error);
         }
     }
     if sequence != reader.last_sequence || heartbeat != reader.last_heartbeat {
         reader.last_sequence = sequence;
         reader.last_heartbeat = heartbeat;
         reader.last_progress = Instant::now();
+        reader.last_error.clear();
     } else if producer_streaming && reader.last_progress.elapsed() >= Duration::from_secs(2) {
         // A valid but stale fallback mapping is indistinguishable from a live
         // ring unless both sequence and producer heartbeat are observed.
         reader.mapping = None;
         reader.last_progress = Instant::now();
+        reader.empty_responses += 1;
+        reader.last_ipc_payload_bytes = 0;
+        reader.last_error = "NV12 preview ring stopped advancing".into();
         return Ok(Response::new(Vec::new()));
     }
-    let ReaderState { mapping, playout, .. } = &mut *reader;
-    match mapping.as_ref().unwrap().read_scheduled(after_sequence, playout) {
-        Ok(bytes) => Ok(Response::new(bytes)),
+    let last_returned_generation = reader.last_returned_generation;
+    let result = reader
+        .mapping
+        .as_ref()
+        .unwrap()
+        .read_newest(after_sequence, last_returned_generation);
+    match result {
+        Ok(frame) => {
+            reader.ring_write_sequence = frame.ring_write_sequence;
+            reader.stream_generation = frame.stream_generation;
+            reader.torn_slots_rejected += frame.torn_slots_rejected;
+            reader.last_ipc_payload_bytes = frame.bytes.len();
+            if let Some(sequence) = frame.frame_sequence {
+                reader.non_empty_responses += 1;
+                reader.last_returned_sequence = sequence;
+                reader.last_returned_generation = frame.stream_generation;
+                reader.last_width = frame.width;
+                reader.last_height = frame.height;
+            } else {
+                reader.empty_responses += 1;
+            }
+            Ok(Response::new(frame.bytes))
+        }
         Err(error) => {
             reader.mapping = None;
+            reader.last_error = error.clone();
             Err(error)
         }
     }
@@ -702,12 +742,153 @@ const _: () = {
 mod tests {
     use super::*;
 
+    struct TestRing {
+        // u64 backing guarantees the alignment required by RingHeader/SlotHeader.
+        words: Vec<u64>,
+    }
+
+    impl TestRing {
+        fn new() -> Self {
+            let mut ring = Self {
+                words: vec![0u64; MAPPING_SIZE.div_ceil(std::mem::size_of::<u64>())],
+            };
+            unsafe {
+                let mut header: RingHeader = std::mem::zeroed();
+                header.magic = OCBR_MAGIC;
+                header.version = RING_VERSION;
+                header.header_size = RING_HEADER_SIZE as u16;
+                header.slot_count = SLOT_COUNT as u32;
+                header.slot_size = SLOT_SIZE as u32;
+                header.max_width = 1920;
+                header.max_height = 1920;
+                header.ring_abi_hash = RING_ABI_HASH;
+                std::ptr::write(ring.base_mut() as *mut RingHeader, header);
+            }
+            ring
+        }
+
+        fn base(&self) -> *const u8 {
+            self.words.as_ptr() as *const u8
+        }
+
+        fn base_mut(&mut self) -> *mut u8 {
+            self.words.as_mut_ptr() as *mut u8
+        }
+
+        fn write_frame(
+            &mut self,
+            ring_sequence: u64,
+            stream_generation: u64,
+            source_sequence: u64,
+            width: usize,
+            height: usize,
+        ) {
+            let index = ((ring_sequence - 1) % SLOT_COUNT as u64) as usize;
+            let slot_offset = RING_HEADER_SIZE + index * SLOT_SIZE;
+            let payload_size = width * height * 3 / 2;
+            let epoch = ring_sequence * 2 | 1;
+            unsafe {
+                let mut slot: SlotHeader = std::mem::zeroed();
+                slot.write_epoch = epoch;
+                slot.sequence = source_sequence;
+                slot.capture_timestamp_ns = source_sequence * 1_000_000;
+                slot.width = width as u32;
+                slot.height = height as u32;
+                slot.y_stride = width as u32;
+                slot.uv_stride = width as u32;
+                slot.pixel_format = FORMAT_NV12;
+                slot.payload_size = payload_size as u32;
+                slot.data_offset = (slot_offset + SLOT_HEADER_SIZE) as u32;
+                slot.ring_sequence = ring_sequence;
+                slot.stream_generation = stream_generation;
+                slot.committed_epoch = epoch;
+                std::ptr::write(self.base_mut().add(slot_offset) as *mut SlotHeader, slot);
+                std::ptr::write_bytes(
+                    self.base_mut().add(slot_offset + SLOT_HEADER_SIZE),
+                    128,
+                    payload_size,
+                );
+                let header = &*(self.base() as *const RingHeader);
+                header
+                    .stream_generation
+                    .store(stream_generation, Ordering::Release);
+                header
+                    .published_sequence
+                    .store(source_sequence, Ordering::Release);
+                header.published_slot.store(index as u32, Ordering::Release);
+                header
+                    .ring_write_sequence
+                    .store(ring_sequence, Ordering::Release);
+            }
+        }
+
+        fn tear_frame(&mut self, ring_sequence: u64) {
+            let index = ((ring_sequence - 1) % SLOT_COUNT as u64) as usize;
+            let slot_offset = RING_HEADER_SIZE + index * SLOT_SIZE;
+            unsafe {
+                let slot = self.base_mut().add(slot_offset) as *mut SlotHeader;
+                (*slot).write_epoch = ring_sequence * 2 | 1;
+                (*slot).committed_epoch = ring_sequence * 2;
+                (*slot).ring_sequence = ring_sequence;
+                (*slot).stream_generation = (&*(self.base() as *const RingHeader))
+                    .stream_generation
+                    .load(Ordering::Acquire);
+                (*slot).pixel_format = FORMAT_NV12;
+                (&*(self.base() as *const RingHeader))
+                    .ring_write_sequence
+                    .store(ring_sequence, Ordering::Release);
+            }
+        }
+    }
+
+    fn preview_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
+    fn preview_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
     #[test]
     fn ring_abi_layout_matches_producer_and_virtual_camera() {
         assert_eq!(std::mem::size_of::<RingHeader>(), RING_HEADER_SIZE);
         assert_eq!(std::mem::size_of::<SlotHeader>(), 128);
         assert_eq!(std::mem::offset_of!(RingHeader, consumer_attached), 80);
         assert_eq!(std::mem::offset_of!(RingHeader, producer_build_hash), 192);
+    }
+
+    #[test]
+    fn newest_reader_returns_first_newer_and_new_generation_but_not_duplicates_or_torn_slots() {
+        let mut ring = TestRing::new();
+        ring.write_frame(1, 1, 41, 640, 480);
+
+        let first = unsafe { read_newest_from_base(ring.base(), 0, 0) }.unwrap();
+        assert!(
+            !first.bytes.is_empty(),
+            "populated ring must return immediately"
+        );
+        assert_eq!(preview_u64(&first.bytes, 8), 41);
+
+        let duplicate = unsafe { read_newest_from_base(ring.base(), 41, 1) }.unwrap();
+        assert!(
+            duplicate.bytes.is_empty(),
+            "same source sequence must be empty"
+        );
+
+        ring.write_frame(2, 1, 42, 640, 480);
+        let newer = unsafe { read_newest_from_base(ring.base(), 41, 1) }.unwrap();
+        assert_eq!(preview_u64(&newer.bytes, 8), 42);
+
+        ring.tear_frame(3);
+        let torn = unsafe { read_newest_from_base(ring.base(), 42, 1) }.unwrap();
+        assert!(torn.bytes.is_empty());
+        assert!(torn.torn_slots_rejected >= 1);
+
+        // Source sequence restarted below after_sequence, but generation changed.
+        ring.write_frame(4, 2, 1, 640, 480);
+        let restarted = unsafe { read_newest_from_base(ring.base(), 42, 1) }.unwrap();
+        assert_eq!(preview_u64(&restarted.bytes, 8), 1);
+        assert_eq!(restarted.stream_generation, 2);
     }
 
     #[test]
@@ -718,6 +899,50 @@ mod tests {
         // Already within the cap: passed through unchanged.
         assert_eq!(downscale_dimensions(640, 480), (640, 480));
         assert_eq!(downscale_dimensions(960, 540), (960, 540));
+    }
+
+    #[test]
+    fn newest_reader_downscales_landscape_and_portrait_with_valid_payloads() {
+        let mut ring = TestRing::new();
+        ring.write_frame(1, 1, 1, 1920, 1080);
+        let landscape = unsafe { read_newest_from_base(ring.base(), 0, 0) }.unwrap();
+        assert_eq!(
+            (
+                preview_u32(&landscape.bytes, 24),
+                preview_u32(&landscape.bytes, 28)
+            ),
+            (960, 540)
+        );
+        assert_eq!(
+            landscape.bytes.len(),
+            PREVIEW_HEADER_SIZE + 960 * 540 * 3 / 2
+        );
+
+        ring.write_frame(2, 2, 1, 1080, 1920);
+        let portrait = unsafe { read_newest_from_base(ring.base(), 1, 1) }.unwrap();
+        assert_eq!(
+            (
+                preview_u32(&portrait.bytes, 24),
+                preview_u32(&portrait.bytes, 28)
+            ),
+            (540, 960)
+        );
+        assert_eq!(
+            portrait.bytes.len(),
+            PREVIEW_HEADER_SIZE + 540 * 960 * 3 / 2
+        );
+    }
+
+    #[test]
+    fn incompatible_ring_abi_is_a_visible_error() {
+        let mut ring = TestRing::new();
+        unsafe {
+            (*(ring.base_mut() as *mut RingHeader)).version = RING_VERSION + 1;
+        }
+        let error = unsafe { read_newest_from_base(ring.base(), 0, 0) }
+            .err()
+            .expect("ABI mismatch must fail");
+        assert!(error.contains("incompatible ring ABI"));
     }
 
     #[test]

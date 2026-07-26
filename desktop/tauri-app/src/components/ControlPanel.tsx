@@ -7,8 +7,13 @@ import SignalChain from './SignalChain';
 import { Lamp, Notice, Section, Tel, ToggleRow, Well } from './ui';
 import { connectAndSetupObs, ObsStatus } from '../services/obs';
 import { apiFetch, buildUrl } from '../services/api';
+import { desktopInvoke as invoke } from '../services/desktopBridge';
 import { logEvent, logError, logTestMarker } from '../services/logging';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  EMPTY_PREVIEW_DIAGNOSTICS,
+  PREVIEW_DIAGNOSTICS_EVENT,
+  type PreviewStageDiagnostics,
+} from '../services/previewDiagnostics';
 import {
   buildProducerLaunchSpec,
   buildSettingsMutation,
@@ -295,6 +300,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   // Rolling diagnostics log surfaced in-app so runtime problems can be copied
   // without digging through the terminal. Capped to the most recent entries.
   const [diagLog, setDiagLog] = useState<string[]>([]);
+  const [previewDiagnostics, setPreviewDiagnostics] = useState<PreviewStageDiagnostics>(
+    () => ({ ...EMPTY_PREVIEW_DIAGNOSTICS }),
+  );
+  const previewDiagnosticsRef = useRef<PreviewStageDiagnostics>({ ...EMPTY_PREVIEW_DIAGNOSTICS });
   const lastDiagRef = useRef<Record<string, string>>({});
   // Refs so the periodic metrics sampler can read current state without being a
   // dependency (avoids re-creating the interval every poll).
@@ -312,6 +321,27 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     const isErr = /fail|error|unreachable|below target/i.test(message);
     (isErr ? logError : logEvent)(key, message);
   }, []);
+
+  useEffect(() => {
+    const onPreviewDiagnostics = (event: Event) => {
+      const next = (event as CustomEvent<PreviewStageDiagnostics>).detail;
+      if (!next) return;
+      const previous = previewDiagnosticsRef.current;
+      previewDiagnosticsRef.current = next;
+      setPreviewDiagnostics(next);
+      if (!previous.ready && next.ready) {
+        addDiag('h264Preview', `Desktop preview READY: renderer displayed sequence ${next.lastDisplayedSequence}`);
+      }
+      if (!previous.consumerStalled && next.consumerStalled) {
+        addDiag('h264Preview', 'Preview consumer is not releasing frames; producer ring is healthy.');
+      }
+      if (previous.lastError !== next.lastError && next.lastError) {
+        addDiag('h264Preview', `Preview error: ${next.lastError}`);
+      }
+    };
+    window.addEventListener(PREVIEW_DIAGNOSTICS_EVENT, onPreviewDiagnostics);
+    return () => window.removeEventListener(PREVIEW_DIAGNOSTICS_EVENT, onPreviewDiagnostics);
+  }, [addDiag]);
 
   // Capabilities of the currently selected lens, reported honestly by Android.
   const activeCam: any = cameras.find(c => c.id === settings.cameraId);
@@ -569,6 +599,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       `Android FPS actual: ${androidMetrics?.actualFps ?? '?'}  encoded: ${androidMetrics?.encodedWidth}x${androidMetrics?.encodedHeight}`,
       m ? `Producer: in ${m.decoded_fps} / out ${m.written_fps} fps target ${m.fps_target}, ${m.estimated_mbps} Mbps, ${m.total_pipeline_ms}ms, dropped ${m.dropped_jpegs}, queue ${m.jpeg_queue_len}` : 'Producer: not running',
       `Producer last error: ${vcamState?.last_error || m?.last_error || 'none'}`,
+      `Desktop preview: ready=${previewDiagnostics.ready} ring=${previewDiagnostics.ringAlive} ringWrite=${previewDiagnostics.ringWriteSequence} calls=${previewDiagnostics.previewCommandCalls} nonEmpty=${previewDiagnostics.nonEmptyResponses} returned=${previewDiagnostics.lastReturnedSequence} ipcBytes=${previewDiagnostics.ipcPayloadBytes} parsed=${previewDiagnostics.parsedWidth}x${previewDiagnostics.parsedHeight} uploads=${previewDiagnostics.rendererUploadCount} displays=${previewDiagnostics.rendererDisplayCount} displayed=${previewDiagnostics.lastDisplayedSequence} error=${previewDiagnostics.lastError || 'none'}`,
       '=== event log ===',
       ...diagLog,
     ].join('\n');
@@ -682,7 +713,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         const state = await invoke<VirtualCamState>('get_virtual_camera_status');
         vcamStateRef.current = state;
         setVcamState(state);
-        addDiag('h264Preview', 'Desktop H.264 preview decoder is ready');
+        addDiag('h264Preview', 'Desktop H.264 producer is running; waiting for the renderer to display a preview frame');
         window.dispatchEvent(new CustomEvent('reload-preview'));
       })
       .catch((error: any) => {
@@ -1669,6 +1700,28 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                     : diagLog.slice().reverse().map((line, i) => <div className="log__line" key={i}>{line}</div>)}
                 </div>
               </div>
+            </Section>
+
+            <Section legend="Desktop preview stages" icon={<Monitor size={13} />}>
+              <div className="tel-grid">
+                <Tel k="Preview state" v={previewDiagnostics.ready ? 'READY — frame displayed' : 'WAITING — no displayed frame'} tone={previewDiagnostics.ready ? 'ready' : 'warn'} />
+                <Tel k="Producer / ring" v={`${producerRunning ? 'running' : 'stopped'} / ${previewDiagnostics.ringAlive ? 'alive' : 'unavailable'}`} tone={producerRunning && previewDiagnostics.ringAlive ? 'ready' : 'warn'} />
+                <Tel k="Ring write sequence / generation" v={`${previewDiagnostics.ringWriteSequence} / ${previewDiagnostics.streamGeneration}`} />
+                <Tel k="Preview command calls" v={previewDiagnostics.previewCommandCalls} />
+                <Tel k="Non-empty / empty responses" v={`${previewDiagnostics.nonEmptyResponses} / ${previewDiagnostics.emptyResponses}`} />
+                <Tel k="Last returned sequence" v={previewDiagnostics.lastReturnedSequence || 'none'} />
+                <Tel k="IPC payload bytes" v={previewDiagnostics.ipcPayloadBytes} />
+                <Tel k="Header / parsed geometry" v={`${previewDiagnostics.frameHeaderValid ? 'valid' : 'waiting'} / ${previewDiagnostics.parsedWidth || '—'}×${previewDiagnostics.parsedHeight || '—'}`} tone={previewDiagnostics.frameHeaderValid ? 'ready' : 'warn'} />
+                <Tel k="Renderer uploads / displays" v={`${previewDiagnostics.rendererUploadCount} / ${previewDiagnostics.rendererDisplayCount}`} tone={previewDiagnostics.rendererDisplayCount > 0 ? 'ready' : 'warn'} />
+                <Tel k="Last displayed sequence" v={previewDiagnostics.lastDisplayedSequence || 'none'} />
+                <Tel k="Torn slots rejected" v={previewDiagnostics.tornSlotsRejected} tone={previewDiagnostics.tornSlotsRejected > 0 ? 'warn' : undefined} />
+                <Tel k="Last preview error" v={previewDiagnostics.lastError || 'none'} tone={previewDiagnostics.lastError ? 'fail' : 'muted'} />
+              </div>
+              {previewDiagnostics.consumerStalled && (
+                <Notice kind="fail" icon={<AlertTriangle size={13} />}>
+                  Preview consumer is not releasing frames; producer ring is healthy.
+                </Notice>
+              )}
             </Section>
 
             {/* --- degradation warnings, gathered in one place --- */}

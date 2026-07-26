@@ -1,8 +1,28 @@
 import { useEffect, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { desktopInvoke as invoke } from '../services/desktopBridge';
+import {
+  EMPTY_PREVIEW_DIAGNOSTICS,
+  publishPreviewDiagnostics,
+  type PreviewStageDiagnostics,
+} from '../services/previewDiagnostics';
 
 interface Props {
   fitMode: string;
+}
+
+interface NativePreviewDiagnostics {
+  ring_alive: boolean;
+  ring_write_sequence: number;
+  stream_generation: number;
+  preview_command_calls: number;
+  non_empty_responses: number;
+  empty_responses: number;
+  last_returned_sequence: number;
+  last_ipc_payload_bytes: number;
+  last_width: number;
+  last_height: number;
+  torn_slots_rejected: number;
+  last_error: string;
 }
 
 function compile(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader {
@@ -20,6 +40,7 @@ export default function Nv12RingPreview({ fitMode }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState('');
+  const [warning, setWarning] = useState('');
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -40,6 +61,17 @@ export default function Nv12RingPreview({ fitMode }: Props) {
     let textureHeight = 0;
     let yStride = 0;
     let uvStride = 0;
+    let diagnostics: PreviewStageDiagnostics = { ...EMPTY_PREVIEW_DIAGNOSTICS };
+    let lastBackendPoll = 0;
+    let lastNativeNonEmptyResponses = 0;
+    let lastDeliveredRingWriteSequence = 0;
+    let ringAdvancedWithoutFrameAt = 0;
+
+    const updateDiagnostics = (patch: Partial<PreviewStageDiagnostics>) => {
+      diagnostics = { ...diagnostics, ...patch };
+      publishPreviewDiagnostics(diagnostics);
+    };
+    updateDiagnostics({});
 
     try {
       const vertex = compile(gl, gl.VERTEX_SHADER, `#version 300 es
@@ -110,17 +142,57 @@ export default function Nv12RingPreview({ fitMode }: Props) {
       // True once pixels have been uploaded at least once, so the redraw below has
       // something valid to show.
       let hasFrame = false;
+      let displayedSequence = 0;
+
+      const refreshBackendDiagnostics = async () => {
+        const native = await invoke<NativePreviewDiagnostics>('get_nv12_preview_diagnostics');
+        const currentTime = performance.now();
+        if (native.non_empty_responses > lastNativeNonEmptyResponses) {
+          lastNativeNonEmptyResponses = native.non_empty_responses;
+          lastDeliveredRingWriteSequence = native.ring_write_sequence;
+          ringAdvancedWithoutFrameAt = 0;
+        } else if (native.ring_write_sequence > lastDeliveredRingWriteSequence) {
+          if (ringAdvancedWithoutFrameAt === 0) ringAdvancedWithoutFrameAt = currentTime;
+        }
+        const consumerStalled = native.ring_alive
+          && ringAdvancedWithoutFrameAt > 0
+          && currentTime - ringAdvancedWithoutFrameAt > 1000;
+        const stalledMessage = consumerStalled
+          ? 'Preview consumer is not releasing frames; producer ring is healthy.'
+          : '';
+        setWarning(stalledMessage);
+        if (native.last_error) setError(native.last_error);
+        updateDiagnostics({
+          ringAlive: native.ring_alive,
+          ringWriteSequence: native.ring_write_sequence,
+          streamGeneration: native.stream_generation,
+          previewCommandCalls: native.preview_command_calls,
+          nonEmptyResponses: native.non_empty_responses,
+          emptyResponses: native.empty_responses,
+          lastReturnedSequence: native.last_returned_sequence,
+          ipcPayloadBytes: native.last_ipc_payload_bytes,
+          parsedWidth: native.last_width || diagnostics.parsedWidth,
+          parsedHeight: native.last_height || diagnostics.parsedHeight,
+          tornSlotsRejected: native.torn_slots_rejected,
+          consumerStalled,
+          lastError: native.last_error,
+        });
+      };
+
       const drawNewest = async () => {
         try {
+          updateDiagnostics({ previewCommandCalls: diagnostics.previewCommandCalls + 1 });
           const raw = await invoke<ArrayBuffer | Uint8Array>('get_nv12_preview_frame', { afterSequence });
           if (stopped) return;
           const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+          updateDiagnostics({ ipcPayloadBytes: bytes.byteLength });
           if (bytes.byteLength >= 48) {
             const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
             if (view.getUint32(0, true) !== 0x5250564e || view.getUint16(4, true) !== 1 || view.getUint16(6, true) !== 48) {
               throw new Error('Native preview returned an invalid NV12 frame header');
             }
             afterSequence = Number(view.getBigUint64(8, true));
+            displayedSequence = afterSequence;
             const width = view.getUint32(24, true);
             const height = view.getUint32(28, true);
             const nextYStride = view.getUint32(32, true);
@@ -155,6 +227,15 @@ export default function Nv12RingPreview({ fitMode }: Props) {
             gl.uniform1f(gl.getUniformLocation(program, 'yScale'), width / yStride);
             gl.uniform1f(gl.getUniformLocation(program, 'uvScale'), width / uvStride);
             hasFrame = true;
+            updateDiagnostics({
+              nonEmptyResponses: diagnostics.nonEmptyResponses + 1,
+              lastReturnedSequence: afterSequence,
+              frameHeaderValid: true,
+              parsedWidth: width,
+              parsedHeight: height,
+              rendererUploadCount: diagnostics.rendererUploadCount + 1,
+              lastError: '',
+            });
           }
           // Redraw EVERY poll, not only when new pixels arrived.
           //
@@ -167,11 +248,28 @@ export default function Nv12RingPreview({ fitMode }: Props) {
           // Re-issuing the draw costs nothing: the textures are already uploaded.
           if (hasFrame) {
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            const glError = gl.getError();
+            if (glError !== gl.NO_ERROR) throw new Error(`NV12 preview WebGL draw failed (0x${glError.toString(16)})`);
             setReady(true);
             setError('');
+            updateDiagnostics({
+              rendererDisplayCount: diagnostics.rendererDisplayCount + 1,
+              lastDisplayedSequence: displayedSequence,
+              ready: true,
+              lastError: '',
+            });
+          }
+          const now = performance.now();
+          if (now - lastBackendPoll >= 250) {
+            lastBackendPoll = now;
+            await refreshBackendDiagnostics();
           }
         } catch (failure: any) {
-          if (!stopped) setError(failure?.message || String(failure));
+          if (!stopped) {
+            const message = failure?.message || String(failure);
+            setError(message);
+            updateDiagnostics({ lastError: message, ready: diagnostics.rendererDisplayCount > 0 });
+          }
         }
         // The virtual camera remains full-rate; the preview polls at ~60 Hz and
         // always requests only the newest ring slot. Polling at exactly the
@@ -191,9 +289,12 @@ export default function Nv12RingPreview({ fitMode }: Props) {
         gl.deleteBuffer(buffer);
         gl.deleteVertexArray(vao);
         gl.deleteProgram(program);
+        publishPreviewDiagnostics({ ...EMPTY_PREVIEW_DIAGNOSTICS });
       };
     } catch (failure: any) {
-      setError(failure?.message || String(failure));
+      const message = failure?.message || String(failure);
+      setError(message);
+      updateDiagnostics({ lastError: message });
     }
   }, []);
 
@@ -204,9 +305,9 @@ export default function Nv12RingPreview({ fitMode }: Props) {
         className={`preview-img ${fitMode === 'fit' ? 'fit-contain' : 'fit-cover'}`}
         style={{ width: '100%', height: '100%', opacity: ready ? 1 : 0 }}
       />
-      {(!ready || error) && (
+      {(!ready || error || warning) && (
         <div className="preview-overlay">
-          {error || 'Starting desktop H.264 preview decoder…'}
+          {error || warning || 'Starting desktop H.264 preview decoder…'}
         </div>
       )}
     </>

@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react';
 import { Camera, Unplug, Zap, Monitor, Usb, Wifi, ShieldCheck, FileText, AlertTriangle } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
 import Preview from './components/Preview';
 import ControlPanel from './components/ControlPanel';
 import LogsView from './components/LogsView';
 import { Lamp, Meter } from './components/ui';
 import type { Health } from './components/ui';
 import { apiFetch } from './services/api';
+import { desktopInvoke as invoke, isTauriRuntime } from './services/desktopBridge';
 import { startSession, logEvent } from './services/logging';
 import './App.css';
 
@@ -215,7 +215,7 @@ function ConnectionScreen({ onConnect }: ConnectionScreenProps) {
   );
 }
 
-export default function App() {
+function DesktopApp() {
   const [baseUrl, setBaseUrl] = useState('');
   const [token, setToken] = useState('');
   const [isConnected, setIsConnected] = useState(false);
@@ -424,4 +424,25 @@ export default function App() {
       {showLogs && <LogsView onClose={() => setShowLogs(false)} />}
     </div>
   );
+}
+
+export default function App() {
+  if (!isTauriRuntime()) {
+    return (
+      <div className="connection-screen">
+        <div className="connection-card panel animate-fade">
+          <div className="brand-hero">
+            <div className="brand-hero__mark"><Monitor size={24} /></div>
+            <h1>Open<span>Cam</span>Bridge</h1>
+            <p>Desktop features are unavailable in a web browser. Open OpenCamBridge through the desktop application.</p>
+          </div>
+          <div className="error-banner">
+            <AlertTriangle size={15} />
+            <span>Tauri bridge unavailable — this page is not running inside the desktop app.</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  return <DesktopApp />;
 }
