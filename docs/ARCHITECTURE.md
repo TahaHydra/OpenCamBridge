@@ -1,124 +1,54 @@
-# OpenCamBridge Architecture
+# OpenCamBridge V2 architecture
 
-Last updated for branch `main`.
+Last updated for `v2/streaming-engine`.
 
-## Pipeline overview
+## End-to-end data path
 
-```
-Android phone                         Windows PC
-=============                         ==========
-CameraX ImageAnalysis (YUV_420_888)
-   |
-   |  MjpegStreamer: NV21 -> JPEG          (stable path)
-   |  H264Streamer:  NV12 -> MediaCodec    (experimental path)
-   v
-Ktor HTTP server (ControlServer)
-   /stream.mjpeg  /stream.h264  /api/*  /obs  /health
-   |
-   |  USB: adb forward tcp:8080  (default, private)
-   |  LAN: token-authenticated HTTP
-   v
-rust-frame-producer.exe
-   decode JPEG (or H.264 via openh264) -> BGRA32 -> rotate/mirror/resize
-   |
-   v
-Shared memory framebuffer (OCBF header + BGRA pixels)
-   C:\ProgramData\OpenCamBridge\framebuffer.bin  (or Global\ section)
-   |
-   v
-Media Foundation virtual camera (VirtualCameraMediaSource.dll,
-hosted via VirtualCamera_Installer --mode host)
-   |
-   v
-OBS "Video Capture Device" / Windows camera apps
+```text
+Camera2 regular / constrained high-speed / high-speed GPU bridge
+  -> MediaCodec AVC encoder input Surface (optional phone preview target)
+  -> asynchronous complete H.264 access units
+  -> OCB2 /stream.ocb2
+  -> Media Foundation H.264 MFT + D3D11 manager
+  -> decoded NV12, optional one-time D3D11 video-processor resize
+     (bounded CPU NV12 letterbox fallback after GPU failure)
+  -> validated NV12 ring, newest complete slot only
+  -> SimpleMediaStream NV12 sample
+  -> Windows camera consumer
 ```
 
-The Tauri desktop app (`desktop/tauri-app`) orchestrates the Windows side:
-it connects to the phone (USB or LAN+token), starts/stops the producer and
-the virtual camera host, mirrors settings to the phone, and shows metrics.
+MJPEG uses CameraX ImageAnalysis, performs the authoritative NV21 rotation/mirror on Android, emits Content-Length multipart JPEG frames, decodes into NV12 on Windows, and joins the same ring/consumer path. It is compatibility fallback, not removed.
 
-## Components
+## Android ownership
 
-### Android app (`android/`)
+`StreamService` and its bounded `PipelineController` own lifecycle and command serialization. Lifecycle states are `STOPPED`, `STARTING`, `STREAMING`, `RECONFIGURING`, `RECOVERING`, `STOPPING`, and `FAILED`. Stop/recover take priority; compatible same-client settings are coalesced; different clients still pass revision conflict processing.
 
-- `StreamService` - foreground service (camera type); owns the lifecycle
-  state machine (STOPPED/STARTING/STREAMING/REBINDING/STOPPING/ERROR), the
-  Ktor server, and both streamers. Bind/codec failures propagate into the
-  ERROR state; they are not swallowed.
-- `MjpegStreamer` - CameraX ImageAnalysis -> NV21 -> JPEG into
-  `StreamState.latestFrame` (single latest-frame slot; HTTP side fans out).
-  Encoding is paced to the requested FPS and idles at ~2 fps when zero
-  MJPEG clients are connected.
-- `H264Streamer` - CameraX -> MediaCodec AVC; the encoder is configured
-  after CameraX reports the selected capture size, negotiates its raw input
-  layout (NV12 or I420) per device, and broadcasts Annex B buffers to
-  per-client bounded channels; slow clients are disconnected.
-- `ControlServer` - Ktor CIO server; REST API + streams + embedded web UI.
-  See `protocol/SPEC.md` for the auth rules (bind-time enforcement,
-  loopback-only security settings, constant-time token compare).
-- `StreamState` - atomics-based shared state (single source of truth),
-  including `torchRequested` so torch survives rebinds.
-- `ResolutionPolicy` - profile-driven CameraX resolution selection.
-- `CameraSelectors` / `FpsRanges` / `CameraRepository` - per-device lens
-  selection by Camera2 id (ultrawide/telephoto/etc. with graceful fallback)
-  and AE FPS ranges chosen from what the device actually reports.
+`PipelineSnapshot` is the authoritative immutable CAS state and contains revision, generation, lifecycle, desired, selected, actual, fallback, request identity/source, preview status, and update time. Generation-gated publications prevent status from mixing old actual values with new desired values.
 
-### Rust frame producer (`windows/.../rust-frame-producer/`)
+`H264Streamer` selects only complete Camera2/encoder tuples. Regular surface capture is attempted where valid; constrained high-speed direct surface and SurfaceTexture/EGL bridge paths cover public high-speed configurations. Encoder output is asynchronous, B-frames are disabled, keyframe interval is one second, and a new client requests a keyframe. OCB2 stream info carries the source transform.
 
-Single binary, three sources:
+`MjpegStreamer` retains CameraX compatibility. Canonical MJPEG modes come from per-resolution camera FPS capability and internal H.264 fallback selects a valid tuple rather than retaining an impossible H.264 FPS.
 
-- `--source mjpeg` (stable): HTTP client with **no total request timeout**
-  (the default reqwest 30s timeout would kill long-lived streams), TCP
-  keepalive, exponential reconnect backoff, HTTP status checking (401 hints
-  at token problems), JPEG decode -> BGRA, explicit `--rotate`/`--mirror`
-  or portrait auto-rotate, resize, shared-memory write with QPC timestamp.
-- `--source test-pattern`: synthetic frames for debugging the vcam side alone.
-- `--source h264` (EXPERIMENTAL): Annex B transport with a reader thread
-  that extracts complete NAL units into a bounded queue, and a decoder
-  thread using the bundled **openh264** (compiled from source at build
-  time). On queue overflow or mid-stream reconnect it drops data only until
-  the next SPS/PPS/IDR sync point, so the decoder never sees a corrupt
-  bitstream. Decoded frames go through the same rotate/mirror/resize/write
-  pipeline as MJPEG, but the H.264 main loop is event-driven: the decoder
-  wakes the writer the moment a frame is ready (writes still paced to the
-  target FPS), so latency does not include waiting for the next fixed tick.
-  Experimental until validated on real devices.
+`ControlServer` exposes `/stream.ocb2`, `/stream.mjpeg`, REST state/control, SSE, dashboard, and `/obs`. Dashboard and OBS use the shared incremental browser OCB2 parser plus WebCodecs, with explicit unsupported-browser errors.
 
-Metrics: one JSON line per second on stdout (parsed by the Tauri app);
-errors also go to stderr (surfaced as `last_error` in the desktop UI).
+## OCB2
 
-### Windows virtual camera (`windows/virtual-camera-mediafoundation/`)
+Every 48-byte little-endian header includes magic, version, header size, record type, flags, sequence, capture timestamp, encoder timestamp, payload length, and reserved bytes. Records cover stream info, codec configuration, one complete access unit, heartbeat, end, and error. Payloads are bounded to 16 MiB independently by parsers and decoder entry points. Reconnect resets partial-record state and decoding waits for a new keyframe after stream info/discontinuity.
 
-Derived from the Microsoft Media Foundation virtual camera sample.
-`SimpleMediaSource`/`SimpleMediaStream` read the shared framebuffer through
-`SharedMemoryClient`, which validates the OCBF header and nearest-neighbor
-scales on resolution mismatch. Registration requires admin
-(`register_hklm.bat` / `VirtualCamera_Installer`).
+The shared corpus in `protocol/conformance` runs against Kotlin, Rust, and the actual browser parser.
 
-### Desktop app (`desktop/tauri-app/`)
+## Windows producer and ring
 
-- Connection screen with explicit **USB (recommended)** and **Wi-Fi (LAN)**
-  modes; USB mode runs `adb forward` itself; LAN mode requires the token from
-  the phone's Security tab and validates it before entering the dashboard.
-- All API calls and stream URLs carry the token (header for fetches, query
-  parameter for `<img>`/OBS URLs). The producer receives `--token`.
-- Producer receives `--rotate`/`--mirror` so the virtual camera output
-  matches the preview orientation.
-- OBS fallback modes (browser source / window capture via obs-websocket)
-  remain available but the Media Foundation virtual camera is the main path.
+The producer has observable states from `STARTING` through connection, stream-info/config/keyframe/decode, `WRITING_RING`, stalled/fallback/failed. Media Foundation D3D11 output is reported separately from hardware decode, which remains `unknown` unless acceleration can be proven.
 
-## Known failure modes and mitigations
+The ring ABI is generated from `protocol/ring-abi.schema.json`. It has a 256-byte header and aligned slot headers/data, atomic publication, ACL-restricted file/mapping access, producer/consumer heartbeats, build hashes, dimensions/strides/format/size/offset validation, and two or three reusable NV12 slots. Producer writes and camera reads never queue old presentation frames.
 
-- Camera bind failure on Android -> service enters ERROR with the cause in
-  `/api/camera/status.lastError`; `/api/stream/recover` retries.
-- Producer loses the phone connection -> reconnects with backoff; the vcam
-  keeps showing the last written frame; desktop shows the producer error.
-- Framebuffer/consumer resolution mismatch -> vcam scales nearest-neighbor
-  (visible quality drop) and logs via OutputDebugString.
-- LAN token mismatch -> HTTP 401 everywhere except /health; producer metrics
-  say "check the LAN access token".
+## Virtual camera
 
-## Non-goals (V1)
+`VirtualCameraMediaSource.dll` ships only the Synthetic/SimpleMediaSource production path. `SimpleMediaStream` advertises NV12 1080p60/30 and 720p60/30, with RGB32 compatibility last. Buffer writes use the `IMF2DBuffer2` -> `IMF2DBuffer` -> `IMFMediaBuffer` fallback chain and validate positive NV12 pitch/negative RGB32 pitch correctly.
 
-No audio, no iOS, no macOS driver, no WebRTC, no cloud, no accounts,
-no telemetry, no watermark.
+`VirtualCamera_Installer.exe` owns production register/unregister/status/host commands. Inherited Microsoft manager/test/MSI/wrapper projects are archived under `upstream-samples` and are absent from the production build graph.
+
+## Desktop orchestration
+
+Tauri chooses an explicit ADB device, applies revisioned complete tuples, starts the producer with Android selected/actual source properties and independent Windows output dimensions, verifies three ring commits plus host activation, and maintains current virtual-camera-consumer readiness separately. The desktop preview reads the newest NV12 slot at at most 30 FPS and cannot back-pressure the ring.

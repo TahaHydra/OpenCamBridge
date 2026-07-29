@@ -3,6 +3,7 @@ package com.opencambridge.android.camera
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -13,6 +14,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import android.content.Context
 import com.opencambridge.android.state.StreamState
+import com.opencambridge.android.state.StreamConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -30,6 +32,7 @@ import kotlin.coroutines.suspendCoroutine
  * Opens the camera via CameraX ImageAnalysis and optional Preview.
  * Safely handles configuration changes using a Mutex.
  */
+@androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
 class MjpegStreamer(
     private val context: Context,
     private val lifecycleOwner: LifecycleOwner
@@ -41,17 +44,31 @@ class MjpegStreamer(
 
     private var cameraProvider: ProcessCameraProvider? = null
     private var currentCamera: Camera? = null
+    @Volatile private var activeConfig: StreamConfig? = null
+    @Volatile private var activePipelineGeneration: Long = -1
 
     // Reusable buffers to avoid GC churn at 30-60 fps
     private var nv21Buffer: ByteArray? = null
     private var nv21RotatedBuffer: ByteArray? = null
+    private var nv21TransformScratch: ByteArray? = null
     private val jpegStream = ByteArrayOutputStream(512 * 1024)
 
     // Encode-side pacing: skip camera frames beyond the requested FPS so we do
     // not burn CPU JPEG-encoding frames the HTTP layer would drop anyway.
     private var lastEncodeNs = 0L
+    private var captureWindowStartNs = 0L
+    private var captureWindowFrames = 0
 
-    suspend fun start() {
+    suspend fun start(selectedFallbackMode: H264ModeDto? = null) {
+        val desired = StreamState.currentConfig()
+        activeConfig = selectedFallbackMode?.let {
+            desired.copy(width = it.width, height = it.height, fps = it.fps, profile = "exact")
+        } ?: desired
+        activePipelineGeneration = StreamState.pipelineGeneration.get()
+        captureWindowStartNs = 0L
+        captureWindowFrames = 0
+        lastEncodeNs = 0L
+        StreamState.activeStreamMode.set("mjpeg")
         val provider = suspendCoroutine<ProcessCameraProvider> { cont ->
             val future = ProcessCameraProvider.getInstance(context)
             future.addListener({
@@ -74,6 +91,7 @@ class MjpegStreamer(
             StreamState.rebindInProgress.set(true)
             try {
                 val provider = cameraProvider ?: return@withLock
+                val config = activeConfig ?: StreamState.currentConfig().also { activeConfig = it }
 
                 // Force torch off and cancel zoom before unbinding to prevent driver state corruption
                 currentCamera?.cameraControl?.enableTorch(false)
@@ -84,21 +102,20 @@ class MjpegStreamer(
                     provider.unbindAll()
                 }
 
-                val selector = buildSelector(StreamState.cameraId.get())
+                val selector = buildSelector(config.cameraId)
 
                 val resSelector = ResolutionPolicy.buildSelector(
-                    profile = StreamState.profile.get(),
-                    requestedWidth = StreamState.width.get(),
-                    requestedHeight = StreamState.height.get(),
-                    allowNative = StreamState.profile.get() == "native",
-                    allowAspectFallback = false
+                    profile = config.profile,
+                    requestedWidth = config.width,
+                    requestedHeight = config.height
                 )
 
-                val targetFps = StreamState.fps.get()
+                val targetFps = config.fps
+                StreamState.selectedFps.set(targetFps)
 
                 // Pick an FPS range the *device* actually supports; hardcoded
                 // ranges like [30,30] do not exist on all sensors.
-                val fpsRange = FpsRanges.choose(context, StreamState.cameraId.get(), targetFps)
+                val fpsRange = FpsRanges.choose(context, config.cameraId, targetFps)
 
                 val imageAnalysisBuilder = ImageAnalysis.Builder()
                     .setResolutionSelector(resSelector)
@@ -118,14 +135,14 @@ class MjpegStreamer(
                 }
                 android.util.Log.i(
                     "OpenCamBridge",
-                    "Binding MJPEG CameraX camera=${StreamState.cameraId.get()} profile=${StreamState.profile.get()} requested=${StreamState.width.get()}x${StreamState.height.get()} fps=$targetFps fpsRange=$fpsRange preview=${StreamState.localPreviewEnabled.get()}"
+                    "Binding MJPEG CameraX camera=${config.cameraId} profile=${config.profile} requested=${config.width}x${config.height} fps=$targetFps fpsRange=$fpsRange preview=${config.localPreviewEnabled}"
                 )
                 // Surface the chosen AE range in the app Logs tab: if a 60 fps
                 // request resolves to a variable range like [30,60] (or a lower
                 // fixed range), that explains a delivered rate below target.
                 com.opencambridge.android.state.AppLogger.i(
                     "Camera",
-                    "Bind cam=${StreamState.cameraId.get()} req=${StreamState.width.get()}x${StreamState.height.get()}@$targetFps aeRange=${fpsRange ?: "default"}"
+                    "Bind cam=${config.cameraId} req=${config.width}x${config.height}@$targetFps aeRange=${fpsRange ?: "default"}"
                 )
 
                 val imageAnalysis = imageAnalysisBuilder.build()
@@ -161,7 +178,7 @@ class MjpegStreamer(
                     val useCases = mutableListOf<androidx.camera.core.UseCase>(imageAnalysis)
 
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                        if (StreamState.localPreviewEnabled.get()) {
+                        if (config.localPreviewEnabled) {
                             // Bind the Preview whenever it is enabled, even if the
                             // Compose PreviewView has not published its surface yet;
                             // setSurfaceProvider attaches it dynamically once ready
@@ -175,6 +192,13 @@ class MjpegStreamer(
                             *useCases.toTypedArray()
                         )
                         observeCameraControls()
+                        StreamState.publishPhonePreview(
+                            activePipelineGeneration,
+                            config.localPreviewEnabled && surfaceProvider != null,
+                            if (config.localPreviewEnabled && surfaceProvider == null) {
+                                "CameraX preview requested but no phone SurfaceProvider is attached"
+                            } else ""
+                        )
 
                         // Extract actual resolution selected by CameraX
                         val resolution = imageAnalysis.resolutionInfo?.resolution
@@ -189,12 +213,22 @@ class MjpegStreamer(
                             StreamState.selectedEffectiveWidth.set(effW)
                             StreamState.selectedEffectiveHeight.set(effH)
                             StreamState.normalizedForPolicy.set(true)
+                            StreamState.publishSelectedPipeline(
+                                activePipelineGeneration, config.cameraId, "mjpeg", "CAMERAX_IMAGE_ANALYSIS",
+                                effW, effH, targetFps, null, false
+                            )
+                            if (config.streamMode == "mjpeg") {
+                                val fallback = effW != config.width || effH != config.height
+                                StreamState.publishFallback(
+                                    fallback,
+                                    if (fallback) "CameraX selected ${effW}x${effH} instead of requested ${config.width}x${config.height}" else ""
+                                )
+                            }
 
                             android.util.Log.i("MjpegStreamer", "Selected Resolution: ${resolution.width}x${resolution.height} (Effective: ${effW}x${effH})")
                         }
                     }
 
-                    StreamState.streaming.set(true)
                 } catch (e: Exception) {
                     android.util.Log.e("MjpegStreamer", "bindToLifecycle failed: ${e.message}")
                     // Surface the failure instead of silently reporting STREAMING.
@@ -210,7 +244,8 @@ class MjpegStreamer(
         rebindMutex.withLock {
             cameraProvider?.unbindAll()
             currentCamera = null
-            StreamState.streaming.set(false)
+            activeConfig = null
+            activePipelineGeneration = -1
             StreamState.latestFrame.set(null)
         }
     }
@@ -297,6 +332,23 @@ class MjpegStreamer(
         }
 
         try {
+            val captureNowNs = System.nanoTime()
+            if (captureWindowStartNs == 0L) captureWindowStartNs = captureNowNs
+            captureWindowFrames++
+            if (captureNowNs - captureWindowStartNs >= 1_000_000_000L) {
+                StreamState.captureFps.set(captureWindowFrames)
+                StreamState.cameraSessionFps.set(captureWindowFrames)
+                val actualWidth = StreamState.encodedWidth.get().takeIf { it > 0 }
+                    ?: StreamState.selectedEffectiveWidth.get()
+                val actualHeight = StreamState.encodedHeight.get().takeIf { it > 0 }
+                    ?: StreamState.selectedEffectiveHeight.get()
+                StreamState.publishActualPipeline(
+                    activePipelineGeneration, actualWidth, actualHeight,
+                    captureWindowFrames, StreamState.actualFps.get(), 0
+                )
+                captureWindowFrames = 0
+                captureWindowStartNs = captureNowNs
+            }
             StreamState.rotationDegrees.set(imageProxy.imageInfo.rotationDegrees)
             StreamState.frameWidth.set(imageProxy.width)
             StreamState.frameHeight.set(imageProxy.height)
@@ -307,16 +359,17 @@ class MjpegStreamer(
             // CPU saver 2: with zero connected MJPEG clients, keep the latest
             // frame fresh at ~2 fps only (status/preview pickup stays instant,
             // battery does not burn encoding for nobody).
-            val nowNs = System.nanoTime()
-            val targetFps = StreamState.fps.get().coerceIn(1, 120)
-            val minIntervalNs = (1_000_000_000L / targetFps) * 9 / 10
-            val idleIntervalNs = 500_000_000L
-            val sinceLastNs = nowNs - lastEncodeNs
+            val captureTimestampNs = imageProxy.imageInfo.timestamp
+                .takeIf { it > 0L } ?: captureNowNs
+            val config = activeConfig ?: return
+            val targetFps = config.fps.coerceIn(1, 120)
             val idle = StreamState.mjpegClientCount.get() == 0
-            if (sinceLastNs < minIntervalNs || (idle && sinceLastNs < idleIntervalNs)) {
+            if (!FramePacingPolicy.shouldEncode(
+                    captureTimestampNs, lastEncodeNs, targetFps, idle
+                )) {
                 return
             }
-            lastEncodeNs = nowNs
+            lastEncodeNs = captureTimestampNs
 
             val width = imageProxy.width
             val height = imageProxy.height
@@ -367,22 +420,30 @@ class MjpegStreamer(
             // so nothing downstream may rotate again; portrait frames are
             // letterboxed by the producer into the fixed 16:9 virtual camera.
             val autoRot = imageProxy.imageInfo.rotationDegrees
-            val manualRot = (StreamState.displayRotation.get().toIntOrNull() ?: 0).mod(360)
+            val manualRot = (config.displayRotation.toIntOrNull() ?: 0).mod(360)
             val totalRot = (autoRot + manualRot).mod(360)
 
+            val transformNeeded = totalRot != 0 || config.mirror
             val outBuf: ByteArray
             val outW: Int
             val outH: Int
-            if (totalRot != 0) {
+            if (transformNeeded) {
                 if (nv21RotatedBuffer?.size != frameSize) nv21RotatedBuffer = ByteArray(frameSize)
+                if (nv21TransformScratch?.size != frameSize) nv21TransformScratch = ByteArray(frameSize)
                 val dst = nv21RotatedBuffer!!
-                // Stage B: NV21 rotation (only when a rotation is applied).
+                val scratch = nv21TransformScratch!!
+                // Stage B: authoritative NV21 rotation + mirror. Every MJPEG
+                // consumer receives these exact pixels and must not transform
+                // them again downstream.
                 val rotStartNs = System.nanoTime()
-                rotateNv21(nv21, dst, width, height, totalRot)
+                val dimensions = Nv21Transform.transform(
+                    nv21, dst, scratch, width, height, totalRot, config.mirror
+                )
                 val rotMs = (System.nanoTime() - rotStartNs) / 1_000_000.0
                 StreamState.rotateMsAvg.set(ewma(StreamState.rotateMsAvg.get(), rotMs))
                 outBuf = dst
-                if (totalRot % 180 != 0) { outW = height; outH = width } else { outW = width; outH = height }
+                outW = dimensions.width
+                outH = dimensions.height
             } else {
                 // No rotation this frame: record 0 so the average decays toward it.
                 StreamState.rotateMsAvg.set(ewma(StreamState.rotateMsAvg.get(), 0.0))
@@ -393,7 +454,7 @@ class MjpegStreamer(
             StreamState.rotationApplied.set(totalRot != 0)
             StreamState.encodedWidth.set(outW)
             StreamState.encodedHeight.set(outH)
-            StreamState.resizeNeeded.set(outW != StreamState.width.get() || outH != StreamState.height.get())
+            StreamState.resizeNeeded.set(outW != config.width || outH != config.height)
 
             val quality = StreamState.jpegQuality.get()
             // Stage C: YuvImage build + compressToJpeg.
@@ -404,11 +465,14 @@ class MjpegStreamer(
             val jpegMs = (System.nanoTime() - jpegStartNs) / 1_000_000.0
             StreamState.jpegMsAvg.set(ewma(StreamState.jpegMsAvg.get(), jpegMs))
 
-            val encodeMs = (System.nanoTime() - encodeStartNs) / 1_000_000.0
-            StreamState.androidEncodeMsAvg.set(ewma(StreamState.androidEncodeMsAvg.get(), encodeMs))
-
+            // `toByteArray()` is a full JPEG-sized allocation and copy. It is
+            // part of phone-side processing, not transport, and at 1080p can be
+            // the difference between a nominal 30 FPS setting and 24 unique
+            // frames. Measure it inside the processing budget.
             StreamState.latestFrame.set(jpegStream.toByteArray())
             StreamState.latestFrameRevision.incrementAndGet()
+            val encodeMs = (System.nanoTime() - encodeStartNs) / 1_000_000.0
+            StreamState.androidEncodeMsAvg.set(ewma(StreamState.androidEncodeMsAvg.get(), encodeMs))
 
             val now = System.currentTimeMillis()
             StreamState.framesThisSecond.incrementAndGet()
@@ -418,6 +482,10 @@ class MjpegStreamer(
                 if (StreamState.fpsWindowStartMs.compareAndSet(windowStart, now)) {
                     val count = StreamState.framesThisSecond.getAndSet(0)
                     StreamState.actualFps.set(count)
+                    StreamState.publishActualPipeline(
+                        activePipelineGeneration, outW, outH,
+                        StreamState.captureFps.get(), count, 0
+                    )
                 }
             }
         } catch (e: Exception) {
@@ -497,65 +565,6 @@ class MjpegStreamer(
                 }
                 dstOffset += width
             }
-        }
-    }
-
-    /**
-     * Rotates an NV21 frame by 90/180/270 degrees clockwise into [dst], as a
-     * pure memory permutation — no JPEG decode/re-encode, so it is cheap enough
-     * to run per frame. For 90/270 the output dimensions are (height x width).
-     * NV21 layout: full-res Y plane, then interleaved V,U at quarter resolution.
-     */
-    private fun rotateNv21(src: ByteArray, dst: ByteArray, width: Int, height: Int, degrees: Int) {
-        val ySize = width * height
-        val total = ySize + ySize / 2
-        when (degrees) {
-            90 -> {
-                var i = 0
-                for (x in 0 until width) {
-                    for (y in height - 1 downTo 0) {
-                        dst[i++] = src[y * width + x]
-                    }
-                }
-                i = ySize
-                for (x in 0 until width step 2) {
-                    for (y in height / 2 - 1 downTo 0) {
-                        val p = ySize + y * width + x
-                        dst[i++] = src[p]     // V
-                        dst[i++] = src[p + 1] // U
-                    }
-                }
-            }
-            180 -> {
-                var i = 0
-                for (p in ySize - 1 downTo 0) {
-                    dst[i++] = src[p]
-                }
-                i = ySize
-                var p = total - 2
-                while (p >= ySize) {
-                    dst[i++] = src[p]     // V
-                    dst[i++] = src[p + 1] // U
-                    p -= 2
-                }
-            }
-            270 -> {
-                var i = 0
-                for (x in width - 1 downTo 0) {
-                    for (y in 0 until height) {
-                        dst[i++] = src[y * width + x]
-                    }
-                }
-                i = ySize
-                for (x in width - 2 downTo 0 step 2) {
-                    for (y in 0 until height / 2) {
-                        val p = ySize + y * width + x
-                        dst[i++] = src[p]     // V
-                        dst[i++] = src[p + 1] // U
-                    }
-                }
-            }
-            else -> System.arraycopy(src, 0, dst, 0, total)
         }
     }
 

@@ -7,6 +7,11 @@ import android.content.SharedPreferences
  * Persists application settings to SharedPreferences and applies them to StreamState.
  */
 class SettingsManager(context: Context) {
+    private companion object {
+        /** Set once the legacy one-second keyframe clamp has been migrated. */
+        const val KEYFRAME_MIGRATION_KEY = "h264KeyframeIntervalMigratedV2"
+    }
+
     private val prefs: SharedPreferences = context.getSharedPreferences("OpenCamBridgeSettings", Context.MODE_PRIVATE)
 
     fun load() {
@@ -15,23 +20,44 @@ class SettingsManager(context: Context) {
 
         var token = prefs.getString("accessToken", "") ?: ""
         if (token.isEmpty()) {
-            // Full 128-bit random token (UUID is backed by SecureRandom).
+            // UUIDv4 has 122 SecureRandom-backed random bits after version/variant bits.
             token = java.util.UUID.randomUUID().toString().replace("-", "")
             prefs.edit().putString("accessToken", token).apply()
         }
         StreamState.accessToken.set(token)
 
-        StreamState.streamMode.set(prefs.getString("streamMode", "mjpeg") ?: "mjpeg")
+        StreamState.streamMode.set(prefs.getString("streamMode", "h264") ?: "h264")
         StreamState.h264Bitrate.set(prefs.getInt("h264Bitrate", 4000000))
-        StreamState.h264KeyframeInterval.set(prefs.getInt("h264KeyframeInterval", 2))
+        val savedKeyframeInterval = prefs.getInt(
+            "h264KeyframeInterval",
+            H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS
+        )
+        // Builds before the interval became a real setting coerced it to exactly
+        // one second, so a stored 1 is an artefact of that clamp rather than a
+        // choice, and leaving it would mean nobody benefits from the longer GOP
+        // without discovering a slider they never had. Rewrite it once, keyed off
+        // a migration marker, so a deliberate 1 chosen afterwards still sticks.
+        val alreadyMigrated = prefs.getBoolean(KEYFRAME_MIGRATION_KEY, false)
+        val keyframeInterval = if (!alreadyMigrated && savedKeyframeInterval <= 1) {
+            H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS
+        } else {
+            H264SettingsPolicy.normalizeKeyframeInterval(savedKeyframeInterval)
+        }
+        StreamState.h264KeyframeInterval.set(keyframeInterval)
+        if (savedKeyframeInterval != keyframeInterval || !alreadyMigrated) {
+            prefs.edit()
+                .putInt("h264KeyframeInterval", keyframeInterval)
+                .putBoolean(KEYFRAME_MIGRATION_KEY, true)
+                .apply()
+        }
 
         StreamState.cameraId.set(prefs.getString("cameraId", "0") ?: "0")
-        StreamState.width.set(prefs.getInt("width", 1280))
-        StreamState.height.set(prefs.getInt("height", 720))
-        StreamState.outputWidth.set(prefs.getInt("outputWidth", 1280))
-        StreamState.outputHeight.set(prefs.getInt("outputHeight", 720))
-        StreamState.profile.set(prefs.getString("profile", "balanced") ?: "balanced")
-        StreamState.fps.set(prefs.getInt("fps", 30))
+        StreamState.width.set(prefs.getInt("width", 1920))
+        StreamState.height.set(prefs.getInt("height", 1080))
+        StreamState.outputWidth.set(prefs.getInt("outputWidth", 1920))
+        StreamState.outputHeight.set(prefs.getInt("outputHeight", 1080))
+        StreamState.profile.set(prefs.getString("profile", "adaptive") ?: "adaptive")
+        StreamState.fps.set(prefs.getInt("fps", 60))
         StreamState.jpegQuality.set(prefs.getInt("jpegQuality", 85))
         StreamState.previewFitMode.set(prefs.getString("previewFitMode", "fill") ?: "fill")
         // Orientation mode: "auto" (view follows how the phone is held),
@@ -51,7 +77,9 @@ class SettingsManager(context: Context) {
 
         StreamState.mirror.set(prefs.getBoolean("mirror", false))
         StreamState.localPreviewEnabled.set(prefs.getBoolean("localPreviewEnabled", false))
+        StreamState.targetBandwidthMbps.set(prefs.getInt("targetBandwidthMbps", 0))
         StreamState.developerMode.set(prefs.getBoolean("developerMode", false))
+        StreamState.refreshConfigSnapshotFromLegacy()
     }
 
     fun save() {
@@ -76,6 +104,7 @@ class SettingsManager(context: Context) {
             putString("displayRotation", StreamState.displayRotation.get())
             putBoolean("mirror", StreamState.mirror.get())
             putBoolean("localPreviewEnabled", StreamState.localPreviewEnabled.get())
+            putInt("targetBandwidthMbps", StreamState.targetBandwidthMbps.get())
             putBoolean("developerMode", StreamState.developerMode.get())
             apply()
         }

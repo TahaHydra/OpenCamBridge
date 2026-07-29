@@ -1,3 +1,5 @@
+param([string]$DeviceSerial)
+
 Write-Host "=== OpenCamBridge DEV START ===" -ForegroundColor Cyan
 
 $ErrorActionPreference = "Continue"
@@ -13,17 +15,33 @@ if (!(Test-Path $adb)) {
 
 Write-Host "Checking ADB devices..."
 & $adb devices
+$connected = @(& $adb devices | Select-Object -Skip 1 | ForEach-Object {
+    if ($_ -match '^([^\s]+)\s+device$') { $Matches[1] }
+} | Where-Object { $_ })
+if ([string]::IsNullOrWhiteSpace($DeviceSerial)) {
+    if ($connected.Count -gt 1) {
+        Write-Host "Several phones are connected. Re-run with -DeviceSerial <serial>." -ForegroundColor Red
+        exit 1
+    }
+    if ($connected.Count -eq 1) { $DeviceSerial = $connected[0] }
+}
+if ($connected -notcontains $DeviceSerial) {
+    Write-Host "Selected phone '$DeviceSerial' is not connected and authorized." -ForegroundColor Red
+    exit 1
+}
+$adbTarget = @('-s', $DeviceSerial)
 
 
 
 Write-Host "Starting Android app..."
-& $adb shell am force-stop com.opencambridge.android
+& $adb @adbTarget shell am force-stop com.opencambridge.android
 Start-Sleep -Milliseconds 500
-& $adb shell am start -n com.opencambridge.android/.MainActivity
+& $adb @adbTarget shell am start -n com.opencambridge.android/.MainActivity
 
 Write-Host "Setting ADB forward 8080..."
-& $adb forward --remove-all
-& $adb forward tcp:8080 tcp:8080
+# Only remove our own forward; --remove-all would kill forwards owned by other tools.
+& $adb @adbTarget forward --remove tcp:8080 2>$null
+& $adb @adbTarget forward tcp:8080 tcp:8080
 
 Write-Host "Waiting for Android control server..."
 $healthOk = $false

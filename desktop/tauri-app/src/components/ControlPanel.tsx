@@ -1,11 +1,32 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Play, Square, Settings2, Sliders, RefreshCw, RotateCw, ZoomIn, ZoomOut, Monitor, Video, ShieldAlert } from 'lucide-react';
+import {
+  Play, Square, Settings2, Sliders, RefreshCw, RotateCw, ZoomIn, ZoomOut, Monitor, Video, ShieldAlert,
+  Activity, Aperture, Gauge, Radio, Copy, Trash2, AlertTriangle, Cable, Layers, Cpu, Terminal, Flashlight,
+} from 'lucide-react';
+import SignalChain from './SignalChain';
+import { Lamp, Notice, Section, Tel, ToggleRow, Well } from './ui';
 import { connectAndSetupObs, ObsStatus } from '../services/obs';
 import { apiFetch, buildUrl } from '../services/api';
+import { desktopInvoke as invoke } from '../services/desktopBridge';
 import { logEvent, logError, logTestMarker } from '../services/logging';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  EMPTY_PREVIEW_DIAGNOSTICS,
+  PREVIEW_DIAGNOSTICS_EVENT,
+  type PreviewStageDiagnostics,
+} from '../services/previewDiagnostics';
+import {
+  buildProducerLaunchSpec,
+  buildSettingsMutation,
+  describeMutationRejection,
+  selectPipelineRestartScope,
+  shouldStartH264PreviewProducer,
+  shouldImportAuthoritativeState
+} from '../services/pipelineSyncPolicy.js';
 
 interface VirtualCamMetrics {
+  type?: string;
+  producer_state?: string;
+  ring_frames_committed?: number;
   source: string;
   profile: string;
   source_width: number;
@@ -13,28 +34,93 @@ interface VirtualCamMetrics {
   output_width: number;
   output_height: number;
   fps_target: number;
+  source_fps?: number;
   http_jpeg_fps: number;
   decoded_fps: number;
   written_fps: number;
+  transport_fps?: number;
+  transport_received_fps?: number;
+  decoded_unique_fps?: number;
+  producer_decoded_fps?: number;
+  ring_written_fps?: number;
+  virtual_camera_unique_fps?: number;
+  repeated_samples?: number;
+  virtual_camera_requested_fps?: number;
+  virtual_camera_repeated_fps?: number;
   dropped_jpegs: number;
+  replaced_frames?: number;
   jpeg_queue_len: number;
   decode_ms_avg: number;
   rotate_ms_avg: number;
   resize_ms_avg: number;
   write_ms_avg: number;
   total_pipeline_ms: number;
+  producer_processing_ms?: number;
+  latency_ms?: number;
+  phone_to_ring_latency_ms?: number;
   bytes_per_sec: number;
   estimated_mbps: string;
+  transport_bandwidth_mbps?: string;
   pixel_format: string;
   decode_backend?: string;
   resize_backend?: string;
+  decoder_name?: string;
+  d3d11_output?: boolean;
+  hardware_decoder?: boolean | null;
+  encoder_name?: string;
+  hardware_encoder?: boolean;
+  camera_id?: string;
+  fallback_reason?: string;
   rotation?: number;
   last_error: string | null;
+  virtual_camera_ready?: boolean;
+  ring?: RingDiagnostics;
+}
+
+interface RingDiagnostics {
+  consumer_attached: boolean;
+  consumer_pid: number;
+  consumer_heartbeat_qpc: number;
+  sample_requests: number;
+  ring_read_attempts: number;
+  ring_read_successes: number;
+  ring_validation_failures: number;
+  sample_copy_failures: number;
+  last_ring_error: number;
+  last_accepted_sequence: number;
+  negotiated_subtype: number;
+  negotiated_width: number;
+  negotiated_height: number;
+  negotiated_fps_num: number;
+  negotiated_fps_den: number;
+  source_fps_num: number;
+  source_fps_den: number;
+  resize_backend: string;
+  resize_failures: number;
+  installed_dll_build_hash: string;
+  producer_build_hash: string;
+  ring_abi_hash: number;
+  ring_write_sequence: number;
+  stream_generation: number;
+  ring_frames_overwritten: number;
+  playout_buffer_depth_ms: number;
+  playout_target_delay_ms: number;
+  playout_late_dropped: number;
+  playout_underruns: number;
+  playout_scheduler_resets: number;
+  playout_clock_ppm: number;
+  playout_max_output_gap_ms: number;
 }
 
 interface VirtualCamState {
   running: boolean;
+  process_running?: boolean;
+  pipeline_ready?: boolean;
+  producer_ready?: boolean;
+  virtual_camera_ready?: boolean;
+  producer_state?: string;
   host_running: boolean;
+  host_activated: boolean;
   registered: boolean;
   metrics: VirtualCamMetrics | null;
   producer_path?: string;
@@ -42,6 +128,23 @@ interface VirtualCamState {
   producer_pid?: number;
   last_error?: string;
   last_metrics_time?: number;
+  last_event?: string;
+  binary_identity: {
+    ready: boolean;
+    producer_path: string;
+    producer_file_hash: string;
+    producer_runtime_hash: string;
+    built_dll_path: string;
+    built_dll_hash: string;
+    installed_dll_path: string;
+    installed_dll_hash: string;
+    registered_dll_path: string;
+    registered_dll_hash: string;
+    loaded_dll_hash: string;
+    loaded_dll_current: boolean;
+    error?: string;
+    remediation: string;
+  };
 }
 
 interface ControlPanelProps {
@@ -54,35 +157,81 @@ interface ControlPanelProps {
   setPreviewOff: (val: boolean) => void;
 }
 
+type ProducerPurpose = 'preview' | 'feed' | 'webcam';
+
+function normalizeAndroidMetrics(raw: any): any {
+  if (!raw || !('capture' in raw)) return raw;
+  const capture = raw.capture;
+  const h264 = raw.h264;
+  const mjpeg = raw.mjpeg;
+  const selection = raw.selection || {};
+  const fallback = raw.fallback;
+  return {
+    ...raw,
+    ...selection,
+    fps: capture?.actualFps ?? 0,
+    requestedFps: capture?.requestedFps ?? 0,
+    actualFps: capture?.actualFps ?? 0,
+    captureFps: capture?.actualFps ?? 0,
+    cameraCaptureFps: capture?.actualFps ?? 0,
+    selectedFps: capture?.selectedFps ?? 0,
+    cameraSessionFps: capture?.cameraSessionFps ?? 0,
+    gpuBridgeFps: capture?.gpuBridgeFps,
+    captureEngine: capture?.engine,
+    encodedWidth: capture?.actualWidth ?? 0,
+    encodedHeight: capture?.actualHeight ?? 0,
+    encodedFps: h264?.encodedFps ?? mjpeg?.encodedFps ?? 0,
+    phoneEncodedFps: h264?.encodedFps ?? mjpeg?.encodedFps ?? 0,
+    encodedBitrate: h264?.bitrate ?? 0,
+    encoderName: h264?.encoderName,
+    hardwareEncoder: h264?.hardwareEncoder ?? false,
+    androidEncodeMsAvg: mjpeg?.encodeMs,
+    phoneEncodeMs: mjpeg?.encodeMs ?? 0,
+    yuvMsAvg: mjpeg?.yuvMs,
+    jpegMsAvg: mjpeg?.jpegMs,
+    rotateMsAvg: mjpeg?.rotateMs,
+    mjpegProcessingCapacityFps: mjpeg?.processingCapacityFps ?? 0,
+    latestFrameRevision: mjpeg?.latestFrameRevision ?? 0,
+    estimatedMbps: raw.transport?.estimatedMbps ?? '0.0',
+    targetBandwidthMbps: raw.transport?.targetBandwidthMbps ?? 0,
+    fallbackUsed: fallback?.active ?? false,
+    fallbackReason: fallback?.reason ?? '',
+  };
+}
+
 export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, previewOff, setPreviewOff }: ControlPanelProps) {
   const [cameras, setCameras] = useState<any[]>([]);
   const [settings, setSettings] = useState({
     cameraId: '0',
-    profile: 'balanced',
-    width: 1280,
-    height: 720,
-    outputWidth: 1280,
-    outputHeight: 720,
+    profile: 'adaptive',
+    width: 1920,
+    height: 1080,
+    outputWidth: 1920,
+    outputHeight: 1080,
+    // Default to 30 fps: on many phones (e.g. OnePlus 9) 60 fps at 1080p/720p is
+    // only reachable via a constrained high-speed session that crops the sensor
+    // FOV (looks like a "lens switch") and AE-limits to ~15 fps in low light.
+    // 30 fps uses the full-FOV regular session; 60 remains an explicit preset.
     fps: 30,
-    jpegQuality: 85,
+    jpegQuality: 75,
     displayRotation: '0',
     aspectRatio: '16:9',
     mirror: false,
     torchEnabled: false,
     linearZoom: 0.0,
-    streamMode: 'mjpeg',
+    streamMode: 'h264',
     targetBandwidthMbps: 0,
     h264Bitrate: 4000000,
-    h264KeyframeInterval: 2
+    h264KeyframeInterval: 5
   });
 
   const PROFILE_PRESETS: Record<string, any> = {
     'low-latency': {
       profile: 'low-latency',
-      width: 960,
-      height: 540,
-      outputWidth: 960,
-      outputHeight: 540,
+      width: 1280,
+      height: 720,
+      outputWidth: 1280,
+      outputHeight: 720,
       fps: 30,
       jpegQuality: 70,
       aspectRatio: '16:9'
@@ -114,7 +263,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       outputWidth: 1920,
       outputHeight: 1080,
       fps: 30,
-      jpegQuality: 90,
+      jpegQuality: 75,
       aspectRatio: '16:9'
     },
     'experimental-1080p60': {
@@ -130,6 +279,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   };
 
   const settingsRef = useRef(settings);
+  const authoritativeRevisionRef = useRef<number | null>(null);
+  const settingsHydratedRef = useRef(false);
+  const producerPurposeRef = useRef<ProducerPurpose | null>(null);
+  const previewProducerStartInFlightRef = useRef(false);
+  const previewProducerRetryAfterRef = useRef(0);
+  const previewAutoStartSuppressedRef = useRef(false);
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -141,18 +296,6 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   // poll overwrite the user's just-made selection with the pre-change server
   // value (which would make the desktop controls appear to "snap back").
   const isSyncingRef = useRef(false);
-  // After a local change, ignore incoming status merges until this time so a
-  // lagging phone status poll can't revert the value the user just set (the
-  // "I changed quality and had to reload the page for it to move" bug). The
-  // phone needs a beat to apply and report the new value.
-  const settleUntilRef = useRef(0);
-  const bumpSettle = () => { settleUntilRef.current = Date.now() + 2500; };
-  // Monotonic apply id. Each desktop settings POST carries the next value; the
-  // phone echoes the highest it has applied in status.appliedVersion. We refuse
-  // to merge stream-shaping fields from status until the phone has caught up to
-  // our latest apply — otherwise a slow CameraX rebind lets stale status snap
-  // the resolution/fps dropdowns back to the old value.
-  const localApplyVersionRef = useRef(0);
 
   const [obsPassword, setObsPassword] = useState('');
   const [obsMode, setObsMode] = useState<'browser' | 'window'>('browser');
@@ -164,17 +307,26 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   const [vcamMessage, setVcamMessage] = useState('');
   const [androidStreamStatus, setAndroidStreamStatus] = useState('unknown');
   const [androidMetrics, setAndroidMetrics] = useState<any>(null);
+  const [phoneInfo, setPhoneInfo] = useState<any>(null);
   const [now, setNow] = useState(Date.now() / 1000);
 
-  // Developer / Experimental mode. Off by default: V1 is a stable MJPEG product.
-  // When off, H.264 codec selection, capture profiles, and the verbose producer
-  // metrics are hidden — normal users just pick resolution/fps/quality.
+  // The rail is paged rather than one endless scroll: SIGNAL answers "is it
+  // working", the rest are the things a user changes, and DIAG keeps every raw
+  // counter reachable without making it the first thing anyone reads.
+  const [tab, setTab] = useState<'signal' | 'image' | 'output' | 'diag'>('signal');
+
+  // Developer mode only controls verbose diagnostics and presets. Codec choice
+  // is a normal product setting because hardware H.264 is the V2 primary path.
   const [devMode, setDevMode] = useState<boolean>(() => localStorage.getItem('ocb.devMode') === '1');
   useEffect(() => { localStorage.setItem('ocb.devMode', devMode ? '1' : '0'); }, [devMode]);
 
   // Rolling diagnostics log surfaced in-app so runtime problems can be copied
   // without digging through the terminal. Capped to the most recent entries.
   const [diagLog, setDiagLog] = useState<string[]>([]);
+  const [previewDiagnostics, setPreviewDiagnostics] = useState<PreviewStageDiagnostics>(
+    () => ({ ...EMPTY_PREVIEW_DIAGNOSTICS }),
+  );
+  const previewDiagnosticsRef = useRef<PreviewStageDiagnostics>({ ...EMPTY_PREVIEW_DIAGNOSTICS });
   const lastDiagRef = useRef<Record<string, string>>({});
   // Refs so the periodic metrics sampler can read current state without being a
   // dependency (avoids re-creating the interval every poll).
@@ -193,19 +345,48 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     (isErr ? logError : logEvent)(key, message);
   }, []);
 
+  useEffect(() => {
+    const onPreviewDiagnostics = (event: Event) => {
+      const next = (event as CustomEvent<PreviewStageDiagnostics>).detail;
+      if (!next) return;
+      const previous = previewDiagnosticsRef.current;
+      previewDiagnosticsRef.current = next;
+      setPreviewDiagnostics(next);
+      if (!previous.ready && next.ready) {
+        addDiag('h264Preview', `Desktop preview READY: renderer displayed sequence ${next.lastDisplayedSequence}`);
+      }
+      if (!previous.consumerStalled && next.consumerStalled) {
+        addDiag('h264Preview', 'Preview consumer is not releasing frames; producer ring is healthy.');
+      }
+      if (previous.lastError !== next.lastError && next.lastError) {
+        addDiag('h264Preview', `Preview error: ${next.lastError}`);
+      }
+    };
+    window.addEventListener(PREVIEW_DIAGNOSTICS_EVENT, onPreviewDiagnostics);
+    return () => window.removeEventListener(PREVIEW_DIAGNOSTICS_EVENT, onPreviewDiagnostics);
+  }, [addDiag]);
+
   // Capabilities of the currently selected lens, reported honestly by Android.
   const activeCam: any = cameras.find(c => c.id === settings.cameraId);
   // Torch: hide only when the active lens explicitly reports no flash. If the
   // field is absent (older phone build / capability unknown) keep it visible so
   // version skew never hides a working torch.
   const torchSupported = activeCam ? activeCam.hasTorch !== false : false;
+  const h264Modes: any[] = Array.isArray(activeCam?.h264Modes) ? activeCam.h264Modes : [];
+  const mjpegModes: any[] = Array.isArray(activeCam?.mjpegModes) ? activeCam.mjpegModes : [];
+  const activeModes = settings.streamMode === 'h264' ? h264Modes : mjpegModes;
   const fpsCapFor = (w: number, h: number): number => {
-    const e = activeCam?.fpsByResolution?.find((r: any) => r.width === w && r.height === h);
-    return e ? e.maxFps : 0; // 0 = unknown (do not restrict)
+    if (settings.streamMode === 'h264') {
+      return Math.max(0, ...h264Modes.filter((m: any) => m.width === w && m.height === h).map((m: any) => m.fps));
+    }
+    return Math.max(0, ...mjpegModes.filter((m: any) => m.width === w && m.height === h).map((m: any) => m.fps));
   };
   const maxFpsHere = fpsCapFor(settings.width, settings.height);
-  const supports60 = maxFpsHere === 0 || maxFpsHere >= 50;
-  const supports30 = maxFpsHere === 0 || maxFpsHere >= 25;
+  const fpsChoices = Array.from(new Set(activeModes
+    .filter((m: any) => m.width === settings.width && m.height === settings.height)
+    .map((m: any) => Number(m.fps)))).sort((a, b) => a - b);
+  const resolutionChoices = Array.from(new Map(activeModes.map((m: any) =>
+    [`${m.width}x${m.height}`, { width: m.width, height: m.height }])).values()) as any[];
 
   const handleStartObs = async () => {
     if (obsMode === 'window' && onEnterObsMode) {
@@ -222,8 +403,6 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     // not rotate again.
     const obsUrl = buildUrl(baseUrl, '/obs', token, {
       fit: fitMode === 'fill' ? 'cover' : 'contain',
-      mirror: settings.mirror ? 'true' : 'false',
-      rotate: '0',
     });
 
     const success = await connectAndSetupObs(obsPassword, obsUrl, obsMode, (status) => setObsStatus(status));
@@ -233,53 +412,73 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     }
   };
 
+  const importAuthoritativeState = useCallback((raw: any, force = false) => {
+    const status = raw?.status || raw;
+    if (!status) return;
+    if (!force && !shouldImportAuthoritativeState(
+      authoritativeRevisionRef.current, status.revision, isSyncingRef.current
+    )) return;
+    authoritativeRevisionRef.current = Number(status.revision ?? 0);
+    settingsHydratedRef.current = true;
+    const current = settingsRef.current;
+    const next: any = {
+      ...current,
+      cameraId: status.cameraId ?? current.cameraId,
+      profile: status.profile ?? current.profile,
+      width: status.width ?? current.width,
+      height: status.height ?? current.height,
+      outputWidth: status.outputWidth ?? current.outputWidth,
+      outputHeight: status.outputHeight ?? current.outputHeight,
+      fps: status.fps ?? current.fps,
+      jpegQuality: status.jpegQuality ?? current.jpegQuality,
+      streamMode: status.streamMode ?? current.streamMode,
+      displayRotation: status.displayRotation ?? current.displayRotation,
+      aspectRatio: status.aspectRatio ?? current.aspectRatio,
+      mirror: status.mirror ?? current.mirror,
+      torchEnabled: status.torchEnabled ?? current.torchEnabled,
+      linearZoom: status.linearZoom ?? current.linearZoom,
+      targetBandwidthMbps: status.targetBandwidthMbps ?? current.targetBandwidthMbps,
+      h264Bitrate: status.h264Bitrate ?? current.h264Bitrate,
+      // v2 fixes this at one second. Normalize legacy phone state here so an
+      // old persisted value cannot poison unrelated desktop controls.
+      h264KeyframeInterval: 5
+    };
+    settingsRef.current = next;
+    setSettings(next);
+  }, []);
+
   const fetchStatus = useCallback(() => {
     apiFetch(baseUrl, '/api/camera/status', token)
       .then(res => res.json())
       .then(data => {
         const status = data.status || data;
         if (status) {
-          // The phone has caught up to our latest apply once appliedVersion >=
-          // our local apply id. Until then, keep the user's just-selected
-          // stream-shaping values (no snapback from stale rebind status).
-          const androidCaughtUp = Number(status.appliedVersion || 0) >= localApplyVersionRef.current;
-          setSettings(prev => {
-            const merged: any = {
-              ...prev,
-              // Display/control fields round-trip fast and are safe to mirror on
-              // every poll, so phone-side changes show on the desktop within ~1s.
-              displayRotation: status.displayRotation ?? prev.displayRotation,
-              aspectRatio: status.aspectRatio ?? prev.aspectRatio,
-              mirror: status.mirror ?? prev.mirror,
-              torchEnabled: status.torchEnabled ?? prev.torchEnabled,
-              linearZoom: status.linearZoom ?? prev.linearZoom,
-              targetBandwidthMbps: status.targetBandwidthMbps ?? prev.targetBandwidthMbps,
-              h264Bitrate: status.h264Bitrate ?? prev.h264Bitrate,
-              h264KeyframeInterval: status.h264KeyframeInterval ?? prev.h264KeyframeInterval
-            };
-            // Stream-shaping fields (resolution/fps/quality/profile/lens/codec):
-            // only merge once the phone has applied our latest change, so an
-            // in-flight rebind can't revert the dropdowns.
-            if (androidCaughtUp) {
-              merged.cameraId = status.cameraId ?? prev.cameraId;
-              merged.profile = status.profile ?? prev.profile;
-              merged.width = status.width ?? prev.width;
-              merged.height = status.height ?? prev.height;
-              merged.outputWidth = status.outputWidth ?? prev.outputWidth;
-              merged.outputHeight = status.outputHeight ?? prev.outputHeight;
-              merged.fps = status.fps ?? prev.fps;
-              merged.jpegQuality = status.jpegQuality ?? prev.jpegQuality;
-              merged.streamMode = status.streamMode ?? prev.streamMode;
-            }
-            return merged;
-          });
+          importAuthoritativeState(status);
         }
       })
       .catch(console.error);
-  }, [baseUrl, token]);
+  }, [baseUrl, token, importAuthoritativeState]);
 
   useEffect(() => {
-    apiFetch(baseUrl, '/api/camera/list', token)
+    const events = new EventSource(buildUrl(baseUrl, '/api/state/events', token));
+    const onState = () => fetchStatus();
+    events.addEventListener('state', onState);
+    events.onerror = () => {
+      // The existing one-second poll remains a reconnect/version-skew fallback.
+    };
+    return () => {
+      events.removeEventListener('state', onState);
+      events.close();
+    };
+  }, [baseUrl, token, fetchStatus]);
+
+  useEffect(() => {
+    apiFetch(baseUrl, '/api/device/info', token)
+      .then(res => res.json())
+      .then(setPhoneInfo)
+      .catch(() => setPhoneInfo(null));
+
+    apiFetch(baseUrl, '/api/pipeline/capabilities', token)
       .then(res => res.json())
       .then(data => {
         const list = Array.isArray(data) ? data : data.cameras || [];
@@ -328,7 +527,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
       apiFetch(baseUrl, '/api/stream/metrics', token)
         .then(res => res.json())
-        .then(data => setAndroidMetrics(data))
+        .then(data => setAndroidMetrics(normalizeAndroidMetrics(data)))
         .catch(() => setAndroidMetrics(null));
 
     }, 1000);
@@ -352,7 +551,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       if (ratio < 0.7) {
         if (fpsLowSinceRef.current === 0) fpsLowSinceRef.current = Date.now();
         if (Date.now() - fpsLowSinceRef.current > 5000) {
-          addDiag('fpsDrift', `FPS running low: ${out}/${m.fps_target} (camera AE/encode limited, not the PC)`);
+          const androidFps = androidMetricsRef.current?.actualFps ?? 0;
+          const cause = androidFps >= m.fps_target * 0.8
+            ? 'desktop decode/processing limited'
+            : 'phone capture/encode limited';
+          addDiag('fpsDrift', `FPS running low: ${out}/${m.fps_target} (${cause})`);
         }
       } else {
         fpsLowSinceRef.current = 0;
@@ -391,10 +594,13 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         `androidFps=${am?.actualFps ?? '?'}`,
         // Android per-stage profiling (ms): YUV->NV21, rotate, JPEG encode, total.
         am ? `android[yuv=${(am.yuvMsAvg ?? 0).toFixed?.(1) ?? am.yuvMsAvg} rot=${(am.rotateMsAvg ?? 0).toFixed?.(1) ?? am.rotateMsAvg} jpeg=${(am.jpegMsAvg ?? 0).toFixed?.(1) ?? am.jpegMsAvg} enc=${(am.androidEncodeMsAvg ?? 0).toFixed?.(1) ?? am.androidEncodeMsAvg}]` : '',
-        m ? `prodIn=${m.decoded_fps} prodOut=${m.written_fps}` : 'prod=off (producer not started — OBS is not receiving frames)',
+        // transport = complete JPEGs or H.264 access units received; written =
+        // distinct decoded frames published to the ring. A large gap identifies
+        // the desktop decode/processing stage rather than the phone transport.
+        m ? `transportReceivedFps=${m.transport_received_fps ?? m.transport_fps ?? m.http_jpeg_fps} producerDecodedFps=${m.producer_decoded_fps ?? m.decoded_fps} ringWrittenFps=${m.ring_written_fps ?? m.written_fps} configuredSourceFps=${m.source_fps ?? m.fps_target}` : 'prod=off (producer not started — OBS is not receiving frames)',
         // Producer per-stage profiling (ms) + which optimized paths ran.
         m ? `prod[decode=${m.decode_ms_avg}(${m.decode_backend ?? '?'}) rot=${m.rotate_ms_avg} resize=${m.resize_ms_avg}(${m.resize_backend ?? '?'}) write=${m.write_ms_avg}]` : '',
-        m ? `mbps=${m.estimated_mbps} lat=${m.total_pipeline_ms}ms drop=${m.dropped_jpegs} q=${m.jpeg_queue_len}` : '',
+        m ? `transportMbps=${m.transport_bandwidth_mbps ?? m.estimated_mbps} producerProcessingMs=${m.producer_processing_ms ?? m.total_pipeline_ms}${m.source === 'mjpeg' ? ` jpegDrop=${m.dropped_jpegs} jpegQ=${m.jpeg_queue_len}` : ''}` : '',
         (vcamStateRef.current?.last_error || m?.last_error) ? `err=${vcamStateRef.current?.last_error || m?.last_error}` : '',
       ].filter(Boolean);
       logEvent('metrics', parts.join('  '));
@@ -414,8 +620,9 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       `Codec: ${s.streamMode}  jpegQuality: ${s.jpegQuality}  targetBandwidth: ${s.targetBandwidthMbps || 'off'}`,
       `Rotation: ${s.displayRotation}  mirror: ${s.mirror}`,
       `Android FPS actual: ${androidMetrics?.actualFps ?? '?'}  encoded: ${androidMetrics?.encodedWidth}x${androidMetrics?.encodedHeight}`,
-      m ? `Producer: in ${m.decoded_fps} / out ${m.written_fps} fps target ${m.fps_target}, ${m.estimated_mbps} Mbps, ${m.total_pipeline_ms}ms, dropped ${m.dropped_jpegs}, queue ${m.jpeg_queue_len}` : 'Producer: not running',
+      m ? `Producer: transport ${m.transport_received_fps ?? m.transport_fps} / decoded ${m.producer_decoded_fps ?? m.decoded_fps} / ring ${m.ring_written_fps ?? m.written_fps} fps, configured source ${m.source_fps ?? m.fps_target}, ${m.transport_bandwidth_mbps ?? m.estimated_mbps} Mbps, processing ${m.producer_processing_ms ?? m.total_pipeline_ms}ms${m.source === 'mjpeg' ? `, JPEG dropped ${m.dropped_jpegs}, queue ${m.jpeg_queue_len}` : ''}` : 'Producer: not running',
       `Producer last error: ${vcamState?.last_error || m?.last_error || 'none'}`,
+      `Desktop preview: ready=${previewDiagnostics.ready} ring=${previewDiagnostics.ringAlive} generation=${previewDiagnostics.streamGeneration} ringWrite=${previewDiagnostics.ringWriteSequence} receivedFps=${previewDiagnostics.previewReceivedFps} displayedFps=${previewDiagnostics.previewDisplayedFps} skipped=${previewDiagnostics.previewSkippedSequences} ipcMs=${previewDiagnostics.ipcTransferMs.toFixed(2)} uploadMs=${previewDiagnostics.previewUploadMs.toFixed(2)} colour=${previewDiagnostics.colorMatrix}/${previewDiagnostics.colorRange} parsed=${previewDiagnostics.parsedWidth}x${previewDiagnostics.parsedHeight} displayed=${previewDiagnostics.lastDisplayedSequence} error=${previewDiagnostics.lastError || 'none'}`,
       '=== event log ===',
       ...diagLog,
     ].join('\n');
@@ -432,7 +639,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     setVcamMessage('Registering...');
     try {
       const msg = await invoke<string>('register_virtual_camera_backend');
-      setVcamMessage(msg);
+      const details = await invoke<string>('get_virtual_camera_backend_details');
+      setVcamMessage(`${msg} ${details.split('\n')[0]}`);
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
     } catch (e: any) {
       setVcamMessage(e.toString());
@@ -440,68 +648,145 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     setIsVcamRegistering(false);
   };
 
-  const startStream = () => apiFetch(baseUrl, '/api/stream/start', token, { method: 'POST' });
-  const stopStream = () => apiFetch(baseUrl, '/api/stream/stop', token, { method: 'POST' });
-
-  const handleStartProducer = async (s: any) => {
-    const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
-    const source = s.streamMode === 'h264' ? 'h264' : 'mjpeg';
-    const targetUrl = source === 'h264' ? `${base}/stream.h264` : `${base}/stream.mjpeg`;
-    // Rotation is applied on the phone now (the /stream.mjpeg frames are already
-    // rotated), so the producer must NOT rotate again — pass 0 explicitly, which
-    // also disables its portrait auto-rotate. The producer still letterboxes a
-    // portrait frame into the fixed landscape output.
-    const rotate = 0;
-    console.log('[Tauri UI] Calling start_virtual_camera_feeder with', {
-      url: targetUrl, source, width: s.outputWidth || s.width, height: s.outputHeight || s.height, fps: s.fps, quality: s.jpegQuality, profile: s.profile, rotate, mirror: s.mirror
-    });
-    try {
-      await invoke('start_virtual_camera_feeder', {
-        url: targetUrl,
-        source,
-        width: s.outputWidth || s.width,
-        height: s.outputHeight || s.height,
-        fps: s.fps,
-        quality: s.jpegQuality,
-        profile: s.profile,
-        rotate,
-        mirror: !!s.mirror,
-        token: token || undefined
-      });
-      console.log('[Tauri UI] start_virtual_camera_feeder completed');
-    } catch (e: any) {
-      console.error('[Tauri UI] start_virtual_camera_feeder failed:', e);
-      setVcamMessage(`Failed to start producer: ${e.toString()}`);
-    }
+  const pipelineCommand = async (path: string) => {
+    const response = await apiFetch(baseUrl, path, token, { method: 'POST' });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.success === false) throw new Error(body.message || `HTTP ${response.status}`);
+    if (body.revision != null) authoritativeRevisionRef.current = Number(body.revision);
+    return body;
   };
+
+  const handleUnregisterVcam = async () => {
+    setIsVcamRegistering(true);
+    setVcamMessage('Removing OpenCamBridge virtual camera...');
+    try {
+      const msg = await invoke<string>('unregister_virtual_camera_backend');
+      setVcamMessage(msg);
+      invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
+    } catch (e: any) {
+      setVcamMessage(e.toString());
+    }
+    setIsVcamRegistering(false);
+  };
+  const startStream = () => pipelineCommand('/api/stream/start');
+  const stopStream = () => pipelineCommand('/api/stream/stop');
+
+  const handleStartProducer = async (
+    s: any,
+    actual?: any,
+    purpose: ProducerPurpose = 'feed'
+  ) => {
+    const { source, targetUrl, sourceWidth, sourceHeight, sourceFps, outputWidth, outputHeight } =
+      buildProducerLaunchSpec(s, actual, baseUrl);
+    // jpegQuality is applied on the Android side; the producer no longer takes it.
+    console.log('[Tauri UI] Calling start_virtual_camera_feeder with', {
+      url: targetUrl, source,
+      sourceWidth, sourceHeight, sourceFps,
+      outputWidth, outputHeight, profile: s.profile
+    });
+    await invoke('start_virtual_camera_feeder', {
+      url: targetUrl,
+      source,
+      width: outputWidth,
+      height: outputHeight,
+      fps: sourceFps,
+      sourceWidth,
+      sourceHeight,
+      sourceFps,
+      profile: s.profile,
+      token: token || undefined
+    });
+    producerPurposeRef.current = purpose;
+    console.log('[Tauri UI] start_virtual_camera_feeder completed');
+  };
+
+  // The H.264 preview reads decoded NV12 frames from the producer's shared
+  // ring. Keep that decoder/feed independent from the Media Foundation camera
+  // host: opening the desktop app starts preview decoding, but it does not
+  // activate the webcam for OBS until the user presses Start Webcam.
+  useEffect(() => {
+    if (androidMetrics?.lifecycleState !== 'STREAMING') {
+      // An explicit Stop suppresses the preview producer while the local
+      // metrics sample is still stale. Once Android reports the stopped state,
+      // a later genuine stream start may auto-start H.264 preview again.
+      previewAutoStartSuppressedRef.current = false;
+    }
+    const sourceFps = Number(
+      androidMetrics?.selectedFps || androidMetrics?.encodedFps || settings.fps || 0
+    );
+    const shouldStart = shouldStartH264PreviewProducer({
+      previewEnabled: !previewOff,
+      settingsHydrated: settingsHydratedRef.current,
+      lifecycleState: androidMetrics?.lifecycleState,
+      activeStreamMode: androidMetrics?.activeStreamMode || settings.streamMode,
+      producerRunning: !!vcamState?.process_running,
+      sourceWidth: androidMetrics?.encodedWidth,
+      sourceHeight: androidMetrics?.encodedHeight,
+      sourceFps
+    });
+    if (!shouldStart || previewAutoStartSuppressedRef.current || isSyncingRef.current || previewProducerStartInFlightRef.current) return;
+    if (Date.now() < previewProducerRetryAfterRef.current) return;
+
+    previewProducerStartInFlightRef.current = true;
+    addDiag('h264Preview', 'Starting the desktop H.264 preview decoder');
+    void handleStartProducer(settingsRef.current, androidMetrics, 'preview')
+      .then(async () => {
+        previewProducerRetryAfterRef.current = 0;
+        setVcamMessage('');
+        const state = await invoke<VirtualCamState>('get_virtual_camera_status');
+        vcamStateRef.current = state;
+        setVcamState(state);
+        addDiag('h264Preview', 'Desktop H.264 producer is running; waiting for the renderer to display a preview frame');
+        window.dispatchEvent(new CustomEvent('reload-preview'));
+      })
+      .catch((error: any) => {
+        previewProducerRetryAfterRef.current = Date.now() + 5000;
+        const message = `H.264 preview decoder failed: ${String(error)}`;
+        setVcamMessage(message);
+        addDiag('h264Preview', message);
+      })
+      .finally(() => {
+        previewProducerStartInFlightRef.current = false;
+      });
+  }, [androidMetrics, previewOff, settings.fps, settings.streamMode, vcamState?.process_running, addDiag]);
 
   const handleStartNativeCamera = async () => {
     const s = settingsRef.current;
 
     setVcamMessage('Starting pipeline...');
     try {
-      if (!vcamState?.host_running) {
+      previewAutoStartSuppressedRef.current = false;
+      await waitForPreviewProducerIdle();
+      if (!vcamState?.host_running || !vcamState?.host_activated) {
         await invoke('start_virtual_camera_host');
       }
 
-      await restartFullPipelineWithSettings(s);
+      await restartFullPipelineWithSettings(s, []);
 
       setVcamMessage('');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
     } catch (e: any) {
       console.error('[Tauri UI] handleStartNativeCamera failed:', e);
       setVcamMessage(`Error: ${e.toString()}`);
+      // A producer that is alive but failed readiness must not leave the Start
+      // button disabled. Keep the visible error and return to a retryable state.
+      try { await invoke('stop_virtual_camera_feeder'); producerPurposeRef.current = null; } catch {}
+      try { setVcamState(await invoke<VirtualCamState>('get_virtual_camera_status')); } catch {}
     }
   };
 
   const handleStopNativeCamera = async () => {
     try {
+      previewAutoStartSuppressedRef.current = true;
+      await waitForPreviewProducerIdle();
       await invoke('stop_virtual_camera_feeder');
+      producerPurposeRef.current = null;
       await invoke('stop_virtual_camera_host');
       await stopStream();
       setVcamMessage('Stopped native pipeline.');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
     } catch (e: any) {
+      previewAutoStartSuppressedRef.current = false;
       setVcamMessage(`Error: ${e.toString()}`);
     }
   };
@@ -511,8 +796,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
     setVcamMessage('Starting feed...');
     try {
-      await restartAndroidStreamWithSettings(s);
-      await handleStartProducer(s);
+      previewAutoStartSuppressedRef.current = false;
+      await waitForPreviewProducerIdle();
+      const actual = await restartAndroidStreamWithSettings(s, []);
+      await handleStartProducer(s, actual, 'feed');
 
       setVcamMessage('');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
@@ -528,91 +815,153 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
   const handleStopFeedOnly = async () => {
     try {
+      previewAutoStartSuppressedRef.current = true;
+      await waitForPreviewProducerIdle();
       await invoke('stop_virtual_camera_feeder');
+      producerPurposeRef.current = null;
       await stopStream();
       setVcamMessage('Stopped feed.');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
     } catch (e: any) {
+      previewAutoStartSuppressedRef.current = false;
       setVcamMessage(`Error: ${e.toString()}`);
     }
   };
 
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-  const postSettingsToAndroid = async (s: any) => {
-    localApplyVersionRef.current += 1;
-    await apiFetch(baseUrl, '/api/settings', token, {
+  const waitForPreviewProducerIdle = async () => {
+    const deadline = Date.now() + 22_000;
+    while (previewProducerStartInFlightRef.current && Date.now() < deadline) {
+      await sleep(50);
+    }
+    if (previewProducerStartInFlightRef.current) {
+      throw new Error('Timed out waiting for H.264 preview decoder startup');
+    }
+  };
+
+  const postSettingsToAndroid = async (s: any, keysChanged: string[]) => {
+    if (keysChanged.length === 0) return null;
+    if (!settingsHydratedRef.current || authoritativeRevisionRef.current == null) {
+      throw new Error('Phone settings have not been loaded; refusing to post local defaults');
+    }
+    const patch: any = {};
+    const directKeys = [
+      'profile', 'width', 'height', 'outputWidth', 'outputHeight', 'fps', 'jpegQuality',
+      'cameraId', 'aspectRatio', 'displayRotation', 'mirror', 'streamMode',
+      'targetBandwidthMbps', 'h264Bitrate', 'h264KeyframeInterval'
+    ];
+    for (const key of directKeys) {
+      if (keysChanged.includes(key)) patch[key] = s[key];
+    }
+    // Keep the interval inside the range the phone accepts, so a stale or
+    // out-of-range persisted value cannot make an unrelated edit (an MJPEG
+    // resolution change, say) fail validation on merge. This clamps rather than
+    // pinning: the interval is a real setting now that keyframes are requested
+    // on demand, and overwriting it here would silently undo the user's choice.
+    patch.h264KeyframeInterval = Math.min(10, Math.max(1, Number(s.h264KeyframeInterval) || 5));
+    if (keysChanged.includes('width') || keysChanged.includes('height')) {
+      patch.outputWidth = s.outputWidth;
+      patch.outputHeight = s.outputHeight;
+    }
+    const response = await apiFetch(baseUrl, '/api/settings', token, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        applyId: localApplyVersionRef.current,
-        profile: s.profile,
-        width: s.width,
-        height: s.height,
-        outputWidth: s.outputWidth,
-        outputHeight: s.outputHeight,
-        fps: s.fps,
-        jpegQuality: s.jpegQuality,
-        cameraId: s.cameraId,
-        aspectRatio: s.aspectRatio || 'auto',
-        // These two were missing, so desktop orientation/mirror changes never
-        // actually reached the phone (and polling snapped the UI back).
-        displayRotation: s.displayRotation ?? '0',
-        mirror: !!s.mirror,
-        streamMode: s.streamMode,
-        targetBandwidthMbps: s.targetBandwidthMbps,
-        h264Bitrate: s.h264Bitrate,
-        h264KeyframeInterval: s.h264KeyframeInterval,
-        localPreviewEnabled: !previewOff
-      })
+      body: JSON.stringify(buildSettingsMutation(
+        patch,
+        authoritativeRevisionRef.current,
+        globalThis.crypto?.randomUUID?.() || `tauri-${Date.now()}`,
+        'tauri'
+      ))
     });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.success === false) {
+      const rejection = describeMutationRejection(response.status, body);
+      if (rejection.authoritativeState) {
+        importAuthoritativeState(rejection.authoritativeState, true);
+      } else {
+        fetchStatus();
+      }
+      throw new Error(rejection.message);
+    }
+    if (body.revision != null) authoritativeRevisionRef.current = Number(body.revision);
+    if (body.authoritativeState) importAuthoritativeState(body.authoritativeState, true);
+    return body;
   };
 
   const applySettingsAndRefreshPreview = async (nextSettings: any, keysChanged: string[]) => {
-    setSettings(nextSettings);
-    settingsRef.current = nextSettings;
-    bumpSettle();
     setIsSyncing(true);
     isSyncingRef.current = true;
 
     try {
+      await waitForPreviewProducerIdle();
       // h264Bitrate and jpegQuality are intentionally absent: Android applies
       // both to the live pipeline without a rebind (bitrate via
       // MediaCodec.setParameters; JPEG quality is read per-frame). Restarting
       // the whole pipeline on every quality-slider step was the source of the
       // repeated producer restarts.
-      const streamImpacting = ['profile', 'width', 'height', 'fps', 'cameraId', 'streamMode', 'h264KeyframeInterval'].some(k => keysChanged.includes(k));
+      const streamImpacting = ['profile', 'width', 'height', 'fps', 'cameraId', 'streamMode', 'h264KeyframeInterval', 'displayRotation', 'mirror'].some(k => keysChanged.includes(k));
 
-      // Android streaming and the producer/virtual-camera are SEPARATE things.
-      // The producer must never be started just because Android has frames.
-      const producerRunning = !!vcamState?.running;
+      // Android capture, the decoded producer feed, and the virtual-camera
+      // host are separate lifecycle layers. H.264 preview needs the producer,
+      // but only an activated host publishes that feed as a Windows camera.
+      const liveVcamState = vcamStateRef.current ?? vcamState;
+      const producerRunning = !!(liveVcamState?.process_running ?? liveVcamState?.running);
       const androidStreaming =
         androidStreamStatus === 'running' &&
         (Number(androidMetrics?.encodedWidth || 0) > 0 ||
           Number(androidMetrics?.fps || 0) > 0 ||
           Number(androidMetrics?.latestFrameRevision || 0) > 0);
 
-      if (streamImpacting && producerRunning) {
-        // Producer is feeding OBS: a resolution/fps/lens/codec change needs both
-        // the Android stream AND the producer restarted.
+      const restartScope = selectPipelineRestartScope({
+        streamImpacting,
+        producerRunning,
+        hostRunning: !!liveVcamState?.host_running,
+        hostActivated: !!liveVcamState?.host_activated
+      });
+
+      if (restartScope === 'webcam') {
+        // The complete webcam is active: preserve both its decoded feed and
+        // its activated Media Foundation host across the settings change.
         addDiag('apply', `[${keysChanged.join(',')}] -> full pipeline restart (Android + producer)`);
-        await restartFullPipelineWithSettings(nextSettings);
-      } else if (streamImpacting && androidStreaming) {
-        // Only the phone stream/preview is live (producer OFF). Rebind Android
-        // alone — do NOT start the producer. Preview reconnects itself when
-        // frames resume (metrics-based recovery in Preview).
+        await restartFullPipelineWithSettings(nextSettings, keysChanged);
+      } else if (restartScope === 'producer') {
+        const previewOnly = producerPurposeRef.current === 'preview';
+        if (previewOnly && nextSettings.streamMode !== 'h264') {
+          // MJPEG renders directly in the WebView, so a producer that existed
+          // only for H.264 preview is no longer needed after this mode switch.
+          addDiag('apply', `[${keysChanged.join(',')}] -> Android rebind; release H.264 preview decoder`);
+          await invoke('stop_virtual_camera_feeder');
+          producerPurposeRef.current = null;
+          await restartAndroidStreamWithSettings(nextSettings, keysChanged);
+        } else {
+          addDiag('apply', `[${keysChanged.join(',')}] -> Android + decoded feed restart (webcam host off)`);
+          await restartProducerPipelineWithSettings(
+            nextSettings,
+            keysChanged,
+            producerPurposeRef.current || 'feed'
+          );
+        }
+      } else if (restartScope === 'android' && androidStreaming) {
+        // MJPEG preview does not need the decoded producer feed. H.264 will
+        // start its preview-only producer as soon as the rebind is complete.
         addDiag('apply', `[${keysChanged.join(',')}] -> Android rebind only (producer off)`);
-        await restartAndroidStreamWithSettings(nextSettings);
+        await restartAndroidStreamWithSettings(nextSettings, keysChanged);
       } else {
         addDiag('apply', `[${keysChanged.join(',')}] -> settings only (no rebind)`);
         // Non-stream-impacting change (quality/mirror/rotation/bandwidth), or
         // nothing is live. The running MJPEG already reflects quality/rotation
         // live and mirror is a preview transform, so do NOT reload the preview.
-        await postSettingsToAndroid(nextSettings);
+        await postSettingsToAndroid(nextSettings, keysChanged);
       }
+      // The phone accepted the revision. Reflect the requested desired state;
+      // the next authoritative status import may refine it after adaptation.
+      settingsRef.current = nextSettings;
+      setSettings(nextSettings);
     } catch (err: any) {
       console.error('[Tauri UI] applySettingsAndRefreshPreview failed:', err);
       setVcamMessage(`Settings apply failed: ${err.toString()}`);
+      fetchStatus();
     } finally {
       setIsSyncing(false);
       isSyncingRef.current = false;
@@ -620,19 +969,34 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   };
 
   const updateSetting = async (key: string, value: any) => {
-    const newSettings = { ...settingsRef.current, [key]: value };
+    let newSettings = { ...settingsRef.current, [key]: value };
+    if (key === 'cameraId' || key === 'streamMode') {
+      const camera = cameras.find(c => c.id === newSettings.cameraId) as any;
+      const modes = newSettings.streamMode === 'h264' ? camera?.h264Modes : camera?.mjpegModes;
+      const canonical = Array.isArray(modes) ? modes : [];
+      const selected = canonical.find((m: any) =>
+        m.width === newSettings.width && m.height === newSettings.height && m.fps === newSettings.fps
+      ) || canonical[0];
+      if (selected) newSettings = {
+        ...newSettings, width: selected.width, height: selected.height, fps: selected.fps,
+        outputWidth: selected.width, outputHeight: selected.height
+      };
+    }
 
     if (key === 'torchEnabled') {
-      setSettings(newSettings);
-      settingsRef.current = newSettings;
-      bumpSettle();
       try {
-        const res = await apiFetch(baseUrl, '/api/camera/torch', token, { method: 'POST', body: JSON.stringify({ enabled: value }), headers: { 'Content-Type': 'application/json' }});
+        const res = await apiFetch(baseUrl, '/api/camera/torch', token, { method: 'POST', body: JSON.stringify({
+          enabled: value, baseRevision: authoritativeRevisionRef.current,
+          requestId: globalThis.crypto?.randomUUID?.() || `tauri-${Date.now()}`, clientType: 'tauri'
+        }), headers: { 'Content-Type': 'application/json' }});
+        const body = await res.json().catch(() => ({}));
         if (!res.ok) {
-          const body = await res.text().catch(() => '');
-          addDiag('torch', `Torch ${value ? 'on' : 'off'} failed: HTTP ${res.status} ${body}`);
+          if (body.authoritativeState) importAuthoritativeState(body.authoritativeState, true); else fetchStatus();
+          addDiag('torch', `Torch ${value ? 'on' : 'off'} failed: HTTP ${res.status} ${body.message || ''}`);
           setVcamMessage(`Torch not available on this camera (HTTP ${res.status}).`);
         } else {
+          if (body.revision != null) authoritativeRevisionRef.current = Number(body.revision);
+          settingsRef.current = newSettings; setSettings(newSettings);
           addDiag('torch', `Torch ${value ? 'on' : 'off'}`);
         }
       } catch (e: any) {
@@ -641,19 +1005,31 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       }
       return;
     } else if (key === 'linearZoom') {
-      setSettings(newSettings);
-      settingsRef.current = newSettings;
-      bumpSettle();
       try {
-        const res = await apiFetch(baseUrl, '/api/camera/zoom', token, { method: 'POST', body: JSON.stringify({ linearZoom: value }), headers: { 'Content-Type': 'application/json' }});
-        if (!res.ok) addDiag('zoom', `Zoom failed: HTTP ${res.status}`);
+        const res = await apiFetch(baseUrl, '/api/camera/zoom', token, { method: 'POST', body: JSON.stringify({
+          linearZoom: value, baseRevision: authoritativeRevisionRef.current,
+          requestId: globalThis.crypto?.randomUUID?.() || `tauri-${Date.now()}`, clientType: 'tauri'
+        }), headers: { 'Content-Type': 'application/json' }});
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          if (body.authoritativeState) importAuthoritativeState(body.authoritativeState, true); else fetchStatus();
+          addDiag('zoom', `Zoom failed: HTTP ${res.status}`);
+        } else {
+          if (body.revision != null) authoritativeRevisionRef.current = Number(body.revision);
+          settingsRef.current = newSettings; setSettings(newSettings);
+        }
       } catch (e: any) {
         addDiag('zoom', `Zoom request failed: ${e}`);
       }
       return;
     }
 
-    await applySettingsAndRefreshPreview(newSettings, [key]);
+    await applySettingsAndRefreshPreview(
+      newSettings,
+      key === 'cameraId' || key === 'streamMode'
+        ? [key, 'width', 'height', 'fps', 'outputWidth', 'outputHeight']
+        : [key]
+    );
   };
 
   const waitForAndroidResolution = async (s: any, timeoutMs = 8000) => {
@@ -664,7 +1040,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       try {
         const res = await apiFetch(baseUrl, '/api/stream/metrics', token);
         if (res.ok) {
-          const m = await res.json();
+          const m = normalizeAndroidMetrics(await res.json());
           lastMetrics = m;
 
           const encodedOk =
@@ -676,7 +1052,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
             Number(m.fps || 0) > 0 ||
             Number(m.encodedWidth || 0) > 0;
 
-          if (encodedOk && hasFrame) {
+          if (hasFrame && (encodedOk || m.fallbackUsed || m.activeStreamMode !== s.streamMode)) {
             return m;
           }
         }
@@ -685,20 +1061,29 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       await sleep(300);
     }
 
-    // The device may legitimately pick a nearby supported size instead of the
-    // exact request (that is what the resolution policy is for). If frames are
-    // flowing, proceed with a warning instead of failing the whole pipeline.
+    // A different size is accepted only as an explicit adaptive/fallback
+    // selection. An unexplained mismatch is a failed start, not silent resize.
     const hasAnyFrame = lastMetrics && (
       Number(lastMetrics.latestFrameRevision || 0) > 0 ||
       Number(lastMetrics.encodedWidth || 0) > 0
     );
-    if (hasAnyFrame) {
+    if (hasAnyFrame && (lastMetrics.fallbackUsed || lastMetrics.activeStreamMode !== s.streamMode || s.profile === 'adaptive')) {
       console.warn(
         `[Tauri UI] Android is streaming ${lastMetrics.encodedWidth}x${lastMetrics.encodedHeight} ` +
         `instead of the requested ${s.width}x${s.height}; continuing (producer resizes).`
       );
+      setVcamMessage(
+        `Adaptive capture: requested ${s.width}x${s.height}@${s.fps}, ` +
+        `selected/actual ${lastMetrics.encodedWidth}x${lastMetrics.encodedHeight}@${lastMetrics.captureFps || 0}. ` +
+        `${lastMetrics.fallbackReason || 'Producer will resize once on the GPU.'}`
+      );
       return lastMetrics;
     }
+
+    if (hasAnyFrame) throw new Error(
+      `Android streamed unexplained ${lastMetrics.encodedWidth}x${lastMetrics.encodedHeight} ` +
+      `instead of requested ${s.width}x${s.height}; refusing silent fallback.`
+    );
 
     throw new Error(
       `Android did not start streaming after settings change (requested ${s.width}x${s.height}). ` +
@@ -706,48 +1091,100 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     );
   };
 
-  const restartAndroidStreamWithSettings = async (s: any) => {
-    console.log('[Tauri UI] Restarting Android stream with settings:', s);
-
-    await stopStream();
-    await sleep(500);
-
-    await postSettingsToAndroid(s);
-    await sleep(200);
-
+  const restartAndroidStreamWithSettings = async (s: any, keysChanged: string[]) => {
+    console.log('[Tauri UI] Applying Android pipeline settings:', keysChanged);
+    await postSettingsToAndroid(s, keysChanged);
+    // Start is idempotent. If settings were applied while streaming, the phone
+    // actor has already completed the required rebind before POST returned.
     await startStream();
 
     const metrics = await waitForAndroidResolution(s);
+    if (metrics.lifecycleState !== 'STREAMING') {
+      throw new Error(`Android pipeline is ${metrics.lifecycleState || 'not STREAMING'} after startup`);
+    }
     console.log('[Tauri UI] Android stream rebound OK:', metrics);
 
     return metrics;
   };
 
-  const restartFullPipelineWithSettings = async (s: any) => {
+  const restartProducerPipelineWithSettings = async (
+    s: any,
+    keysChanged: string[],
+    purpose: ProducerPurpose
+  ) => {
+    // A preview/feed producer owns the same decoded NV12 ring as the complete
+    // webcam pipeline, but no virtual-camera host is active. Restart only the
+    // Android source and producer, and verify ring readiness without requiring
+    // COM registration or host activation.
+    try {
+      await invoke('stop_virtual_camera_feeder');
+      producerPurposeRef.current = null;
+      addDiag('pipeline', 'decoded feed stopped for reconfiguration');
+    } catch (error: any) {
+      addDiag('pipeline', `decoded feed stop failed: ${error}`);
+    }
+
+    const actual = await restartAndroidStreamWithSettings(s, keysChanged);
+    await handleStartProducer(s, actual, purpose);
+    const state = await invoke<VirtualCamState>('get_virtual_camera_status');
+    setVcamState(state);
+    const committed = Number(state.metrics?.ring_frames_committed || 0);
+    addDiag(
+      'pipeline',
+      `decodedFeedRunning=${!!state.process_running} state=${state.producer_state} committed=${committed}`
+    );
+    if (!state.process_running) throw new Error('Decoded frame producer exited during startup');
+    if (state.producer_state !== 'WRITING_RING') {
+      throw new Error(`Decoded frame producer is ${state.producer_state || 'not writing the ring'}`);
+    }
+    if (committed < 3) throw new Error(`Decoded frame producer committed only ${committed}/3 readiness frames`);
+
+    fetchStatus();
+    if (!previewOff) window.dispatchEvent(new CustomEvent('reload-preview'));
+  };
+
+  const restartFullPipelineWithSettings = async (s: any, keysChanged: string[]) => {
     // This path is only taken when the producer was actually running (see
     // applySettingsAndRefreshPreview using vcamState.running), so it MUST end
     // with the producer running again. Verify it and surface a real error if not
     // — a settings change must never silently leave OBS with prod=off.
     addDiag('pipeline', 'full restart: producerWasRunning=true');
-    try { await invoke('stop_virtual_camera_feeder'); addDiag('pipeline', 'stopProducer ok'); }
+    try {
+      await invoke('stop_virtual_camera_feeder');
+      producerPurposeRef.current = null;
+      addDiag('pipeline', 'stopProducer ok');
+    }
     catch (e: any) { addDiag('pipeline', `stopProducer fail: ${e}`); }
 
-    try { await restartAndroidStreamWithSettings(s); addDiag('pipeline', 'androidRebind ok'); }
-    catch (e: any) { addDiag('pipeline', `androidRebind fail: ${e}`); }
+    let actual: any = null;
+    try { actual = await restartAndroidStreamWithSettings(s, keysChanged); addDiag('pipeline', `androidRebind ok (${actual?.activeStreamMode || s.streamMode})`); }
+    catch (e: any) { addDiag('pipeline', `androidRebind fail: ${e}`); throw e; }
 
-    await handleStartProducer(s);
+    await handleStartProducer(s, actual, 'webcam');
+    const readinessDeadline = Date.now() + 12_000;
     let state = await invoke<VirtualCamState>('get_virtual_camera_status');
-    if (!state.running) {
-      addDiag('pipeline', 'producer not running after start — retrying once');
-      await sleep(600);
-      await handleStartProducer(s);
+    while (Date.now() < readinessDeadline) {
+      setVcamState(state);
+      if (!state.host_running || !state.host_activated) {
+        throw new Error(state.last_error || 'Virtual-camera host exited before pipeline readiness');
+      }
+      if (!state.process_running && state.producer_state === 'FAILED') {
+        throw new Error(state.last_error || 'Producer process exited during startup');
+      }
+      if (state.pipeline_ready) break;
+      await sleep(250);
       state = await invoke<VirtualCamState>('get_virtual_camera_status');
     }
     setVcamState(state);
-    addDiag('pipeline', `finalProducerRunning=${!!state.running}`);
-    if (!state.running) {
-      setVcamMessage('Producer failed to restart — OBS is not receiving frames. See Logs.');
-    }
+    const committed = Number(state.metrics?.ring_frames_committed || 0);
+    addDiag('pipeline', `finalProducerRunning=${!!state.process_running} state=${state.producer_state} committed=${committed}`);
+    if (!state.process_running) throw new Error('Producer process exited during startup');
+    if (state.producer_state !== 'WRITING_RING') throw new Error(`Producer is ${state.producer_state || 'not writing the ring'}`);
+    if (committed < 3) throw new Error(`Producer committed only ${committed}/3 readiness frames`);
+    if (!state.host_running) throw new Error('Virtual-camera host exited during startup');
+    if (!state.host_activated) throw new Error('Virtual-camera host did not activate the Media Foundation camera');
+    if (!state.registered) throw new Error('Virtual-camera backend is not registered');
+    if (!state.pipeline_ready) throw new Error('Complete webcam readiness timed out before the pipeline became ready');
 
     fetchStatus();
 
@@ -762,8 +1199,18 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       console.error('Unknown profile:', profile);
       return;
     }
-
-    const newSettings = { ...settingsRef.current, ...preset };
+    const selected = activeModes.find((m: any) =>
+      m.width === preset.width && m.height === preset.height && m.fps === preset.fps
+    ) || activeModes[0];
+    if (!selected) {
+      setVcamMessage(`No canonical ${settingsRef.current.streamMode.toUpperCase()} modes are available on this camera.`);
+      return;
+    }
+    const newSettings = {
+      ...settingsRef.current, ...preset,
+      width: selected.width, height: selected.height, fps: selected.fps,
+      outputWidth: selected.width, outputHeight: selected.height
+    };
     await applySettingsAndRefreshPreview(newSettings, ['profile', 'width', 'height', 'fps', 'jpegQuality']);
   };
 
@@ -773,12 +1220,14 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
   // resolution can pair with any FPS (e.g. 720p30, 720p60, 1080p30, 1080p60).
   const updateResolution = async (w: number, h: number) => {
     const profile = w >= 1920 ? 'quality' : w >= 1280 ? 'balanced' : 'low-latency';
+    const validFps = activeModes.filter((m: any) => m.width === w && m.height === h).map((m: any) => Number(m.fps));
+    const selectedFps = validFps.includes(settingsRef.current.fps) ? settingsRef.current.fps : validFps[0];
     const next = {
       ...settingsRef.current,
-      width: w, height: h, outputWidth: w, outputHeight: h, profile,
+      width: w, height: h, outputWidth: w, outputHeight: h, profile, fps: selectedFps,
     };
     logTestMarker('START', `${next.streamMode} ${w}x${h}@${next.fps} lens=${next.cameraId} q${next.jpegQuality}`);
-    await applySettingsAndRefreshPreview(next, ['width', 'height', 'profile']);
+    await applySettingsAndRefreshPreview(next, ['width', 'height', 'outputWidth', 'outputHeight', 'profile', 'fps']);
   };
 
   const updateFps = async (fps: number) => {
@@ -814,682 +1263,752 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     await applySettingsAndRefreshPreview(next, ['displayRotation']);
   };
 
-  // V1 is MJPEG-only for normal users: leaving Developer mode forces the codec
-  // back to the stable MJPEG path so H.264 can never be left running by accident.
-  useEffect(() => {
-    if (!devMode && settingsRef.current.streamMode !== 'mjpeg') {
-      const next = { ...settingsRef.current, streamMode: 'mjpeg' };
-      setSettings(next);
-      settingsRef.current = next;
-      addDiag('codec', 'Developer mode off — codec reset to MJPEG');
-      postSettingsToAndroid(next).catch(() => {});
-    }
-  }, [devMode, addDiag]);
+  // ---- Derived product state -------------------------------------------------
+  // These are the only questions the overview needs to answer, in order:
+  // is it on air, is it ready, is anything degraded, and where.
+  const androidRunning = androidStreamStatus === 'running';
+  const producerRunning = !!vcamState?.process_running;
+  const framesReady = !!vcamState?.pipeline_ready;
+  const isLive = !!vcamState?.virtual_camera_ready;
+  const consumerAttached = isLive || !!vcamState?.metrics?.ring?.consumer_attached;
+  const binariesBlocked = !!(vcamState?.binary_identity && !vcamState.binary_identity.ready);
+  const activeError = vcamState?.last_error || vcamState?.metrics?.last_error || '';
+  const ring = vcamState?.metrics?.ring;
+  const metrics = vcamState?.metrics;
+  const transport: 'USB' | 'LAN' = token ? 'LAN' : 'USB';
+  const diagAlert = binariesBlocked ? 'fail' : activeError || androidMetrics?.fallbackUsed ? 'warn' : '';
+
+  const tallyState = isLive ? 'is-live' : framesReady ? 'is-ready' : producerRunning ? 'is-busy' : '';
+  const tallyTitle = isLive ? 'On air' : framesReady ? 'Ready' : producerRunning ? vcamState?.producer_state || 'Starting' : 'Off air';
+  const tallyNote = isLive
+    ? 'An app is reading OpenCamBridge Camera.'
+    : framesReady
+      ? 'Frames are queued. Select OpenCamBridge Camera in your app.'
+      : producerRunning && !vcamState?.host_running
+        ? 'Desktop preview only — nothing is published to Windows.'
+        : producerRunning
+          ? `Producer is ${vcamState?.producer_state || 'starting'}.`
+          : 'Nothing is published to Windows yet.';
+
+  const dash = (value: any, suffix = '') =>
+    value === null || value === undefined || value === '' ? '—' : `${value}${suffix}`;
 
   return (
-    <div className="control-panel glass-panel animate-fade" style={{ display: 'flex', flexDirection: 'column', gap: 24, padding: 24 }}>
-
-      {/* NATIVE WINDOWS CAMERA SECTION */}
-      <div className="control-group" style={{ background: 'rgba(30, 40, 50, 0.4)', borderRadius: 12, padding: 16, border: '1px solid rgba(100, 150, 255, 0.2)' }}>
-        <h3 style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, color: '#4dabf7' }}>
-          <Monitor size={18} /> Native Windows Camera
-        </h3>
-
-        {/* Status Grid */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16, fontSize: '0.85rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--text-secondary)' }}>Camera Host:</span>
-            <span style={{ color: vcamState?.host_running ? '#51cf66' : '#ff6b6b' }}>{vcamState?.host_running ? 'Running' : 'Stopped'}</span>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--text-secondary)' }}>Android Stream:</span>
-            <span style={{ color: androidStreamStatus === 'running' ? '#51cf66' : '#ff6b6b' }}>{androidStreamStatus === 'running' ? 'Running' : 'Stopped'}</span>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--text-secondary)' }}>Producer:</span>
-            <span style={{ color: vcamState?.running ? '#51cf66' : '#ff6b6b' }}>{vcamState?.running ? 'Running' : 'Stopped'}</span>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--text-secondary)' }}>Profile:</span>
-            <span style={{ color: '#fff', textTransform: 'capitalize' }}>{settings.profile}</span>
-          </div>
+    <div className="control-panel panel animate-fade">
+      {/* The tally lamp answers "is this actually working" before any number
+          does, and it stays visible on every tab. */}
+      <div className="rail-head">
+        <div className={`tally ${tallyState}`}>
+          <Lamp state={isLive ? 'live' : framesReady ? 'ok' : producerRunning ? 'busy' : 'idle'} />
+          <span className="tally__title">{tallyTitle}</span>
+          <span className="tally__sub">{tallyNote}</span>
         </div>
+      </div>
 
-        {/* Buttons */}
-        {vcamState && !vcamState.registered ? (
-          <div style={{ marginBottom: 16, background: 'rgba(255, 179, 0, 0.1)', padding: 12, borderRadius: 6, border: '1px solid rgba(255, 179, 0, 0.3)' }}>
-            <p style={{ fontSize: '0.85rem', color: '#ffb300', marginBottom: 12 }}>
-              <ShieldAlert size={14} style={{ display: 'inline', verticalAlign: 'text-bottom', marginRight: 4 }} />
-              Camera COM Object is not registered.
-            </p>
-            <button className="btn btn-primary" style={{ width: '100%' }} onClick={handleRegisterVcam} disabled={isVcamRegistering}>
-              {isVcamRegistering ? 'Registering...' : 'Register Camera Backend'}
-            </button>
-          </div>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 16 }}>
-            {/* Primary product control: ONE button starts the whole webcam
-                (Android stream + virtual camera host + producer to OBS). */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-              <button className="btn btn-primary" onClick={handleStartNativeCamera} disabled={!!(vcamState?.running && vcamState?.host_running)}>
-                <Play size={16} style={{ marginRight: 6 }} /> Start Webcam
-              </button>
-              <button className="btn btn-secondary" onClick={handleStopNativeCamera} disabled={!vcamState?.running && !vcamState?.host_running}>
-                <Square size={16} style={{ marginRight: 6 }} /> Stop Webcam
-              </button>
-            </div>
-            <p style={{ fontSize: '0.75rem', color: vcamState?.running ? '#51cf66' : '#ffb300', margin: 0 }}>
-              {vcamState?.running
-                ? "Sending to OBS — add a Video Capture Device and pick 'OpenCamBridge Camera'."
-                : 'Phone preview only — not sending to OBS. Press Start Webcam.'}
-            </p>
+      <nav className="tabs" role="tablist">
+        {([
+          ['signal', 'Signal'],
+          ['output', 'Output'],
+          ['image', 'Image'],
+          ['diag', 'Diag'],
+        ] as const).map(([id, label]) => (
+          <button
+            key={id}
+            role="tab"
+            aria-selected={tab === id}
+            className={`tab${tab === id ? ' is-active' : ''}`}
+            onClick={() => setTab(id)}
+          >
+            {label}
+            {id === 'diag' && diagAlert && <span className={`tab__dot${diagAlert === 'fail' ? ' tab__dot--fail' : ''}`} />}
+          </button>
+        ))}
+      </nav>
 
-            {/* Granular pipeline controls: developer mode only. */}
-            {devMode && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 4, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
-                <div style={{ fontSize: '0.72rem', color: '#666' }}>Developer: granular pipeline controls</div>
-                <div>
-                  <div style={{ fontSize: '0.8rem', color: '#888', marginBottom: 6 }}>Phone stream only (feed):</div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                    <button className="btn btn-secondary" onClick={handleStartFeedOnly} disabled={vcamState?.running}><Play size={14} style={{ marginRight: 6 }} /> Start</button>
-                    <button className="btn btn-secondary" onClick={handleStopFeedOnly} disabled={!vcamState?.running}><Square size={14} style={{ marginRight: 6 }} /> Stop</button>
-                  </div>
+      <div className="control-panel__scroll">
+        {/* ================================================================
+            SIGNAL — start/stop, and where frames are being lost
+            ================================================================ */}
+        {tab === 'signal' && (
+          <div className="stagger">
+            <Section legend="Publish to Windows" icon={<Radio size={13} />}>
+              {vcamState && !vcamState.registered ? (
+                <div className="stack stack--10">
+                  <Notice kind="warn" icon={<ShieldAlert size={14} />} title="Camera driver is not registered">
+                    Windows cannot see OpenCamBridge Camera until its COM object is registered once, from an
+                    elevated terminal.
+                  </Notice>
+                  <button className="btn btn-primary btn--block btn--lg" onClick={handleRegisterVcam} disabled={isVcamRegistering}>
+                    {isVcamRegistering ? <RefreshCw size={15} className="animate-spin" /> : <ShieldAlert size={15} />}
+                    {isVcamRegistering ? 'Registering…' : 'Register camera backend'}
+                  </button>
                 </div>
-                <div>
-                  <div style={{ fontSize: '0.8rem', color: '#888', marginBottom: 6 }}>Virtual camera host:</div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                    <button className="btn btn-secondary" onClick={async () => {
-                      try { await invoke('start_virtual_camera_host'); setVcamMessage(''); addDiag('host', 'Virtual camera host started'); }
-                      catch (e: any) { setVcamMessage(`Virtual camera host failed: ${e}`); addDiag('host', `Host start failed: ${e}`); }
-                      invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState).catch(() => {});
-                    }} disabled={vcamState?.host_running}><Play size={14} style={{ marginRight: 6 }} /> Start</button>
-                    <button className="btn btn-secondary" onClick={async () => {
-                      try { await invoke('stop_virtual_camera_host'); addDiag('host', 'Virtual camera host stopped'); }
-                      catch (e: any) { addDiag('host', `Host stop failed: ${e}`); }
-                      invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState).catch(() => {});
-                    }} disabled={!vcamState?.host_running}><Square size={14} style={{ marginRight: 6 }} /> Stop</button>
+              ) : (
+                <div className="stack stack--10">
+                  <div className="btn-row">
+                    <button
+                      className="btn btn-primary btn--lg"
+                      onClick={handleStartNativeCamera}
+                      disabled={!!(vcamState?.process_running && vcamState?.host_running)}
+                    >
+                      <Play size={15} /> Start webcam
+                    </button>
+                    <button
+                      className="btn btn--lg"
+                      onClick={handleStopNativeCamera}
+                      disabled={!vcamState?.process_running && !vcamState?.host_running}
+                    >
+                      <Square size={15} /> Stop
+                    </button>
                   </div>
+
+                  {binariesBlocked && vcamState?.binary_identity && (
+                    <Notice kind="fail" icon={<AlertTriangle size={14} />} title="Stale or mismatched camera binaries">
+                      {vcamState.binary_identity.error}
+                      <code>{vcamState.binary_identity.remediation}</code>
+                    </Notice>
+                  )}
+
+                  {activeError && (
+                    <Notice kind="fail" icon={<AlertTriangle size={14} />} title="Last error">
+                      {activeError}
+                    </Notice>
+                  )}
+
+                  {vcamMessage && <p className="hint">{vcamMessage}</p>}
+
+                  {devMode && !vcamState?.process_running && !vcamState?.host_running && (
+                    <button className="btn btn-danger btn--block" onClick={handleUnregisterVcam} disabled={isVcamRegistering}>
+                      Remove virtual camera registration
+                    </button>
+                  )}
+
+                  {devMode && (
+                    <Well legend="Granular pipeline (developer)" icon={<Cpu size={12} />}>
+                      <div className="field">
+                        <span className="field__label">Phone feed only</span>
+                        <div className="btn-row">
+                          <button className="btn btn--sm" onClick={handleStartFeedOnly} disabled={vcamState?.process_running}>
+                            <Play size={12} /> Start
+                          </button>
+                          <button className="btn btn--sm" onClick={handleStopFeedOnly} disabled={!vcamState?.process_running}>
+                            <Square size={12} /> Stop
+                          </button>
+                        </div>
+                      </div>
+                      <div className="field">
+                        <span className="field__label">Virtual camera host</span>
+                        <div className="btn-row">
+                          <button
+                            className="btn btn--sm"
+                            disabled={vcamState?.host_running}
+                            onClick={async () => {
+                              try { await invoke('start_virtual_camera_host'); setVcamMessage(''); addDiag('host', 'Virtual camera host started'); }
+                              catch (e: any) { setVcamMessage(`Virtual camera host failed: ${e}`); addDiag('host', `Host start failed: ${e}`); }
+                              invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState).catch(() => {});
+                            }}
+                          >
+                            <Play size={12} /> Start
+                          </button>
+                          <button
+                            className="btn btn--sm"
+                            disabled={!vcamState?.host_running}
+                            onClick={async () => {
+                              try { await invoke('stop_virtual_camera_host'); addDiag('host', 'Virtual camera host stopped'); }
+                              catch (e: any) { addDiag('host', `Host stop failed: ${e}`); }
+                              invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState).catch(() => {});
+                            }}
+                          >
+                            <Square size={12} /> Stop
+                          </button>
+                        </div>
+                      </div>
+                    </Well>
+                  )}
                 </div>
-              </div>
-            )}
+              )}
+            </Section>
+
+            <Section legend="Signal chain" icon={<Activity size={13} />}>
+              <SignalChain
+                targetFps={Number(androidMetrics?.selectedFps || androidMetrics?.encodedFps || settings.fps)}
+                transport={transport}
+                androidRunning={androidRunning}
+                androidMetrics={androidMetrics}
+                metrics={metrics}
+                producerRunning={producerRunning}
+                consumerAttached={consumerAttached}
+                streamMode={androidMetrics?.activeStreamMode || settings.streamMode}
+              />
+            </Section>
+
+            <Section legend="Session" icon={<Cable size={13} />}>
+              <Tel k="Phone" v={phoneInfo ? `${phoneInfo.manufacturer || ''} ${phoneInfo.model || ''}`.trim() || 'Connected' : '—'} />
+              <Tel k="Lens" v={activeCam?.label || settings.cameraId} />
+              <Tel
+                k="Link"
+                v={transport === 'USB' ? 'USB · adb forward' : 'Wi-Fi · bearer token'}
+                tone={transport === 'USB' ? 'ready' : 'warn'}
+              />
+              <Tel
+                k="Source"
+                v={`${androidMetrics?.encodedWidth || settings.width}×${androidMetrics?.encodedHeight || settings.height} @ ${androidMetrics?.selectedFps || androidMetrics?.encodedFps || settings.fps} · ${(androidMetrics?.activeStreamMode || settings.streamMode).toUpperCase()}`}
+              />
+              <Tel
+                k="Windows output"
+                v={ring ? `${ring.negotiated_width}×${ring.negotiated_height} @ ${Math.round(ring.negotiated_fps_num / Math.max(1, ring.negotiated_fps_den))}` : `${settings.outputWidth}×${settings.outputHeight}`}
+              />
+              <Tel k="Device name" v="OpenCamBridge Camera" tone="muted" />
+              <Tel k="Profile" v={settings.profile} tone="muted" />
+            </Section>
           </div>
         )}
 
-        {vcamMessage && (
-          <p style={{ fontSize: '0.8rem', color: '#aaa', marginBottom: 12, fontStyle: 'italic' }}>{vcamMessage}</p>
-        )}
-
-        {/* Compact product status (always visible) */}
-        {vcamState && (
-          <div style={{ background: 'rgba(20,25,30,0.5)', padding: 12, borderRadius: 8, border: '1px solid #222', fontSize: '0.8rem', marginBottom: 12 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-              <span style={{ color: '#888' }}>Status</span>
-              <span style={{ color: vcamState.running ? '#51cf66' : '#888' }}>{vcamState.running ? 'Streaming' : 'Idle'}</span>
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-              <span style={{ color: '#888' }}>FPS (out / target)</span>
-              <span style={{ color: (vcamState.metrics && vcamState.metrics.written_fps >= settings.fps - 5) ? '#51cf66' : '#ffb300' }}>
-                {vcamState.metrics ? `${vcamState.metrics.written_fps} / ${settings.fps}` : '— / ' + settings.fps}
-                {androidMetrics?.actualFps != null ? ` (phone ${androidMetrics.actualFps})` : ''}
-              </span>
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: '#888' }}>Output</span>
-              <span>{vcamState.metrics ? `${vcamState.metrics.output_width}x${vcamState.metrics.output_height} ${settings.streamMode.toUpperCase()}` : `${settings.width}x${settings.height}`}</span>
-            </div>
-            {(vcamState.last_error || vcamState.metrics?.last_error) && (
-              <div style={{ marginTop: 6, color: '#ff6b6b', fontSize: '0.75rem', wordBreak: 'break-all' }}>
-                {vcamState.last_error || vcamState.metrics?.last_error}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Diagnostics log (always visible; copyable) */}
-        <div style={{ background: '#0a0a0a', padding: 12, borderRadius: 8, border: '1px solid #222', marginBottom: 12 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-            <span style={{ color: '#4dabf7', fontSize: '0.85rem', fontWeight: 600 }}>Diagnostics</span>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button className="btn btn-secondary" style={{ padding: '2px 10px', fontSize: '0.7rem' }} onClick={copyDiagnostics}>Copy</button>
-              <button className="btn btn-secondary" style={{ padding: '2px 10px', fontSize: '0.7rem' }} onClick={() => { setDiagLog([]); lastDiagRef.current = {}; }}>Clear</button>
-            </div>
-          </div>
-          <div style={{ maxHeight: 140, overflowY: 'auto', fontFamily: 'monospace', fontSize: '0.68rem', color: '#9aa', lineHeight: 1.5 }}>
-            {diagLog.length === 0
-              ? <span style={{ color: '#555' }}>No events yet.</span>
-              : diagLog.slice().reverse().map((l, i) => (<div key={i}>{l}</div>))}
-          </div>
-        </div>
-
-        {/* Verbose producer metrics (developer mode) */}
-        {devMode && vcamState && (
-          <div style={{ background: '#0a0a0a', padding: 12, borderRadius: 8, border: '1px solid #222', fontFamily: 'monospace', fontSize: '0.75rem', color: '#51cf66' }}>
-
-            {/* Extended Status */}
-            <div style={{ marginBottom: 8, paddingBottom: 8, borderBottom: '1px solid #222' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888' }}>
-                <span>Producer Running:</span>
-                <span style={{ color: vcamState.running ? '#51cf66' : '#ff6b6b' }}>{vcamState.running ? 'Yes' : 'No'}</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                <span>Producer Exists:</span>
-                <span style={{ color: vcamState.producer_exists ? '#51cf66' : '#ff6b6b' }}>{vcamState.producer_exists ? 'Yes' : 'No'}</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                <span>Producer PID:</span>
-                <span style={{ color: '#fff' }}>{vcamState.producer_pid || 'None'}</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                <span>Executable:</span>
-                <span
-                  style={{ color: '#4dabf7', textDecoration: 'underline', cursor: 'pointer', textAlign: 'right', wordBreak: 'break-all', maxWidth: '70%' }}
-                  onClick={() => vcamState.producer_path && navigator.clipboard.writeText(vcamState.producer_path)}
-                  title={vcamState.producer_path ? `${vcamState.producer_path} (Click to copy)` : 'Unknown'}
+        {/* ================================================================
+            OUTPUT — what the phone captures and what Windows receives
+            ================================================================ */}
+        {tab === 'output' && (
+          <div className="stagger">
+            <Section legend="Resolution & rate" icon={<Settings2 size={13} />}>
+              <div className="field">
+                <span className="field__label">Resolution</span>
+                <select
+                  className="input-control"
+                  value={`${settings.width}x${settings.height}`}
+                  onChange={(e) => {
+                    const [w, h] = e.target.value.split('x').map(Number);
+                    updateResolution(w, h);
+                  }}
                 >
-                  {vcamState.producer_path ? vcamState.producer_path.split('\\').pop() : 'Unknown'}
+                  {resolutionChoices.length === 0 && <option value="" disabled>No supported modes on this lens</option>}
+                  {resolutionChoices.map((r: any) => (
+                    <option key={`${r.width}x${r.height}`} value={`${r.width}x${r.height}`}>
+                      {r.height === 1080 ? '1080p' : r.height === 720 ? '720p' : `${r.height}p`} ({r.width}×{r.height})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="field">
+                <span className="field__label">
+                  Frame rate
+                  {androidMetrics?.actualFps != null && <b>{androidMetrics.actualFps} / {settings.fps} now</b>}
                 </span>
+                <select className="input-control" value={settings.fps} onChange={(e) => updateFps(parseInt(e.target.value, 10))}>
+                  {fpsChoices.map(rate => <option key={rate} value={rate}>{rate} fps</option>)}
+                  {fpsChoices.length === 0 && <option value="" disabled>No supported rate</option>}
+                </select>
+                <p className="hint">
+                  Resolution and frame rate are validated together as one complete camera and encoder mode.
+                  {maxFpsHere > 0
+                    ? ` This lens reaches ${maxFpsHere} fps at ${settings.width}×${settings.height} on the selected path.`
+                    : settings.streamMode === 'h264'
+                      ? ' No hardware H.264 mode is available for this combination.'
+                      : ' Actual rate depends on the phone camera and lighting.'}
+                </p>
+                {devMode && activeCam?.supportsHighSpeed && (
+                  <p className="hint">
+                    <strong>Diagnostics:</strong> this lens has constrained high-speed modes
+                    {Array.isArray(activeCam.highSpeedFpsRanges) && activeCam.highSpeedFpsRanges.length > 0
+                      ? ` up to ${Math.max(...activeCam.highSpeedFpsRanges.map((r: any) => r.max))} fps`
+                      : ''}. H.264 may use a direct high-speed surface or the GPU bridge; MJPEG stays on the regular
+                    ImageAnalysis capability.
+                  </p>
+                )}
               </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', color: '#ff6b6b', marginTop: 4 }}>
-                <span>Last Error:</span>
-                <span style={{ textAlign: 'right', wordBreak: 'break-all', maxWidth: '70%' }}>{vcamState.last_error || 'None'}</span>
+
+              {devMode && (
+                <div className="field">
+                  <span className="field__label">Capture profile (advanced)</span>
+                  <select className="input-control" value={settings.profile} onChange={(e) => updateProfile(e.target.value)}>
+                    <option value="low-latency">Low latency (1280×720, Q70)</option>
+                    <option value="balanced">Balanced (1280×720, Q85)</option>
+                    <option value="balanced-720p60">Balanced 60 (1280×720 @ 60, Q80)</option>
+                    <option value="quality">Quality (1920×1080, Q75)</option>
+                    <option value="experimental-1080p60">1080p @ 60</option>
+                  </select>
+                  <p className="hint">
+                    Developer preset: sets resolution and quality together. Normal use goes through Resolution and
+                    Frame rate above.
+                  </p>
+                </div>
+              )}
+            </Section>
+
+            <Section legend="Codec" icon={<Cpu size={13} />}>
+              <div className="field">
+                <span className="field__label">Transport codec</span>
+                <select className="input-control" value={settings.streamMode} onChange={(e) => updateSetting('streamMode', e.target.value)}>
+                  <option value="h264">Hardware H.264 / OCB2 (recommended)</option>
+                  <option value="mjpeg">MJPEG (compatibility)</option>
+                </select>
+                <p className="hint">
+                  H.264 encodes straight off the Camera2 surface, frames it as OCB2, and decodes on Windows in
+                  hardware. The app falls back to MJPEG only when that complete path is unavailable.
+                </p>
               </div>
-            </div>
 
-            {androidMetrics && (
-              <div style={{ marginBottom: 8, paddingBottom: 8, borderBottom: '1px solid #222' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Requested Aspect:</span>
-                  <span>{androidMetrics.requestedAspectRatio}</span>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Selected Aspect:</span>
-                  <span style={{ color: androidMetrics.aspectRatioMatch ? '#51cf66' : '#ffb300' }}>{androidMetrics.selectedAspectRatio}</span>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Native Encode Dim:</span>
-                  <span>{androidMetrics.encodedWidth}x{androidMetrics.encodedHeight}</span>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Rotation Resizing:</span>
-                  <span style={{ color: androidMetrics.resizeNeeded ? '#ffb300' : '#51cf66' }}>{androidMetrics.resizeNeeded ? 'Required' : 'Native Match'}</span>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Android FPS:</span>
-                  <span style={{ color: (androidMetrics.actualFps || androidMetrics.fps) >= settings.fps - 5 ? '#51cf66' : '#ffb300' }}>
-                    {androidMetrics.actualFps ?? androidMetrics.fps} / {settings.fps}
-                  </span>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#888', marginTop: 4 }}>
-                  <span>Android JPEG Encode:</span>
-                  <span>{Number(androidMetrics.androidEncodeMsAvg || 0).toFixed(1)} ms</span>
-                </div>
+              {settings.streamMode === 'mjpeg' ? (
+                <>
+                  <div className="field">
+                    <span className="field__label">JPEG quality <b>{settings.jpegQuality}%</b></span>
+                    <input type="range" min="40" max="95" step="1" value={settings.jpegQuality}
+                      onChange={(e) => updateSetting('jpegQuality', parseInt(e.target.value))} />
+                  </div>
+                  <div className="field">
+                    <span className="field__label">
+                      Target bandwidth
+                      <b>{settings.targetBandwidthMbps === 0 ? 'off' : `${settings.targetBandwidthMbps} Mb/s`}</b>
+                    </span>
+                    <input type="range" min="0" max="50" step="1" value={settings.targetBandwidthMbps}
+                      onChange={(e) => updateSetting('targetBandwidthMbps', parseInt(e.target.value))} />
+                    <p className="hint">Zero disables automatic quality adjustment.</p>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="field">
+                    <span className="field__label">Bitrate <b>{(settings.h264Bitrate / 1_000_000).toFixed(0)} Mb/s</b></span>
+                    <input type="range" min="1" max="20" step="1" value={Math.round(settings.h264Bitrate / 1_000_000)}
+                      onChange={(e) => updateSetting('h264Bitrate', parseInt(e.target.value) * 1_000_000)} />
+                    <p className="hint">
+                      Applies live with no stream interruption. The phone raises very low requests to a
+                      resolution-appropriate floor.
+                    </p>
+                  </div>
+                  <div className="field">
+                    <span className="field__label">Keyframe interval <b>{settings.h264KeyframeInterval}s</b></span>
+                    <input type="range" min="1" max="10" step="1" value={settings.h264KeyframeInterval}
+                      onChange={(e) => updateSetting('h264KeyframeInterval', parseInt(e.target.value))} />
+                    <p className="hint">
+                      Keyframes are requested on demand whenever a consumer connects or the stream is
+                      interrupted, so this is only a safety net. Longer intervals spend more of the bitrate on
+                      the picture and less on repeating full frames; shorter ones recover marginally faster if a
+                      request is ever missed.
+                    </p>
+                  </div>
+                </>
+              )}
+            </Section>
 
-                {/* Degradation Warnings */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8 }}>
-                  {androidMetrics.fallbackUsed && (
-                    <div style={{ padding: '4px 8px', background: 'rgba(255, 179, 0, 0.1)', color: '#ffb300', border: '1px solid rgba(255, 179, 0, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
-                      ⚠️ Fallback resolution used: {androidMetrics.resolutionPolicy}
-                    </div>
+            <Section legend="Desktop" icon={<Monitor size={13} />}>
+              <ToggleRow
+                title="Desktop preview"
+                note="Turn off to remove this window from the frame budget while diagnosing throughput."
+                checked={!previewOff}
+                onChange={(value) => setPreviewOff(!value)}
+              />
+              <ToggleRow
+                title="Developer mode"
+                note="Adds capture profiles, granular pipeline controls, and verbose telemetry."
+                checked={devMode}
+                onChange={setDevMode}
+              />
+            </Section>
+          </div>
+        )}
+
+        {/* ================================================================
+            IMAGE — everything that changes how the picture looks
+            ================================================================ */}
+        {tab === 'image' && (
+          <div className="stagger">
+            <Section legend="Lens" icon={<Aperture size={13} />}>
+              <div className="field">
+                <span className="field__label">Camera</span>
+                <select className="input-control" value={settings.cameraId} onChange={(e) => updateSetting('cameraId', e.target.value)}>
+                  {cameras.map(c => (
+                    <option key={c.id} value={c.id}>
+                      {c.label || `${c.facing?.charAt(0).toUpperCase()}${c.facing?.slice(1)} camera (${c.id})`}
+                    </option>
+                  ))}
+                  {cameras.length === 0 && <option value="0">Default camera</option>}
+                </select>
+              </div>
+
+              <div className="field">
+                <span className="field__label">Zoom <b>{((settings.linearZoom || 0) * 100).toFixed(0)}%</b></span>
+                <div className="fader-row">
+                  <button className="btn" onClick={() => updateSetting('linearZoom', Math.max(0, (settings.linearZoom || 0) - 0.1))}>
+                    <ZoomOut size={14} />
+                  </button>
+                  <input type="range" min="0" max="100" step="1" value={(settings.linearZoom || 0) * 100}
+                    onChange={(e) => updateSetting('linearZoom', parseInt(e.target.value) / 100.0)} />
+                  <button className="btn" onClick={() => updateSetting('linearZoom', Math.min(1.0, (settings.linearZoom || 0) + 0.1))}>
+                    <ZoomIn size={14} />
+                  </button>
+                </div>
+                {settings.linearZoom > 0 && (
+                  <button className="btn btn--sm btn--block mt-8" onClick={() => updateSetting('linearZoom', 0.0)}>Reset zoom</button>
+                )}
+              </div>
+            </Section>
+
+            <Section legend="Framing" icon={<RotateCw size={13} />}>
+              <div className="field">
+                <span className="field__label">Rotation <b>{parseInt(settings.displayRotation, 10) || 0}°</b></span>
+                <button className="btn btn--block" onClick={rotateOutput}>
+                  <RotateCw size={14} /> Rotate 90°
+                </button>
+                <p className="hint">
+                  Video is already uprighted for how the phone is held. This adds a further 90° offset.
+                </p>
+              </div>
+
+              {devMode && (
+                <div className="field">
+                  <span className="field__label">Preview layout (developer)</span>
+                  <select className="input-control" value={orientationMode} onChange={(e) => updateOrientationMode(e.target.value)}>
+                    <option value="auto">Auto — follow phone</option>
+                    <option value="16:9">Horizontal (16:9)</option>
+                    <option value="9:16">Vertical (9:16)</option>
+                  </select>
+                  <p className="hint">
+                    Shapes only this preview box. The virtual camera stays 16:9, so vertical video is pillarboxed
+                    in the apps that consume it.
+                  </p>
+                </div>
+              )}
+
+              <div className="mt-14">
+                <ToggleRow
+                  title="Mirror image"
+                  note="Flip horizontally, as a front camera normally previews."
+                  checked={settings.mirror}
+                  onChange={(value) => updateSetting('mirror', value)}
+                />
+                {torchSupported ? (
+                  <ToggleRow
+                    title={<span className="row"><Flashlight size={13} /> Torch</span>}
+                    note="Hold the LED on for a dim room."
+                    checked={settings.torchEnabled}
+                    onChange={(value) => updateSetting('torchEnabled', value)}
+                  />
+                ) : activeCam ? (
+                  <ToggleRow
+                    title={<span className="row muted"><Flashlight size={13} /> Torch</span>}
+                    right={<span className="micro">not on this lens</span>}
+                  />
+                ) : null}
+              </div>
+            </Section>
+
+            {isSyncing && (
+              <div className="section">
+                <p className="hint row"><RefreshCw size={12} className="animate-spin" /> Syncing settings with the phone…</p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ================================================================
+            DIAG — every raw counter, still one click away
+            ================================================================ */}
+        {tab === 'diag' && (
+          <div className="stagger">
+            <Section legend="Events" icon={<Terminal size={13} />}>
+              <div className="well">
+                <div className="well__head">
+                  <h4 className="legend"><Terminal size={12} /> Session log</h4>
+                  <div className="well__head-actions">
+                    <button className="btn btn--sm" onClick={copyDiagnostics}><Copy size={11} /> Copy</button>
+                    <button className="btn btn--sm" onClick={() => { setDiagLog([]); lastDiagRef.current = {}; }}>
+                      <Trash2 size={11} /> Clear
+                    </button>
+                  </div>
+                </div>
+                <div className="log">
+                  {diagLog.length === 0
+                    ? <span className="log__empty">No events yet.</span>
+                    : diagLog.slice().reverse().map((line, i) => <div className="log__line" key={i}>{line}</div>)}
+                </div>
+              </div>
+            </Section>
+
+            <Section legend="Desktop preview stages" icon={<Monitor size={13} />}>
+              <div className="tel-grid">
+                <Tel k="Preview state" v={previewDiagnostics.ready ? 'READY — frame displayed' : 'WAITING — no displayed frame'} tone={previewDiagnostics.ready ? 'ready' : 'warn'} />
+                <Tel k="Producer / ring" v={`${producerRunning ? 'running' : 'stopped'} / ${previewDiagnostics.ringAlive ? 'alive' : 'unavailable'}`} tone={producerRunning && previewDiagnostics.ringAlive ? 'ready' : 'warn'} />
+                <Tel k="Ring write sequence / generation" v={`${previewDiagnostics.ringWriteSequence} / ${previewDiagnostics.streamGeneration}`} />
+                <Tel k="Preview command calls" v={previewDiagnostics.previewCommandCalls} />
+                <Tel k="Non-empty / empty responses" v={`${previewDiagnostics.nonEmptyResponses} / ${previewDiagnostics.emptyResponses}`} />
+                <Tel k="Last returned sequence" v={previewDiagnostics.lastReturnedSequence || 'none'} />
+                <Tel k="IPC payload bytes" v={previewDiagnostics.ipcPayloadBytes} />
+                <Tel k="Header / parsed geometry" v={`${previewDiagnostics.frameHeaderValid ? 'valid' : 'waiting'} / ${previewDiagnostics.parsedWidth || '—'}×${previewDiagnostics.parsedHeight || '—'}`} tone={previewDiagnostics.frameHeaderValid ? 'ready' : 'warn'} />
+                <Tel k="Renderer uploads / displays" v={`${previewDiagnostics.rendererUploadCount} / ${previewDiagnostics.rendererDisplayCount}`} tone={previewDiagnostics.rendererDisplayCount > 0 ? 'ready' : 'warn'} />
+                <Tel k="Last displayed sequence" v={previewDiagnostics.lastDisplayedSequence || 'none'} />
+                <Tel k="Preview received / displayed fps" v={`${previewDiagnostics.previewReceivedFps} / ${previewDiagnostics.previewDisplayedFps}`} tone={previewDiagnostics.ready && previewDiagnostics.previewDisplayedFps > 0 ? 'ready' : 'warn'} />
+                <Tel k="Preview skipped sequences" v={previewDiagnostics.previewSkippedSequences} tone={previewDiagnostics.previewSkippedSequences > 0 ? 'warn' : undefined} />
+                <Tel k="IPC transfer / WebGL upload" v={`${previewDiagnostics.ipcTransferMs.toFixed(2)} / ${previewDiagnostics.previewUploadMs.toFixed(2)} ms`} />
+                <Tel k="Source fps / colour" v={`${previewDiagnostics.sourceFps || '—'} / ${previewDiagnostics.colorMatrix || '—'} ${previewDiagnostics.colorRange || ''}`} />
+                <Tel k="Primaries / transfer" v={`${previewDiagnostics.colorPrimaries || '—'} / ${previewDiagnostics.colorTransfer || '—'}`} />
+                <Tel k="Torn slots rejected" v={previewDiagnostics.tornSlotsRejected} tone={previewDiagnostics.tornSlotsRejected > 0 ? 'warn' : undefined} />
+                <Tel k="Last preview error" v={previewDiagnostics.lastError || 'none'} tone={previewDiagnostics.lastError ? 'fail' : 'muted'} />
+              </div>
+              {previewDiagnostics.consumerStalled && (
+                <Notice kind="fail" icon={<AlertTriangle size={13} />}>
+                  Preview consumer is not releasing frames; producer ring is healthy.
+                </Notice>
+              )}
+            </Section>
+
+            {/* --- degradation warnings, gathered in one place --- */}
+            {(androidMetrics || metrics) && (
+              <Section legend="Warnings" icon={<AlertTriangle size={13} />}>
+                <div className="stack stack--8">
+                  {androidMetrics?.fallbackUsed && (
+                    <Notice kind="warn" icon={<AlertTriangle size={13} />}>
+                      Fallback resolution in use: {androidMetrics.resolutionPolicy}
+                    </Notice>
+                  )}
+                  {(androidMetrics?.fallbackReason || metrics?.fallback_reason) && (
+                    <Notice kind="warn" icon={<AlertTriangle size={13} />} title="Active fallback">
+                      {androidMetrics?.fallbackReason || metrics?.fallback_reason}
+                    </Notice>
                   )}
                   {settings.profile === 'native' && (
-                    <div style={{ padding: '4px 8px', background: 'rgba(255, 107, 107, 0.1)', color: '#ff6b6b', border: '1px solid rgba(255, 107, 107, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
-                      ⚠️ Native mode active: High CPU & latency expected
-                    </div>
+                    <Notice kind="fail" icon={<AlertTriangle size={13} />}>
+                      Native mode is active: expect high CPU use and latency.
+                    </Notice>
                   )}
-                  {androidMetrics.selectedEffectiveWidth > settings.width * 1.5 && (
-                    <div style={{ padding: '4px 8px', background: 'rgba(255, 107, 107, 0.1)', color: '#ff6b6b', border: '1px solid rgba(255, 107, 107, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
-                      ⚠️ Source too large: Profile degraded, selected {androidMetrics.selectedRawWidth}x{androidMetrics.selectedRawHeight} instead of {settings.width}x{settings.height}
-                    </div>
+                  {androidMetrics?.selectedEffectiveWidth > settings.width * 1.5 && (
+                    <Notice kind="fail" icon={<AlertTriangle size={13} />} title="Source too large">
+                      The profile degraded and selected {androidMetrics.selectedRawWidth}×{androidMetrics.selectedRawHeight}
+                      {' '}instead of {settings.width}×{settings.height}.
+                    </Notice>
                   )}
-                  {vcamState?.metrics && vcamState.metrics.decoded_fps < settings.fps - 5 && (
-                    <div style={{ padding: '4px 8px', background: 'rgba(255, 179, 0, 0.1)', color: '#ffb300', border: '1px solid rgba(255, 179, 0, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
-                      ⚠️ FPS below target: {vcamState.metrics.decoded_fps} / {settings.fps}
-                    </div>
+                  {metrics && metrics.decoded_fps < settings.fps - 5 && (
+                    <Notice kind="warn" icon={<AlertTriangle size={13} />}>
+                      Decoded rate is below target: {metrics.decoded_fps} of {settings.fps} fps.
+                    </Notice>
                   )}
-                  {vcamState?.metrics && vcamState.metrics.source_width !== vcamState.metrics.output_width && (
-                    <div style={{ padding: '4px 8px', background: 'rgba(255, 179, 0, 0.1)', color: '#ffb300', border: '1px solid rgba(255, 179, 0, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
-                      ⚠️ Heavy resize: {vcamState.metrics.source_width}x{vcamState.metrics.source_height} &rarr; {vcamState.metrics.output_width}x{vcamState.metrics.output_height}
-                    </div>
+                  {metrics && metrics.source_width !== metrics.output_width && (
+                    <Notice kind="warn" icon={<AlertTriangle size={13} />}>
+                      Resize in the path: {metrics.source_width}×{metrics.source_height} → {metrics.output_width}×{metrics.output_height}.
+                    </Notice>
                   )}
                   {settings.profile === 'experimental-1080p60' && settings.outputWidth === 1280 && (
-                    <div style={{ padding: '4px 8px', background: 'rgba(255, 179, 0, 0.1)', color: '#ffb300', border: '1px solid rgba(255, 179, 0, 0.3)', borderRadius: 4, fontSize: '0.7rem' }}>
-                      ⚠️ Virtual output mismatch: Capture requested 1080p60, virtual output currently 720p.
-                    </div>
+                    <Notice kind="warn" icon={<AlertTriangle size={13} />}>
+                      Capture requested 1080p60 but the virtual output is still 720p.
+                    </Notice>
                   )}
-                  {settings.profile === 'experimental-1080p60' && vcamState?.metrics && (
-                    <div style={{ padding: '8px', background: 'rgba(77, 171, 247, 0.1)', color: '#4dabf7', border: '1px solid rgba(77, 171, 247, 0.3)', borderRadius: 4, fontSize: '0.75rem', marginTop: 4 }}>
-                      <div style={{ fontWeight: 'bold', marginBottom: 4 }}>1080p60 Truth Metrics:</div>
-                      <div>Target: 60 FPS | Actual: {vcamState.metrics.written_fps} FPS</div>
-                      <div>
-                        Status: {
-                          vcamState.metrics.written_fps >= 55 ? <span style={{ color: '#51cf66' }}>OK</span> :
-                          vcamState.metrics.written_fps >= 45 ? <span style={{ color: '#ffb300' }}>Degraded</span> :
-                          <span style={{ color: '#ff6b6b' }}>Not Viable</span>
-                        }
-                      </div>
-                      <div style={{ marginTop: 4, fontStyle: 'italic', color: '#888' }}>
-                        Bottleneck Analysis:
-                        <ul style={{ margin: '2px 0 0 16px', padding: 0 }}>
-                          <li>Android Encode: {androidMetrics.actualFps || 0} FPS ({Number(androidMetrics.androidEncodeMsAvg || 0).toFixed(1)}ms)</li>
-                          <li>Rust Decode: {vcamState.metrics.decode_ms_avg} ms</li>
-                          <li>IPC Write: {vcamState.metrics.write_ms_avg} ms</li>
-                        </ul>
-                      </div>
-                    </div>
-                  )}
+                  {!androidMetrics?.fallbackUsed
+                    && !(androidMetrics?.fallbackReason || metrics?.fallback_reason)
+                    && settings.profile !== 'native'
+                    && !(androidMetrics?.selectedEffectiveWidth > settings.width * 1.5)
+                    && !(metrics && metrics.decoded_fps < settings.fps - 5)
+                    && !(metrics && metrics.source_width !== metrics.output_width)
+                    && <p className="hint">No degradation reported on the active path.</p>}
                 </div>
+              </Section>
+            )}
+
+            <Section legend="Throughput" icon={<Gauge size={13} />}>
+              {metrics ? (
+                <>
+                  <div className="tel-grid">
+                    <Tel k="Configured source fps" v={metrics.source_fps ?? metrics.fps_target} />
+                    <Tel k="Transport received fps" v={metrics.transport_received_fps ?? metrics.transport_fps ?? metrics.http_jpeg_fps} />
+                    <Tel k="Producer decoded fps" v={metrics.producer_decoded_fps ?? metrics.decoded_unique_fps ?? metrics.decoded_fps} />
+                    <Tel k="Ring written fps" v={metrics.ring_written_fps ?? metrics.written_fps} />
+                    <Tel k="Virtual cam requested fps" v={metrics.virtual_camera_requested_fps ?? 0} />
+                    <Tel k="Virtual cam unique" v={metrics.virtual_camera_unique_fps ?? metrics.written_fps} />
+                    <Tel k="Virtual cam repeated fps" v={metrics.virtual_camera_repeated_fps ?? metrics.repeated_samples ?? 0} tone={(metrics.repeated_samples ?? 0) > 0 ? 'warn' : undefined} />
+                    <Tel k="Producer replaced frames" v={metrics.replaced_frames ?? 0} />
+                    {metrics.source === 'mjpeg' && <Tel k="JPEG dropped / queue" v={`${metrics.dropped_jpegs} / ${metrics.jpeg_queue_len}`} />}
+                    <Tel k="Transport bandwidth" v={`${metrics.transport_bandwidth_mbps ?? metrics.estimated_mbps} Mb/s`} />
+                    <Tel k="Decode time" v={`${metrics.decode_ms_avg} ms`} />
+                    <Tel k="Producer processing" v={`${metrics.producer_processing_ms ?? metrics.total_pipeline_ms} ms`} />
+                    {metrics.source === 'ocb2-h264' && <Tel k="Phone→ring lower bound" v={`${metrics.phone_to_ring_latency_ms ?? metrics.latency_ms ?? 0} ms`} />}
+                  </div>
+                  <Tel
+                    k="Decoder"
+                    v={`${metrics.decoder_name || metrics.decode_backend || 'MJPEG'} · ${
+                      metrics.hardware_decoder == null
+                        ? `hardware unknown, D3D11 ${metrics.d3d11_output ? 'active' : 'inactive'}`
+                        : metrics.hardware_decoder ? 'hardware' : 'software fallback'
+                    }`}
+                    tone={metrics.hardware_decoder === false ? 'warn' : undefined}
+                  />
+                  <Tel k="Pixel format" v={metrics.pixel_format} tone="muted" />
+                  {metrics.source_width !== metrics.output_width && (
+                    <Tel k="Resizing" v={`${metrics.source_width}×${metrics.source_height} → ${metrics.output_width}×${metrics.output_height}`} tone="warn" />
+                  )}
+                  {ring && (
+                    <>
+                      <Tel k="Playout buffer / target" v={`${ring.playout_buffer_depth_ms} / ${ring.playout_target_delay_ms} ms`} />
+                      <Tel k="Playout underruns / late drops" v={`${ring.playout_underruns} / ${ring.playout_late_dropped}`} tone={ring.playout_underruns || ring.playout_late_dropped ? 'warn' : 'ready'} />
+                    </>
+                  )}
+                  {vcamState?.last_metrics_time && (
+                    <p className="hint" style={{ textAlign: 'right' }}>
+                      Last update {Math.max(0, Math.floor(now - vcamState.last_metrics_time))}s ago
+                    </p>
+                  )}
+                  {settings.profile === 'experimental-1080p60' && (
+                    <Notice kind="info" icon={<Gauge size={13} />} title="1080p60 truth metrics">
+                      Target 60 fps, actual {metrics.written_fps} fps —{' '}
+                      {metrics.written_fps >= 55 ? 'viable' : metrics.written_fps >= 45 ? 'degraded' : 'not viable'}.
+                      Phone capture {androidMetrics?.actualFps || 0} fps via {androidMetrics?.captureEngine || 'unknown'};
+                      decode {metrics.decode_ms_avg} ms; IPC write {metrics.write_ms_avg} ms.
+                    </Notice>
+                  )}
+                </>
+              ) : (
+                <p className="hint">Waiting for producer metrics…</p>
+              )}
+            </Section>
+
+            <Section legend="Phone pipeline" icon={<Activity size={13} />}>
+              {androidMetrics ? (
+                <>
+                  <Tel k="Aspect requested / selected" v={`${androidMetrics.requestedAspectRatio} / ${androidMetrics.selectedAspectRatio}`}
+                    tone={androidMetrics.aspectRatioMatch ? undefined : 'warn'} />
+                  <Tel k="Resolution desired / selected / actual"
+                    v={`${settings.width}×${settings.height} / ${androidMetrics.selectedEffectiveWidth || 0}×${androidMetrics.selectedEffectiveHeight || 0} / ${androidMetrics.encodedWidth}×${androidMetrics.encodedHeight}`} />
+                  <Tel k="Rate desired / selected / encoded"
+                    v={`${settings.fps} / ${androidMetrics.selectedFps || 0} / ${androidMetrics.encodedFps || 0}`}
+                    tone={(androidMetrics.encodedFps || 0) >= settings.fps - 5 ? 'ready' : 'warn'} />
+                  <Tel k="Mode desired / active" v={`${settings.streamMode.toUpperCase()} / ${(androidMetrics.activeStreamMode || settings.streamMode).toUpperCase()}`} />
+                  <Tel k="Rotation resize" v={androidMetrics.resizeNeeded ? 'required' : 'native match'} tone={androidMetrics.resizeNeeded ? 'warn' : 'ready'} />
+                  {androidMetrics.capture && (
+                    <Tel k="Capture engine / session fps"
+                      v={`${androidMetrics.captureEngine || 'unknown'} / ${androidMetrics.cameraSessionFps || 0}${androidMetrics.gpuBridgeFps != null ? ` → GPU ${androidMetrics.gpuBridgeFps}` : ''}`} />
+                  )}
+                  <Tel
+                    k="Phone preview"
+                    v={!androidMetrics.phonePreviewRequested ? 'not requested'
+                      : androidMetrics.phonePreviewActive ? 'active'
+                      : `inactive: ${androidMetrics.phonePreviewFailureReason || 'waiting for target'}`}
+                    tone={androidMetrics.phonePreviewRequested && !androidMetrics.phonePreviewActive ? 'warn' : 'ready'} />
+                  {androidMetrics.h264 && (
+                    <>
+                      <Tel k="Encoder" v={`${androidMetrics.encoderName} · ${androidMetrics.hardwareEncoder ? 'hardware' : 'software fallback'}`}
+                        tone={androidMetrics.hardwareEncoder ? undefined : 'warn'} />
+                      <Tel k="Encoded fps / bitrate" v={`${androidMetrics.encodedFps || 0} / ${((androidMetrics.encodedBitrate || 0) / 1_000_000).toFixed(2)} Mb/s`} />
+                    </>
+                  )}
+                  {androidMetrics.mjpeg && (
+                    <>
+                      <Tel k="MJPEG phone processing" v={`${Number(androidMetrics.androidEncodeMsAvg || 0).toFixed(1)} ms`} />
+                      <Tel
+                        k="MJPEG measured capacity"
+                        v={`${androidMetrics.mjpegProcessingCapacityFps || 0} fps at Q${settings.jpegQuality}`}
+                        tone={(androidMetrics.mjpegProcessingCapacityFps || 0) >= settings.fps ? 'ready' : 'warn'}
+                      />
+                    </>
+                  )}
+                </>
+              ) : (
+                <p className="hint">Waiting for phone metrics…</p>
+              )}
+            </Section>
+
+            <Section legend="Processes" icon={<Cpu size={13} />}>
+              <div className="stack stack--8">
+                <div className="row"><Lamp state={androidRunning ? 'ok' : 'down'} /><span className="grow">Android control server</span>
+                  <span className="micro">{androidRunning ? 'running' : 'stopped'}</span></div>
+                <div className="row"><Lamp state={producerRunning ? 'ok' : 'down'} /><span className="grow">Frame producer</span>
+                  <span className="micro">{vcamState?.producer_state || (producerRunning ? 'running' : 'stopped')}</span></div>
+                <div className="row"><Lamp state={vcamState?.host_running ? 'ok' : 'down'} /><span className="grow">Virtual camera host</span>
+                  <span className="micro">{vcamState?.host_running ? 'running' : 'stopped'}</span></div>
+                <div className="row"><Lamp state={consumerAttached ? 'live' : 'idle'} /><span className="grow">Virtual camera consumer</span>
+                  <span className="micro">{consumerAttached ? 'reading' : 'not attached'}</span></div>
               </div>
+              <div className="mt-14">
+                <Tel k="Producer PID" v={vcamState?.producer_pid || 'none'} />
+                <Tel k="Producer binary present" v={vcamState?.producer_exists ? 'yes' : 'no'} tone={vcamState?.producer_exists ? 'ready' : 'fail'} />
+                <Tel
+                  k="Executable"
+                  v={vcamState?.producer_path ? vcamState.producer_path.split('\\').pop() : 'unknown'}
+                  tone="link"
+                  title={vcamState?.producer_path ? `${vcamState.producer_path} — click to copy` : 'unknown'}
+                  onClick={() => vcamState?.producer_path && navigator.clipboard.writeText(vcamState.producer_path)}
+                />
+                <Tel k="Last error" v={vcamState?.last_error || 'none'} tone={vcamState?.last_error ? 'fail' : 'muted'} />
+                {vcamState?.last_event && <Tel k="Last producer event" v={vcamState.last_event} tone="muted" />}
+              </div>
+            </Section>
+
+            {ring && (
+              <Section legend="Ring & binaries" icon={<Layers size={13} />}>
+                <Tel k="Commits / reads / requests" v={`${metrics?.ring_frames_committed ?? 0} / ${ring.ring_read_successes} / ${ring.sample_requests}`} />
+                <Tel
+                  k="Validation / copy failures"
+                  v={`${ring.ring_validation_failures} / ${ring.sample_copy_failures} (0x${(ring.last_ring_error >>> 0).toString(16)})`}
+                  tone={ring.ring_validation_failures || ring.sample_copy_failures ? 'fail' : 'ready'}
+                />
+                <Tel k="Negotiated media type" v={`${ring.negotiated_width}×${ring.negotiated_height} @ ${ring.negotiated_fps_num}/${ring.negotiated_fps_den}`} />
+                <Tel
+                  k="Resize backend / source fps"
+                  v={`${ring.resize_backend || 'unknown'} (${ring.resize_failures} GPU failures) / ${ring.source_fps_num}/${ring.source_fps_den}`}
+                  tone={ring.resize_backend === 'cpu-fallback' ? 'warn' : 'ready'}
+                />
+                <Tel
+                  k="Producer / DLL hash"
+                  v={`${ring.producer_build_hash.slice(0, 12) || 'unknown'} / ${ring.installed_dll_build_hash.slice(0, 12) || 'unknown'}`}
+                  title={`${ring.producer_build_hash} / ${ring.installed_dll_build_hash}`}
+                  tone="muted"
+                />
+                {vcamState?.binary_identity && (
+                  <Tel
+                    k="Built / installed / registered / loaded"
+                    v={`${vcamState.binary_identity.built_dll_hash.slice(0, 8) || 'n/a'} / ${vcamState.binary_identity.installed_dll_hash.slice(0, 8) || 'n/a'} / ${vcamState.binary_identity.registered_dll_hash.slice(0, 8) || 'n/a'} / ${vcamState.binary_identity.loaded_dll_current ? (vcamState.binary_identity.loaded_dll_hash.slice(0, 8) || 'n/a') : 'not active'}`}
+                    title={`${vcamState.binary_identity.built_dll_hash} / ${vcamState.binary_identity.installed_dll_hash} / ${vcamState.binary_identity.registered_dll_hash} / ${vcamState.binary_identity.loaded_dll_hash}`}
+                    tone={vcamState.binary_identity.ready ? 'ready' : 'fail'}
+                  />
+                )}
+                <p className="hint">
+                  A mismatch between built, installed, registered, and loaded hashes means Windows is running a
+                  different DLL than the one just built. Re-run <strong>dev-build-vcam.ps1</strong>.
+                </p>
+              </Section>
             )}
 
-            {vcamState.metrics ? (
-              <>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>FPS (In/Out):</span>
-                    <span>{vcamState.metrics.decoded_fps} / {vcamState.metrics.written_fps}</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Latency Est:</span>
-                    <span>{vcamState.metrics.total_pipeline_ms} ms</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Est. Bandwidth:</span>
-                    <span style={{ color: '#4dabf7' }}>{vcamState.metrics.estimated_mbps} Mbps</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Decode Time:</span>
-                    <span>{vcamState.metrics.decode_ms_avg} ms</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Rotate Time:</span>
-                    <span>{vcamState.metrics.rotate_ms_avg} ms</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Resize Time:</span>
-                    <span>{vcamState.metrics.resize_ms_avg} ms</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Dropped JPEGs:</span>
-                    <span style={{ color: vcamState.metrics.dropped_jpegs > 0 ? '#ff6b6b' : 'inherit' }}>{vcamState.metrics.dropped_jpegs}</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Queue Len:</span>
-                    <span>{vcamState.metrics.jpeg_queue_len}</span>
-                  </div>
+            <Section legend="OBS fallback" icon={<Video size={13} />}>
+              <p className="hint" style={{ marginTop: 0 }}>
+                Only needed when the native Windows camera is blocked — OBS can read this window or a browser
+                source instead.
+              </p>
+              <div className="field mt-14">
+                <span className="field__label">Mode</span>
+                <select className="input-control" value={obsMode} onChange={(e) => setObsMode(e.target.value as 'browser' | 'window')}>
+                  <option value="browser">Browser source (recommended)</option>
+                  <option value="window">Window capture</option>
+                </select>
+              </div>
+              <div className="field">
+                <span className="field__label">OBS WebSocket password</span>
+                <input type="password" className="input-control" placeholder="optional" value={obsPassword}
+                  onChange={(e) => setObsPassword(e.target.value)} />
+              </div>
+              <button className="btn btn--block mt-14" onClick={handleStartObs} disabled={isObsConnecting}>
+                {isObsConnecting ? <RefreshCw size={14} className="animate-spin" /> : <Monitor size={14} />}
+                {isObsConnecting ? 'Connecting…' : 'Connect OBS WebSocket'}
+              </button>
+
+              {obsStatus && (
+                <div className="mt-8">
+                  <Notice kind={obsStatus.error ? 'fail' : 'info'} title={obsStatus.message}>
+                    {obsStatus.error}
+                  </Notice>
                 </div>
-                {vcamState.metrics.source_width !== vcamState.metrics.output_width && (
-                  <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid #222', display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#888' }}>Resizing:</span>
-                    <span>{vcamState.metrics.source_width}x{vcamState.metrics.source_height} &rarr; {vcamState.metrics.output_width}x{vcamState.metrics.output_height}</span>
-                  </div>
-                )}
-                {vcamState.last_metrics_time && (
-                  <div style={{ marginTop: 8, fontSize: '0.65rem', color: (now - vcamState.last_metrics_time > 3) ? '#ffb300' : '#444', textAlign: 'right' }}>
-                    Last update: {Math.max(0, Math.floor(now - vcamState.last_metrics_time))}s ago
-                  </div>
-                )}
-              </>
-            ) : (
-              <div style={{ color: '#888', textAlign: 'center', padding: '8px 0' }}>Waiting for metrics...</div>
-            )}
+              )}
+
+              <button className="btn btn--block mt-14" onClick={onEnterObsMode}>
+                <Monitor size={14} /> Enter clean feed
+              </button>
+              <p className="hint">Full-screen, chrome-free preview for manual window capture. Esc exits.</p>
+            </Section>
+
+            <Section legend="Reference" icon={<Sliders size={13} />}>
+              <Tel k="Source generation" v={dash(androidMetrics?.generation)} tone="muted" />
+              <Tel k="Lifecycle" v={dash(androidMetrics?.lifecycleState)} tone="muted" />
+              <Tel k="Ring ABI hash" v={ring ? `0x${(ring.ring_abi_hash >>> 0).toString(16)}` : '—'} tone="muted" />
+              <Tel k="Consumer PID" v={dash(ring?.consumer_pid)} tone="muted" />
+            </Section>
           </div>
         )}
-      </div>
-
-      <div className="control-group">
-        <h3 style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-          <Settings2 size={16} /> Resolution &amp; Frame Rate
-        </h3>
-
-        <div className="control-item">
-          <label>Resolution</label>
-          <select
-            className="input-control"
-            value={`${settings.width}x${settings.height}`}
-            onChange={(e) => {
-              const [w, h] = e.target.value.split('x').map(Number);
-              updateResolution(w, h);
-            }}
-          >
-            <option value="640x480">480p (640x480)</option>
-            <option value="960x540">540p (960x540)</option>
-            <option value="1280x720">720p (1280x720)</option>
-            <option value="1920x1080">1080p (1920x1080)</option>
-          </select>
-        </div>
-
-        <div className="control-item" style={{ marginTop: 12 }}>
-          <label>Frame Rate</label>
-          <select
-            className="input-control"
-            value={settings.fps}
-            onChange={(e) => updateFps(parseInt(e.target.value, 10))}
-          >
-            <option value={15}>15 fps</option>
-            <option value={30} disabled={!supports30}>30 fps{!supports30 ? ' (unsupported here)' : ''}</option>
-            <option value={60} disabled={!supports60}>60 fps{!supports60 ? ' (unsupported here)' : ''}</option>
-          </select>
-          <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-            Resolution and frame rate are independent.
-            {maxFpsHere > 0
-              ? ` This lens reports up to ${maxFpsHere} fps at ${settings.width}x${settings.height} via the normal camera API.`
-              : ' Actual rate depends on the phone camera and lighting.'}
-            {androidMetrics?.actualFps != null &&
-              ` Delivering ${androidMetrics.actualFps}/${settings.fps} fps now.`}
-          </p>
-          {devMode && activeCam?.supportsHighSpeed && (
-            <p style={{ fontSize: '0.68rem', color: '#ffb300', marginTop: 4 }}>
-              Diagnostics: this lens has high-speed (slow-motion) modes
-              {Array.isArray(activeCam.highSpeedFpsRanges) && activeCam.highSpeedFpsRanges.length > 0
-                ? ` up to ${Math.max(...activeCam.highSpeedFpsRanges.map((r: any) => r.max))} fps`
-                : ''}, but Android's constrained high-speed session is not usable by the
-              MJPEG webcam path — so the webcam max stays the normal-API value above.
-            </p>
-          )}
-        </div>
-
-        {devMode && (
-          <div className="control-item" style={{ marginTop: 12 }}>
-            <label>Capture Profile (advanced)</label>
-            <select
-              className="input-control"
-              value={settings.profile}
-              onChange={(e) => updateProfile(e.target.value)}
-            >
-              <option value="low-latency">Low Latency (960x540, Q70)</option>
-              <option value="balanced">Balanced (1280x720, Q85)</option>
-              <option value="balanced-720p60">Balanced 60 (1280x720 @ 60fps, Q80)</option>
-              <option value="quality">Quality (1920x1080, Q90)</option>
-              <option value="experimental-1080p60">Experimental (1080p @ 60fps)</option>
-            </select>
-            <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-              Developer preset: sets resolution + quality (+fps for "60" presets)
-              together. Normal users use the Resolution and Frame Rate controls.
-            </p>
-          </div>
-        )}
-      </div>
-
-      <div className="control-group">
-        <h3 style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-          <Sliders size={16} /> Image Controls
-        </h3>
-
-        <div className="control-item">
-          <label>Camera Lens</label>
-          <select
-            className="input-control"
-            value={settings.cameraId}
-            onChange={(e) => updateSetting('cameraId', e.target.value)}
-          >
-            {cameras.map(c => (
-              <option key={c.id} value={c.id}>
-                {c.label || `${c.facing?.charAt(0).toUpperCase() + c.facing?.slice(1)} Camera (${c.id})`}
-              </option>
-            ))}
-            {cameras.length === 0 && <option value="0">Default Camera</option>}
-          </select>
-        </div>
-
-        <div className="control-item">
-          <label style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span>Zoom Level</span>
-            <span>{((settings.linearZoom || 0) * 100).toFixed(0)}%</span>
-          </label>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 4 }}>
-            <button className="btn btn-secondary" style={{ padding: '6px' }} onClick={() => updateSetting('linearZoom', Math.max(0, (settings.linearZoom || 0) - 0.1))}>
-              <ZoomOut size={16} />
-            </button>
-            <input
-              type="range"
-              min="0" max="100" step="1"
-              style={{ flex: 1 }}
-              value={((settings.linearZoom || 0) * 100)}
-              onChange={(e) => updateSetting('linearZoom', parseInt(e.target.value) / 100.0)}
-            />
-            <button className="btn btn-secondary" style={{ padding: '6px' }} onClick={() => updateSetting('linearZoom', Math.min(1.0, (settings.linearZoom || 0) + 0.1))}>
-              <ZoomIn size={16} />
-            </button>
-          </div>
-          {settings.linearZoom > 0 && (
-            <button className="btn btn-secondary" style={{ width: '100%', marginTop: 8 }} onClick={() => updateSetting('linearZoom', 0.0)}>
-              Reset Zoom
-            </button>
-          )}
-        </div>
-
-        {devMode && (
-          <div className="control-item">
-            <label>Stream Codec (Developer)</label>
-            <select
-              className="input-control"
-              value={settings.streamMode}
-              onChange={(e) => updateSetting('streamMode', e.target.value)}
-            >
-              <option value="mjpeg">MJPEG (Stable)</option>
-              <option value="h264">H.264 (Experimental / unstable)</option>
-            </select>
-            <p style={{ fontSize: '0.7rem', color: '#ffb300', marginTop: 4 }}>
-              ⚠️ H.264 is experimental and may fail on some devices (the bundled
-              openh264 decoder errors on certain phone encoder output). MJPEG is
-              the stable V1 path. Use H.264 only for testing.
-            </p>
-          </div>
-        )}
-
-        {(settings.streamMode === 'mjpeg' || !devMode) ? (
-          <>
-            <div className="control-item" style={{ marginTop: 12 }}>
-              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span>JPEG Quality</span>
-                <span>{settings.jpegQuality}%</span>
-              </label>
-              <input
-                type="range"
-                min="40" max="95" step="1"
-                style={{ width: '100%', marginTop: 8 }}
-                value={settings.jpegQuality}
-                onChange={(e) => updateSetting('jpegQuality', parseInt(e.target.value))}
-              />
-            </div>
-
-            <div className="control-item" style={{ marginTop: 12 }}>
-              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span>Target Bandwidth (Auto Quality)</span>
-                <span>{settings.targetBandwidthMbps === 0 ? 'Off' : `${settings.targetBandwidthMbps} Mbps`}</span>
-              </label>
-              <input
-                type="range"
-                min="0" max="50" step="1"
-                style={{ width: '100%', marginTop: 8 }}
-                value={settings.targetBandwidthMbps}
-                onChange={(e) => updateSetting('targetBandwidthMbps', parseInt(e.target.value))}
-              />
-              <p style={{ fontSize: '0.75rem', color: '#888', marginTop: 4 }}>Set to 0 to disable automatic quality adjustment.</p>
-            </div>
-          </>
-        ) : (
-          <div style={{ marginTop: 12, padding: 12, background: 'rgba(255, 179, 0, 0.06)', borderRadius: 6, border: '1px solid rgba(255, 179, 0, 0.25)' }}>
-            <p style={{ fontSize: '0.75rem', color: '#ffb300', marginBottom: 12 }}>
-              H.264 is experimental. The desktop preview falls back to ~5 fps JPEG
-              snapshots; the virtual camera itself runs at full rate.
-            </p>
-            <div className="control-item">
-              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span>Bitrate</span>
-                <span>{(settings.h264Bitrate / 1_000_000).toFixed(0)} Mbps</span>
-              </label>
-              <input
-                type="range"
-                min="1" max="20" step="1"
-                style={{ width: '100%', marginTop: 8 }}
-                value={Math.round(settings.h264Bitrate / 1_000_000)}
-                onChange={(e) => updateSetting('h264Bitrate', parseInt(e.target.value) * 1_000_000)}
-              />
-              <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-                Applies live — no stream interruption.
-              </p>
-            </div>
-            <div className="control-item" style={{ marginTop: 12 }}>
-              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span>Keyframe Interval</span>
-                <span>{settings.h264KeyframeInterval}s</span>
-              </label>
-              <input
-                type="range"
-                min="1" max="10" step="1"
-                style={{ width: '100%', marginTop: 8 }}
-                value={settings.h264KeyframeInterval}
-                onChange={(e) => updateSetting('h264KeyframeInterval', parseInt(e.target.value))}
-              />
-              <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-                Shorter intervals recover faster after network hiccups but cost bandwidth.
-              </p>
-            </div>
-          </div>
-        )}
-
-        <div className="control-row" style={{ marginTop: 20 }}>
-          <label style={{ fontSize: '0.9rem' }}>Disable Preview (Diagnostic)</label>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={previewOff}
-              onChange={(e) => setPreviewOff(e.target.checked)}
-            />
-            <span className="slider"></span>
-          </label>
-        </div>
-
-        <div className="control-row" style={{ marginTop: 12 }}>
-          <label style={{ fontSize: '0.9rem' }}>
-            Developer / Experimental Mode
-            <span style={{ display: 'block', fontSize: '0.7rem', color: '#888' }}>
-              Shows H.264 codec, capture profiles, and verbose metrics.
-            </span>
-          </label>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={devMode}
-              onChange={(e) => setDevMode(e.target.checked)}
-            />
-            <span className="slider"></span>
-          </label>
-        </div>
-
-        <div className="control-item" style={{ marginTop: 20 }}>
-          <label>Rotate</label>
-          <button className="btn btn-secondary" style={{ width: '100%' }} onClick={rotateOutput}>
-            <RotateCw size={16} style={{ marginRight: 6 }} /> Rotate 90°  (now {parseInt(settings.displayRotation, 10) || 0}°)
-          </button>
-          <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-            Video is auto-uprighted for how the phone is held; this adds a 90° offset.
-          </p>
-        </div>
-
-        {devMode && (
-          <div className="control-item" style={{ marginTop: 16 }}>
-            <label>Preview layout (developer)</label>
-            <select
-              className="input-control"
-              value={orientationMode}
-              onChange={(e) => updateOrientationMode(e.target.value)}
-            >
-              <option value="auto">Auto (follow phone)</option>
-              <option value="16:9">Horizontal (16:9)</option>
-              <option value="9:16">Vertical (9:16)</option>
-            </select>
-            <p style={{ fontSize: '0.7rem', color: '#888', marginTop: 4 }}>
-              Shapes only THIS preview box. The virtual camera apps receive stays
-              16:9 — vertical video shows there with side bars.
-            </p>
-          </div>
-        )}
-
-        <div className="control-row" style={{ marginTop: 20 }}>
-          <label style={{ fontSize: '0.9rem' }}>Mirror Image</label>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={settings.mirror}
-              onChange={(e) => updateSetting('mirror', e.target.checked)}
-            />
-            <span className="slider"></span>
-          </label>
-        </div>
-
-        {torchSupported ? (
-          <div className="control-row" style={{ marginTop: 12 }}>
-            <label style={{ fontSize: '0.9rem' }}>Flashlight (Torch)</label>
-            <label className="switch">
-              <input
-                type="checkbox"
-                checked={settings.torchEnabled}
-                onChange={(e) => updateSetting('torchEnabled', e.target.checked)}
-              />
-              <span className="slider"></span>
-            </label>
-          </div>
-        ) : activeCam ? (
-          <div className="control-row" style={{ marginTop: 12 }}>
-            <label style={{ fontSize: '0.9rem', color: '#888' }}>Flashlight (Torch)</label>
-            <span style={{ fontSize: '0.75rem', color: '#888' }}>Not available on this lens</span>
-          </div>
-        ) : null}
-
-        {isSyncing && (
-          <div style={{ marginTop: 16, fontSize: '0.8rem', color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'center' }}>
-            <RefreshCw size={12} className="animate-spin" /> Syncing settings...
-          </div>
-        )}
-      </div>
-
-      {/* OBS FALLBACK SECTION */}
-      <div style={{ borderTop: '1px solid var(--surface-border)', paddingTop: 16 }}>
-        <h3 style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, color: '#aaa' }}>
-          <Video size={16} /> OBS Fallback Mode
-        </h3>
-
-        <div className="control-item">
-          <select
-            className="input-control"
-            value={obsMode}
-            onChange={(e) => setObsMode(e.target.value as 'browser' | 'window')}
-            style={{ marginBottom: 8, width: '100%', cursor: 'pointer' }}
-          >
-            <option value="browser">Mode: Browser Source (Recommended)</option>
-            <option value="window">Mode: Window Capture</option>
-          </select>
-          <input
-            type="password"
-            className="input-control"
-            placeholder="OBS WebSocket Password (optional)"
-            value={obsPassword}
-            onChange={(e) => setObsPassword(e.target.value)}
-            style={{ marginBottom: 8 }}
-          />
-          <button className="btn btn-secondary" style={{ width: '100%', display: 'flex', justifyContent: 'center', gap: 8 }} onClick={handleStartObs} disabled={isObsConnecting}>
-            {isObsConnecting ? <RefreshCw size={16} className="animate-spin" /> : <Monitor size={16} />}
-            {isObsConnecting ? 'Connecting...' : 'Start OBS WebSocket Integration'}
-          </button>
-        </div>
-
-        {obsStatus && (
-          <div style={{ marginTop: 12, padding: 12, background: obsStatus.error ? 'rgba(255,50,50,0.1)' : 'rgba(50,255,50,0.1)', borderRadius: 6, border: `1px solid ${obsStatus.error ? 'rgba(255,50,50,0.3)' : 'rgba(50,255,50,0.3)'}` }}>
-            <strong style={{ display: 'block', fontSize: '0.85rem', color: obsStatus.error ? '#ff6b6b' : '#51cf66' }}>{obsStatus.message}</strong>
-            {obsStatus.error && <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.4 }}>{obsStatus.error}</p>}
-          </div>
-        )}
-
-        <div style={{ marginTop: 16, borderTop: '1px solid var(--surface-border)', paddingTop: 16 }}>
-          <button className="btn" style={{ width: '100%', background: 'var(--surface-light)', color: 'var(--text-primary)', display: 'flex', justifyContent: 'center', gap: 8 }} onClick={onEnterObsMode}>
-            Enter Clean Feed (Manual Mode)
-          </button>
-          <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', textAlign: 'center', marginTop: 8, lineHeight: 1.4 }}>
-            Only needed if Native Camera is blocked.
-          </p>
-        </div>
       </div>
     </div>
   );

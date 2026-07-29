@@ -15,16 +15,19 @@ import com.opencambridge.android.server.UpdateSettingsRequest
  * HTTP API (which remains for remote clients only).
  *
  * Handlers are registered by StreamService while it is alive and cleared on
- * destroy; callers fall back to a local persist when nothing is registered.
+ * destroy. Pipeline handlers are suspend functions so the phone UI receives
+ * the same authoritative completion/conflict/failure result as HTTP clients;
+ * it never mutates a second local copy of pipeline settings.
  */
 object ServiceBridge {
-    @Volatile var applyPatch: ((UpdateSettingsRequest, String?) -> Unit)? = null
-    @Volatile var setTorch: ((Boolean) -> Unit)? = null
-    @Volatile var setLinearZoom: ((Float) -> Unit)? = null
-    @Volatile var setZoomRatio: ((Float) -> Unit)? = null
-    @Volatile var startCamera: (() -> Unit)? = null
-    @Volatile var stopCamera: (() -> Unit)? = null
-    @Volatile var recoverCamera: (() -> Unit)? = null
+    @Volatile var applyPatch: (suspend (UpdateSettingsRequest, String?) -> PipelineResult)? = null
+    @Volatile var setTorch: (suspend (Boolean, Long, String, String) -> PipelineResult)? = null
+    @Volatile var setLinearZoom: (suspend (Float, Long, String, String) -> PipelineResult)? = null
+    @Volatile var setZoomRatio: (suspend (Float, Long, String, String) -> PipelineResult)? = null
+    @Volatile var startCamera: (suspend () -> PipelineResult)? = null
+    @Volatile var stopCamera: (suspend () -> PipelineResult)? = null
+    @Volatile var recoverCamera: (suspend () -> PipelineResult)? = null
+    @Volatile var previewSurfaceChanged: (suspend (Boolean) -> PipelineResult)? = null
 
     val isServiceRunning: Boolean get() = applyPatch != null
 
@@ -36,5 +39,6 @@ object ServiceBridge {
         startCamera = null
         stopCamera = null
         recoverCamera = null
+        previewSurfaceChanged = null
     }
 }

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { CameraOff, RefreshCw } from 'lucide-react';
 import { buildUrl } from '../services/api';
+import Nv12RingPreview from './Nv12RingPreview';
 
 interface PreviewProps {
   baseUrl: string;
@@ -84,10 +85,10 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
   }, []);
 
   // Human-readable state for the overlay.
-  const rebinding = lifecycle === 'STARTING' || lifecycle === 'REBINDING';
+  const rebinding = lifecycle === 'STARTING' || lifecycle === 'RECONFIGURING' || lifecycle === 'RECOVERING';
   const stopped = lifecycle === 'STOPPED' || lifecycle === 'STOPPING';
   const offline = lifecycle === 'OFFLINE' || lifecycle === 'UNKNOWN';
-  const cameraError = lifecycle === 'ERROR';
+  const cameraError = lifecycle === 'FAILED';
   const statusMsg = offline ? 'Android server unreachable'
     : cameraError ? 'Camera error — check the phone Logs tab'
     : stopped ? 'Camera stopped'
@@ -97,7 +98,6 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
   const showOverlay = isError || rebinding || stopped || offline || cameraError;
 
   const layout = serverStatus?.aspectRatio || 'auto';
-  const mirror = serverStatus?.mirror || false;
 
   // The phone streams already-rotated, always-upright frames. The orientation
   // mode only shapes this VIEW:
@@ -112,9 +112,9 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
     framePortrait; // auto
   const boxClass = boxPortrait ? 'layout-portrait' : 'layout-landscape';
 
-  // No content rotation here (frames arrive rotated) — mirror only.
+  // MJPEG pixels arrive fully transformed (rotation and mirror) from Android.
   const rotatorStyle: any = {
-    transform: `translate(-50%, -50%) scaleX(${mirror ? -1 : 1})`,
+    transform: 'translate(-50%, -50%)',
     width: boxSize.w ? `${boxSize.w}px` : '100%',
     height: boxSize.h ? `${boxSize.h}px` : '100%',
   };
@@ -128,11 +128,21 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
   // - Auto: box always matches the frame, so the user's fit mode applies as-is.
   const effectiveFit =
     layout === '16:9' && framePortrait ? 'fit' : fitMode;
+  const h264Primary = (serverStatus?.activeStreamMode || serverStatus?.streamMode) === 'h264';
+  const h264Active = h264Primary && lifecycle === 'STREAMING';
+  const previewSessionKey = [
+    timestamp,
+    serverStatus?.pipelineGeneration ?? serverStatus?.snapshot?.generation ?? 0,
+    serverStatus?.activeStreamMode || serverStatus?.streamMode || '',
+    serverStatus?.encodedWidth || 0,
+    serverStatus?.encodedHeight || 0,
+    serverStatus?.selectedFps || serverStatus?.fps || 0,
+  ].join(':');
 
   return (
     <div className="preview-wrapper animate-fade">
       <div className={`preview-stage ${boxClass}`} ref={boxRef}>
-        <div className="stream-rotator" style={rotatorStyle}>
+        {!h264Primary && <div className="stream-rotator" style={rotatorStyle}>
           <img
             ref={imgRef}
             src={mjpegUrl}
@@ -142,9 +152,13 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
             alt="Live Stream"
             style={{ opacity: isError ? 0 : 1 }}
           />
-        </div>
+        </div>}
 
-        {showOverlay && (
+        {h264Active ? (
+          // Every producer generation gets a fresh renderer. A stale READY flag,
+          // sequence cursor or texture can never survive a rebind/codec switch.
+          <Nv12RingPreview key={previewSessionKey} fitMode={effectiveFit} />
+        ) : showOverlay && (
           <div className="preview-overlay">
             {rebinding ? <RefreshCw size={48} opacity={0.6} className="animate-spin" /> : <CameraOff size={48} opacity={0.5} />}
             <div>{statusMsg}</div>
@@ -156,21 +170,28 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
           </div>
         )}
 
-        {!showOverlay && (
-          <button
-            className="btn btn-secondary"
-            style={{ position: 'absolute', top: 16, right: 16, padding: '6px 12px', fontSize: '0.8rem', background: 'rgba(0,0,0,0.5)' }}
-            onClick={reloadPreview}
-          >
-            <RefreshCw size={14} /> Reload
-          </button>
-        )}
-
-        {!isError && serverStatus?.streamMode === 'h264' && (
-          <div style={{ position: 'absolute', bottom: 16, left: 16, padding: '4px 10px', fontSize: '0.7rem', color: '#ffb300', background: 'rgba(0,0,0,0.6)', border: '1px solid rgba(255,179,0,0.4)', borderRadius: 4 }}>
-            H.264 active — this preview is a ~5 fps snapshot; the virtual camera runs at full rate
+        {(h264Active || !showOverlay) && (
+          <div className="vf-actions">
+            <button className="btn btn--sm" onClick={reloadPreview}>
+              <RefreshCw size={12} /> Reload
+            </button>
           </div>
         )}
+
+        {/* Viewfinder readout: what is actually being encoded, on the glass
+            where the operator is already looking. */}
+        {(h264Active || !showOverlay) && (
+          <div className="vf-hud">
+            <b>{serverStatus?.encodedWidth || '—'}×{serverStatus?.encodedHeight || '—'}</b>
+            <i>/</i>
+            <b>{serverStatus?.snapshot?.actual?.encodedFps || serverStatus?.snapshot?.selected?.fps || serverStatus?.fps || '—'}</b> fps
+            <i>/</i>
+            <b>{(serverStatus?.activeStreamMode || serverStatus?.streamMode || '—').toString().toUpperCase()}</b>
+            {serverStatus?.mirror && <><i>/</i>MIRROR</>}
+            {Number(serverStatus?.rotationDegrees) > 0 && <><i>/</i>{serverStatus.rotationDegrees}°</>}
+          </div>
+        )}
+
       </div>
     </div>
   );

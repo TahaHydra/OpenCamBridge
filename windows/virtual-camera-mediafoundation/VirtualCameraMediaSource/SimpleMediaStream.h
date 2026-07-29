@@ -10,6 +10,10 @@
 #include "SimpleFrameGenerator.h"
 #include "SharedMemoryClient.h"
 
+#include <atomic>
+#include <mutex>
+#include <wil/resource.h>
+
 namespace winrt::WindowsSample::implementation
 {
     struct SimpleMediaStream : winrt::implements<SimpleMediaStream, IMFMediaStream2>
@@ -54,6 +58,12 @@ namespace winrt::WindowsSample::implementation
         _Requires_lock_held_(m_Lock) HRESULT StartInternal(bool bSendEvent, IMFMediaType* pNewMediaType);
         _Requires_lock_held_(m_Lock) HRESULT StopInternal(bool bSendEvent);
 
+        // Throttle sample delivery to the negotiated frame interval so the
+        // virtual camera behaves like a real device instead of serving a sample
+        // on every RequestSample spin (which drove ~340k requests for ~150
+        // frames and pegged CPU). Called without m_Lock held.
+        void PaceToFrameRate();
+
         winrt::slim_mutex  m_Lock;
 
         wil::com_ptr_nothrow<IMFMediaSource> m_parent;
@@ -72,6 +82,25 @@ namespace winrt::WindowsSample::implementation
         DWORD m_dwStreamId = 0;
         MFSampleAllocatorUsage m_allocatorUsage;
         SharedMemoryClient m_shmClient;
+                // Single presentation series, rebased from the playout schedule.
+                LONGLONG m_streamEpoch100ns = 0;
+                LONGLONG m_lastSampleTime100ns = 0;
+                // Last successfully delivered pixels, repeated on a transient ring
+                // failure so a hiccup never becomes a visible flash.
+                std::vector<BYTE> m_lastGoodFrame;
+                DWORD m_lastGoodFrameLength = 0;
+
+        // FrameServer may issue RequestSample calls concurrently. One request
+        // owns pacing, the ring copy, and sample publication as a transaction;
+        // otherwise a later caller can finish its wait while the previous
+        // 3-6 MB frame is still being copied and both samples publish as a
+        // short/long catch-up pair.
+        std::mutex m_sampleRequestLock;
+        std::atomic<LONGLONG> m_frameDuration100ns{ 333333 }; // negotiated interval, 30 fps default
+        // Absolute deadline for the NEXT sample, advanced by exactly one interval each
+        // time so timer overshoot cannot accumulate across frames.
+        std::atomic<LONGLONG> m_nextDeadline100ns{ 0 };
+        wil::unique_handle m_pacingTimer;                     // high-resolution waitable timer
     };
 }
 

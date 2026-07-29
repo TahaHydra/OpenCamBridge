@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test src/services/desktopBridge.test.mjs src/services/pipelineSyncPolicy.test.mjs src/services/signalChainPolicy.test.mjs && npm run test:ocb2",
+    "test:ocb2": "node ../../protocol/conformance/run-browser-corpus.cjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

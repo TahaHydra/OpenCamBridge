@@ -1,270 +1,240 @@
-# OpenCamBridge Protocol V1
+# OpenCamBridge Protocol V2
 
-## Security and Auth
+OCB2 is the low-latency H.264 transport between the Android Camera2 encoder and
+the Windows producer. TCP packet boundaries have no meaning: receivers parse
+self-delimiting records and pass one complete H.264 access unit at a time to the
+decoder. All integers are little-endian.
 
-- **usbOnly (Default)**: Server binds to `127.0.0.1`. No token required. Only
-  reachable from the phone itself or through `adb forward` over USB.
-- **lanToken**: Server binds to `0.0.0.0`. Every endpoint except `/health`
-  requires the access token, via the `?token=...` query parameter or the
-  `X-OpenCamBridge-Token` header.
-- Unauthenticated LAN access is not supported.
+MJPEG V1 remains available at `/stream.mjpeg` as a compatibility fallback.
 
-Enforcement rules (implemented in `ControlServer`):
+## Security and endpoints
 
-1. The token requirement is decided by the **bind-time** access mode, not the
-   live setting. If the server was bound to `0.0.0.0`, tokens stay mandatory
-   even if `accessMode` is later changed at runtime; the new mode only takes
-   effect after the streaming service restarts and rebinds.
-2. `accessMode`, `port`, and `accessToken` can only be changed by **loopback**
-   clients (the phone UI, or a desktop connected through USB `adb forward`).
-   Requests from LAN addresses that include these fields have them ignored,
-   even with a valid token.
-3. Token comparison is constant-time. An empty configured token never matches.
-4. Tokens are 32 hex characters (128 bits, generated from `UUID.randomUUID()`).
-5. CORS is restricted to the desktop app origins (`tauri.localhost`,
-   `localhost:1420`, `127.0.0.1:1420`). The phone web UI and `/obs` page are
-   same-origin and unaffected.
+- `usbOnly` binds Android to loopback and is reached through a serial-specific
+  `adb forward`. It requires no token.
+- `lanToken` binds to the LAN and requires `X-OpenCamBridge-Token` (preferred)
+  or a `token` query parameter on every endpoint except `/health`.
+- Tokens are compared in constant time. LAN callers cannot change the access
+  mode, port, or token.
+- The desktop passes the token to the producer through its environment, never
+  through process arguments. The producer removes the variable immediately
+  after reading it.
 
-## Ports
+Streaming endpoints:
 
-- HTTP control/API: 8080 (or dynamically assigned)
-- Stream: same HTTP server for V1
+- `GET /stream.ocb2` — OCB2 records, content type
+  `application/vnd.opencambridge.ocb2`.
+- `GET /stream.mjpeg` — multipart MJPEG compatibility stream. Each part has a
+  validated `Content-Length`.
+- `GET /stream.h264` — retired raw-NAL endpoint; returns HTTP 410.
 
-## Endpoints
+The existing control, settings, camera, OBS, health, and metrics endpoints are
+unchanged.
 
-GET /health  
-Returns plain text `OK`. (No token required.)
+## OCB2 record header
 
-GET /api/device/info  
-Returns app/device/server info.
+Every record starts with this fixed 48-byte header, followed immediately by
+`payload_length` bytes.
 
-GET /api/camera/list  
-Returns available Android cameras.
+| Offset | Size | Field | Meaning |
+|---:|---:|---|---|
+| 0 | 4 | magic | ASCII `OCB2` |
+| 4 | 2 | version | `2` |
+| 6 | 2 | header size | `48` |
+| 8 | 2 | record type | See below |
+| 10 | 2 | reserved | Must be zero |
+| 12 | 4 | flags | Bit field below |
+| 16 | 8 | sequence | Monotonic video-frame sequence; non-video records reuse the latest value |
+| 24 | 8 | capture timestamp | Monotonic nanoseconds |
+| 32 | 8 | encoder timestamp | Signed MediaCodec presentation time in microseconds |
+| 40 | 4 | payload length | Maximum 16 MiB |
+| 44 | 4 | send delta | Microseconds since the previous video record was queued for transmission; `0` when unknown |
 
-GET /api/camera/status  
-Returns current camera/stream state.
+### Send delta
 
-GET /api/camera/controls
-Returns available control options for the current camera.
+This field was reserved through version 2 and is now diagnostic, which is why the
+version and header size did not change: senders that never wrote it emitted zero,
+and readers that ignore it behave exactly as before. Receivers must treat `0` as
+"unknown" rather than "no delay".
 
-GET /api/camera/capabilities
-Returns camera capabilities (resolutions, FPS, etc.).
+It is deliberately a delta and not an absolute timestamp. The phone's monotonic
+clock and the desktop's have no fixed relationship, so absolute values are not
+comparable across the two machines, but an interval is. Holding the sender's
+deltas next to the receiver's arrival deltas is what separates *the encoder
+emitted late* from *the transport batched* — the one question that frame-rate
+averages cannot answer, because bursty and even delivery average identically.
 
-GET /api/settings
-Returns current active settings.
+Record types:
 
-POST /api/settings
-Updates multiple settings at once. Security-critical fields (`accessMode`,
-`port`, `accessToken`) are accepted only from loopback clients (see above).
-`accessMode`/`port` changes require a streaming service restart to take
-effect, because the server socket binds once at startup.
+| Value | Name | Payload |
+|---:|---|---|
+| 1 | stream information | UTF-8 JSON |
+| 2 | codec configuration | Annex-B SPS/PPS bytes |
+| 3 | video access unit | One complete Annex-B H.264 access unit |
+| 4 | heartbeat | Empty |
+| 5 | end of stream | Optional UTF-8 reason |
+| 6 | error | UTF-8 error text |
 
-POST /api/stream/start  
-Starts camera capture.
+Flags are `codec configuration = 1`, `keyframe = 2`, `discontinuity = 4`, and
+`end of stream = 8`.
 
-POST /api/stream/stop  
-Stops camera capture.
+The discontinuity flag is a property of the stream, not of one record type, and
+is meaningful on any record. A heartbeat may carry it as a bare marker: Android
+sends one after discarding a slow client's queued records, so the client resets
+in place instead of the connection being closed. A video access unit always
+carries one complete access unit and is never used as an empty marker.
 
-POST /api/stream/recover
-Attempts to recover from camera errors.
+The stream-information JSON contains `codec`, `framing`, `width`, `height`,
+`fpsNumerator`, `fpsDenominator`, `bitrate`, `cameraId`, `encoderName`,
+`hardwareEncoder`, and `pixelFormat`. V2 currently requires H.264,
+`annex-b-access-units`, and NV12 decoder output.
 
-GET /api/stream/metrics
-Returns performance metrics.
+## Connection and recovery rules
 
-POST /api/camera/switch  
-Switches camera by camera id.
+On each client connection Android sends stream information and current codec
+configuration, requests an encoder sync frame, and marks the restart as a
+discontinuity. A client resets any partial parser record on reconnect, flushes
+its decoder on a discontinuity, and waits for a keyframe before resuming decode.
+It never scans arbitrary TCP chunks for Annex-B start codes.
 
-POST /api/camera/zoom
-POST /api/camera/torch
-POST /api/camera/autofocus
-Various camera hardware controls. Torch state is remembered and restored
-after camera rebinds.
+For USB sessions the desktop retains the explicitly selected ADB serial and
+local port. It periodically re-applies only that device's `tcp:<port>` forward,
+allowing the producer's normal HTTP reconnect loop to recover after a cable
+disconnect without restarting the desktop application or producer.
 
-POST /api/settings/resolution  
-Changes requested resolution.
+The encoder uses Camera2 directly with the MediaCodec input surface, no
+ImageAnalysis/YUV conversion. It uses no B-frames, a one-second keyframe
+interval, bounded bitrate, asynchronous output, and output presentation
+timestamps. Advertised regular modes are complete tuples: camera ID, output
+format, resolution, AE FPS range, and minimum frame duration. A rate is
+selectable only when that exact Camera2 output/resolution tuple can meet it and
+the encoder also supports it. A camera-wide 60 FPS AE range does not turn a
+30 FPS 1080p output into a 60 FPS mode. The usual preference order is:
 
-POST /api/settings/fps  
-Changes requested FPS.
+1. 1920x1080 at 60 fps
+2. 1280x720 at 60 fps
+3. 1920x1080 at 30 fps
+4. 1280x720 at 30 fps
 
-POST /api/settings/jpeg-quality  
-Changes MJPEG JPEG quality.
+The first requested/supported mode is used. Unsupported requests fall through
+the preference list. Encoder or Windows decoder failure activates MJPEG. The
+selected source rate is carried in stream metadata and remains authoritative
+through the producer, ring, preview, and virtual-camera mode list.
 
-POST /api/settings/preview-fit-mode
-POST /api/settings/aspect-ratio
-Additional settings endpoints.
+Stream information also carries the YUV matrix, nominal range, primaries, and
+transfer function reported by MediaCodec. HD SDR defaults to BT.709 limited
+range and SD SDR to BT.601 limited range when the encoder omits a value.
 
-GET /api/logs
-POST /api/logs/clear
-Log management endpoints.
+## Windows decode and frame ring
 
-GET /stream.mjpeg  
-Returns `multipart/x-mixed-replace; boundary=FRAME` MJPEG stream. **(Stable)**
-Each part is a complete JPEG with a `Content-Length` header. Output is paced
-to the configured FPS. The connection survives camera rebinds (frames pause,
-the socket stays open); it closes when streaming stops or errors.
+The primary Windows decoder is the Media Foundation H.264 MFT with a D3D11
+device manager. Its output subtype is NV12. OpenH264 is retained only as the
+software decoder fallback, and its I420 result is interleaved directly to NV12.
+Neither H.264 path converts frames to BGRA.
+If the software decoder cannot sustain at least 80 percent of the selected rate
+for three measurement windows, the producer asks Android to rebind to MJPEG.
 
-GET /stream.h264
-Returns a raw H.264 byte stream. **(Experimental - see "H.264 status" below.)**
+Producer and virtual-camera DLL share a version-4 `OCBR` ring. The header is 320
+bytes followed by sixteen equal slots. Each slot has a 128-byte metadata header
+and space for at most a 1920x1080 NV12 frame, so the mapping is roughly 50 MB.
 
-GET /api/stream/info
-Returns stream metadata: `mode`, `resolution`, `fps`, `h264Bitrate`, plus
-`codec`, `container`, `experimental`, and `notes` describing exactly what the
-active stream is.
+Ring metadata includes the published slot and sequence, producer heartbeat,
+consumer-selected width/height/rate, and total virtual-camera unique/repeated
+sample counters. Slot metadata contains write and commit epochs, sequence,
+capture/receive/decode timestamps, dimensions, Y/UV strides, pixel format,
+payload size, flags, data offset, packed colour descriptor, and NV12 bytes. The
+descriptor uses a previously reserved field, so the ring ABI is unchanged.
 
-GET /obs
-Returns a clean HTML page displaying the MJPEG stream for browser-based OBS
-captures. Accepts `fit`, `mirror`, `rotate` query parameters (and `token` in
-LAN mode).
+The producer fills a non-published slot, commits it with release ordering, then
+atomically publishes it. The virtual camera copies only a stable selected slot
+whose epoch and all metadata validate. Its complete Media Foundation sample
+request is serialized so concurrent client requests cannot re-arm one timer or
+publish catch-up samples while the previous frame is still being copied. A
+repeated sample reuses the last stable frame and increments only the repeated
+counter.
 
-## H.264 status (experimental, truthful description)
+### Frame history and consumer cursors
 
-What exists today:
+Version 4 makes the ring a bounded history rather than a single latest frame. The
+distinction matters because the two consumers — the virtual camera and the desktop
+preview — read on unrelated clocks, and `published_slot` can only ever name the
+newest frame, never what came before it.
 
-- Android encodes with `MediaCodec` (`video/avc`) and serves the encoder
-  output at `/stream.h264` with content type `video/h264`.
-- Bitstream: **Annex B** byte stream (start-code delimited NAL units), no
-  container, no framing protocol, no timestamps on the wire.
-- SPS/PPS: the codec-config buffer is cached and sent as the first bytes to
-  each new subscriber when available. Some device encoders additionally repeat
-  SPS/PPS inline before IDR frames. Consumers must tolerate both.
-- Encoder profile: the encoder is asked for **Constrained Baseline** (no
-  CABAC, no B-slices, no 8x8 transform) when it advertises support, because
-  that is the H.264 subset the Windows-side openh264 software decoder handles
-  most reliably. Encoders that do not offer the profile keep their default.
-  Keyframe interval and bitrate are configurable via settings.
-- 1080p60 caveat: real-time software decoding of 1080p60 H.264 with openh264 is
-  CPU-bound and may not sustain 60 fps; when the decoder falls behind, the
-  producer drops to the next keyframe (visible as a brief jump) and reports the
-  transient error in `last_error`. MJPEG is the recommended path for 1080p60.
-- Slow subscribers are disconnected rather than having NAL units dropped
-  (dropping arbitrary NALs would corrupt the stream until the next IDR).
+`ring_write_sequence` is a monotonic count of committed writes, published after the
+slot commits, so it is exactly "how many frames are fully written". Write *n* lives in
+slot `(n - 1) % slot_count`, which lets a consumer holding a cursor determine which
+frames the ring still holds. Each slot repeats its own `ring_sequence`, so a consumer
+can confirm the slot still holds the write it selected. `stream_generation` is bumped
+on every reconnect and geometry change; without it a restart is indistinguishable from
+catastrophic loss, since both look like the sequence jumping.
 
-- The encoder negotiates a concrete raw input layout (NV12 or I420) with the
-  device codec and is configured only after CameraX reports the actually
-  selected capture size, so the bitstream geometry always matches the frames.
-- The encoder is asked to repeat SPS/PPS before IDR frames
-  (`prepend-sps-pps-to-idr-frames`); encoders that do not support the key
-  ignore it, so consumers must still tolerate config-only startup.
-- Every new `/stream.h264` subscriber triggers an immediate sync-frame
-  request, so consumers get decodable video right away instead of waiting up
-  to a keyframe interval.
-- B-slices are disabled (`max-bframes` 0): lower latency, and the openh264
-  decoder on the Windows side does not support them. Low-latency and
-  realtime-priority hints are set where the encoder supports them.
-- `h264Bitrate` changes are applied to the running encoder via
-  `MediaCodec.setParameters` (no camera rebind, no stream interruption);
-  `h264KeyframeInterval` changes still require a rebind.
+Cursors are consumer-local: neither consumer may disturb the other's accounting. The
+selection arithmetic is generated into all three languages from
+`protocol/ring-abi.schema.json` rather than hand-written per consumer, because a
+disagreement about which slot holds a given write would make one consumer read a
+different frame than the one it reports. The Rust copy carries the tests.
 
-Windows consumption (experimental):
+The virtual camera and desktop preview have separate bounded cursors. The desktop
+preview's first call returns the newest committed frame immediately, then drains newer
+live frames in order and skips forward when more than three are pending. The virtual
+camera starts immediately from a stable frame about 90-100 ms behind the live edge,
+then consumes equal-rate sequences in order. Neither cursor changes the other's state.
+Both consumers can count *skipped* frames separately from frames already overwritten
+in the ring.
 
-- The Rust frame producer's `--source h264` mode decodes the Annex B stream
-  with the bundled **openh264** decoder (compiled from source at build time)
-  and writes BGRA frames to the shared framebuffer through the same
-  rotation/mirror/resize pipeline as MJPEG.
-- On decoder-queue overflow or a mid-stream reconnect, the producer drops
-  data only until the next SPS/PPS/IDR sync point rather than feeding the
-  decoder a corrupt bitstream; decode errors before the first keyframe are
-  expected and reported in `last_error`, then clear on recovery.
-- This path is **experimental until validated on real devices**; MJPEG
-  remains the Stable V1 path.
+### Playout scheduling
 
-## Shared framebuffer format (Windows IPC)
+Media Foundation requests are paced at the negotiated output interval. A missed
+deadline is rebased to the current time; it is never repaid with a sub-frame catch-up
+interval. The virtual camera uses a fixed time-sized sequence queue rather than the
+adaptive capture-timestamp servo. The queue target is 90 ms rounded up to whole source
+intervals: three intervals (about 100 ms) at 30 fps and six at 60 fps.
 
-Producer: `rust-frame-producer.exe`. Consumer: the Media Foundation virtual
-camera media source. Backing store, in order of preference:
+For equal source and output rates, the consumer releases the next committed sequence
+in order. If output is faster than the source, it repeats the previous stable sequence
+until the next exists. If the source is faster than output, it recentres at the fixed
+live-edge delay, which performs deterministic rate conversion. A generation change
+immediately selects a stable frame from the new generation; retained slots from the
+old stream are never replayed.
 
-1. File mapping of `C:\ProgramData\OpenCamBridge\framebuffer.bin`
-   (synchronized with `LockFileEx`), or
-2. Named section `Global\OpenCamBridgeFrameBuffer` with mutex
-   `Global\OpenCamBridgeFrameMutex`.
+This deliberately replaces the adaptive scheduler in the native shipping path. Live
+probing showed that scheduler pinning its target at 140 ms while a healthy 30 fps ring
+advanced, reducing virtual-camera unique output to 22-25 fps. The fixed queue delivered
+3,044 unique frames from 3,046 ring writes over 101.6 seconds, with three isolated
+repeats and no catch-up burst.
 
-Layout: a packed little-endian header followed immediately by pixel data.
-Pixel rows are stored **top-down** (row 0 = top of the image). The Media
-Foundation consumer copies rows straight and declares the surface top-down by
-setting a **positive** `MF_MT_DEFAULT_STRIDE` (= width*4) on its RGB32 media
-types. RGB32 in MF otherwise defaults to bottom-up (negative derived stride),
-which makes consumers such as OBS render the image upside down. Orientation is
-fixed via that media-type attribute, never by flipping rows in the copy (a
-flipped copy with a negative locked pitch writes out of bounds → black screen).
+The desktop preview uses its own bounded cursor queue and never modifies
+virtual-camera consumer state.
 
-| Field         | Type | Meaning                                   |
-|---------------|------|-------------------------------------------|
-| magic         | u32  | `0x4642434F` ("OCBF")                     |
-| version       | u32  | 1                                         |
-| width         | u32  | Frame width in pixels                     |
-| height        | u32  | Frame height in pixels                    |
-| stride        | u32  | Bytes per row (width * 4)                 |
-| format        | u32  | 1 = BGRA32                                |
-| frame_counter | u64  | Monotonic frame counter                   |
-| timestamp_qpc | u64  | QueryPerformanceCounter at write time     |
-| data_size     | u32  | Payload size in bytes (width*height*4)    |
-| reserved      | u32  | 0                                         |
+The shared object grants frame write access only to SYSTEM, LOCAL SERVICE, and
+the current application user. Creation fails if the current user SID cannot be
+resolved; it never falls back to a broadly writable ACL.
 
-The mapping is sized for at most 1920x1080 BGRA (`1920*1080*4 + 1024` bytes);
-the producer refuses larger configurations.
+## Media Foundation virtual-camera formats
 
-## Rust producer CLI (summary)
+The source advertises the current source-matching common NV12 type first, then
+safe compatibility modes:
 
-```
-rust-frame-producer --source <mjpeg|test-pattern|h264> --url <stream url>
-                    [--width W] [--height H] [--fps N] [--profile NAME]
-                    [--token TOKEN]       # sent as X-OpenCamBridge-Token
-                    [--rotate 0|90|180|270]  # explicit output rotation
-                    [--mirror]            # horizontal flip, applied after rotation
-```
+- NV12 1920x1080 30 fps
+- NV12 1280x720 30 fps
+- NV12 640x480 30 fps
+- NV12 1920x1080 60 fps only when the source is genuinely at least 50 fps
+- NV12 1280x720 60 fps only when the source is genuinely at least 50 fps
+- YUY2 1920x1080, 1280x720, and 640x480 at 30 fps for DirectShow/WebRTC
+- RGB32 1280x720 30 fps compatibility fallback
+- RGB32 640x480 30 fps compatibility fallback
 
-Without `--rotate`, portrait sources are auto-rotated 90 degrees into
-landscape outputs (legacy behavior). One metrics JSON line is printed per
-second on stdout; `last_error` is `null` or a human-readable string.
+NV12 is copied directly. RGB32 conversion happens only when a legacy consumer
+selects that fallback. Sample timestamps are monotonically increasing Media
+Foundation 100-nanosecond units. A frame is reported as unique only when its
+source sequence changes. Every media type carries matching BT.709 matrix,
+nominal-range, primaries, and transfer-function attributes.
 
-## Rotation model (V1, MJPEG)
+## Metrics
 
-Rotation is applied to the actual pixels **on the phone**, before JPEG
-encoding, in two composed parts:
-
-1. **Auto-upright**: the streaming service tracks the phone's *physical*
-   orientation (accelerometer `OrientationEventListener`, works in background
-   and with display auto-rotate locked) and feeds it to CameraX as
-   `targetRotation`; each frame is then rotated by
-   `imageInfo.rotationDegrees`. Held vertical, horizontal, or upside down, the
-   streamed video is always upright.
-2. **Manual offset**: `displayRotation` (0/90/180/270) is added on top. It
-   remains in the API, but the product UIs no longer expose a rotate button —
-   they expose an **orientation mode** instead (stored in `aspectRatio`:
-   `auto` | `16:9` | `9:16`) that shapes the preview canvas: `auto` follows the
-   phone (vertical phone -> 9:16 preview box), the other two pin it, with
-   letterboxing on mismatch. Selecting a mode resets `displayRotation` to 0 so
-   stale offsets cannot leave the stream sideways. The virtual camera output
-   itself stays 16:9 (consuming apps expect a landscape webcam); vertical video
-   is pillarboxed there.
-
-Because `/stream.mjpeg` frames arrive already rotated, **no consumer rotates
-again**: the desktop app launches the producer with `--rotate 0`, the `/obs`
-page uses `rotate=0`, and the desktop preview applies only mirroring. Frame
-dimensions on the wire flip between landscape and portrait as the phone turns;
-consumers must not assume a fixed frame size.
-
-Producer fitting into the fixed output size: the Media Foundation virtual
-camera renders a fixed output resolution (`--width` x `--height`), so each
-frame is fit into that box. A frame whose orientation matches the box is
-resized to fill (a plain no-op resize in the matching-16:9 case); a portrait
-frame in the landscape box is scaled to fit preserving aspect ratio and
-centered with black side bars — never cropped, never stretched. The `--rotate`
-CLI flag still exists for standalone/manual producer use, but the desktop app
-always passes 0 now.
-
-## V1 scope
-
-- MJPEG is the stable V1 path and the default codec.
-- H.264 is **developer-only** for V1: it is hidden behind the desktop app's
-  Developer/Experimental mode, never auto-starts, and the bundled openh264
-  decoder still fails (`Native:16`) on some phone encoder output. It remains in
-  the tree for future work but is not a V1 release path.
-- Camera capabilities (per-lens torch availability and per-resolution max FPS)
-  are reported by `/api/camera/list` so the UI only offers controls the active
-  lens actually supports.
-- No audio.  
-- No iOS.  
-- No macOS virtual camera driver yet.
-- No Bluetooth video.  
-- No cloud, no accounts, no telemetry.
+Metrics keep camera capture, phone encoded, transport received, producer
+decoded, ring written, preview received/displayed, and virtual-camera
+requested/unique/repeated FPS separate. Preview sequence skips, IPC transfer
+time, WebGL upload time, producer processing time, phone encode time, playout
+depth/target, underruns, late drops, and transport bandwidth retain those
+literal meanings. MJPEG queue/drop counters are shown only in MJPEG mode.
+Producer processing time is not labelled as end-to-end latency.

@@ -7,6 +7,17 @@ Write-Host "=== Build OpenCamBridge Media Foundation DLL ===" -ForegroundColor C
 
 $ErrorActionPreference = "Stop"
 
+# Some launchers inject both PATH and Path into the Windows environment block.
+# MSBuild/CL enumerates that block into a case-insensitive dictionary and then
+# fails with MSB6001 before compiling anything. Canonicalize to one Path entry.
+$pathLines = & "$env:SystemRoot\System32\cmd.exe" /c "set path" 2>$null
+$canonicalPath = ($pathLines | Where-Object { $_ -match '^(?i:path)=' } | Select-Object -Last 1) -replace '^[^=]*=', ''
+if ($canonicalPath) {
+    [Environment]::SetEnvironmentVariable('PATH', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('Path', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('Path', $canonicalPath, 'Process')
+}
+
 $root = $PSScriptRoot
 $mfRoot = "$root\windows\virtual-camera-mediafoundation"
 $vcxproj = "$mfRoot\VirtualCameraMediaSource\VirtualCameraMediaSource.vcxproj"
@@ -19,6 +30,17 @@ $targetDll = "$mfRoot\VirtualCamera_Installer\x64\Release\VirtualCameraMediaSour
 # desktop app launches it from the path below, so build it and put it there.
 $builtInstaller = "$mfRoot\x64\Release\VirtualCamera_Installer.exe"
 $targetInstaller = "$mfRoot\VirtualCamera_Installer\x64\Release\VirtualCamera_Installer.exe"
+$sourceCommit = (& git -C $root rev-parse HEAD).Trim()
+$abiSchema = Get-Content "$root\protocol\ring-abi.schema.json" -Raw | ConvertFrom-Json
+$abiVersion = $abiSchema.version
+& "$root\protocol\generate-ring-abi.ps1" -Check
+if ($LASTEXITCODE -ne 0) { throw "Ring ABI generated-file validation failed" }
+$generatedAbi = Get-Content "$mfRoot\VirtualCameraMediaSource\RingAbi.generated.h" -Raw
+if ($generatedAbi -notmatch '#define OCBR_ABI_HASH (0x[0-9a-f]+)ULL') { throw "Generated ring ABI fingerprint is missing" }
+$abiHash = $Matches[1]
+
+Write-Host "Source commit: $sourceCommit" -ForegroundColor Cyan
+Write-Host "Ring ABI: version=$abiVersion hash=$abiHash" -ForegroundColor Cyan
 
 $vsDevCmd = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
 
@@ -31,7 +53,6 @@ if (!$NoKill) {
 Write-Host "Stopping processes that can lock the DLL..." -ForegroundColor Yellow
 Stop-Process -Name obs64 -Force -ErrorAction SilentlyContinue
 Stop-Process -Name tauri-app -Force -ErrorAction SilentlyContinue
-Stop-Process -Name node -Force -ErrorAction SilentlyContinue
 Stop-Process -Name rust-frame-producer -Force -ErrorAction SilentlyContinue
 Stop-Process -Name VirtualCamera_Installer -Force -ErrorAction SilentlyContinue
 Stop-Service FrameServer -Force -ErrorAction SilentlyContinue
@@ -67,6 +88,7 @@ $vcrtTargets = "$mfRoot\packages\Microsoft.VCRTForwarders.140.$vcrtVer\build\nat
 if (!(Test-Path $cppwinrtExe) -or !(Test-Path $wilTargets) -or !(Test-Path $vcrtTargets)) {
     Write-Host "Restoring NuGet packages (CppWinRT $cppwinrtVer, WIL $wilVer, VCRTForwarders $vcrtVer)..." -ForegroundColor Yellow
     cmd /c "call `"$vsDevCmd`" -arch=amd64 && msbuild `"$vcxproj`" /t:Restore /p:RestorePackagesConfig=true /p:Configuration=Release /p:Platform=x64 $solutionDirArg /v:minimal && msbuild `"$installerProj`" /t:Restore /p:RestorePackagesConfig=true /p:Configuration=Release /p:Platform=x64 $solutionDirArg /v:minimal"
+    if ($LASTEXITCODE -ne 0) { throw "NuGet/MSBuild restore failed with exit code $LASTEXITCODE" }
     if (!(Test-Path $cppwinrtExe) -or !(Test-Path $wilTargets) -or !(Test-Path $vcrtTargets)) {
         Write-Host "NuGet restore failed: expected packages under $mfRoot\packages (needs network access on first build)." -ForegroundColor Red
         exit 1
@@ -80,6 +102,7 @@ Write-Host "Building VirtualCameraMediaSource.vcxproj with v143..." -ForegroundC
 $cmd = "call `"$vsDevCmd`" -arch=amd64 && msbuild `"$vcxproj`" /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 $solutionDirArg"
 
 cmd /c $cmd
+if ($LASTEXITCODE -ne 0) { throw "VirtualCameraMediaSource build failed with exit code $LASTEXITCODE" }
 
 if (!(Test-Path $builtDll)) {
     Write-Host "Build finished but DLL not found: $builtDll" -ForegroundColor Red
@@ -100,6 +123,7 @@ Write-Host "Building VirtualCamera_Installer.vcxproj (virtual camera host exe)..
 $cmdHost = "call `"$vsDevCmd`" -arch=amd64 && msbuild `"$installerProj`" /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 $solutionDirArg"
 
 cmd /c $cmdHost
+if ($LASTEXITCODE -ne 0) { throw "VirtualCamera host build failed with exit code $LASTEXITCODE" }
 
 if (!(Test-Path $builtInstaller)) {
     Write-Host "Build finished but host exe not found: $builtInstaller" -ForegroundColor Red
@@ -124,9 +148,22 @@ Get-Item $builtDll | Select-Object FullName,Length,LastWriteTime
 
 Write-Host "Installed DLL:" -ForegroundColor Green
 Get-Item $targetDll | Select-Object FullName,Length,LastWriteTime
+$builtDllHash = (Get-FileHash $builtDll -Algorithm SHA256).Hash
+$installedDllHash = (Get-FileHash $targetDll -Algorithm SHA256).Hash
+Write-Host "Built DLL SHA-256:     $builtDllHash" -ForegroundColor Cyan
+Write-Host "Installed DLL SHA-256: $installedDllHash" -ForegroundColor Cyan
+if ($builtDllHash -ne $installedDllHash) {
+    throw "Installed DLL hash does not match the built DLL. Refusing to report a successful camera build."
+}
 
 Write-Host "Virtual camera host exe:" -ForegroundColor Green
 Get-Item $targetInstaller | Select-Object FullName,Length,LastWriteTime
+
+Write-Host "Running native buffer-lock and NV12 resize fallback tests..." -ForegroundColor Yellow
+& $targetInstaller --self-test-pipeline
+if ($LASTEXITCODE -ne 0) {
+    throw "Virtual-camera native pipeline self-tests failed with exit code $LASTEXITCODE"
+}
 
 # The COM registration decides which DLL the Windows FrameServer actually
 # loads. If it points at another clone/path, rebuilding here changes nothing
@@ -140,10 +177,75 @@ try {
         Write-Host "  registered: $registeredDll" -ForegroundColor Red
         Write-Host "  this build: $targetDll" -ForegroundColor Red
         Write-Host "The camera keeps loading the registered DLL - your rebuild will NOT take effect." -ForegroundColor Red
-        Write-Host "Fix: run windows\virtual-camera-mediafoundation\register_hklm.bat as Administrator, then restart the camera pipeline." -ForegroundColor Yellow
+        throw "Registered/loaded DLL path differs from this build. Run register_hklm.bat as Administrator."
+    } elseif ($registeredDll) {
+        $registeredHash = (Get-FileHash $registeredDll -Algorithm SHA256).Hash
+        Write-Host "Loaded DLL path: $registeredDll" -ForegroundColor Cyan
+        Write-Host "Loaded DLL SHA-256: $registeredHash" -ForegroundColor Cyan
+        if ($registeredHash -ne $builtDllHash) {
+            throw "Registered DLL hash differs from the built DLL."
+        }
     }
 } catch {
-    Write-Host "Note: virtual camera COM object not registered yet. Run windows\virtual-camera-mediafoundation\register_hklm.bat as Administrator once." -ForegroundColor Yellow
+    if ($_.Exception.Message -like "*Cannot find path*" -or $_.Exception.Message -like "*does not exist*") {
+        Write-Host "Loaded DLL path: NOT REGISTERED" -ForegroundColor Yellow
+        Write-Host "Run windows\virtual-camera-mediafoundation\register_hklm.bat as Administrator once." -ForegroundColor Yellow
+    } else {
+        throw
+    }
+}
+
+# Cross-process identity validation. The registry path says what Windows will
+# load on the next activation; the live ring says what a currently attached
+# camera consumer actually loaded. Never label stale ring bytes as current.
+$producerExe = "$mfRoot\rust-frame-producer\target\release\rust-frame-producer.exe"
+$producerHash = if (Test-Path $producerExe) { (Get-FileHash $producerExe -Algorithm SHA256).Hash } else { "" }
+Write-Host "Producer executable: $producerExe" -ForegroundColor Cyan
+Write-Host "Producer SHA-256: $(if ($producerHash) { $producerHash } else { 'NOT BUILT' })" -ForegroundColor $(if ($producerHash) { 'Cyan' } else { 'Yellow' })
+
+$ringPath = "C:\ProgramData\OpenCamBridge\framebuffer.bin"
+$runtimeIdentityCurrent = $false
+$runtimeDllHash = ""
+$runtimeProducerHash = ""
+if (Test-Path $ringPath) {
+    try {
+        $header = New-Object byte[] 256
+        $stream = [System.IO.File]::Open($ringPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $read = $stream.Read($header, 0, $header.Length)
+        } finally {
+            $stream.Dispose()
+        }
+        if ($read -eq 256 -and [BitConverter]::ToUInt32($header, 0) -eq 0x5242434F -and [BitConverter]::ToUInt16($header, 4) -eq $abiVersion) {
+            $heartbeat = [BitConverter]::ToInt64($header, 40)
+            $heartbeatAge = ([Diagnostics.Stopwatch]::GetTimestamp() - $heartbeat) / [Diagnostics.Stopwatch]::Frequency
+            $runtimeIdentityCurrent = $heartbeat -gt 0 -and $heartbeatAge -ge 0 -and $heartbeatAge -lt 2.0
+            $runtimeDllHash = -join ($header[160..191] | ForEach-Object { $_.ToString('x2') })
+            $runtimeProducerHash = -join ($header[192..223] | ForEach-Object { $_.ToString('x2') })
+        }
+    } catch {
+        Write-Host "Runtime ring identity: UNAVAILABLE ($($_.Exception.Message))" -ForegroundColor Yellow
+    }
+}
+
+if ($runtimeIdentityCurrent) {
+    Write-Host "Loaded DLL SHA-256 (current ring): $runtimeDllHash" -ForegroundColor Cyan
+    Write-Host "Running producer SHA-256 (current ring): $runtimeProducerHash" -ForegroundColor Cyan
+    $identityErrors = @()
+    if ($runtimeDllHash -ne $builtDllHash.ToLowerInvariant()) {
+        $identityErrors += "loaded DLL differs from the built/installed DLL"
+    }
+    if ($producerHash -and $runtimeProducerHash -ne $producerHash.ToLowerInvariant()) {
+        $identityErrors += "running producer differs from the release producer executable"
+    }
+    if ($identityErrors.Count -gt 0) {
+        Write-Host "BINARY IDENTITY MISMATCH: $($identityErrors -join '; ')" -ForegroundColor Red
+        Write-Host "Remediation: stop camera consumers, run .\dev-build-vcam.ps1, then run the installer --register from an elevated PowerShell." -ForegroundColor Red
+        throw "OpenCamBridge built/installed/loaded identity mismatch"
+    }
+    Write-Host "Producer/built/installed/registered/loaded identities: PASSED" -ForegroundColor Green
+} else {
+    Write-Host "Loaded DLL/running producer identity: SKIPPED (no current ring heartbeat; not reported as ready)" -ForegroundColor Yellow
 }
 
 Write-Host "Media Foundation DLL + host build/copy done." -ForegroundColor Green

@@ -27,21 +27,21 @@ export default function LogsView({ onClose }: LogsViewProps) {
   }, [auto, refresh]);
 
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 9998, background: 'rgba(0,0,0,0.85)', display: 'flex', flexDirection: 'column', padding: 20 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-        <strong style={{ color: '#4dabf7', fontSize: '1rem' }}>Session Logs</strong>
-        <span style={{ color: '#666', fontSize: '0.72rem', wordBreak: 'break-all', flex: 1 }}>{path || 'No session file yet — connect to start one.'}</span>
-        <button className="btn btn-secondary" style={{ padding: '4px 10px', fontSize: '0.75rem' }} onClick={refresh}><RefreshCw size={13} /> Refresh</button>
-        <button className="btn btn-secondary" style={{ padding: '4px 10px', fontSize: '0.75rem' }} onClick={() => setAuto(a => !a)}>{auto ? 'Auto: ON' : 'Auto: OFF'}</button>
-        <button className="btn btn-secondary" style={{ padding: '4px 10px', fontSize: '0.75rem' }} onClick={() => navigator.clipboard.writeText(text)}><Copy size={13} /> Copy</button>
-        <button className="btn btn-secondary" style={{ padding: '4px 10px', fontSize: '0.75rem' }} onClick={() => logTestMarker('END', 'manual marker from Logs view').then(refresh)}>Mark</button>
-        <button className="btn btn-secondary" style={{ padding: '4px 10px', fontSize: '0.75rem' }} onClick={openLogsFolder}><FolderOpen size={13} /> Folder</button>
-        <button className="btn btn-secondary" style={{ padding: '4px 10px', fontSize: '0.75rem' }} onClick={() => clearLog().then(refresh)}><Trash2 size={13} /> Clear</button>
-        <button className="btn btn-secondary" style={{ padding: '4px 10px', fontSize: '0.75rem' }} onClick={onClose}><X size={13} /> Close</button>
+    <div className="sheet animate-fade">
+      <div className="sheet__bar">
+        <h2 className="legend" style={{ flex: 'none' }}>Session log</h2>
+        <span className="sheet__path mono">{path || 'No session file yet — connect to start one.'}</span>
+        <button className="btn btn--sm" onClick={refresh}><RefreshCw size={12} /> Refresh</button>
+        <button className="btn btn--sm" onClick={() => setAuto(a => !a)}>
+          <span className={`lamp ${auto ? 'lamp--on' : ''}`} /> Auto
+        </button>
+        <button className="btn btn--sm" onClick={() => navigator.clipboard.writeText(text)}><Copy size={12} /> Copy</button>
+        <button className="btn btn--sm" onClick={() => logTestMarker('END', 'manual marker from Logs view').then(refresh)}>Mark</button>
+        <button className="btn btn--sm" onClick={openLogsFolder}><FolderOpen size={12} /> Folder</button>
+        <button className="btn btn--sm" onClick={() => clearLog().then(refresh)}><Trash2 size={12} /> Clear</button>
+        <button className="btn btn--sm" onClick={onClose}><X size={12} /> Close</button>
       </div>
-      <pre style={{ flex: 1, overflow: 'auto', background: '#0a0a0a', border: '1px solid #222', borderRadius: 8, padding: 12, margin: 0, fontFamily: 'monospace', fontSize: '0.72rem', color: '#9aa', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-        {text || 'No log entries yet.'}
-      </pre>
+      <pre className="sheet__body">{text || 'No log entries yet.'}</pre>
     </div>
   );
 }

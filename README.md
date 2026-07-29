@@ -1,207 +1,106 @@
 # OpenCamBridge
 
-OpenCamBridge is a free open-source phone-as-webcam project.
-No cloud, no account, no telemetry, no ads, no watermark.
+OpenCamBridge is a privacy-first Android-to-Windows webcam: no cloud, account, telemetry, ads, or watermark. This branch contains the V2 low-latency streaming engine.
 
-## V1 scope
+## V2 pipeline
 
-OpenCamBridge V1 is a clean, privacy-first, open-source Android-to-Windows
-webcam: no cloud, no account, no telemetry, no ads, no watermark. USB-first,
-LAN optional with a token. **MJPEG is the stable production path.** H.264 is
-kept in the tree but hidden behind Developer/Experimental mode and is not a V1
-release path.
+The primary path is:
 
-Normal users independently choose Resolution, Frame Rate, JPEG Quality, and
-target Bandwidth/Auto-quality — the app no longer drives capture through bundled
-profile presets. FPS and resolution are separate controls; the UI only offers a
-frame rate the selected lens actually reports at the chosen resolution.
+```text
+Android Camera2
+  -> MediaCodec H.264 surface encoder
+  -> OCB2 framed access units over USB/ADB or authenticated LAN
+  -> Windows Media Foundation H.264 decoder with D3D11 output
+  -> NV12 two/three-slot ring
+  -> Media Foundation virtual camera
+```
 
-## Architecture Pipeline
+MJPEG remains a complete compatibility path when H.264 capture/encode/decode is unavailable or the user selects compatibility mode. The primary H.264 path does not pass camera frames through Kotlin YUV conversion, and the Windows virtual-camera path remains NV12 unless RGB32 compatibility is negotiated.
 
-- **Stable V1 (MJPEG)**: Android CameraX -> `/stream.mjpeg` -> Rust producer -> shared memory framebuffer -> Media Foundation virtual camera -> OBS.
-- **Developer-only (H.264, experimental/unstable)**: Android MediaCodec (Constrained Baseline) -> `/stream.h264` (Annex B) -> Rust producer `--source h264` -> bundled openh264 decoder -> shared memory framebuffer -> virtual camera. Hidden unless Developer/Experimental mode is enabled in the desktop app; never auto-starts. The openh264 decoder still errors (`Native:16`) on some phone encoder output — use MJPEG.
+Supported consumer formats are NV12 1920x1080 and 1280x720 at 60 or 30 FPS, plus RGB32 fallback. A mode is offered only when the selected camera and encoder expose a complete path. Adaptive preference is 1080p60, 720p60, 1080p30, 720p30, then a canonical MJPEG tuple; explicit profiles never silently adapt.
 
-All lenses the phone exposes (main, ultrawide, telephoto, front, external)
-are selectable; the app negotiates per-device resolutions, FPS ranges, torch
-availability, and encoder input formats instead of assuming fixed values. The
-desktop hides torch on lenses without a flash and disables frame rates a lens
-cannot deliver at the chosen resolution.
+See [architecture](docs/ARCHITECTURE.md), [protocol](protocol/SPEC.md), [native dependency map](docs/NATIVE_DEPENDENCY_MAP.md), and [validation checklist](docs/VALIDATION.md).
 
-Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [protocol/SPEC.md](protocol/SPEC.md).
+## Connecting
 
-## Connecting the phone
+- USB is recommended. Android binds to `127.0.0.1`; the desktop selects an explicit ADB serial and creates a targeted forward.
+- LAN binds publicly only in token mode. Every route except `/health` requires the token captured when the server binds. Security mutations remain loopback-only.
 
-- **USB (recommended, default)**: the phone binds to `127.0.0.1` only; the
-  desktop app runs `adb forward` for you (Connection screen -> USB tab).
-  Video never leaves the cable, and no token is needed.
-- **Wi-Fi (LAN)**: switch the phone to *LAN Token* mode (app -> Security tab),
-  then enter the phone URL and the 32-character access token in the desktop
-  app's Wi-Fi tab. Every endpoint except `/health` requires the token.
-  Security settings themselves can only be changed from the phone or over USB.
-
-## Current stable workflow
+## Development
 
 ```powershell
-cd C:\Dev\OpenCamBridge
+cd C:\Dev\OpenCamBridge-Fable
 .\dev-reset.ps1
 .\dev-start.ps1
 ```
 
-## When C++ Media Foundation code changes
+After native changes:
 
 ```powershell
-cd C:\Dev\OpenCamBridge
 .\dev-build-vcam.ps1
-.\dev-reset.ps1
-.\dev-start.ps1
 ```
 
-`dev-build-vcam.ps1` works on a fresh clone with no manual NuGet steps: it
-restores the pinned packages from `VirtualCameraMediaSource\packages.config`
-into `windows\virtual-camera-mediafoundation\packages` (location fixed by the
-`nuget.config` next to the `.sln`) the first time, which needs network access;
-later runs are offline. It builds the `.vcxproj` with an explicit
-`/p:SolutionDir` so package imports and the output dir
-(`windows\virtual-camera-mediafoundation\x64\Release`) resolve exactly like a
-Visual Studio solution build. Flags: `-ForceKillApps` also closes
-Teams/Zoom/etc. when the DLL is locked; `-NoKill` skips all process/service
-kills (useful for CI or scripted verification).
-
-## OBS setup
-
-Use:
-
-* Source: Video Capture Device
-* Device: OpenCamBridge Camera
-* Resolution/FPS Type: Custom
-* Match the Resolution and Frame Rate you selected in the desktop app
-  (e.g. 1280x720 @ 30, or 1920x1080 @ 60 on a phone/lens that supports it)
-* Video Format: Any or RGB32
-
-Do not use Device Default during development.
-
-## Troubleshooting
-
-If DLL copy fails:
+The native script builds the production DLL and host, runs installer CLI, ABI, buffer-lock, and NV12-resize self-tests, and compares built/installed/registered/runtime binary identities. Registration commands are explicit:
 
 ```powershell
-tasklist /svc /fi "PID eq <PID>"
-Stop-Service FrameServer -Force
-Stop-Service FrameServerMonitor -Force
+VirtualCamera_Installer.exe --register
+VirtualCamera_Installer.exe --unregister
+VirtualCamera_Installer.exe --status
+VirtualCamera_Installer.exe --mode host
+VirtualCamera_Installer.exe --self-test-pipeline
 ```
 
-If still locked, reboot and rerun `dev-build-vcam.ps1` before opening OBS/Tauri.
-
-If OBS is blue:
-
-```powershell
-Get-Content C:\ProgramData\OpenCamBridge\vcam.log -Tail 100
-Get-Process rust-frame-producer
-Invoke-RestMethod http://127.0.0.1:8080/api/stream/metrics
-```
-
-## Initial V1 Goals
-
-- Android phone camera over Wi-Fi
-- Android USB via adb reverse
-- Browser MJPEG stream
-- Local HTTP control API
-- Windows virtual camera driver
-- No cloud, No account, No ads, No telemetry, No watermark
-
-## Not in V1
-
-- iOS implementation
-- Bluetooth video
-- WebRTC
-- macOS virtual camera driver
-- HEVC
+Registration requires an elevated terminal. No-argument execution prints usage; it does not enter an inherited sample menu.
 
 ## Build from source
 
 ```powershell
-# Android APK
+# Android unit tests, APKs, lint
 cd android
-.\gradlew.bat assembleDebug
-adb install -r .\app\build\outputs\apk\debug\app-debug.apk
+.\gradlew.bat testDebugUnitTest assembleDebug assembleRelease lint
 
-# Rust frame producer
-cd windows\virtual-camera-mediafoundation\rust-frame-producer
+# Rust producer
+cd ..\windows\virtual-camera-mediafoundation\rust-frame-producer
+cargo fmt --check
+cargo test --all-targets
 cargo build --release
 
-# Desktop app
-cd desktop\tauri-app
-npm ci
-npx tsc --noEmit
-cargo check --manifest-path .\src-tauri\Cargo.toml
+# Desktop backend and frontend
+cd ..\..\..\desktop\tauri-app
+npm install
+npm run test
+npm run build
+cd src-tauri
+cargo fmt --check
+cargo test --all-targets
+cargo build --release
 
-# Media Foundation virtual camera DLL + host exe (from repo root)
-# Builds VirtualCameraMediaSource.dll AND VirtualCamera_Installer.exe (the
-# virtual camera host the desktop app launches) and puts both where the
-# desktop app expects them.
-.\dev-build-vcam.ps1
+# Native DLL + host, from repository root
+cd ..\..\..
+.\dev-build-vcam.ps1 -NoKill
 ```
+
+## OBS
+
+Add a Video Capture Device, select `OpenCamBridge Camera`, choose Custom resolution/FPS, and match the negotiated consumer format. Prefer NV12; use RGB32 only for compatibility. OBS attachment is reported separately from producer/ring readiness.
 
 ## Diagnostics
 
-The desktop app has a copyable **Diagnostics** panel (in the control panel)
-showing the selected lens/resolution/FPS, target-vs-actual FPS, producer
-in/out FPS, bandwidth, latency, dropped frames, torch/rotation state, and the
-last errors. Use **Copy** to grab a snapshot for bug reports. The Android app
-has a **Logs** tab covering control/camera errors.
+Desktop diagnostics separate desired, selected, actual, and consumer output; camera/session, GPU bridge, encoded, transport, decoded-unique, virtual-camera-unique, and repeated sample rates; fallback reason; frame latency; drops/replacements; decoder/D3D11 status; and binary identities. A process being alive is not reported as a flowing pipeline.
 
-## Known Limitations
-
-- No audio support.
-- No iOS app.
-- No macOS virtual camera driver yet.
-- **H.264 is developer-only and unstable**: the bundled openh264 decoder still
-  errors (`Native:16`) on some phone encoder output. MJPEG is the supported V1
-  path. See the TODO in `rust-frame-producer/src/main.rs` for the rewrite plan.
-- 60 FPS depends on the phone lens + resolution + lighting; the UI reports the
-  actual delivered rate and only offers frame rates the lens supports.
-- Building the Rust producer requires a C/C++ compiler (openh264 is compiled
-  from source; installing `nasm` is optional and only enables its faster
-  assembly routines).
-
-## Release Checklist
-
-Before tagging a release, ensure:
-- [ ] Android build completes (`.\gradlew.bat assembleDebug` / `assembleRelease`)
-- [ ] Rust producer builds (`cargo build --release`)
-- [ ] Desktop type-checks and its backend compiles (`npx tsc --noEmit`, `cargo check --manifest-path .\src-tauri\Cargo.toml`)
-- [ ] Tauri app builds (`npm run tauri build`)
-- [ ] Virtual camera DLL builds from a clean clone (`.\dev-build-vcam.ps1`)
-- [ ] Pipeline runs correctly via `dev-reset.ps1` and `dev-start.ps1`
-- [ ] Runtime matrix in [docs/RUNTIME-CHECKLIST.md](docs/RUNTIME-CHECKLIST.md) passes on target devices
-- [ ] MJPEG 720p60 works on a supported phone; 1080p falls back honestly when unsupported
-- [ ] Torch shows only on lenses that support it and works there
-- [ ] Every lens in the camera dropdown actually switches the picture
-- [ ] Phone and desktop controls stay in sync
-- [ ] H.264 is hidden unless Developer mode is on; MJPEG is the default
-- [ ] SHA256 hashes generated for all release artifacts (below)
-
-## Generating release artifact hashes
-
-Publish a SHA256 for every binary you ship (APK, installer, producer exe) so
-users can verify downloads:
+Useful logs:
 
 ```powershell
-# Single file
-Get-FileHash .\app-release.apk -Algorithm SHA256
-
-# All artifacts in a folder -> SHA256SUMS.txt
-Get-ChildItem .\release\* -File |
-  Get-FileHash -Algorithm SHA256 |
-  ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
-  Out-File -Encoding ascii .\release\SHA256SUMS.txt
+Get-Content C:\ProgramData\OpenCamBridge\vcam.log -Tail 100
+Invoke-RestMethod http://127.0.0.1:8080/api/stream/metrics
 ```
 
-## Security Note
+## Security
 
-- **USB mode (default)** is recommended and binds securely to 127.0.0.1.
-- **LAN mode** requires a 128-bit token; it is enforced from the moment the
-  server binds and cannot be disabled remotely, even with a valid token.
-- Security settings (mode/port/token) are changeable only from the phone or
-  over USB.
-- Open unauthenticated LAN camera access is intentionally not supported.
+USB-only mode binds loopback. LAN uses a UUIDv4 bearer token (122 random bits); token comparison uses `MessageDigest.isEqual`, and remote clients cannot change binding/security state. Tokens are passed through protected process environment only and removed immediately after the producer reads them.
+
+## Current validation status
+
+Automated evidence is tracked in `AUDIT.md`. Phone, OBS, FFmpeg, screen-off, USB reconnect, thermal, live constrained-high-speed, and external allocator acceptance remain `NOT YET TESTED` unless an explicit physical result is recorded there.
+
+No audio, iOS, macOS virtual camera, Bluetooth video, HEVC, or cloud relay is provided.
