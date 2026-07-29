@@ -111,6 +111,7 @@ struct OpenCamBridgeFrameMetadata {
     uint64_t receiveTimestampNs = 0;
     uint64_t decodeTimestampNs = 0;
     uint32_t flags = 0;
+    uint32_t colorDescriptor = 0;
     bool isNew = false;
     // Presentation time chosen by the playout scheduler, on the host clock. This is
     // what the sample must be stamped with: a synthetic timeline of its own would drift
@@ -135,6 +136,8 @@ public:
         REFGUID outputSubtype,
         OpenCamBridgeFrameMetadata* metadata);
     HRESULT SetConsumerFormat(DWORD width, DWORD height, DWORD fpsNumerator, DWORD fpsDenominator, REFGUID subtype);
+    HRESULT GetProducerFormat(DWORD* width, DWORD* height, DWORD* fpsNumerator,
+        DWORD* fpsDenominator, uint32_t* colorDescriptor);
     HRESULT SetConsumerAttached(bool attached);
     HRESULT MarkSampleRequest();
     HRESULT ReportSampleCopyFailure(HRESULT error);
@@ -167,10 +170,13 @@ private:
     // this consumer has not yet seen, and the stream generation it belongs to. Local
     // because the two consumers (this camera and the desktop preview) read at
     // different rates and neither may disturb the other's accounting.
-    OcbPlayoutScheduler m_playout;
-    bool m_playoutConfigured = false;
     uint64_t m_cursorNext = 0;
     uint64_t m_cursorGeneration = 0;
+    uint64_t m_outputSampleTimeNs = 0;
+    uint64_t m_lastUniqueHostNs = 0;
+    uint64_t m_playoutUnderruns = 0;
+    uint64_t m_playoutResets = 0;
+    uint64_t m_maxOutputGapNs = 0;
     // Selection-cadence trace; see TraceSelection. Off unless OCB_VCAM_TRACE is set.
     LONG64 m_lastSelectQpc = 0;
     std::vector<BYTE> m_nv12Scratch;

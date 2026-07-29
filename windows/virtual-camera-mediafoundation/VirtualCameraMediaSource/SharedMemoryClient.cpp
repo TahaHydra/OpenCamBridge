@@ -26,23 +26,6 @@ static uint64_t OcbHostNowNs()
         + (remainder * 1000000000ULL) / static_cast<uint64_t>(frequency.QuadPart);
 }
 
-// Latency profile for this consumer, chosen once. `OCB_PLAYOUT_PROFILE=low|balanced|
-// stable|diag120` and `OCB_PLAYOUT_SERVO=0` exist so buffering depth can be A/B tested
-// against drift correction without two variables moving at once.
-static OcbPlayoutProfile OcbProfileFromEnvironment(bool& servoEnabled)
-{
-    wchar_t name[32] = {};
-    const DWORD length = GetEnvironmentVariableW(L"OCB_PLAYOUT_PROFILE", name, ARRAYSIZE(name));
-    wchar_t servo[8] = {};
-    const DWORD servoLength = GetEnvironmentVariableW(L"OCB_PLAYOUT_SERVO", servo, ARRAYSIZE(servo));
-    servoEnabled = !(servoLength > 0 && servo[0] == L'0');
-    if (length == 0 || length >= ARRAYSIZE(name)) return OCB_PLAYOUT_PROFILE_BALANCED;
-    if (_wcsicmp(name, L"low") == 0) return OCB_PLAYOUT_PROFILE_LOW;
-    if (_wcsicmp(name, L"stable") == 0) return OCB_PLAYOUT_PROFILE_STABLE;
-    if (_wcsicmp(name, L"diag120") == 0) return OCB_PLAYOUT_PROFILE_DIAGNOSTIC_120MS;
-    return OCB_PLAYOUT_PROFILE_BALANCED;
-}
-
 SharedMemoryClient::SharedMemoryClient()
     : m_hFile(NULL), m_hMapFile(NULL), m_pMappedView(nullptr), m_viewSize(0), m_lastSequence(0)
 {
@@ -323,6 +306,13 @@ void SharedMemoryClient::CloseHandles()
     m_hFile = NULL;
     m_viewSize = 0;
     m_lastSequence = 0;
+    m_cursorNext = 0;
+    m_cursorGeneration = 0;
+    m_outputSampleTimeNs = 0;
+    m_lastUniqueHostNs = 0;
+    m_playoutUnderruns = 0;
+    m_playoutResets = 0;
+    m_maxOutputGapNs = 0;
     m_identityPublished = false;
 }
 
@@ -370,8 +360,8 @@ void SharedMemoryClient::TraceSelection(uint64_t sequence, bool isNew, LONG publ
         isNew ? 1 : 0, publishedSlot, static_cast<long long>(selectDeltaUs),
         static_cast<unsigned long long>(selection.overwritten),
         static_cast<unsigned long long>(decision.bufferDepthNs / 1000000ULL),
-        static_cast<unsigned long long>(m_playout.TargetDelayNs() / 1000000ULL),
-        static_cast<long long>(m_playout.ClockCorrectionPpm()),
+        0ULL,
+        0LL,
         static_cast<unsigned long long>(decision.lateDrops));
 }
 
@@ -444,8 +434,56 @@ HRESULT SharedMemoryClient::SetConsumerFormat(DWORD width, DWORD height, DWORD f
     InterlockedExchange(&ring->consumerFpsDen, static_cast<LONG>(fpsDenominator ? fpsDenominator : 1));
     InterlockedExchange(&ring->negotiatedSubtype,
         subtype == MFVideoFormat_NV12 ? OCBR_FORMAT_NV12 :
-        subtype == MFVideoFormat_RGB32 ? OCBR_FORMAT_RGB32 : 0);
+        subtype == MFVideoFormat_RGB32 ? OCBR_FORMAT_RGB32 :
+        subtype == MFVideoFormat_YUY2 ? 4 : 0);
     RETURN_IF_FAILED(SetConsumerAttached(true));
+    return S_OK;
+}
+
+HRESULT SharedMemoryClient::GetProducerFormat(
+    DWORD* width,
+    DWORD* height,
+    DWORD* fpsNumerator,
+    DWORD* fpsDenominator,
+    uint32_t* colorDescriptor)
+{
+    RETURN_HR_IF_NULL(E_POINTER, width);
+    RETURN_HR_IF_NULL(E_POINTER, height);
+    RETURN_HR_IF_NULL(E_POINTER, fpsNumerator);
+    RETURN_HR_IF_NULL(E_POINTER, fpsDenominator);
+    RETURN_HR_IF_NULL(E_POINTER, colorDescriptor);
+    *width = 0; *height = 0; *fpsNumerator = 0; *fpsDenominator = 1;
+    *colorDescriptor = 0x01020102; // BT.709 limited, BT.709 primaries/transfer.
+    RETURN_IF_FAILED(OpenHandles());
+    auto* ring = static_cast<OpenCamBridgeRingHeader*>(m_pMappedView);
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_DATA),
+        ring->magic != OCBR_MAGIC || ring->version != OCBR_VERSION ||
+        ring->headerSize != OCBR_HEADER_SIZE || ring->ringAbiHash != OCBR_ABI_HASH);
+    *fpsNumerator = static_cast<DWORD>((std::max<LONG>)(1,
+        InterlockedCompareExchange(&ring->producerFpsNum, 0, 0)));
+    *fpsDenominator = static_cast<DWORD>((std::max<LONG>)(1,
+        InterlockedCompareExchange(&ring->producerFpsDen, 0, 0)));
+    const LONG published = InterlockedCompareExchange(&ring->publishedSlot, 0, 0);
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_NOT_READY),
+        published < 0 || published >= static_cast<LONG>(ring->slotCount));
+    const uint64_t offset = ring->headerSize + static_cast<uint64_t>(published) * ring->slotSize;
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_DATA),
+        offset + sizeof(OpenCamBridgeSlotHeader) > m_viewSize);
+    auto* slot = reinterpret_cast<OpenCamBridgeSlotHeader*>(
+        static_cast<BYTE*>(m_pMappedView) + offset);
+    const LONG64 before = InterlockedCompareExchange64(&slot->committedEpoch, 0, 0);
+    MemoryBarrier();
+    OpenCamBridgeSlotHeader snapshot = {};
+    memcpy(&snapshot, slot, sizeof(snapshot));
+    MemoryBarrier();
+    const LONG64 after = InterlockedCompareExchange64(&slot->committedEpoch, 0, 0);
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_RETRY),
+        before == 0 || before != after || snapshot.writeEpoch != snapshot.committedEpoch);
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_DATA),
+        snapshot.pixelFormat != OCBR_FORMAT_NV12 || snapshot.width == 0 || snapshot.height == 0);
+    *width = snapshot.width;
+    *height = snapshot.height;
+    if (snapshot.reservedTail != 0) *colorDescriptor = snapshot.reservedTail;
     return S_OK;
 }
 
@@ -458,7 +496,7 @@ static bool IsD3dDeviceLoss(HRESULT error)
 }
 
 static HRESULT Nv12ToRgb32(const BYTE* nv12, DWORD width, DWORD height, LONG pitch,
-    BYTE* scanline, BYTE* bufferStart, DWORD bufferLength)
+    BYTE* scanline, BYTE* bufferStart, DWORD bufferLength, uint32_t colorDescriptor)
 {
     RETURN_HR_IF(E_INVALIDARG, pitch == 0);
     const uint64_t rowBytes = static_cast<uint64_t>(width) * 4;
@@ -473,6 +511,27 @@ static HRESULT Nv12ToRgb32(const BYTE* nv12, DWORD width, DWORD height, LONG pit
     const uintptr_t firstScanline = reinterpret_cast<uintptr_t>(scanline);
     const BYTE* yPlane = nv12;
     const BYTE* uvPlane = nv12 + static_cast<size_t>(width) * height;
+    const uint32_t matrix = colorDescriptor & 0xff;
+    const bool fullRange = ((colorDescriptor >> 8) & 0xff) == 2;
+    int yOffset = fullRange ? 0 : 16;
+    int yScale = fullRange ? 256 : 298;
+    int rV = 459, gU = -55, gV = -136, bU = 541; // BT.709 limited.
+    if (matrix == 1) {
+        rV = fullRange ? 359 : 409;
+        gU = fullRange ? -88 : -100;
+        gV = fullRange ? -183 : -208;
+        bU = fullRange ? 454 : 516;
+    } else if (matrix == 3) {
+        rV = fullRange ? 377 : 430;
+        gU = fullRange ? -42 : -48;
+        gV = fullRange ? -146 : -167;
+        bU = fullRange ? 482 : 548;
+    } else if (fullRange) {
+        rV = 403;
+        gU = -48;
+        gV = -120;
+        bU = 475;
+    }
     for (DWORD y = 0; y < height; ++y) {
         const uint64_t rowOffset = static_cast<uint64_t>(y) * absolutePitch;
         uintptr_t rowAddress = firstScanline;
@@ -487,13 +546,13 @@ static HRESULT Nv12ToRgb32(const BYTE* nv12, DWORD width, DWORD height, LONG pit
             rowAddress < bufferBegin || rowAddress > bufferEnd || rowBytes > bufferEnd - rowAddress);
         BYTE* dst = reinterpret_cast<BYTE*>(rowAddress);
         for (DWORD x = 0; x < width; ++x) {
-            int yy = static_cast<int>(yPlane[static_cast<size_t>(y) * width + x]) - 16;
+            int yy = static_cast<int>(yPlane[static_cast<size_t>(y) * width + x]) - yOffset;
             int u = static_cast<int>(uvPlane[static_cast<size_t>(y / 2) * width + (x & ~1u)]) - 128;
             int v = static_cast<int>(uvPlane[static_cast<size_t>(y / 2) * width + (x & ~1u) + 1]) - 128;
-            int c = (std::max)(0, yy) * 298;
-            dst[x * 4] = ClampByte((c + 516 * u + 128) >> 8);
-            dst[x * 4 + 1] = ClampByte((c - 100 * u - 208 * v + 128) >> 8);
-            dst[x * 4 + 2] = ClampByte((c + 409 * v + 128) >> 8);
+            int c = (std::max)(0, yy) * yScale;
+            dst[x * 4] = ClampByte((c + bU * u + 128) >> 8);
+            dst[x * 4 + 1] = ClampByte((c + gU * u + gV * v + 128) >> 8);
+            dst[x * 4 + 2] = ClampByte((c + rV * v + 128) >> 8);
             dst[x * 4 + 3] = 255;
         }
     }
@@ -512,12 +571,6 @@ HRESULT SharedMemoryClient::ReadFrame(BYTE* pBuf, BYTE* bufferStart, DWORD len, 
     RETURN_IF_FAILED(OpenHandles());
     RETURN_IF_FAILED(PublishDllIdentity());
     auto* ring = static_cast<OpenCamBridgeRingHeader*>(m_pMappedView);
-    if (!m_playoutConfigured) {
-        bool servoEnabled = true;
-        m_playout.Configure(OcbProfileFromEnvironment(servoEnabled));
-        m_playout.SetServoEnabled(servoEnabled);
-        m_playoutConfigured = true;
-    }
     InterlockedIncrement64(&ring->ringReadAttempts);
     UpdateConsumerHeartbeat(ring);
     HRESULT result = CopyStableSlot(pBuf, bufferStart, len, pitch, width, height, outputSubtype, metadata);
@@ -604,37 +657,137 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
     timing.sourceIntervalNs = (1000000000ULL * sourceFpsDenominator) / sourceFpsNumerator;
     timing.slotCount = ring->slotCount;
     const uint64_t intervalNs = timing.outputIntervalNs;
-    (void)intervalNs;
-
     const uint64_t nowNs = OcbHostNowNs();
 
-    // PEEKED, not committed. The frame still has to be copied and that copy can fail,
-    // because the producer may lap the slot in between. Advancing state here and copying
-    // afterwards meant a failed copy still consumed the frame: the next request skipped
-    // it and the failure surfaced as a diagnostic frame instead of being retried.
-    OcbPlayoutDecision decision =
-        m_playout.Peek(nowNs, candidates, candidateCount, timing);
-    // Media Foundation clients can create short-lived stream instances while
-    // probing the camera. In that lifecycle, a conventional prefill can keep
-    // producing the neutral fallback because every instance starts with a new
-    // scheduler. Starting from the oldest slot in an already-full ring also
-    // schedules beyond its overwrite horizon. Release a target-buffered frame
-    // immediately, then follow the scheduler from that safe anchor.
-    OcbBootstrapFirstFrame(
-        decision, candidates, candidateCount, nowNs, m_playout.TargetDelayNs());
-    if (decision.action == OcbPlayoutAction::Starve) {
-        // A prefill Starve decision can also carry the scheduler's initial or
-        // generation-change anchor. It has no frame copy to validate, so commit
-        // it here. Returning without this commit left the scheduler unanchored:
-        // every Media Foundation request moved the deadline to "now + target"
-        // again and the first real frame could never become due.
-        m_playout.Commit(decision, timing);
-        InterlockedExchange64(&ring->playoutTargetDelayNs, static_cast<LONG64>(m_playout.TargetDelayNs()));
-        InterlockedExchange64(&ring->playoutSchedulerResets, static_cast<LONG64>(m_playout.SchedulerResets()));
-        // Prefill, or an empty ring. Reported so the caller repeats its last good
-        // image rather than presenting invented content.
-        return HRESULT_FROM_WIN32(ERROR_RETRY);
+    // The producer already writes the ring at the authoritative phone cadence
+    // and RequestSample is paced at the negotiated output cadence. Re-applying
+    // an adaptive timestamp scheduler here caused a healthy 30 fps ring to pin
+    // its target at 140 ms and release only 22-25 unique fps. Use a small fixed
+    // sequence queue instead:
+    //
+    //  * 30 -> 30 consumes every sequence in order,
+    //  * 30 -> 60 naturally repeats when no new sequence exists,
+    //  * 60 -> 30 recentres at the fixed live-edge delay and skips cleanly,
+    //  * a generation change can never replay stale retained slots.
+    bool foundNewest = false;
+    bool foundOldest = false;
+    uint64_t newestCaptureNs = 0;
+    OcbPlayoutCandidate chosen = {};
+    OcbPlayoutCandidate oldest = {};
+    for (size_t index = 0; index < candidateCount; ++index) {
+        const auto& candidate = candidates[index];
+        if (candidate.streamGeneration != generation) continue;
+        newestCaptureNs = (std::max)(newestCaptureNs, candidate.captureTimestampNs);
+        if (!foundNewest || candidate.ringSequence > chosen.ringSequence) {
+            chosen = candidate;
+            foundNewest = true;
+        }
+        if (!foundOldest || candidate.ringSequence < oldest.ringSequence) {
+            oldest = candidate;
+            foundOldest = true;
+        }
     }
+    if (!foundNewest) return HRESULT_FROM_WIN32(ERROR_RETRY);
+
+    const bool generationChanged = m_cursorGeneration != generation;
+    constexpr uint64_t fixedQueueDelayNs = 90000000ULL;
+    uint64_t targetFrames =
+        (fixedQueueDelayNs + timing.sourceIntervalNs - 1) / timing.sourceIntervalNs;
+    targetFrames = (std::max<uint64_t>)(1, targetFrames);
+    targetFrames = (std::min<uint64_t>)(targetFrames, ring->slotCount - 2);
+    const uint64_t targetSequence = chosen.ringSequence > targetFrames
+        ? chosen.ringSequence - targetFrames : oldest.ringSequence;
+
+    auto selectNewestAtOrBefore = [&](uint64_t sequence, OcbPlayoutCandidate& output) {
+        bool found = false;
+        for (size_t index = 0; index < candidateCount; ++index) {
+            const auto& candidate = candidates[index];
+            if (candidate.streamGeneration != generation ||
+                candidate.ringSequence > sequence) continue;
+            if (!found || candidate.ringSequence > output.ringSequence) {
+                output = candidate;
+                found = true;
+            }
+        }
+        return found;
+    };
+    auto selectExact = [&](uint64_t sequence, OcbPlayoutCandidate& output) {
+        for (size_t index = 0; index < candidateCount; ++index) {
+            const auto& candidate = candidates[index];
+            if (candidate.streamGeneration == generation &&
+                candidate.ringSequence == sequence)
+            {
+                output = candidate;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    bool hasNewFrame = false;
+    if (generationChanged || m_cursorNext == 0) {
+        // First frame is immediate but retains enough committed history to
+        // absorb ordinary USB/decode arrival jitter.
+        hasNewFrame = selectNewestAtOrBefore(targetSequence, chosen);
+        if (!hasNewFrame) {
+            chosen = oldest;
+            hasNewFrame = true;
+        }
+    } else if (timing.sourceIntervalNs < timing.outputIntervalNs) {
+        // Source is faster than the negotiated output. Re-centering at a fixed
+        // time delay performs deterministic rate conversion (for example,
+        // 60 -> 30 skips approximately every other sequence).
+        hasNewFrame = selectNewestAtOrBefore(targetSequence, chosen) &&
+            chosen.ringSequence >= m_cursorNext;
+    } else {
+        // Equal rate, or an output faster than the source: consume the next
+        // sequence in order. This is the jitter buffer that newest-only polling
+        // lacks.
+        hasNewFrame = selectExact(m_cursorNext, chosen);
+        if (!hasNewFrame && chosen.ringSequence >= m_cursorNext &&
+            m_cursorNext < oldest.ringSequence)
+        {
+            // A paused consumer fell outside ring history. Resume at the fixed
+            // live-edge delay rather than bursting through stale frames.
+            hasNewFrame = selectNewestAtOrBefore(targetSequence, chosen);
+        }
+    }
+    if (!hasNewFrame) {
+        const uint64_t previousSequence = m_cursorNext - 1;
+        bool foundPrevious = false;
+        for (size_t index = 0; index < candidateCount; ++index) {
+            const auto& candidate = candidates[index];
+            if (candidate.streamGeneration == generation &&
+                candidate.ringSequence == previousSequence)
+            {
+                chosen = candidate;
+                foundPrevious = true;
+                break;
+            }
+        }
+        // If the previous slot was overwritten, the newest stable frame is the
+        // only truthful fallback and is new by definition.
+        if (!foundPrevious) hasNewFrame = true;
+    }
+
+    OcbPlayoutDecision decision = {};
+    decision.action = hasNewFrame
+        ? OcbPlayoutAction::Release
+        : timing.outputIntervalNs < timing.sourceIntervalNs
+            ? OcbPlayoutAction::RepeatPlanned
+            : OcbPlayoutAction::RepeatUnderrun;
+    decision.slotIndex = chosen.slotIndex;
+    decision.ringSequence = chosen.ringSequence;
+    decision.captureTimestampNs = chosen.captureTimestampNs;
+    decision.sampleTimeNs = m_outputSampleTimeNs == 0
+        ? nowNs : m_outputSampleTimeNs + intervalNs;
+    decision.durationNs = intervalNs;
+    decision.bufferDepthNs = newestCaptureNs > chosen.captureTimestampNs
+        ? newestCaptureNs - chosen.captureTimestampNs : 0;
+    decision.arrivalHostNs = chosen.ringWriteTimestampNs;
+    decision.generation = generation;
+    decision.reset = generationChanged;
+    decision.valid = true;
 
     // Frames destroyed before playout reached them. Distinct from the scheduler's own
     // late-drop count: this one says the ring was too short, not that we chose to skip.
@@ -725,6 +878,23 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
             for (DWORD row = 0; row < height / 2; ++row) {
                 memcpy(dstUv + static_cast<size_t>(row) * pitch, srcUv + static_cast<size_t>(row) * sourceUvStride, width);
             }
+        } else if (outputSubtype == MFVideoFormat_YUY2) {
+            if (pitch <= 0 || static_cast<DWORD>(pitch) < width * 2 ||
+                static_cast<uint64_t>(pitch) * height > destinationAvailable) {
+                return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+            }
+            const BYTE* srcUv = source + sourceYBytes;
+            for (DWORD row = 0; row < height; ++row) {
+                const BYTE* srcYRow = source + static_cast<size_t>(row) * sourceYStride;
+                const BYTE* srcUvRow = srcUv + static_cast<size_t>(row / 2) * sourceUvStride;
+                BYTE* dst = pBuf + static_cast<size_t>(row) * pitch;
+                for (DWORD col = 0; col < width; col += 2) {
+                    dst[col * 2] = srcYRow[col];
+                    dst[col * 2 + 1] = srcUvRow[col];
+                    dst[col * 2 + 2] = srcYRow[col + 1];
+                    dst[col * 2 + 3] = srcUvRow[col + 1];
+                }
+            }
         } else if (outputSubtype == MFVideoFormat_RGB32) {
             if (!sourceCompact) {
                 const size_t compactSize = static_cast<size_t>(width) * height * 3 / 2;
@@ -737,7 +907,10 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
                     srcUv + static_cast<size_t>(row) * sourceUvStride, width);
                 source = m_nv12Scratch.data();
             }
-            copyResult = Nv12ToRgb32(source, width, height, pitch, pBuf, bufferStart, len);
+            const uint32_t colorDescriptor =
+                local.reservedTail != 0 ? local.reservedTail : 0x01020102;
+            copyResult = Nv12ToRgb32(
+                source, width, height, pitch, pBuf, bufferStart, len, colorDescriptor);
         } else {
             return MF_E_UNSUPPORTED_FORMAT;
         }
@@ -752,45 +925,54 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
         metadata->receiveTimestampNs = local.receiveTimestampNs;
         metadata->decodeTimestampNs = local.decodeTimestampNs;
         metadata->flags = local.flags;
+        metadata->colorDescriptor = local.reservedTail;
         metadata->sampleTimeNs = decision.sampleTimeNs;
         metadata->durationNs = decision.durationNs;
-        // isNew now comes from the SCHEDULER rather than from comparing phone sequences.
-        // A repeat is a decision it made deliberately — because nothing was due yet —
-        // not something inferred after the fact from two identical sequence numbers.
+        // Newness is explicit: a paced request either copied a newer committed
+        // ring sequence or deliberately repeated the last stable one.
         metadata->isNew = decision.action == OcbPlayoutAction::Release;
         m_lastSequence = local.sequence;
         if (metadata->isNew) {
             InterlockedIncrement64(&ring->virtualCameraUniqueFrames);
+            if (m_lastUniqueHostNs != 0 && nowNs > m_lastUniqueHostNs) {
+                m_maxOutputGapNs = (std::max)(m_maxOutputGapNs, nowNs - m_lastUniqueHostNs);
+            }
+            m_lastUniqueHostNs = nowNs;
         } else {
             InterlockedIncrement64(&ring->repeatedVirtualCameraSamples);
+            if (decision.action == OcbPlayoutAction::RepeatUnderrun) {
+                m_playoutUnderruns++;
+            }
         }
 
-        if (selection.generationChanged) {
+        if (decision.reset) {
             // A restart: adopt the new generation and start counting from this frame.
             // Frames from the previous stream are not losses.
             m_cursorGeneration = generation;
+            m_playoutResets++;
         } else if (selection.overwritten > 0) {
             InterlockedExchangeAdd64(&ring->ringFramesOverwritten,
                 static_cast<LONG64>(selection.overwritten));
         }
-        // Committed only now that the frame is copied and verified.
-        m_playout.Commit(decision, timing);
+        // Advance only after the chosen slot remained stable through the copy.
+        m_outputSampleTimeNs = decision.sampleTimeNs;
         m_cursorNext = decision.ringSequence + 1;
         // Publish playout telemetry for the producer to report. Relaxed stores: these are
         // diagnostics read at human timescales, never used to make a decision.
-        InterlockedExchange64(&ring->playoutBufferDepthNs, static_cast<LONG64>(decision.bufferDepthNs));
-        InterlockedExchange64(&ring->playoutTargetDelayNs, static_cast<LONG64>(m_playout.TargetDelayNs()));
-        InterlockedExchange64(&ring->playoutLateDropped, static_cast<LONG64>(m_playout.LateDrops()));
-        InterlockedExchange64(&ring->playoutUnderruns, static_cast<LONG64>(m_playout.UnderrunRepeats()));
-        InterlockedExchange64(&ring->playoutSchedulerResets, static_cast<LONG64>(m_playout.SchedulerResets()));
-        InterlockedExchange(&ring->playoutClockPpm, static_cast<LONG>(m_playout.ClockCorrectionPpm()));
+        InterlockedExchange64(&ring->playoutBufferDepthNs,
+            static_cast<LONG64>(decision.bufferDepthNs));
+        InterlockedExchange64(&ring->playoutTargetDelayNs,
+            static_cast<LONG64>(targetFrames * timing.sourceIntervalNs));
+        InterlockedExchange64(&ring->playoutLateDropped, 0);
+        InterlockedExchange64(&ring->playoutUnderruns, static_cast<LONG64>(m_playoutUnderruns));
+        InterlockedExchange64(&ring->playoutSchedulerResets, static_cast<LONG64>(m_playoutResets));
+        InterlockedExchange(&ring->playoutClockPpm, 0);
         InterlockedExchange(&ring->playoutMaxOutputGapMs,
-            static_cast<LONG>(m_playout.MaxOutputGapNs() / 1000000ULL));
+            static_cast<LONG>(m_maxOutputGapNs / 1000000ULL));
         TraceSelection(local.sequence, metadata->isNew, published, selection, decision);
         return S_OK;
     }
-    // Every attempt saw the slot change underneath, so the producer lapped us. Cancel
-    // so the scheduler does not record the frame as shown.
-    m_playout.Cancel(decision);
+    // Every attempt saw the slot change underneath. Cursor state is intentionally
+    // unchanged so the next request can retry a current stable slot.
     return HRESULT_FROM_WIN32(ERROR_RETRY);
 }

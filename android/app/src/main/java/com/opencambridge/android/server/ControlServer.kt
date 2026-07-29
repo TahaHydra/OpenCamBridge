@@ -1630,6 +1630,14 @@ class ControlServer(
                     yuvMs = StreamState.yuvMsAvg.get(),
                     jpegMs = StreamState.jpegMsAvg.get(),
                     rotateMs = StreamState.rotateMsAvg.get(),
+                    processingCapacityFps = run {
+                        val theoretical = StreamState.androidEncodeMsAvg.get()
+                            .takeIf { it > 0.0 }
+                            ?.let { kotlin.math.floor(1000.0 / it).toInt() }
+                            ?: 0
+                        val measured = actual?.encodedFps ?: 0
+                        listOf(theoretical, measured).filter { it > 0 }.minOrNull() ?: 0
+                    },
                     latestFrameRevision = StreamState.latestFrameRevision.get(),
                     clientCount = StreamState.mjpegClientCount.get()
                 ),
@@ -1863,6 +1871,7 @@ private data class MjpegMetricsDto(
     val yuvMs: Double,
     val jpegMs: Double,
     val rotateMs: Double,
+    val processingCapacityFps: Int,
     val latestFrameRevision: Long,
     val clientCount: Int
 )

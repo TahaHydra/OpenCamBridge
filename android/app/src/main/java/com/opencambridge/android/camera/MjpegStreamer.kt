@@ -359,17 +359,17 @@ class MjpegStreamer(
             // CPU saver 2: with zero connected MJPEG clients, keep the latest
             // frame fresh at ~2 fps only (status/preview pickup stays instant,
             // battery does not burn encoding for nobody).
-            val nowNs = System.nanoTime()
+            val captureTimestampNs = imageProxy.imageInfo.timestamp
+                .takeIf { it > 0L } ?: captureNowNs
             val config = activeConfig ?: return
             val targetFps = config.fps.coerceIn(1, 120)
-            val minIntervalNs = (1_000_000_000L / targetFps) * 9 / 10
-            val idleIntervalNs = 500_000_000L
-            val sinceLastNs = nowNs - lastEncodeNs
             val idle = StreamState.mjpegClientCount.get() == 0
-            if (sinceLastNs < minIntervalNs || (idle && sinceLastNs < idleIntervalNs)) {
+            if (!FramePacingPolicy.shouldEncode(
+                    captureTimestampNs, lastEncodeNs, targetFps, idle
+                )) {
                 return
             }
-            lastEncodeNs = nowNs
+            lastEncodeNs = captureTimestampNs
 
             val width = imageProxy.width
             val height = imageProxy.height
@@ -465,11 +465,14 @@ class MjpegStreamer(
             val jpegMs = (System.nanoTime() - jpegStartNs) / 1_000_000.0
             StreamState.jpegMsAvg.set(ewma(StreamState.jpegMsAvg.get(), jpegMs))
 
-            val encodeMs = (System.nanoTime() - encodeStartNs) / 1_000_000.0
-            StreamState.androidEncodeMsAvg.set(ewma(StreamState.androidEncodeMsAvg.get(), encodeMs))
-
+            // `toByteArray()` is a full JPEG-sized allocation and copy. It is
+            // part of phone-side processing, not transport, and at 1080p can be
+            // the difference between a nominal 30 FPS setting and 24 unique
+            // frames. Measure it inside the processing budget.
             StreamState.latestFrame.set(jpegStream.toByteArray())
             StreamState.latestFrameRevision.incrementAndGet()
+            val encodeMs = (System.nanoTime() - encodeStartNs) / 1_000_000.0
+            StreamState.androidEncodeMsAvg.set(ewma(StreamState.androidEncodeMsAvg.get(), encodeMs))
 
             val now = System.currentTimeMillis()
             StreamState.framesThisSecond.incrementAndGet()

@@ -31,11 +31,18 @@ internal object Nv21Transform {
         val dimensions = outputDimensions(width, height, rotation)
         val rotatedWidth = dimensions.width
         val rotatedHeight = dimensions.height
-        val rotated = if (rotation == 0) src else scratch.also {
-            rotate(src, it, width, height, rotation)
+        when {
+            rotation == 0 && mirror -> mirrorHorizontal(src, dst, rotatedWidth, rotatedHeight)
+            rotation == 0 -> System.arraycopy(src, 0, dst, 0, size)
+            mirror -> {
+                rotate(src, scratch, width, height, rotation)
+                mirrorHorizontal(scratch, dst, rotatedWidth, rotatedHeight)
+            }
+            // Rotation can write directly into the output when no mirror
+            // follows. The previous scratch->dst copy moved another full
+            // 3.1 MB for every rotated 1080p frame.
+            else -> rotate(src, dst, width, height, rotation)
         }
-        if (mirror) mirrorHorizontal(rotated, dst, rotatedWidth, rotatedHeight)
-        else System.arraycopy(rotated, 0, dst, 0, size)
         return dimensions
     }
 

@@ -216,7 +216,7 @@ if (Test-Path $ringPath) {
         } finally {
             $stream.Dispose()
         }
-        if ($read -eq 256 -and [BitConverter]::ToUInt32($header, 0) -eq 0x5242434F -and [BitConverter]::ToUInt16($header, 4) -eq 3) {
+        if ($read -eq 256 -and [BitConverter]::ToUInt32($header, 0) -eq 0x5242434F -and [BitConverter]::ToUInt16($header, 4) -eq $abiVersion) {
             $heartbeat = [BitConverter]::ToInt64($header, 40)
             $heartbeatAge = ([Diagnostics.Stopwatch]::GetTimestamp() - $heartbeat) / [Diagnostics.Stopwatch]::Frequency
             $runtimeIdentityCurrent = $heartbeat -gt 0 -and $heartbeatAge -ge 0 -and $heartbeatAge -lt 2.0

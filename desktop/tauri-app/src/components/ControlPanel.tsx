@@ -34,13 +34,19 @@ interface VirtualCamMetrics {
   output_width: number;
   output_height: number;
   fps_target: number;
+  source_fps?: number;
   http_jpeg_fps: number;
   decoded_fps: number;
   written_fps: number;
   transport_fps?: number;
+  transport_received_fps?: number;
   decoded_unique_fps?: number;
+  producer_decoded_fps?: number;
+  ring_written_fps?: number;
   virtual_camera_unique_fps?: number;
   repeated_samples?: number;
+  virtual_camera_requested_fps?: number;
+  virtual_camera_repeated_fps?: number;
   dropped_jpegs: number;
   replaced_frames?: number;
   jpeg_queue_len: number;
@@ -49,9 +55,12 @@ interface VirtualCamMetrics {
   resize_ms_avg: number;
   write_ms_avg: number;
   total_pipeline_ms: number;
+  producer_processing_ms?: number;
   latency_ms?: number;
+  phone_to_ring_latency_ms?: number;
   bytes_per_sec: number;
   estimated_mbps: string;
+  transport_bandwidth_mbps?: string;
   pixel_format: string;
   decode_backend?: string;
   resize_backend?: string;
@@ -91,6 +100,16 @@ interface RingDiagnostics {
   installed_dll_build_hash: string;
   producer_build_hash: string;
   ring_abi_hash: number;
+  ring_write_sequence: number;
+  stream_generation: number;
+  ring_frames_overwritten: number;
+  playout_buffer_depth_ms: number;
+  playout_target_delay_ms: number;
+  playout_late_dropped: number;
+  playout_underruns: number;
+  playout_scheduler_resets: number;
+  playout_clock_ppm: number;
+  playout_max_output_gap_ms: number;
 }
 
 interface VirtualCamState {
@@ -154,6 +173,7 @@ function normalizeAndroidMetrics(raw: any): any {
     requestedFps: capture?.requestedFps ?? 0,
     actualFps: capture?.actualFps ?? 0,
     captureFps: capture?.actualFps ?? 0,
+    cameraCaptureFps: capture?.actualFps ?? 0,
     selectedFps: capture?.selectedFps ?? 0,
     cameraSessionFps: capture?.cameraSessionFps ?? 0,
     gpuBridgeFps: capture?.gpuBridgeFps,
@@ -161,13 +181,16 @@ function normalizeAndroidMetrics(raw: any): any {
     encodedWidth: capture?.actualWidth ?? 0,
     encodedHeight: capture?.actualHeight ?? 0,
     encodedFps: h264?.encodedFps ?? mjpeg?.encodedFps ?? 0,
+    phoneEncodedFps: h264?.encodedFps ?? mjpeg?.encodedFps ?? 0,
     encodedBitrate: h264?.bitrate ?? 0,
     encoderName: h264?.encoderName,
     hardwareEncoder: h264?.hardwareEncoder ?? false,
     androidEncodeMsAvg: mjpeg?.encodeMs,
+    phoneEncodeMs: mjpeg?.encodeMs ?? 0,
     yuvMsAvg: mjpeg?.yuvMs,
     jpegMsAvg: mjpeg?.jpegMs,
     rotateMsAvg: mjpeg?.rotateMs,
+    mjpegProcessingCapacityFps: mjpeg?.processingCapacityFps ?? 0,
     latestFrameRevision: mjpeg?.latestFrameRevision ?? 0,
     estimatedMbps: raw.transport?.estimatedMbps ?? '0.0',
     targetBandwidthMbps: raw.transport?.targetBandwidthMbps ?? 0,
@@ -190,7 +213,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     // FOV (looks like a "lens switch") and AE-limits to ~15 fps in low light.
     // 30 fps uses the full-FOV regular session; 60 remains an explicit preset.
     fps: 30,
-    jpegQuality: 85,
+    jpegQuality: 75,
     displayRotation: '0',
     aspectRatio: '16:9',
     mirror: false,
@@ -240,7 +263,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       outputWidth: 1920,
       outputHeight: 1080,
       fps: 30,
-      jpegQuality: 90,
+      jpegQuality: 75,
       aspectRatio: '16:9'
     },
     'experimental-1080p60': {
@@ -574,10 +597,10 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
         // transport = complete JPEGs or H.264 access units received; written =
         // distinct decoded frames published to the ring. A large gap identifies
         // the desktop decode/processing stage rather than the phone transport.
-        m ? `transport=${m.transport_fps ?? m.http_jpeg_fps} decoded=${m.decoded_fps} written=${m.written_fps} paceFps=${m.fps_target}` : 'prod=off (producer not started — OBS is not receiving frames)',
+        m ? `transportReceivedFps=${m.transport_received_fps ?? m.transport_fps ?? m.http_jpeg_fps} producerDecodedFps=${m.producer_decoded_fps ?? m.decoded_fps} ringWrittenFps=${m.ring_written_fps ?? m.written_fps} configuredSourceFps=${m.source_fps ?? m.fps_target}` : 'prod=off (producer not started — OBS is not receiving frames)',
         // Producer per-stage profiling (ms) + which optimized paths ran.
         m ? `prod[decode=${m.decode_ms_avg}(${m.decode_backend ?? '?'}) rot=${m.rotate_ms_avg} resize=${m.resize_ms_avg}(${m.resize_backend ?? '?'}) write=${m.write_ms_avg}]` : '',
-        m ? `mbps=${m.estimated_mbps} lat=${m.total_pipeline_ms}ms drop=${m.dropped_jpegs} q=${m.jpeg_queue_len}` : '',
+        m ? `transportMbps=${m.transport_bandwidth_mbps ?? m.estimated_mbps} producerProcessingMs=${m.producer_processing_ms ?? m.total_pipeline_ms}${m.source === 'mjpeg' ? ` jpegDrop=${m.dropped_jpegs} jpegQ=${m.jpeg_queue_len}` : ''}` : '',
         (vcamStateRef.current?.last_error || m?.last_error) ? `err=${vcamStateRef.current?.last_error || m?.last_error}` : '',
       ].filter(Boolean);
       logEvent('metrics', parts.join('  '));
@@ -597,9 +620,9 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       `Codec: ${s.streamMode}  jpegQuality: ${s.jpegQuality}  targetBandwidth: ${s.targetBandwidthMbps || 'off'}`,
       `Rotation: ${s.displayRotation}  mirror: ${s.mirror}`,
       `Android FPS actual: ${androidMetrics?.actualFps ?? '?'}  encoded: ${androidMetrics?.encodedWidth}x${androidMetrics?.encodedHeight}`,
-      m ? `Producer: in ${m.decoded_fps} / out ${m.written_fps} fps target ${m.fps_target}, ${m.estimated_mbps} Mbps, ${m.total_pipeline_ms}ms, dropped ${m.dropped_jpegs}, queue ${m.jpeg_queue_len}` : 'Producer: not running',
+      m ? `Producer: transport ${m.transport_received_fps ?? m.transport_fps} / decoded ${m.producer_decoded_fps ?? m.decoded_fps} / ring ${m.ring_written_fps ?? m.written_fps} fps, configured source ${m.source_fps ?? m.fps_target}, ${m.transport_bandwidth_mbps ?? m.estimated_mbps} Mbps, processing ${m.producer_processing_ms ?? m.total_pipeline_ms}ms${m.source === 'mjpeg' ? `, JPEG dropped ${m.dropped_jpegs}, queue ${m.jpeg_queue_len}` : ''}` : 'Producer: not running',
       `Producer last error: ${vcamState?.last_error || m?.last_error || 'none'}`,
-      `Desktop preview: ready=${previewDiagnostics.ready} ring=${previewDiagnostics.ringAlive} ringWrite=${previewDiagnostics.ringWriteSequence} calls=${previewDiagnostics.previewCommandCalls} nonEmpty=${previewDiagnostics.nonEmptyResponses} returned=${previewDiagnostics.lastReturnedSequence} ipcBytes=${previewDiagnostics.ipcPayloadBytes} parsed=${previewDiagnostics.parsedWidth}x${previewDiagnostics.parsedHeight} uploads=${previewDiagnostics.rendererUploadCount} displays=${previewDiagnostics.rendererDisplayCount} displayed=${previewDiagnostics.lastDisplayedSequence} error=${previewDiagnostics.lastError || 'none'}`,
+      `Desktop preview: ready=${previewDiagnostics.ready} ring=${previewDiagnostics.ringAlive} generation=${previewDiagnostics.streamGeneration} ringWrite=${previewDiagnostics.ringWriteSequence} receivedFps=${previewDiagnostics.previewReceivedFps} displayedFps=${previewDiagnostics.previewDisplayedFps} skipped=${previewDiagnostics.previewSkippedSequences} ipcMs=${previewDiagnostics.ipcTransferMs.toFixed(2)} uploadMs=${previewDiagnostics.previewUploadMs.toFixed(2)} colour=${previewDiagnostics.colorMatrix}/${previewDiagnostics.colorRange} parsed=${previewDiagnostics.parsedWidth}x${previewDiagnostics.parsedHeight} displayed=${previewDiagnostics.lastDisplayedSequence} error=${previewDiagnostics.lastError || 'none'}`,
       '=== event log ===',
       ...diagLog,
     ].join('\n');
@@ -1408,7 +1431,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
 
             <Section legend="Signal chain" icon={<Activity size={13} />}>
               <SignalChain
-                targetFps={settings.fps}
+                targetFps={Number(androidMetrics?.selectedFps || androidMetrics?.encodedFps || settings.fps)}
                 transport={transport}
                 androidRunning={androidRunning}
                 androidMetrics={androidMetrics}
@@ -1429,7 +1452,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
               />
               <Tel
                 k="Source"
-                v={`${settings.width}×${settings.height} @ ${settings.fps} · ${(androidMetrics?.activeStreamMode || settings.streamMode).toUpperCase()}`}
+                v={`${androidMetrics?.encodedWidth || settings.width}×${androidMetrics?.encodedHeight || settings.height} @ ${androidMetrics?.selectedFps || androidMetrics?.encodedFps || settings.fps} · ${(androidMetrics?.activeStreamMode || settings.streamMode).toUpperCase()}`}
               />
               <Tel
                 k="Windows output"
@@ -1501,7 +1524,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                     <option value="low-latency">Low latency (1280×720, Q70)</option>
                     <option value="balanced">Balanced (1280×720, Q85)</option>
                     <option value="balanced-720p60">Balanced 60 (1280×720 @ 60, Q80)</option>
-                    <option value="quality">Quality (1920×1080, Q90)</option>
+                    <option value="quality">Quality (1920×1080, Q75)</option>
                     <option value="experimental-1080p60">1080p @ 60</option>
                   </select>
                   <p className="hint">
@@ -1714,6 +1737,11 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                 <Tel k="Header / parsed geometry" v={`${previewDiagnostics.frameHeaderValid ? 'valid' : 'waiting'} / ${previewDiagnostics.parsedWidth || '—'}×${previewDiagnostics.parsedHeight || '—'}`} tone={previewDiagnostics.frameHeaderValid ? 'ready' : 'warn'} />
                 <Tel k="Renderer uploads / displays" v={`${previewDiagnostics.rendererUploadCount} / ${previewDiagnostics.rendererDisplayCount}`} tone={previewDiagnostics.rendererDisplayCount > 0 ? 'ready' : 'warn'} />
                 <Tel k="Last displayed sequence" v={previewDiagnostics.lastDisplayedSequence || 'none'} />
+                <Tel k="Preview received / displayed fps" v={`${previewDiagnostics.previewReceivedFps} / ${previewDiagnostics.previewDisplayedFps}`} tone={previewDiagnostics.ready && previewDiagnostics.previewDisplayedFps > 0 ? 'ready' : 'warn'} />
+                <Tel k="Preview skipped sequences" v={previewDiagnostics.previewSkippedSequences} tone={previewDiagnostics.previewSkippedSequences > 0 ? 'warn' : undefined} />
+                <Tel k="IPC transfer / WebGL upload" v={`${previewDiagnostics.ipcTransferMs.toFixed(2)} / ${previewDiagnostics.previewUploadMs.toFixed(2)} ms`} />
+                <Tel k="Source fps / colour" v={`${previewDiagnostics.sourceFps || '—'} / ${previewDiagnostics.colorMatrix || '—'} ${previewDiagnostics.colorRange || ''}`} />
+                <Tel k="Primaries / transfer" v={`${previewDiagnostics.colorPrimaries || '—'} / ${previewDiagnostics.colorTransfer || '—'}`} />
                 <Tel k="Torn slots rejected" v={previewDiagnostics.tornSlotsRejected} tone={previewDiagnostics.tornSlotsRejected > 0 ? 'warn' : undefined} />
                 <Tel k="Last preview error" v={previewDiagnostics.lastError || 'none'} tone={previewDiagnostics.lastError ? 'fail' : 'muted'} />
               </div>
@@ -1779,14 +1807,19 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
               {metrics ? (
                 <>
                   <div className="tel-grid">
-                    <Tel k="Transport fps" v={metrics.transport_fps ?? metrics.http_jpeg_fps} />
-                    <Tel k="Decoded unique" v={metrics.decoded_unique_fps ?? metrics.decoded_fps} />
+                    <Tel k="Configured source fps" v={metrics.source_fps ?? metrics.fps_target} />
+                    <Tel k="Transport received fps" v={metrics.transport_received_fps ?? metrics.transport_fps ?? metrics.http_jpeg_fps} />
+                    <Tel k="Producer decoded fps" v={metrics.producer_decoded_fps ?? metrics.decoded_unique_fps ?? metrics.decoded_fps} />
+                    <Tel k="Ring written fps" v={metrics.ring_written_fps ?? metrics.written_fps} />
+                    <Tel k="Virtual cam requested fps" v={metrics.virtual_camera_requested_fps ?? 0} />
                     <Tel k="Virtual cam unique" v={metrics.virtual_camera_unique_fps ?? metrics.written_fps} />
-                    <Tel k="Repeated samples" v={metrics.repeated_samples ?? 0} tone={(metrics.repeated_samples ?? 0) > 0 ? 'warn' : undefined} />
-                    <Tel k="Replaced / dropped" v={`${metrics.replaced_frames ?? 0} / ${metrics.dropped_jpegs}`} />
-                    <Tel k="Bandwidth" v={`${metrics.estimated_mbps} Mb/s`} />
+                    <Tel k="Virtual cam repeated fps" v={metrics.virtual_camera_repeated_fps ?? metrics.repeated_samples ?? 0} tone={(metrics.repeated_samples ?? 0) > 0 ? 'warn' : undefined} />
+                    <Tel k="Producer replaced frames" v={metrics.replaced_frames ?? 0} />
+                    {metrics.source === 'mjpeg' && <Tel k="JPEG dropped / queue" v={`${metrics.dropped_jpegs} / ${metrics.jpeg_queue_len}`} />}
+                    <Tel k="Transport bandwidth" v={`${metrics.transport_bandwidth_mbps ?? metrics.estimated_mbps} Mb/s`} />
                     <Tel k="Decode time" v={`${metrics.decode_ms_avg} ms`} />
-                    <Tel k="Frame latency" v={`${metrics.latency_ms ?? metrics.total_pipeline_ms} ms`} />
+                    <Tel k="Producer processing" v={`${metrics.producer_processing_ms ?? metrics.total_pipeline_ms} ms`} />
+                    {metrics.source === 'ocb2-h264' && <Tel k="Phone→ring lower bound" v={`${metrics.phone_to_ring_latency_ms ?? metrics.latency_ms ?? 0} ms`} />}
                   </div>
                   <Tel
                     k="Decoder"
@@ -1800,6 +1833,12 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                   <Tel k="Pixel format" v={metrics.pixel_format} tone="muted" />
                   {metrics.source_width !== metrics.output_width && (
                     <Tel k="Resizing" v={`${metrics.source_width}×${metrics.source_height} → ${metrics.output_width}×${metrics.output_height}`} tone="warn" />
+                  )}
+                  {ring && (
+                    <>
+                      <Tel k="Playout buffer / target" v={`${ring.playout_buffer_depth_ms} / ${ring.playout_target_delay_ms} ms`} />
+                      <Tel k="Playout underruns / late drops" v={`${ring.playout_underruns} / ${ring.playout_late_dropped}`} tone={ring.playout_underruns || ring.playout_late_dropped ? 'warn' : 'ready'} />
+                    </>
                   )}
                   {vcamState?.last_metrics_time && (
                     <p className="hint" style={{ textAlign: 'right' }}>
@@ -1850,7 +1889,14 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                     </>
                   )}
                   {androidMetrics.mjpeg && (
-                    <Tel k="MJPEG encode time" v={`${Number(androidMetrics.androidEncodeMsAvg || 0).toFixed(1)} ms`} />
+                    <>
+                      <Tel k="MJPEG phone processing" v={`${Number(androidMetrics.androidEncodeMsAvg || 0).toFixed(1)} ms`} />
+                      <Tel
+                        k="MJPEG measured capacity"
+                        v={`${androidMetrics.mjpegProcessingCapacityFps || 0} fps at Q${settings.jpegQuality}`}
+                        tone={(androidMetrics.mjpegProcessingCapacityFps || 0) >= settings.fps ? 'ready' : 'warn'}
+                      />
+                    </>
                   )}
                 </>
               ) : (

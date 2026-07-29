@@ -29,17 +29,29 @@ pub struct VirtualCamMetrics {
     pub output_width: u32,
     pub output_height: u32,
     pub fps_target: u32,
+    #[serde(default)]
+    pub source_fps: u32,
     pub http_jpeg_fps: u32,
     pub decoded_fps: u32,
     pub written_fps: u32,
     #[serde(default)]
     pub transport_fps: u32,
     #[serde(default)]
+    pub transport_received_fps: u32,
+    #[serde(default)]
     pub decoded_unique_fps: u32,
+    #[serde(default)]
+    pub producer_decoded_fps: u32,
+    #[serde(default)]
+    pub ring_written_fps: u32,
     #[serde(default)]
     pub virtual_camera_unique_fps: u32,
     #[serde(default)]
     pub repeated_samples: u64,
+    #[serde(default)]
+    pub virtual_camera_requested_fps: u32,
+    #[serde(default)]
+    pub virtual_camera_repeated_fps: u32,
     pub dropped_jpegs: u32,
     #[serde(default)]
     pub replaced_frames: u64,
@@ -52,12 +64,18 @@ pub struct VirtualCamMetrics {
     pub write_ms_avg: u32,
     pub total_pipeline_ms: u32,
     #[serde(default)]
+    pub producer_processing_ms: u32,
+    #[serde(default)]
     pub latency_ms: u32,
+    #[serde(default)]
+    pub phone_to_ring_latency_ms: u32,
     pub bytes_per_sec: usize,
     // Producer emits this; the desktop "Est. Bandwidth" readout stayed blank
     // without the field. Default keeps older producer builds parseable.
     #[serde(default)]
     pub estimated_mbps: String,
+    #[serde(default)]
+    pub transport_bandwidth_mbps: String,
     pub pixel_format: String,
     // Which optimized paths actually ran (defaults keep older producer builds
     // parseable): "zune"/"standard" decode, "simd"/"standard"/"skipped" resize.
@@ -90,6 +108,26 @@ pub struct VirtualCamMetrics {
     pub virtual_camera_ready: bool,
 }
 
+impl VirtualCamMetrics {
+    fn normalize_truthful_names(&mut self) {
+        let ring_source_fps = self.ring.as_ref().map(|ring| {
+            ring.source_fps_num / ring.source_fps_den.max(1)
+        }).unwrap_or(0);
+        self.source_fps = if ring_source_fps > 0 { ring_source_fps } else { self.fps_target };
+        self.transport_received_fps = self.transport_fps;
+        self.producer_decoded_fps = self.decoded_unique_fps;
+        self.ring_written_fps = self.written_fps;
+        self.virtual_camera_requested_fps = self.ring.as_ref().map(|ring| {
+            ring.negotiated_fps_num / ring.negotiated_fps_den.max(1)
+        }).unwrap_or(0);
+        self.virtual_camera_repeated_fps = self.repeated_samples.min(u32::MAX as u64) as u32;
+        self.producer_processing_ms = self.total_pipeline_ms;
+        self.phone_to_ring_latency_ms =
+            if self.source == "ocb2-h264" { self.latency_ms } else { 0 };
+        self.transport_bandwidth_mbps = self.estimated_mbps.clone();
+    }
+}
+
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub struct RingDiagnostics {
     pub consumer_attached: bool,
@@ -114,6 +152,26 @@ pub struct RingDiagnostics {
     pub installed_dll_build_hash: String,
     pub producer_build_hash: String,
     pub ring_abi_hash: u64,
+    #[serde(default)]
+    pub ring_write_sequence: u64,
+    #[serde(default)]
+    pub stream_generation: u64,
+    #[serde(default)]
+    pub ring_frames_overwritten: u64,
+    #[serde(default)]
+    pub playout_buffer_depth_ms: u64,
+    #[serde(default)]
+    pub playout_target_delay_ms: u64,
+    #[serde(default)]
+    pub playout_late_dropped: u64,
+    #[serde(default)]
+    pub playout_underruns: u64,
+    #[serde(default)]
+    pub playout_scheduler_resets: u64,
+    #[serde(default)]
+    pub playout_clock_ppm: i32,
+    #[serde(default)]
+    pub playout_max_output_gap_ms: u32,
 }
 
 #[derive(Deserialize)]
@@ -745,9 +803,10 @@ pub fn start_virtual_camera_feeder(
                     .and_then(|v| v.as_str())
                 {
                     Some("metrics") => {
-                        if let Ok(metrics) =
+                        if let Ok(mut metrics) =
                             serde_json::from_value::<VirtualCamMetrics>(value.unwrap())
                         {
+                            metrics.normalize_truthful_names();
                             let state_manager = app_clone.state::<VirtualCamManager>();
                             *state_manager.producer_state.lock_recover() =
                                 metrics.producer_state.clone();

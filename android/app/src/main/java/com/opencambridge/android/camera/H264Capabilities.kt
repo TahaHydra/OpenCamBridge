@@ -129,18 +129,21 @@ object H264Capabilities {
         }
         val regularRanges: Array<out Range<Int>> =
             chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
-        val regularRange = chooseRegularRange(regularRanges, mode.fps)
+        val regularRange = RegularModePolicy.selectRange(
+            regularRanges.map { RegularModePolicy.AeRange(it.lower, it.upper) },
+            mode.fps,
+        )?.let { Range(it.min, it.max) }
         val minDuration = if (regularSizes.contains(size)) {
             try { map.getOutputMinFrameDuration(MediaCodec::class.java, size) } catch (_: Exception) { 0L }
         } else {
             0L
         }
-        val durationFps = if (minDuration > 0L) 1_000_000_000.0 / minDuration else Double.POSITIVE_INFINITY
         val regularReason = when {
             encoderFailure != null -> encoderFailure
             !regularSizes.contains(size) -> "MediaCodec surface size is absent from regular outputs"
             regularRange == null -> "no regular AE range contains ${mode.fps} fps"
-            durationFps + 0.5 < mode.fps -> "regular min frame duration ${minDuration}ns limits output to %.2f fps".format(durationFps)
+            !RegularModePolicy.durationSupports(minDuration, mode.fps) ->
+                "regular min frame duration ${minDuration}ns does not prove ${mode.fps} fps"
             else -> "declared by regular Camera2 surface configuration"
         }
 
@@ -262,10 +265,6 @@ object H264Capabilities {
         }
         return null
     }
-
-    private fun chooseRegularRange(ranges: Array<out Range<Int>>, fps: Int): Range<Int>? =
-        ranges.filter { it.lower <= fps && it.upper >= fps }
-            .minWithOrNull(compareBy<Range<Int>>({ it.upper - it.lower }, { -it.lower }))
 
     private fun chooseDirectHighSpeedRange(ranges: List<Range<Int>>, fps: Int): Range<Int>? =
         CapturePathPolicy.directRange(ranges.map { it.lower to it.upper }, fps)?.let { Range(it.first, it.second) }

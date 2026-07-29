@@ -63,6 +63,14 @@ pub struct StreamInfo {
     pub sensor_orientation: u32,
     #[serde(default)]
     pub device_rotation: u32,
+    #[serde(default = "default_color_matrix")]
+    pub color_matrix: String,
+    #[serde(default = "default_color_range")]
+    pub color_range: String,
+    #[serde(default = "default_color_primaries")]
+    pub color_primaries: String,
+    #[serde(default = "default_color_transfer")]
+    pub color_transfer: String,
 }
 
 impl StreamInfo {
@@ -73,9 +81,37 @@ impl StreamInfo {
             self.device_rotation,
         ]
         .iter()
-        .all(|value| matches!(value, 0 | 90 | 180 | 270))
+            .all(|value| matches!(value, 0 | 90 | 180 | 270))
+    }
+
+    /** Packed into the existing ring slot `reserved_tail` field, so colour
+     * metadata crosses the process boundary without changing the ABI layout. */
+    pub fn color_descriptor(&self) -> u32 {
+        let matrix = match self.color_matrix.as_str() {
+            "bt601" => 1,
+            "bt2020" => 3,
+            _ => 2,
+        };
+        let range = if self.color_range == "full" { 2 } else { 1 };
+        let primaries = match self.color_primaries.as_str() {
+            "bt601" => 1,
+            "bt2020" => 3,
+            _ => 2,
+        };
+        let transfer = match self.color_transfer.as_str() {
+            "linear" => 2,
+            "st2084" => 3,
+            "hlg" => 4,
+            _ => 1,
+        };
+        matrix | (range << 8) | (primaries << 16) | (transfer << 24)
     }
 }
+
+fn default_color_matrix() -> String { "bt709".into() }
+fn default_color_range() -> String { "limited".into() }
+fn default_color_primaries() -> String { "bt709".into() }
+fn default_color_transfer() -> String { "bt709".into() }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
@@ -247,6 +283,7 @@ mod tests {
             r#"{"codec":"H264","framing":"annex-b-access-units","width":1280,"height":720,"fpsNumerator":60,"fpsDenominator":1,"bitrate":4000000,"cameraId":"0","encoderName":"test","hardwareEncoder":true,"pixelFormat":"NV12","effectiveRotation":270,"mirror":true,"sensorOrientation":90,"deviceRotation":180}"#
         ).unwrap();
         assert!(info.has_valid_transform());
+        assert_eq!(info.color_descriptor(), 0x0102_0102);
         info.effective_rotation = 45;
         assert!(!info.has_valid_transform());
     }

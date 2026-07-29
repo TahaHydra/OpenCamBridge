@@ -16,6 +16,16 @@ export interface PreviewStageDiagnostics {
   rendererDisplayCount: number;
   lastDisplayedSequence: number;
   tornSlotsRejected: number;
+  previewReceivedFps: number;
+  previewDisplayedFps: number;
+  previewSkippedSequences: number;
+  ipcTransferMs: number;
+  previewUploadMs: number;
+  sourceFps: number;
+  colorMatrix: string;
+  colorRange: string;
+  colorPrimaries: string;
+  colorTransfer: string;
   ready: boolean;
   consumerStalled: boolean;
   lastError: string;
@@ -37,6 +47,16 @@ export const EMPTY_PREVIEW_DIAGNOSTICS: PreviewStageDiagnostics = {
   rendererDisplayCount: 0,
   lastDisplayedSequence: 0,
   tornSlotsRejected: 0,
+  previewReceivedFps: 0,
+  previewDisplayedFps: 0,
+  previewSkippedSequences: 0,
+  ipcTransferMs: 0,
+  previewUploadMs: 0,
+  sourceFps: 0,
+  colorMatrix: '',
+  colorRange: '',
+  colorPrimaries: '',
+  colorTransfer: '',
   ready: false,
   consumerStalled: false,
   lastError: '',

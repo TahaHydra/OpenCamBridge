@@ -129,6 +129,15 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
   const effectiveFit =
     layout === '16:9' && framePortrait ? 'fit' : fitMode;
   const h264Primary = (serverStatus?.activeStreamMode || serverStatus?.streamMode) === 'h264';
+  const h264Active = h264Primary && lifecycle === 'STREAMING';
+  const previewSessionKey = [
+    timestamp,
+    serverStatus?.pipelineGeneration ?? serverStatus?.snapshot?.generation ?? 0,
+    serverStatus?.activeStreamMode || serverStatus?.streamMode || '',
+    serverStatus?.encodedWidth || 0,
+    serverStatus?.encodedHeight || 0,
+    serverStatus?.selectedFps || serverStatus?.fps || 0,
+  ].join(':');
 
   return (
     <div className="preview-wrapper animate-fade">
@@ -145,10 +154,10 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
           />
         </div>}
 
-        {h264Primary ? (
-          // key: the Reload button bumps `timestamp`, remounting the NV12
-          // preview so a stale WebGL surface never survives a mode switch.
-          <Nv12RingPreview key={timestamp} fitMode={effectiveFit} />
+        {h264Active ? (
+          // Every producer generation gets a fresh renderer. A stale READY flag,
+          // sequence cursor or texture can never survive a rebind/codec switch.
+          <Nv12RingPreview key={previewSessionKey} fitMode={effectiveFit} />
         ) : showOverlay && (
           <div className="preview-overlay">
             {rebinding ? <RefreshCw size={48} opacity={0.6} className="animate-spin" /> : <CameraOff size={48} opacity={0.5} />}
@@ -161,7 +170,7 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
           </div>
         )}
 
-        {(h264Primary || !showOverlay) && (
+        {(h264Active || !showOverlay) && (
           <div className="vf-actions">
             <button className="btn btn--sm" onClick={reloadPreview}>
               <RefreshCw size={12} /> Reload
@@ -171,11 +180,11 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
 
         {/* Viewfinder readout: what is actually being encoded, on the glass
             where the operator is already looking. */}
-        {(h264Primary || !showOverlay) && (
+        {(h264Active || !showOverlay) && (
           <div className="vf-hud">
             <b>{serverStatus?.encodedWidth || '—'}×{serverStatus?.encodedHeight || '—'}</b>
             <i>/</i>
-            <b>{serverStatus?.fps ?? '—'}</b> fps
+            <b>{serverStatus?.snapshot?.actual?.encodedFps || serverStatus?.snapshot?.selected?.fps || serverStatus?.fps || '—'}</b> fps
             <i>/</i>
             <b>{(serverStatus?.activeStreamMode || serverStatus?.streamMode || '—').toString().toUpperCase()}</b>
             {serverStatus?.mirror && <><i>/</i>MIRROR</>}

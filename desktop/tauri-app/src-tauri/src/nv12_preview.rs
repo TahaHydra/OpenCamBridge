@@ -20,8 +20,10 @@ use crate::sync_state::RecoverMutex;
 // 1920x1080/1080x1920), and sending one over Tauri IPC every ~33ms is ~90MB/s
 // of JS<->Rust transfer -- a real bottleneck that made the preview's own frame
 // rate lag well behind the actual (fine) producer/ring rate. Downscaling here
-// cuts that transfer ~4x with a cheap nearest-neighbor sample.
+// cuts that transfer ~4x. Bilinear sampling prevents the source-side aliasing
+// that nearest-neighbour introduced before WebGL ever saw the image.
 const PREVIEW_MAX_DIMENSION: usize = 960;
+const PREVIEW_QUEUE_DEPTH: u64 = 3;
 
 const OCBR_MAGIC: u32 = 0x5242_434f;
 const RING_VERSION: u16 = 4;
@@ -29,7 +31,8 @@ const FORMAT_NV12: u32 = 2;
 const MAX_NV12_SIZE: usize = 1920 * 1080 * 3 / 2;
 const SLOT_SIZE: usize = SLOT_HEADER_SIZE + MAX_NV12_SIZE;
 const MAPPING_SIZE: usize = RING_HEADER_SIZE + SLOT_COUNT * SLOT_SIZE;
-const PREVIEW_HEADER_SIZE: usize = 48;
+const PREVIEW_HEADER_SIZE: usize = 80;
+const COLOR_BT709_LIMITED_SDR: u32 = 2 | (1 << 8) | (2 << 16) | (1 << 24);
 
 // ABI source of truth: protocol/ring-abi.schema.json. Compile-time generated
 // checks below bind every field type, size, and offset to C++ and the producer.
@@ -129,6 +132,8 @@ struct PreviewRead {
     width: u32,
     height: u32,
     torn_slots_rejected: u64,
+    skipped_sequences: u64,
+    frame_ring_sequence: u64,
 }
 
 /// Scale down to at most `PREVIEW_MAX_DIMENSION` on the long edge, preserving
@@ -145,11 +150,11 @@ fn downscale_dimensions(width: usize, height: usize) -> (usize, usize) {
     (new_w, new_h)
 }
 
-/// Nearest-neighbor downsample of a tightly-packed NV12 frame (Y plane
+/// Bilinear downsample of a tightly-packed NV12 frame (Y plane
 /// followed by interleaved UV) into `out`, which must be exactly
 /// `out_width*out_height + out_width*(out_height/2)` bytes. Output strides are
 /// equal to `out_width` (no padding) for both planes.
-unsafe fn downscale_nv12(
+unsafe fn downscale_nv12_bilinear(
     y_src: *const u8,
     y_src_stride: usize,
     uv_src: *const u8,
@@ -160,32 +165,64 @@ unsafe fn downscale_nv12(
     out_height: usize,
     out: &mut [u8],
 ) {
+    unsafe fn resize_plane(
+        source: *const u8,
+        source_stride: usize,
+        source_width: usize,
+        source_height: usize,
+        channels: usize,
+        output_width: usize,
+        output_height: usize,
+        output: &mut [u8],
+    ) {
+        const ONE: u64 = 1 << 16;
+        fn coordinates(input: usize, output: usize) -> Vec<(usize, usize, u64)> {
+            (0..output)
+                .map(|position| {
+                    let source = ((position as f64 + 0.5) * input as f64
+                        / output as f64
+                        - 0.5)
+                        .clamp(0.0, (input - 1) as f64);
+                    let first = source.floor() as usize;
+                    let second = (first + 1).min(input - 1);
+                    let weight = ((source - first as f64) * ONE as f64).round() as u64;
+                    (first, second, weight.min(ONE))
+                })
+                .collect()
+        }
+        // Geometry is stable for a preview session. Even without caching these
+        // tiny coordinate tables, this moves floating-point/division work out
+        // of the per-pixel loop (roughly 780k samples per 1080p preview frame).
+        let xs = coordinates(source_width, output_width);
+        let ys = coordinates(source_height, output_height);
+        for oy in 0..output_height {
+            let (y0, y1, wy) = ys[oy];
+            for ox in 0..output_width {
+                let (x0, x1, wx) = xs[ox];
+                for channel in 0..channels {
+                    let top_left = *source.add(y0 * source_stride + x0 * channels + channel) as u64;
+                    let top_right = *source.add(y0 * source_stride + x1 * channels + channel) as u64;
+                    let bottom_left = *source.add(y1 * source_stride + x0 * channels + channel) as u64;
+                    let bottom_right = *source.add(y1 * source_stride + x1 * channels + channel) as u64;
+                    let top = (top_left * (ONE - wx) + top_right * wx + ONE / 2) >> 16;
+                    let bottom = (bottom_left * (ONE - wx) + bottom_right * wx + ONE / 2) >> 16;
+                    output[(oy * output_width + ox) * channels + channel] =
+                        ((top * (ONE - wy) + bottom * wy + ONE / 2) >> 16) as u8;
+                }
+            }
+        }
+    }
+
     let y_out_len = out_width * out_height;
     let (y_out, uv_out) = out.split_at_mut(y_out_len);
-    for oy in 0..out_height {
-        let sy = oy * src_height / out_height;
-        let src_row = y_src.add(sy * y_src_stride);
-        let dst_row = &mut y_out[oy * out_width..(oy + 1) * out_width];
-        for (ox, dst) in dst_row.iter_mut().enumerate() {
-            let sx = ox * src_width / out_width;
-            *dst = *src_row.add(sx);
-        }
-    }
-    let uv_out_height = out_height / 2;
-    let uv_out_pairs = out_width / 2;
-    let uv_src_height = src_height / 2;
-    let uv_src_pairs = src_width / 2;
-    for oy in 0..uv_out_height {
-        let sy = oy * uv_src_height / uv_out_height;
-        let src_row = uv_src.add(sy * uv_src_stride);
-        let dst_row = &mut uv_out[oy * out_width..(oy + 1) * out_width];
-        for ox_pair in 0..uv_out_pairs {
-            let sx_pair = ox_pair * uv_src_pairs / uv_out_pairs;
-            let src = src_row.add(sx_pair * 2);
-            dst_row[ox_pair * 2] = *src;
-            dst_row[ox_pair * 2 + 1] = *src.add(1);
-        }
-    }
+    resize_plane(
+        y_src, y_src_stride, src_width, src_height, 1,
+        out_width, out_height, y_out,
+    );
+    resize_plane(
+        uv_src, uv_src_stride, src_width / 2, src_height / 2, 2,
+        out_width / 2, out_height / 2, uv_out,
+    );
 }
 
 /// Fill the 48-byte NVPR preview header (magic/version/geometry/timestamps),
@@ -198,9 +235,14 @@ fn write_preview_header(
     y_stride: u32,
     uv_stride: u32,
     payload_size: u32,
+    stream_generation: u64,
+    ring_sequence: u64,
+    color_descriptor: u32,
+    source_fps_num: u32,
+    source_fps_den: u32,
 ) {
     response[0..4].copy_from_slice(b"NVPR");
-    response[4..6].copy_from_slice(&1u16.to_le_bytes());
+    response[4..6].copy_from_slice(&2u16.to_le_bytes());
     response[6..8].copy_from_slice(&(PREVIEW_HEADER_SIZE as u16).to_le_bytes());
     response[8..16].copy_from_slice(&metadata.sequence.to_le_bytes());
     response[16..24].copy_from_slice(&metadata.capture_timestamp_ns.to_le_bytes());
@@ -210,6 +252,12 @@ fn write_preview_header(
     response[36..40].copy_from_slice(&uv_stride.to_le_bytes());
     response[40..44].copy_from_slice(&payload_size.to_le_bytes());
     response[44..48].copy_from_slice(&metadata.flags.to_le_bytes());
+    response[48..56].copy_from_slice(&stream_generation.to_le_bytes());
+    response[56..64].copy_from_slice(&ring_sequence.to_le_bytes());
+    response[64..68].copy_from_slice(&color_descriptor.to_le_bytes());
+    response[68..72].copy_from_slice(&source_fps_num.to_le_bytes());
+    response[72..76].copy_from_slice(&source_fps_den.max(1).to_le_bytes());
+    response[76..80].fill(0);
 }
 
 struct Mapping {
@@ -329,20 +377,21 @@ impl Mapping {
         }
     }
 
-    /// Read the newest committed frame without participating in virtual-camera
-    /// playout. The in-app preview is an observer: it never advances consumer
-    /// state and it returns empty only when the newest source sequence was
-    /// already returned to this frontend.
+    /// Read through a tiny preview-only queue without participating in virtual
+    /// camera playout. The first request takes newest for immediate startup;
+    /// subsequent requests drain in order while bounding backlog to three.
     fn read_newest(
         &self,
         after_sequence: u64,
         last_returned_generation: u64,
+        last_returned_ring_sequence: u64,
     ) -> Result<PreviewRead, String> {
         unsafe {
             read_newest_from_base(
                 self.view.Value as *const u8,
                 after_sequence,
                 last_returned_generation,
+                last_returned_ring_sequence,
             )
         }
     }
@@ -352,12 +401,13 @@ unsafe fn read_newest_from_base(
     base: *const u8,
     after_sequence: u64,
     last_returned_generation: u64,
+    last_returned_ring_sequence: u64,
 ) -> Result<PreviewRead, String> {
     let ring = &*(base as *const RingHeader);
     Mapping::validate_header(ring)?;
     let ring_write_sequence = ring.ring_write_sequence.load(Ordering::Acquire);
     let stream_generation = ring.stream_generation.load(Ordering::Acquire);
-    let mut newest: Option<(usize, SlotHeader, u64)> = None;
+    let mut candidates: Vec<(usize, SlotHeader, u64)> = Vec::with_capacity(SLOT_COUNT);
     let mut torn_slots_rejected = 0u64;
 
     // Select from stable header snapshots. Scanning all slots is deliberate:
@@ -386,16 +436,11 @@ unsafe fn read_newest_from_base(
         {
             continue;
         }
-        if newest
-            .as_ref()
-            .map(|(_, current, _)| metadata.ring_sequence > current.ring_sequence)
-            .unwrap_or(true)
-        {
-            newest = Some((index, metadata, before));
-        }
+        candidates.push((index, metadata, before));
     }
+    candidates.sort_by_key(|(_, metadata, _)| metadata.ring_sequence);
 
-    let Some((slot_index, metadata, first_epoch)) = newest else {
+    let Some((_, newest_metadata, _)) = candidates.last() else {
         return Ok(PreviewRead {
             bytes: Vec::new(),
             frame_sequence: None,
@@ -404,12 +449,14 @@ unsafe fn read_newest_from_base(
             width: 0,
             height: 0,
             torn_slots_rejected,
+            skipped_sequences: 0,
+            frame_ring_sequence: 0,
         });
     };
 
-    // Source sequence numbers may restart when generation changes. The first
-    // valid frame of the new generation must therefore bypass after_sequence.
-    if metadata.stream_generation == last_returned_generation && metadata.sequence == after_sequence
+    if stream_generation == last_returned_generation
+        && newest_metadata.ring_sequence <= last_returned_ring_sequence
+        && newest_metadata.sequence == after_sequence
     {
         return Ok(PreviewRead {
             bytes: Vec::new(),
@@ -419,8 +466,45 @@ unsafe fn read_newest_from_base(
             width: 0,
             height: 0,
             torn_slots_rejected,
+            skipped_sequences: 0,
+            frame_ring_sequence: 0,
         });
     }
+
+    let target_ring_sequence =
+        if last_returned_generation != stream_generation || last_returned_ring_sequence == 0 {
+            newest_metadata.ring_sequence
+        } else {
+            let bounded_oldest = newest_metadata
+                .ring_sequence
+                .saturating_sub(PREVIEW_QUEUE_DEPTH.saturating_sub(1));
+            last_returned_ring_sequence
+                .saturating_add(1)
+                .max(bounded_oldest)
+        };
+    let Some((slot_index, metadata, first_epoch)) = candidates
+        .into_iter()
+        .find(|(_, metadata, _)| metadata.ring_sequence >= target_ring_sequence)
+    else {
+        return Ok(PreviewRead {
+            bytes: Vec::new(),
+            frame_sequence: None,
+            stream_generation,
+            ring_write_sequence,
+            width: 0,
+            height: 0,
+            torn_slots_rejected,
+            skipped_sequences: 0,
+            frame_ring_sequence: 0,
+        });
+    };
+    let skipped_sequences = if last_returned_generation == stream_generation {
+        metadata
+            .ring_sequence
+            .saturating_sub(last_returned_ring_sequence.saturating_add(1))
+    } else {
+        0
+    };
 
     let width = metadata.width as usize;
     let height = metadata.height as usize;
@@ -474,12 +558,17 @@ unsafe fn read_newest_from_base(
             y_stride as u32,
             uv_stride as u32,
             expected as u32,
+            stream_generation,
+            metadata.ring_sequence,
+            if metadata.reserved_tail == 0 { COLOR_BT709_LIMITED_SDR } else { metadata.reserved_tail },
+            ring.producer_fps_num.load(Ordering::Acquire),
+            ring.producer_fps_den.load(Ordering::Acquire),
         );
         response
     } else {
         let out_payload = out_width * out_height + out_width * (out_height / 2);
         let mut response = vec![0u8; PREVIEW_HEADER_SIZE + out_payload];
-        downscale_nv12(
+        downscale_nv12_bilinear(
             y_src,
             y_stride,
             uv_src,
@@ -498,6 +587,11 @@ unsafe fn read_newest_from_base(
             out_width as u32,
             out_width as u32,
             out_payload as u32,
+            stream_generation,
+            metadata.ring_sequence,
+            if metadata.reserved_tail == 0 { COLOR_BT709_LIMITED_SDR } else { metadata.reserved_tail },
+            ring.producer_fps_num.load(Ordering::Acquire),
+            ring.producer_fps_den.load(Ordering::Acquire),
         );
         response
     };
@@ -516,6 +610,8 @@ unsafe fn read_newest_from_base(
             width: 0,
             height: 0,
             torn_slots_rejected,
+            skipped_sequences,
+            frame_ring_sequence: 0,
         });
     }
 
@@ -527,6 +623,8 @@ unsafe fn read_newest_from_base(
         width: out_width as u32,
         height: out_height as u32,
         torn_slots_rejected,
+        skipped_sequences,
+        frame_ring_sequence: metadata.ring_sequence,
     })
 }
 
@@ -542,6 +640,7 @@ struct ReaderState {
     last_heartbeat: u64,
     last_progress: Instant,
     last_returned_generation: u64,
+    last_returned_ring_sequence: u64,
     ring_write_sequence: u64,
     stream_generation: u64,
     preview_command_calls: u64,
@@ -552,6 +651,7 @@ struct ReaderState {
     last_width: u32,
     last_height: u32,
     torn_slots_rejected: u64,
+    skipped_sequences: u64,
     last_error: String,
 }
 
@@ -566,6 +666,7 @@ impl Nv12PreviewReader {
                 last_heartbeat: 0,
                 last_progress: Instant::now(),
                 last_returned_generation: 0,
+                last_returned_ring_sequence: 0,
                 ring_write_sequence: 0,
                 stream_generation: 0,
                 preview_command_calls: 0,
@@ -576,6 +677,7 @@ impl Nv12PreviewReader {
                 last_width: 0,
                 last_height: 0,
                 torn_slots_rejected: 0,
+                skipped_sequences: 0,
                 last_error: String::new(),
             }),
         }
@@ -595,6 +697,7 @@ pub struct Nv12PreviewDiagnostics {
     pub last_width: u32,
     pub last_height: u32,
     pub torn_slots_rejected: u64,
+    pub skipped_sequences: u64,
     pub last_error: String,
 }
 
@@ -616,6 +719,7 @@ pub fn get_nv12_preview_diagnostics(
         last_width: reader.last_width,
         last_height: reader.last_height,
         torn_slots_rejected: reader.torn_slots_rejected,
+        skipped_sequences: reader.skipped_sequences,
         last_error: reader.last_error.clone(),
     }
 }
@@ -637,6 +741,7 @@ pub fn get_nv12_preview_frame(
         reader.last_heartbeat = 0;
         reader.last_progress = Instant::now();
         reader.last_returned_generation = 0;
+        reader.last_returned_ring_sequence = 0;
         reader.ring_write_sequence = 0;
         reader.stream_generation = 0;
         reader.preview_command_calls = 0;
@@ -647,6 +752,7 @@ pub fn get_nv12_preview_frame(
         reader.last_width = 0;
         reader.last_height = 0;
         reader.torn_slots_rejected = 0;
+        reader.skipped_sequences = 0;
         reader.last_error.clear();
     }
     reader.preview_command_calls += 1;
@@ -673,6 +779,21 @@ pub fn get_nv12_preview_frame(
                 return Err(error);
             }
         };
+    if reader.stream_generation != 0 && reader.stream_generation != stream_generation {
+        // Every ring generation is a separate preview session. Counters and
+        // cursors from the old producer must not manufacture READY or skips.
+        reader.last_returned_generation = 0;
+        reader.last_returned_ring_sequence = 0;
+        reader.preview_command_calls = 1;
+        reader.non_empty_responses = 0;
+        reader.empty_responses = 0;
+        reader.last_returned_sequence = 0;
+        reader.last_ipc_payload_bytes = 0;
+        reader.last_width = 0;
+        reader.last_height = 0;
+        reader.torn_slots_rejected = 0;
+        reader.skipped_sequences = 0;
+    }
     reader.ring_write_sequence = ring_write_sequence;
     reader.stream_generation = stream_generation;
     if let Some(expected) = expected_build_hash.filter(|value| !value.is_empty()) {
@@ -703,21 +824,28 @@ pub fn get_nv12_preview_frame(
         return Ok(Response::new(Vec::new()));
     }
     let last_returned_generation = reader.last_returned_generation;
+    let last_returned_ring_sequence = reader.last_returned_ring_sequence;
     let result = reader
         .mapping
         .as_ref()
         .unwrap()
-        .read_newest(after_sequence, last_returned_generation);
+        .read_newest(
+            after_sequence,
+            last_returned_generation,
+            last_returned_ring_sequence,
+        );
     match result {
         Ok(frame) => {
             reader.ring_write_sequence = frame.ring_write_sequence;
             reader.stream_generation = frame.stream_generation;
             reader.torn_slots_rejected += frame.torn_slots_rejected;
+            reader.skipped_sequences += frame.skipped_sequences;
             reader.last_ipc_payload_bytes = frame.bytes.len();
             if let Some(sequence) = frame.frame_sequence {
                 reader.non_empty_responses += 1;
                 reader.last_returned_sequence = sequence;
                 reader.last_returned_generation = frame.stream_generation;
+                reader.last_returned_ring_sequence = frame.frame_ring_sequence;
                 reader.last_width = frame.width;
                 reader.last_height = frame.height;
             } else {
@@ -797,6 +925,7 @@ mod tests {
                 slot.y_stride = width as u32;
                 slot.uv_stride = width as u32;
                 slot.pixel_format = FORMAT_NV12;
+                slot.reserved_tail = COLOR_BT709_LIMITED_SDR;
                 slot.payload_size = payload_size as u32;
                 slot.data_offset = (slot_offset + SLOT_HEADER_SIZE) as u32;
                 slot.ring_sequence = ring_sequence;
@@ -819,6 +948,8 @@ mod tests {
                 header
                     .ring_write_sequence
                     .store(ring_sequence, Ordering::Release);
+                header.producer_fps_num.store(30, Ordering::Release);
+                header.producer_fps_den.store(1, Ordering::Release);
             }
         }
 
@@ -862,31 +993,31 @@ mod tests {
         let mut ring = TestRing::new();
         ring.write_frame(1, 1, 41, 640, 480);
 
-        let first = unsafe { read_newest_from_base(ring.base(), 0, 0) }.unwrap();
+        let first = unsafe { read_newest_from_base(ring.base(), 0, 0, 0) }.unwrap();
         assert!(
             !first.bytes.is_empty(),
             "populated ring must return immediately"
         );
         assert_eq!(preview_u64(&first.bytes, 8), 41);
 
-        let duplicate = unsafe { read_newest_from_base(ring.base(), 41, 1) }.unwrap();
+        let duplicate = unsafe { read_newest_from_base(ring.base(), 41, 1, 1) }.unwrap();
         assert!(
             duplicate.bytes.is_empty(),
             "same source sequence must be empty"
         );
 
         ring.write_frame(2, 1, 42, 640, 480);
-        let newer = unsafe { read_newest_from_base(ring.base(), 41, 1) }.unwrap();
+        let newer = unsafe { read_newest_from_base(ring.base(), 41, 1, 1) }.unwrap();
         assert_eq!(preview_u64(&newer.bytes, 8), 42);
 
         ring.tear_frame(3);
-        let torn = unsafe { read_newest_from_base(ring.base(), 42, 1) }.unwrap();
+        let torn = unsafe { read_newest_from_base(ring.base(), 42, 1, 2) }.unwrap();
         assert!(torn.bytes.is_empty());
         assert!(torn.torn_slots_rejected >= 1);
 
         // Source sequence restarted below after_sequence, but generation changed.
         ring.write_frame(4, 2, 1, 640, 480);
-        let restarted = unsafe { read_newest_from_base(ring.base(), 42, 1) }.unwrap();
+        let restarted = unsafe { read_newest_from_base(ring.base(), 42, 1, 2) }.unwrap();
         assert_eq!(preview_u64(&restarted.bytes, 8), 1);
         assert_eq!(restarted.stream_generation, 2);
     }
@@ -905,7 +1036,7 @@ mod tests {
     fn newest_reader_downscales_landscape_and_portrait_with_valid_payloads() {
         let mut ring = TestRing::new();
         ring.write_frame(1, 1, 1, 1920, 1080);
-        let landscape = unsafe { read_newest_from_base(ring.base(), 0, 0) }.unwrap();
+        let landscape = unsafe { read_newest_from_base(ring.base(), 0, 0, 0) }.unwrap();
         assert_eq!(
             (
                 preview_u32(&landscape.bytes, 24),
@@ -919,7 +1050,7 @@ mod tests {
         );
 
         ring.write_frame(2, 2, 1, 1080, 1920);
-        let portrait = unsafe { read_newest_from_base(ring.base(), 1, 1) }.unwrap();
+        let portrait = unsafe { read_newest_from_base(ring.base(), 1, 1, 1) }.unwrap();
         assert_eq!(
             (
                 preview_u32(&portrait.bytes, 24),
@@ -931,6 +1062,33 @@ mod tests {
             portrait.bytes.len(),
             PREVIEW_HEADER_SIZE + 540 * 960 * 3 / 2
         );
+        assert_eq!(preview_u64(&portrait.bytes, 48), 2);
+        assert_eq!(preview_u64(&portrait.bytes, 56), 2);
+        assert_eq!(preview_u32(&portrait.bytes, 64), COLOR_BT709_LIMITED_SDR);
+        assert_eq!(preview_u32(&portrait.bytes, 68), 30);
+        assert_eq!(preview_u32(&portrait.bytes, 72), 1);
+    }
+
+    #[test]
+    fn preview_queue_drains_in_order_and_bounds_backlog() {
+        let mut ring = TestRing::new();
+        for sequence in 1..=8 {
+            ring.write_frame(sequence, 1, sequence, 640, 480);
+        }
+        // First request is immediate newest.
+        let first = unsafe { read_newest_from_base(ring.base(), 0, 0, 0) }.unwrap();
+        assert_eq!(first.frame_ring_sequence, 8);
+        ring.write_frame(9, 1, 9, 640, 480);
+        ring.write_frame(10, 1, 10, 640, 480);
+        let next = unsafe { read_newest_from_base(ring.base(), 8, 1, 8) }.unwrap();
+        assert_eq!(next.frame_ring_sequence, 9);
+
+        for sequence in 11..=16 {
+            ring.write_frame(sequence, 1, sequence, 640, 480);
+        }
+        let bounded = unsafe { read_newest_from_base(ring.base(), 9, 1, 9) }.unwrap();
+        assert_eq!(bounded.frame_ring_sequence, 14);
+        assert_eq!(bounded.skipped_sequences, 4);
     }
 
     #[test]
@@ -939,14 +1097,14 @@ mod tests {
         unsafe {
             (*(ring.base_mut() as *mut RingHeader)).version = RING_VERSION + 1;
         }
-        let error = unsafe { read_newest_from_base(ring.base(), 0, 0) }
+        let error = unsafe { read_newest_from_base(ring.base(), 0, 0, 0) }
             .err()
             .expect("ABI mismatch must fail");
         assert!(error.contains("incompatible ring ABI"));
     }
 
     #[test]
-    fn downscale_nv12_produces_tightly_packed_output_of_expected_size() {
+    fn bilinear_downscale_nv12_produces_tightly_packed_output_of_expected_size() {
         // 4x4 source: solid Y=200, solid U=10,V=20. 2x2 downscale should
         // preserve the flat colour exactly (nearest-neighbor on a uniform
         // image can't introduce artifacts) and be tightly packed (stride ==
@@ -959,7 +1117,7 @@ mod tests {
         let out_h = 2usize;
         let mut out = vec![0u8; out_w * out_h + out_w * (out_h / 2)];
         unsafe {
-            downscale_nv12(
+            downscale_nv12_bilinear(
                 y_src.as_ptr(),
                 src_w,
                 uv_src.as_ptr(),
@@ -974,5 +1132,26 @@ mod tests {
         let y_len = out_w * out_h;
         assert!(out[..y_len].iter().all(|&b| b == 200));
         assert_eq!(&out[y_len..], &[10, 20]);
+    }
+
+    #[test]
+    fn bilinear_downscale_averages_thin_alternating_lines() {
+        let src_w = 4usize;
+        let src_h = 4usize;
+        let mut y_src = vec![0u8; src_w * src_h];
+        for row in 0..src_h {
+            for column in 0..src_w {
+                y_src[row * src_w + column] = if column % 2 == 0 { 0 } else { 255 };
+            }
+        }
+        let uv_src = vec![128u8; src_w * src_h / 2];
+        let mut out = vec![0u8; 2 * 2 * 3 / 2];
+        unsafe {
+            downscale_nv12_bilinear(
+                y_src.as_ptr(), src_w, uv_src.as_ptr(), src_w,
+                src_w, src_h, 2, 2, &mut out,
+            );
+        }
+        assert!(out[..4].iter().all(|value| (127..=128).contains(value)));
     }
 }

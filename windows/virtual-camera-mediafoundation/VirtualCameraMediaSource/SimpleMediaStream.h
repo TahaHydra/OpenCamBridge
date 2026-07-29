@@ -11,6 +11,7 @@
 #include "SharedMemoryClient.h"
 
 #include <atomic>
+#include <mutex>
 #include <wil/resource.h>
 
 namespace winrt::WindowsSample::implementation
@@ -89,12 +90,16 @@ namespace winrt::WindowsSample::implementation
                 std::vector<BYTE> m_lastGoodFrame;
                 DWORD m_lastGoodFrameLength = 0;
 
-        // Frame-rate pacing state (accessed from RequestSample without m_Lock,
-        // reset from Start/Stop under m_Lock, hence atomic).
+        // FrameServer may issue RequestSample calls concurrently. One request
+        // owns pacing, the ring copy, and sample publication as a transaction;
+        // otherwise a later caller can finish its wait while the previous
+        // 3-6 MB frame is still being copied and both samples publish as a
+        // short/long catch-up pair.
+        std::mutex m_sampleRequestLock;
         std::atomic<LONGLONG> m_frameDuration100ns{ 333333 }; // negotiated interval, 30 fps default
         // Absolute deadline for the NEXT sample, advanced by exactly one interval each
         // time so timer overshoot cannot accumulate across frames.
-                std::atomic<LONGLONG> m_nextDeadline100ns{ 0 };       // MFGetSystemTime() of last delivered sample
+        std::atomic<LONGLONG> m_nextDeadline100ns{ 0 };
         wil::unique_handle m_pacingTimer;                     // high-resolution waitable timer
     };
 }

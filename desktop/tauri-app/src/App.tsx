@@ -337,7 +337,10 @@ function DesktopApp() {
   const sourceLabel = serverStatus?.encodedWidth
     ? `${serverStatus.encodedWidth}×${serverStatus.encodedHeight}`
     : '—';
-  const rateValue = serverStatus?.fps ?? '—';
+  const rateValue = serverStatus?.snapshot?.actual?.encodedFps
+    || serverStatus?.snapshot?.selected?.fps
+    || serverStatus?.fps
+    || '—';
   const codecLabel = (serverStatus?.activeStreamMode || serverStatus?.streamMode || '—').toString().toUpperCase();
 
   if (obsMode) {

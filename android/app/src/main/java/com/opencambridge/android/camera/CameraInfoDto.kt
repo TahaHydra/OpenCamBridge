@@ -25,6 +25,10 @@ data class CameraInfoDto(
      *  which produce a grayscale image. Kept out of the ultrawide/main/telephoto
      *  classification so users don't pick it thinking it's the ultrawide. */
     val isMonochrome: Boolean = false,
+    /** Complete evidence for every selectable regular-session mode. This is
+     * deliberately not a camera-wide "max FPS": an AE range and minimum frame
+     * duration only prove a rate for one camera + output format + size tuple. */
+    val regularModes: List<RegularCameraModeDto> = emptyList(),
     /** Honest max FPS achievable at each standard resolution for this lens,
      *  derived from the sensor's minimum frame duration. maxFps == 0 means the
      *  size is not supported (or the duration is unknown). Used to enable/disable
@@ -64,3 +68,15 @@ data class FpsRangeDto(val min: Int, val max: Int)
 
 @Serializable
 data class ResolutionFpsDto(val width: Int, val height: Int, val maxFps: Int)
+
+@Serializable
+data class RegularCameraModeDto(
+    val cameraId: String,
+    val width: Int,
+    val height: Int,
+    val outputFormat: String,
+    val fps: Int,
+    val aeFpsMin: Int,
+    val aeFpsMax: Int,
+    val minFrameDurationNs: Long
+)

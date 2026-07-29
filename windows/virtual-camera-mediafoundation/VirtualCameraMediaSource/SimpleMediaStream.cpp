@@ -56,11 +56,13 @@ namespace winrt::WindowsSample::implementation
                 scanline = bufferStart;
                 pitch = subtype == MFVideoFormat_NV12
                     ? static_cast<LONG>(width)
-                    : static_cast<LONG>(width * 4);
+                    : subtype == MFVideoFormat_YUY2
+                        ? static_cast<LONG>(width * 2)
+                        : static_cast<LONG>(width * 4);
                 return S_OK;
             };
             RETURN_IF_FAILED(OcbTryBufferLockChain(try2D2, try2D, tryContiguous, m_kind));
-            if (subtype == MFVideoFormat_NV12 && pitch < 0) {
+            if ((subtype == MFVideoFormat_NV12 || subtype == MFVideoFormat_YUY2) && pitch < 0) {
                 (void)Unlock();
                 return MF_E_UNSUPPORTED_FORMAT;
             }
@@ -72,7 +74,9 @@ namespace winrt::WindowsSample::implementation
             if (m_kind != OcbBufferLockKind::Contiguous) return S_OK;
             const uint64_t required = subtype == MFVideoFormat_NV12
                 ? static_cast<uint64_t>(width) * height * 3 / 2
-                : static_cast<uint64_t>(width) * height * 4;
+                : subtype == MFVideoFormat_YUY2
+                    ? static_cast<uint64_t>(width) * height * 2
+                    : static_cast<uint64_t>(width) * height * 4;
             RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER), required > bufferLength || required > MAXDWORD);
             return m_buffer->SetCurrentLength(static_cast<DWORD>(required));
         }
@@ -138,10 +142,54 @@ namespace winrt::WindowsSample::implementation
                 nullptr, nullptr, 0, TIMER_ALL_ACCESS));
         }
 
-        const uint32_t NUM_MEDIATYPES = 5;
+        DWORD sourceWidth = 0, sourceHeight = 0, sourceFpsNum = 0, sourceFpsDen = 1;
+        uint32_t sourceColor = 0;
+        const bool sourceKnown = SUCCEEDED(m_shmClient.GetProducerFormat(
+            &sourceWidth, &sourceHeight, &sourceFpsNum, &sourceFpsDen, &sourceColor));
+        const uint32_t sourceFps = sourceKnown && sourceFpsDen > 0
+            ? static_cast<uint32_t>((sourceFpsNum + sourceFpsDen / 2) / sourceFpsDen)
+            : 30;
+        const bool sourceSupports60 = sourceFps >= 50;
+
+        struct Mode { GUID subtype; uint32_t width; uint32_t height; uint32_t fps; };
+        std::vector<Mode> modes;
+        auto addMode = [&modes](GUID subtype, uint32_t width, uint32_t height, uint32_t fps) {
+            for (const auto& existing : modes) {
+                if (existing.subtype == subtype && existing.width == width &&
+                    existing.height == height && existing.fps == fps) return;
+            }
+            modes.push_back({ subtype, width, height, fps });
+        };
+        const bool sourceGeometryCommon =
+            (sourceWidth == 1920 && sourceHeight == 1080) ||
+            (sourceWidth == 1280 && sourceHeight == 720) ||
+            (sourceWidth == 640 && sourceHeight == 480);
+        if (sourceKnown && sourceGeometryCommon) {
+            addMode(MFVideoFormat_NV12, sourceWidth, sourceHeight, sourceSupports60 ? 60 : 30);
+        }
+        // Compatibility-first list. 60 fps is not exposed for a 30 fps
+        // producer, and the first type is always a real 30 fps default.
+        addMode(MFVideoFormat_NV12, 1920, 1080, 30);
+        addMode(MFVideoFormat_NV12, 1280, 720, 30);
+        addMode(MFVideoFormat_NV12, 640, 480, 30);
+        if (sourceSupports60) {
+            addMode(MFVideoFormat_NV12, 1920, 1080, 60);
+            addMode(MFVideoFormat_NV12, 1280, 720, 60);
+        }
+        // DirectShow/WebRTC bridges commonly choose packed YUY2 even when they
+        // can enumerate NV12. Advertising and producing it ourselves avoids a
+        // fragile system colour-converter graph that can negotiate but never
+        // deliver a sample.
+        addMode(MFVideoFormat_YUY2, 1920, 1080, 30);
+        addMode(MFVideoFormat_YUY2, 1280, 720, 30);
+        addMode(MFVideoFormat_YUY2, 640, 480, 30);
+        addMode(MFVideoFormat_RGB32, 1280, 720, 30);
+        addMode(MFVideoFormat_RGB32, 640, 480, 30);
+
+        const uint32_t NUM_MEDIATYPES = static_cast<uint32_t>(modes.size());
         wil::unique_cotaskmem_array_ptr<wil::com_ptr_nothrow<IMFMediaType>> mediaTypeList = wilEx::make_unique_cotaskmem_array<wil::com_ptr_nothrow<IMFMediaType>>(NUM_MEDIATYPES);
 
-        auto createMediaType = [](GUID subtype, uint32_t width, uint32_t height, uint32_t fps, wil::com_ptr_nothrow<IMFMediaType>& spMediaType) -> HRESULT {
+        auto createMediaType = [sourceColor](GUID subtype, uint32_t width, uint32_t height, uint32_t fps, wil::com_ptr_nothrow<IMFMediaType>& spMediaType) -> HRESULT {
             RETURN_IF_FAILED(MFCreateMediaType(&spMediaType));
             spMediaType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
             spMediaType->SetGUID(MF_MT_SUBTYPE, subtype);
@@ -151,27 +199,45 @@ namespace winrt::WindowsSample::implementation
             MFSetAttributeRatio(spMediaType.get(), MF_MT_FRAME_RATE, fps, 1);
             uint64_t bytesPerFrame = subtype == MFVideoFormat_NV12
                 ? static_cast<uint64_t>(width) * height * 3 / 2
-                : static_cast<uint64_t>(width) * height * 4;
+                : subtype == MFVideoFormat_YUY2
+                    ? static_cast<uint64_t>(width) * height * 2
+                    : static_cast<uint64_t>(width) * height * 4;
             uint32_t bitrate = static_cast<uint32_t>((std::min<uint64_t>)(UINT32_MAX, bytesPerFrame * 8 * fps));
             spMediaType->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
             MFSetAttributeRatio(spMediaType.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-            spMediaType->SetUINT32(MF_MT_DEFAULT_STRIDE, subtype == MFVideoFormat_NV12 ? width : width * 4);
+            spMediaType->SetUINT32(MF_MT_DEFAULT_STRIDE,
+                subtype == MFVideoFormat_NV12 ? width :
+                subtype == MFVideoFormat_YUY2 ? width * 2 :
+                width * 4);
+            const uint32_t matrixCode = sourceColor & 0xff;
+            const uint32_t rangeCode = (sourceColor >> 8) & 0xff;
+            const uint32_t primariesCode = (sourceColor >> 16) & 0xff;
+            const uint32_t transferCode = (sourceColor >> 24) & 0xff;
+            spMediaType->SetUINT32(MF_MT_YUV_MATRIX,
+                matrixCode == 1 ? MFVideoTransferMatrix_BT601 :
+                matrixCode == 3 ? MFVideoTransferMatrix_BT2020_10 :
+                MFVideoTransferMatrix_BT709);
+            spMediaType->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE,
+                rangeCode == 2 ? MFNominalRange_0_255 : MFNominalRange_16_235);
+            spMediaType->SetUINT32(MF_MT_VIDEO_PRIMARIES,
+                primariesCode == 1 ? MFVideoPrimaries_SMPTE170M :
+                primariesCode == 3 ? MFVideoPrimaries_BT2020 :
+                MFVideoPrimaries_BT709);
+            spMediaType->SetUINT32(MF_MT_TRANSFER_FUNCTION,
+                transferCode == 2 ? MFVideoTransFunc_10 :
+                transferCode == 3 ? MFVideoTransFunc_2084 :
+                transferCode == 4 ? MFVideoTransFunc_HLG :
+                MFVideoTransFunc_709);
             return S_OK;
         };
 
-        wil::com_ptr_nothrow<IMFMediaType> spMediaType0, spMediaType1, spMediaType2, spMediaType3, spMediaType4;
-        RETURN_IF_FAILED(createMediaType(MFVideoFormat_NV12, 1920, 1080, 60, spMediaType0));
-        mediaTypeList[0] = spMediaType0.detach();
-        RETURN_IF_FAILED(createMediaType(MFVideoFormat_NV12, 1920, 1080, 30, spMediaType1));
-        mediaTypeList[1] = spMediaType1.detach();
-        RETURN_IF_FAILED(createMediaType(MFVideoFormat_NV12, 1280, 720, 60, spMediaType2));
-        mediaTypeList[2] = spMediaType2.detach();
-        RETURN_IF_FAILED(createMediaType(MFVideoFormat_NV12, 1280, 720, 30, spMediaType3));
-        mediaTypeList[3] = spMediaType3.detach();
-        // RGB32 is intentionally last and exists only for consumers that cannot
-        // negotiate NV12. The normal path never converts decoded frames to RGB.
-        RETURN_IF_FAILED(createMediaType(MFVideoFormat_RGB32, 1280, 720, 30, spMediaType4));
-        mediaTypeList[4] = spMediaType4.detach();
+        for (uint32_t index = 0; index < NUM_MEDIATYPES; ++index) {
+            wil::com_ptr_nothrow<IMFMediaType> mediaType;
+            RETURN_IF_FAILED(createMediaType(
+                modes[index].subtype, modes[index].width, modes[index].height,
+                modes[index].fps, mediaType));
+            mediaTypeList[index] = mediaType.detach();
+        }
 
         RETURN_IF_FAILED(MFCreateAttributes(&m_spAttributes, 10));
         RETURN_IF_FAILED(_SetStreamAttributes(m_spAttributes.get()));
@@ -297,6 +363,13 @@ namespace winrt::WindowsSample::implementation
             _In_ IUnknown* pToken
         )
     {
+        // FrameServer can queue this method concurrently. Serialise the complete
+        // request—not only the timer wait—so the next deadline is not consumed
+        // while the previous frame is still being copied and published. This
+        // lock is deliberately independent from m_Lock: Stop can still change
+        // lifecycle state while a request is pacing.
+        std::lock_guard<std::mutex> requestGuard(m_sampleRequestLock);
+
         // Pace to the negotiated frame interval before doing any work (and
         // before taking m_Lock, so a stop is never blocked by the wait). This
         // makes the source behave like a real camera; without it the frame
@@ -467,11 +540,12 @@ namespace winrt::WindowsSample::implementation
             m_nextDeadline100ns.store(now + duration, std::memory_order_relaxed);
             return;
         }
-        if (remaining < -duration)
+        if (remaining <= 0)
         {
-            // More than a whole interval behind. Resynchronise ONCE to the current time
-            // rather than issuing a burst of catch-up samples to close the gap, which is
-            // exactly the visible jump this pipeline exists to avoid.
+            // A copy or scheduler wake overran its deadline. Rebase immediately
+            // instead of paying the delay back with a sub-frame interval. The
+            // catch-up pair is more visible than one honest longer interval and
+            // aliases an otherwise healthy 30 fps ring into repeat/skip cycles.
             m_nextDeadline100ns.store(now + duration, std::memory_order_relaxed);
             return;
         }

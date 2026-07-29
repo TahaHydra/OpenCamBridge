@@ -8,7 +8,9 @@ HRESULT SimpleFrameGenerator::Initialize(_In_ IMFMediaType* pMediaType)
     RETURN_HR_IF_NULL(E_INVALIDARG, pMediaType);
 
     RETURN_IF_FAILED(pMediaType->GetGUID(MF_MT_SUBTYPE, &m_subType));
-    if (m_subType != MFVideoFormat_RGB32 && m_subType != MFVideoFormat_NV12)
+    if (m_subType != MFVideoFormat_RGB32 &&
+        m_subType != MFVideoFormat_NV12 &&
+        m_subType != MFVideoFormat_YUY2)
     {
         RETURN_HR_MSG(MF_E_UNSUPPORTED_FORMAT, "Unsupported format: %s", winrt::to_hstring(m_subType).data());
     }
@@ -53,6 +55,22 @@ HRESULT SimpleFrameGenerator::CreateFrame(
         for (DWORD row = 0; row < m_height / 2; ++row) {
             BYTE* line = uv + static_cast<size_t>(row) * pitch;
             for (DWORD col = 0; col < m_width; col += 2) { line[col] = 128; line[col + 1] = 128; }
+        }
+    }
+    else if (m_subType == MFVideoFormat_YUY2)
+    {
+        RETURN_HR_IF(E_INVALIDARG, pitch <= 0 || static_cast<DWORD>(pitch) < m_width * 2);
+        RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+            static_cast<uint64_t>(pitch) * m_height > len);
+        const BYTE offset = static_cast<BYTE>((MFGetSystemTime() / 1000000) & 0xff);
+        for (DWORD row = 0; row < m_height; ++row) {
+            BYTE* line = pBuf + static_cast<size_t>(row) * pitch;
+            for (DWORD col = 0; col < m_width; col += 2) {
+                line[col * 2] = static_cast<BYTE>(16 + ((row + col + offset) % 220));
+                line[col * 2 + 1] = 128;
+                line[col * 2 + 2] = static_cast<BYTE>(16 + ((row + col + 1 + offset) % 220));
+                line[col * 2 + 3] = 128;
+            }
         }
     }
     else

@@ -32,6 +32,8 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 const OCBR_MAGIC: u32 = 0x5242434F; // "OCBR"
 const RING_VERSION: u16 = 4;
 const FORMAT_NV12: u32 = 2;
+// matrix=BT.709, range=limited, primaries=BT.709, transfer=BT.709.
+const COLOR_BT709_LIMITED_SDR: u32 = 2 | (1 << 8) | (2 << 16) | (1 << 24);
 const MAX_NV12_SIZE: usize = 1920 * 1080 * 3 / 2;
 const SLOT_SIZE: usize = SLOT_HEADER_SIZE + MAX_NV12_SIZE;
 const MAX_SHM_SIZE: u32 = (RING_HEADER_SIZE + SLOT_COUNT * SLOT_SIZE) as u32;
@@ -497,6 +499,7 @@ impl SharedMemoryIpc {
         y_stride: u32,
         uv_stride: u32,
         flags: u32,
+        color_descriptor: u32,
         send_delta_us: u32,
         data: &[u8],
     ) -> bool {
@@ -544,7 +547,7 @@ impl SharedMemoryIpc {
             // only works in a shared clock domain.
             (*slot).ring_write_timestamp_ns = qpc_ns();
             (*slot).send_delta_us = send_delta_us;
-            (*slot).reserved_tail = 0;
+            (*slot).reserved_tail = color_descriptor;
             (*slot).sequence = sequence;
             (*slot).capture_timestamp_ns = capture_timestamp_ns;
             (*slot).receive_timestamp_ns = receive_timestamp_ns;
@@ -620,6 +623,7 @@ impl SharedMemoryIpc {
                 width,
                 width,
                 0,
+                COLOR_BT709_LIMITED_SDR,
                 // No OCB2 sender cadence on this path.
                 0,
                 &nv12,
@@ -999,7 +1003,9 @@ fn bgra_to_nv12(src: &[u8], width: u32, height: u32, dst: &mut [u8]) {
             let b = src[p] as i32;
             let g = src[p + 1] as i32;
             let r = src[p + 2] as i32;
-            dst[y * w + x] = clamp_u8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+            // BT.709 studio-range. MJPEG is decoded to full-range RGB first;
+            // the shared ring has one explicit interpretation for every codec.
+            dst[y * w + x] = clamp_u8(((47 * r + 157 * g + 16 * b + 128) >> 8) + 16);
         }
     }
     let uv_base = w * h;
@@ -1020,8 +1026,8 @@ fn bgra_to_nv12(src: &[u8], width: u32, height: u32, dst: &mut [u8]) {
             g /= 4;
             b /= 4;
             let uv = uv_base + (y / 2) * w + x;
-            dst[uv] = clamp_u8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-            dst[uv + 1] = clamp_u8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+            dst[uv] = clamp_u8(((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128);
+            dst[uv + 1] = clamp_u8(((112 * r - 102 * g - 10 * b + 128) >> 8) + 128);
         }
     }
 }
@@ -1049,6 +1055,10 @@ mod ring_tests {
             mirror: false,
             sensor_orientation: 90,
             device_rotation: rotation,
+            color_matrix: "bt709".into(),
+            color_range: "limited".into(),
+            color_primaries: "bt709".into(),
+            color_transfer: "bt709".into(),
         }
     }
 
@@ -3543,6 +3553,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                     output_y_stride,
                                     output_uv_stride,
                                     record.flags,
+                                    info.color_descriptor(),
                                     record.send_delta_us,
                                     pixels,
                                 );
@@ -3618,6 +3629,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                                                     output_width,
                                                     output_width,
                                                     record.flags,
+                                                    info.color_descriptor(),
                                                     record.send_delta_us,
                                                     pixels,
                                                 );
@@ -3990,6 +4002,7 @@ fn main() {
                     width,
                     width,
                     0,
+                    COLOR_BT709_LIMITED_SDR,
                     // Locally generated, so there is no sender cadence to report.
                     0,
                     &test_nv12,

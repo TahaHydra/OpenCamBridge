@@ -99,6 +99,7 @@ class H264Streamer(
     private var adaptiveMode: H264ModeDto? = null
     private var codecConfig: ByteArray? = null
     private var streamInfo: ByteArray? = null
+    @Volatile private var colourInfo = VideoColourInfo.regularSdr(1920)
     private var partialAccessUnit: ByteArrayOutputStream? = null
     private var partialKeyframe = false
     private var partialPresentationUs = 0L
@@ -217,6 +218,7 @@ class H264Streamer(
         releaseCaptureAttempt()
         codecConfig = null
         streamInfo = null
+        colourInfo = VideoColourInfo.regularSdr(1920)
         partialAccessUnit = null
         partialKeyframe = false
         partialPresentationUs = 0L
@@ -332,6 +334,7 @@ class H264Streamer(
         // rejecting explicit High profile also silently lost CBR and reverted to
         // the implementation default (usually VBR), which for a live virtual
         // camera shows up as a bitrate that wanders.
+        colourInfo = VideoColourInfo.regularSdr(chosen.mode.width)
         fun buildFormat(withHighProfile: Boolean, withCbr: Boolean): MediaFormat =
             MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, chosen.mode.width, chosen.mode.height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
@@ -344,6 +347,15 @@ class H264Streamer(
                 // Tell the encoder it is running in realtime so it does not clock
                 // itself down to a power-saving rate under thermal pressure.
                 setInteger(MediaFormat.KEY_OPERATING_RATE, chosen.mode.fps)
+                // Keep the encoder, decoded NV12 ring, Tauri shader and Media
+                // Foundation media type on one explicit SDR interpretation.
+                setInteger(
+                    MediaFormat.KEY_COLOR_STANDARD,
+                    if (chosen.mode.width >= 1280) MediaFormat.COLOR_STANDARD_BT709
+                    else MediaFormat.COLOR_STANDARD_BT601_NTSC,
+                )
+                setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                     // Independent of KEY_LOW_LATENCY: several encoders honor this
@@ -512,6 +524,19 @@ class H264Streamer(
 
         override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
             if (codec !== this@H264Streamer.codec) return
+            val chosen = selection
+            val nextColour = VideoColourInfo.fromMediaFormat(
+                format,
+                chosen?.mode?.width ?: activeConfig?.width ?: 1920,
+            )
+            val colourChanged = nextColour != colourInfo
+            colourInfo = nextColour
+            if (colourChanged && chosen != null) {
+                val config = activeConfig ?: StreamState.currentConfig()
+                val updated = buildStreamInfo(chosen, config, lastRejectedPaths)
+                streamInfo = updated
+                broadcast(updated)
+            }
             val pieces = listOf("csd-0", "csd-1").mapNotNull { key ->
                 if (!format.containsKey(key)) null else format.getByteBuffer(key)?.toByteArray()
             }
@@ -1068,6 +1093,10 @@ class H264Streamer(
             put("deviceRotation", transform.deviceRotation)
             put("rejectedCapturePaths", rejectedPaths.joinToString(" | "))
             put("pixelFormat", "NV12")
+            put("colorMatrix", colourInfo.matrix)
+            put("colorRange", colourInfo.range)
+            put("colorPrimaries", colourInfo.primaries)
+            put("colorTransfer", colourInfo.transfer)
         }.toString().toByteArray(Charsets.UTF_8)
         return Ocb2.record(Ocb2.TYPE_STREAM_INFO, Ocb2.FLAG_DISCONTINUITY, currentSequence(), SystemClock.elapsedRealtimeNanos(), 0, payload)
     }

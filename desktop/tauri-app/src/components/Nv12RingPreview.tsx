@@ -22,8 +22,11 @@ interface NativePreviewDiagnostics {
   last_width: number;
   last_height: number;
   torn_slots_rejected: number;
+  skipped_sequences: number;
   last_error: string;
 }
+
+const PREVIEW_HEADER_SIZE = 80;
 
 function compile(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader {
   const shader = gl.createShader(type);
@@ -66,6 +69,13 @@ export default function Nv12RingPreview({ fitMode }: Props) {
     let lastNativeNonEmptyResponses = 0;
     let lastDeliveredRingWriteSequence = 0;
     let ringAdvancedWithoutFrameAt = 0;
+    let currentGeneration = 0;
+    let lastRingSequence = 0;
+    let rateWindowStart = performance.now();
+    let receivedInWindow = 0;
+    let displayedInWindow = 0;
+    let ipcDurationTotal = 0;
+    let uploadDurationTotal = 0;
 
     const updateDiagnostics = (patch: Partial<PreviewStageDiagnostics>) => {
       diagnostics = { ...diagnostics, ...patch };
@@ -86,15 +96,21 @@ export default function Nv12RingPreview({ fitMode }: Props) {
         uniform sampler2D uvPlane;
         uniform float yScale;
         uniform float uvScale;
+        uniform float yOffset;
+        uniform float yMultiplier;
+        uniform float rV;
+        uniform float gU;
+        uniform float gV;
+        uniform float bU;
         in vec2 uv;
         out vec4 colour;
         void main() {
-          float y = 1.164383 * (texture(yPlane, vec2(uv.x * yScale, uv.y)).r - 0.062745);
+          float y = yMultiplier * (texture(yPlane, vec2(uv.x * yScale, uv.y)).r - yOffset);
           vec2 chroma = texture(uvPlane, vec2(uv.x * uvScale, uv.y)).rg - vec2(0.5);
           colour = vec4(
-            y + 1.792741 * chroma.y,
-            y - 0.213249 * chroma.x - 0.532909 * chroma.y,
-            y + 2.112402 * chroma.x,
+            y + rV * chroma.y,
+            y + gU * chroma.x + gV * chroma.y,
+            y + bU * chroma.x,
             1.0
           );
         }
@@ -144,6 +160,79 @@ export default function Nv12RingPreview({ fitMode }: Props) {
       let hasFrame = false;
       let displayedSequence = 0;
 
+      const resetPreviewSession = (generation: number) => {
+        currentGeneration = generation;
+        lastRingSequence = 0;
+        afterSequence = 0;
+        textureWidth = 0;
+        textureHeight = 0;
+        yStride = 0;
+        uvStride = 0;
+        hasFrame = false;
+        displayedSequence = 0;
+        rateWindowStart = performance.now();
+        receivedInWindow = 0;
+        displayedInWindow = 0;
+        ipcDurationTotal = 0;
+        uploadDurationTotal = 0;
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        setReady(false);
+        setError('');
+        setWarning('');
+        diagnostics = { ...EMPTY_PREVIEW_DIAGNOSTICS, streamGeneration: generation };
+        publishPreviewDiagnostics(diagnostics);
+      };
+
+      const setColourConversion = (descriptor: number) => {
+        const matrixCode = descriptor & 0xff;
+        const rangeCode = (descriptor >>> 8) & 0xff;
+        const primariesCode = (descriptor >>> 16) & 0xff;
+        const transferCode = (descriptor >>> 24) & 0xff;
+        const matrix = matrixCode === 1 ? 'BT.601' : matrixCode === 3 ? 'BT.2020' : 'BT.709';
+        const range = rangeCode === 2 ? 'full' : 'limited';
+        const primaries = primariesCode === 1 ? 'BT.601' : primariesCode === 3 ? 'BT.2020' : 'BT.709';
+        const transfer = transferCode === 2 ? 'linear' : transferCode === 3 ? 'ST 2084' : transferCode === 4 ? 'HLG' : 'BT.709';
+        const full = rangeCode === 2;
+        let coefficients: [number, number, number, number] =
+          matrixCode === 1
+            ? [1.402, -0.344136, -0.714136, 1.772]
+            : matrixCode === 3
+              ? [1.4746, -0.164553, -0.571353, 1.8814]
+              : [1.5748, -0.187324, -0.468124, 1.8556];
+        if (!full) {
+          coefficients = matrixCode === 1
+            ? [1.596027, -0.391762, -0.812968, 2.017232]
+            : matrixCode === 3
+              ? [1.67867, -0.187326, -0.650424, 2.14177]
+              : [1.792741, -0.213249, -0.532909, 2.112402];
+        }
+        gl.uniform1f(gl.getUniformLocation(program, 'yOffset'), full ? 0 : 16 / 255);
+        gl.uniform1f(gl.getUniformLocation(program, 'yMultiplier'), full ? 1 : 255 / 219);
+        gl.uniform1f(gl.getUniformLocation(program, 'rV'), coefficients[0]);
+        gl.uniform1f(gl.getUniformLocation(program, 'gU'), coefficients[1]);
+        gl.uniform1f(gl.getUniformLocation(program, 'gV'), coefficients[2]);
+        gl.uniform1f(gl.getUniformLocation(program, 'bU'), coefficients[3]);
+        return { matrix, range, primaries, transfer };
+      };
+
+      const publishRates = () => {
+        const now = performance.now();
+        const elapsed = now - rateWindowStart;
+        if (elapsed < 1000) return;
+        updateDiagnostics({
+          previewReceivedFps: Math.round(receivedInWindow * 1000 / elapsed),
+          previewDisplayedFps: Math.round(displayedInWindow * 1000 / elapsed),
+          ipcTransferMs: receivedInWindow > 0 ? ipcDurationTotal / receivedInWindow : 0,
+          previewUploadMs: receivedInWindow > 0 ? uploadDurationTotal / receivedInWindow : 0,
+        });
+        rateWindowStart = now;
+        receivedInWindow = 0;
+        displayedInWindow = 0;
+        ipcDurationTotal = 0;
+        uploadDurationTotal = 0;
+      };
+
       const refreshBackendDiagnostics = async () => {
         const native = await invoke<NativePreviewDiagnostics>('get_nv12_preview_diagnostics');
         const currentTime = performance.now();
@@ -174,6 +263,7 @@ export default function Nv12RingPreview({ fitMode }: Props) {
           parsedWidth: native.last_width || diagnostics.parsedWidth,
           parsedHeight: native.last_height || diagnostics.parsedHeight,
           tornSlotsRejected: native.torn_slots_rejected,
+          previewSkippedSequences: native.skipped_sequences,
           consumerStalled,
           lastError: native.last_error,
         });
@@ -182,15 +272,21 @@ export default function Nv12RingPreview({ fitMode }: Props) {
       const drawNewest = async () => {
         try {
           updateDiagnostics({ previewCommandCalls: diagnostics.previewCommandCalls + 1 });
+          const ipcStart = performance.now();
           const raw = await invoke<ArrayBuffer | Uint8Array>('get_nv12_preview_frame', { afterSequence });
+          const ipcMs = performance.now() - ipcStart;
           if (stopped) return;
           const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
           updateDiagnostics({ ipcPayloadBytes: bytes.byteLength });
-          if (bytes.byteLength >= 48) {
+          let uploadedNewFrame = false;
+          if (bytes.byteLength >= PREVIEW_HEADER_SIZE) {
             const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-            if (view.getUint32(0, true) !== 0x5250564e || view.getUint16(4, true) !== 1 || view.getUint16(6, true) !== 48) {
+            if (view.getUint32(0, true) !== 0x5250564e || view.getUint16(4, true) !== 2 || view.getUint16(6, true) !== PREVIEW_HEADER_SIZE) {
               throw new Error('Native preview returned an invalid NV12 frame header');
             }
+            const generation = Number(view.getBigUint64(48, true));
+            const ringSequence = Number(view.getBigUint64(56, true));
+            if (currentGeneration !== generation) resetPreviewSession(generation);
             afterSequence = Number(view.getBigUint64(8, true));
             displayedSequence = afterSequence;
             const width = view.getUint32(24, true);
@@ -198,10 +294,13 @@ export default function Nv12RingPreview({ fitMode }: Props) {
             const nextYStride = view.getUint32(32, true);
             const nextUvStride = view.getUint32(36, true);
             const payload = view.getUint32(40, true);
+            const colorDescriptor = view.getUint32(64, true);
+            const sourceFpsNum = view.getUint32(68, true);
+            const sourceFpsDen = Math.max(1, view.getUint32(72, true));
             const yBytes = nextYStride * height;
             if (!width || !height || width > 1920 || height > 1920 || width % 2 || height % 2 ||
                 nextYStride < width || nextUvStride < width || yBytes + nextUvStride * (height / 2) !== payload ||
-                48 + payload > bytes.byteLength) {
+                PREVIEW_HEADER_SIZE + payload > bytes.byteLength) {
               throw new Error('Native preview rejected invalid NV12 dimensions/strides');
             }
             if (canvas.width !== width || canvas.height !== height) {
@@ -214,19 +313,28 @@ export default function Nv12RingPreview({ fitMode }: Props) {
             textureHeight = height;
             yStride = nextYStride;
             uvStride = nextUvStride;
+            const uploadStart = performance.now();
             gl.activeTexture(gl.TEXTURE0);
             gl.bindTexture(gl.TEXTURE_2D, yTexture);
-            const y = bytes.subarray(48, 48 + yBytes);
+            const y = bytes.subarray(PREVIEW_HEADER_SIZE, PREVIEW_HEADER_SIZE + yBytes);
             if (dimensionsChanged) gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, yStride, height, 0, gl.RED, gl.UNSIGNED_BYTE, y);
             else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, yStride, height, gl.RED, gl.UNSIGNED_BYTE, y);
             gl.activeTexture(gl.TEXTURE1);
             gl.bindTexture(gl.TEXTURE_2D, uvTexture);
-            const uv = bytes.subarray(48 + yBytes, 48 + payload);
+            const uv = bytes.subarray(PREVIEW_HEADER_SIZE + yBytes, PREVIEW_HEADER_SIZE + payload);
             if (dimensionsChanged) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG8, uvStride / 2, height / 2, 0, gl.RG, gl.UNSIGNED_BYTE, uv);
             else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, uvStride / 2, height / 2, gl.RG, gl.UNSIGNED_BYTE, uv);
             gl.uniform1f(gl.getUniformLocation(program, 'yScale'), width / yStride);
             gl.uniform1f(gl.getUniformLocation(program, 'uvScale'), width / uvStride);
+            const colour = setColourConversion(colorDescriptor);
+            const uploadMs = performance.now() - uploadStart;
+            receivedInWindow += 1;
+            ipcDurationTotal += ipcMs;
+            uploadDurationTotal += uploadMs;
+            const skipped = lastRingSequence > 0 ? Math.max(0, ringSequence - lastRingSequence - 1) : 0;
+            lastRingSequence = ringSequence;
             hasFrame = true;
+            uploadedNewFrame = true;
             updateDiagnostics({
               nonEmptyResponses: diagnostics.nonEmptyResponses + 1,
               lastReturnedSequence: afterSequence,
@@ -234,6 +342,12 @@ export default function Nv12RingPreview({ fitMode }: Props) {
               parsedWidth: width,
               parsedHeight: height,
               rendererUploadCount: diagnostics.rendererUploadCount + 1,
+              previewSkippedSequences: diagnostics.previewSkippedSequences + skipped,
+              sourceFps: sourceFpsNum / sourceFpsDen,
+              colorMatrix: colour.matrix,
+              colorRange: colour.range,
+              colorPrimaries: colour.primaries,
+              colorTransfer: colour.transfer,
               lastError: '',
             });
           }
@@ -252,13 +366,17 @@ export default function Nv12RingPreview({ fitMode }: Props) {
             if (glError !== gl.NO_ERROR) throw new Error(`NV12 preview WebGL draw failed (0x${glError.toString(16)})`);
             setReady(true);
             setError('');
-            updateDiagnostics({
-              rendererDisplayCount: diagnostics.rendererDisplayCount + 1,
-              lastDisplayedSequence: displayedSequence,
-              ready: true,
-              lastError: '',
-            });
+            if (uploadedNewFrame) {
+              displayedInWindow += 1;
+              updateDiagnostics({
+                rendererDisplayCount: diagnostics.rendererDisplayCount + 1,
+                lastDisplayedSequence: displayedSequence,
+                ready: true,
+                lastError: '',
+              });
+            }
           }
+          publishRates();
           const now = performance.now();
           if (now - lastBackendPoll >= 250) {
             lastBackendPoll = now;

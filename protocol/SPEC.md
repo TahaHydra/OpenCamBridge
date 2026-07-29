@@ -104,8 +104,11 @@ disconnect without restarting the desktop application or producer.
 The encoder uses Camera2 directly with the MediaCodec input surface, no
 ImageAnalysis/YUV conversion. It uses no B-frames, a one-second keyframe
 interval, bounded bitrate, asynchronous output, and output presentation
-timestamps. The advertised H.264 modes are the intersection of the selected
-Camera2 surface capabilities and a hardware AVC encoder:
+timestamps. Advertised regular modes are complete tuples: camera ID, output
+format, resolution, AE FPS range, and minimum frame duration. A rate is
+selectable only when that exact Camera2 output/resolution tuple can meet it and
+the encoder also supports it. A camera-wide 60 FPS AE range does not turn a
+30 FPS 1080p output into a 60 FPS mode. The usual preference order is:
 
 1. 1920x1080 at 60 fps
 2. 1280x720 at 60 fps
@@ -113,7 +116,13 @@ Camera2 surface capabilities and a hardware AVC encoder:
 4. 1280x720 at 30 fps
 
 The first requested/supported mode is used. Unsupported requests fall through
-the preference list. Encoder or Windows decoder failure activates MJPEG.
+the preference list. Encoder or Windows decoder failure activates MJPEG. The
+selected source rate is carried in stream metadata and remains authoritative
+through the producer, ring, preview, and virtual-camera mode list.
+
+Stream information also carries the YUV matrix, nominal range, primaries, and
+transfer function reported by MediaCodec. HD SDR defaults to BT.709 limited
+range and SD SDR to BT.601 limited range when the encoder omits a value.
 
 ## Windows decode and frame ring
 
@@ -125,20 +134,23 @@ If the software decoder cannot sustain at least 80 percent of the selected rate
 for three measurement windows, the producer asks Android to rebind to MJPEG.
 
 Producer and virtual-camera DLL share a version-4 `OCBR` ring. The header is 320
-bytes followed by eight equal slots. Each slot has a 128-byte metadata header and
-space for at most a 1920x1080 NV12 frame, so the mapping is roughly 25 MB.
+bytes followed by sixteen equal slots. Each slot has a 128-byte metadata header
+and space for at most a 1920x1080 NV12 frame, so the mapping is roughly 50 MB.
 
 Ring metadata includes the published slot and sequence, producer heartbeat,
 consumer-selected width/height/rate, and total virtual-camera unique/repeated
 sample counters. Slot metadata contains write and commit epochs, sequence,
 capture/receive/decode timestamps, dimensions, Y/UV strides, pixel format,
-payload size, flags, data offset, and NV12 bytes.
+payload size, flags, data offset, packed colour descriptor, and NV12 bytes. The
+descriptor uses a previously reserved field, so the ring ABI is unchanged.
 
 The producer fills a non-published slot, commits it with release ordering, then
-atomically publishes it. The virtual camera copies only a stable newest slot
-whose epoch and all metadata validate. It does not queue old presentation
-frames. There is no global pacing mutex. A repeated sample reuses the newest
-frame but increments only the repeated counter.
+atomically publishes it. The virtual camera copies only a stable selected slot
+whose epoch and all metadata validate. Its complete Media Foundation sample
+request is serialized so concurrent client requests cannot re-arm one timer or
+publish catch-up samples while the previous frame is still being copied. A
+repeated sample reuses the last stable frame and increments only the repeated
+counter.
 
 ### Frame history and consumer cursors
 
@@ -161,52 +173,37 @@ selection arithmetic is generated into all three languages from
 disagreement about which slot holds a given write would make one consumer read a
 different frame than the one it reports. The Rust copy carries the tests.
 
-Both consumers still select the newest frame, so behaviour is unchanged; what the
-cursors add is the ability to count *skipped* frames (this consumer read at the wrong
-moment) separately from *overwritten* frames (the ring was too short to hold them at
-all). The virtual camera, which maps the ring read/write, accumulates the latter into
-`ring_frames_overwritten`; the preview maps read-only and keeps its own count,
-reported by the `get_nv12_preview_cursor_stats` command.
+The virtual camera and desktop preview have separate bounded cursors. The desktop
+preview's first call returns the newest committed frame immediately, then drains newer
+live frames in order and skips forward when more than three are pending. The virtual
+camera starts immediately from a stable frame about 90-100 ms behind the live edge,
+then consumes equal-rate sequences in order. Neither cursor changes the other's state.
+Both consumers can count *skipped* frames separately from frames already overwritten
+in the ring.
 
 ### Playout scheduling
 
-The virtual camera does not show the newest frame in the ring. It asks which frame is
-*due* — mapping each capture timestamp onto the host clock through an anchor, and
-releasing it only once that time arrives.
+Media Foundation requests are paced at the negotiated output interval. A missed
+deadline is rebased to the current time; it is never repaid with a sub-frame catch-up
+interval. The virtual camera uses a fixed time-sized sequence queue rather than the
+adaptive capture-timestamp servo. The queue target is 90 ms rounded up to whole source
+intervals: three intervals (about 100 ms) at 30 fps and six at 60 fps.
 
-This is what removes the freeze-then-jump. Media Foundation pulls samples on its own
-fixed cadence; taking whatever happens to be newest at that instant aliases uneven
-arrivals into runs of repeats followed by a skip. Releasing against capture timestamps
-from a bounded buffer converts the same arrivals into an even cadence.
+For equal source and output rates, the consumer releases the next committed sequence
+in order. If output is faster than the source, it repeats the previous stable sequence
+until the next exists. If the source is faster than output, it recentres at the fixed
+live-edge delay, which performs deterministic rate conversion. A generation change
+immediately selects a stable frame from the new generation; retained slots from the
+old stream are never replayed.
 
-Latency is always expressed in milliseconds, never in frames: two frames is 66 ms at
-30 fps but 33 ms at 60 fps, so a frame-counted buffer silently changes meaning with the
-rate. Three profiles are defined — low (35/55/90 ms), balanced (50/80/120 ms) and stable
-(75/110/180 ms) as minimum/initial/maximum. Balanced is the default, sized from the
-measured arrival jitter.
+This deliberately replaces the adaptive scheduler in the native shipping path. Live
+probing showed that scheduler pinning its target at 140 ms while a healthy 30 fps ring
+advanced, reducing virtual-camera unique output to 22-25 fps. The fixed queue delivered
+3,044 unique frames from 3,046 ring writes over 101.6 seconds, with three isolated
+repeats and no catch-up burst.
 
-Drift between the phone's clock and the PC's is corrected by moving the anchor a bounded
-amount per released frame — a *phase* correction. It is deliberately not a rate
-correction integrated into the mapping: the mapping already integrates, so that
-arrangement is a controller driving an integrator, and it oscillates. See
-`rust-frame-producer/src/playout.rs`, which is normative and carries the simulations.
-
-Target latency adapts asymmetrically: it grows by 10 ms on any underrun or late drop,
-and shrinks by 1 ms only after a long clean run. An underrun is already visible, whereas
-shrinking risks causing the next one.
-
-Sample timestamps come from that same schedule rather than from a counter of the
-camera's own, so they stay tied to the source timeline. They are forced strictly
-increasing, because the schedule is anchored on QPC while the Media Foundation timeline
-starts elsewhere and the two need not agree at the first sample.
-
-Repeats and drops are expected, not failures. A 29.97 fps source feeding a 30 fps
-consumer must repeat occasionally; what the scheduler guarantees is that such a repeat
-is one isolated evenly spaced duplicate instead of a freeze followed by a catch-up
-burst.
-
-The desktop preview still takes the newest frame. Giving both consumers the same timing
-model is not part of this version.
+The desktop preview uses its own bounded cursor queue and never modifies
+virtual-camera consumer state.
 
 The shared object grants frame write access only to SYSTEM, LOCAL SERVICE, and
 the current application user. Creation fails if the current user SID cannot be
@@ -214,22 +211,30 @@ resolved; it never falls back to a broadly writable ACL.
 
 ## Media Foundation virtual-camera formats
 
-The source advertises, in order:
+The source advertises the current source-matching common NV12 type first, then
+safe compatibility modes:
 
-- NV12 1920x1080 60 fps
 - NV12 1920x1080 30 fps
-- NV12 1280x720 60 fps
 - NV12 1280x720 30 fps
+- NV12 640x480 30 fps
+- NV12 1920x1080 60 fps only when the source is genuinely at least 50 fps
+- NV12 1280x720 60 fps only when the source is genuinely at least 50 fps
+- YUY2 1920x1080, 1280x720, and 640x480 at 30 fps for DirectShow/WebRTC
 - RGB32 1280x720 30 fps compatibility fallback
+- RGB32 640x480 30 fps compatibility fallback
 
 NV12 is copied directly. RGB32 conversion happens only when a legacy consumer
 selects that fallback. Sample timestamps are monotonically increasing Media
 Foundation 100-nanosecond units. A frame is reported as unique only when its
-source sequence changes.
+source sequence changes. Every media type carries matching BT.709 matrix,
+nominal-range, primaries, and transfer-function attributes.
 
 ## Metrics
 
-Metrics keep capture, encoded-access-unit, received, decoded-unique, and
-virtual-camera-unique FPS separate. They also report repeated samples,
-transport bitrate, encoder/decoder names and hardware status, source/output
-dimensions, latency, replaced frames, and the active fallback reason.
+Metrics keep camera capture, phone encoded, transport received, producer
+decoded, ring written, preview received/displayed, and virtual-camera
+requested/unique/repeated FPS separate. Preview sequence skips, IPC transfer
+time, WebGL upload time, producer processing time, phone encode time, playout
+depth/target, underruns, late drops, and transport bandwidth retain those
+literal meanings. MJPEG queue/drop counters are shown only in MJPEG mode.
+Producer processing time is not labelled as end-to-end latency.
