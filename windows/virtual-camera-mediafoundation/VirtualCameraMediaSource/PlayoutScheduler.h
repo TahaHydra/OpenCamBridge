@@ -28,6 +28,7 @@
 //
 // All arithmetic is integer so this and the Rust reach identical decisions.
 
+#include <algorithm>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -122,6 +123,81 @@ struct OcbPlayoutDecision {
     uint64_t generation;
 };
 
+/// Convert a populated reset/prefill into a real sample with safe ring headroom.
+///
+/// Media Foundation clients can create short-lived stream instances while
+/// probing or negotiating the camera. If every new instance spends its first
+/// request in prefill, the higher layer can keep showing its neutral fallback
+/// instead of phone video. The scheduler's conventional oldest-slot anchor is
+/// also unsafe when a consumer attaches to a full live ring: adding prefill to
+/// the entire retained history puts every selected frame beyond the overwrite
+/// boundary before it becomes due.
+///
+/// Select the newest candidate at least targetDelayNs behind the live edge and
+/// make it due now. That provides the requested jitter margin immediately
+/// without ever scheduling outside the bounded ring.
+inline bool OcbBootstrapFirstFrame(OcbPlayoutDecision& decision,
+    const OcbPlayoutCandidate* candidates, size_t count,
+    uint64_t nowNs, uint64_t targetDelayNs)
+{
+    if (!decision.reset ||
+        decision.action != OcbPlayoutAction::Starve || candidates == nullptr || count == 0)
+    {
+        return false;
+    }
+
+    uint64_t newestCaptureNs = 0;
+    for (size_t index = 0; index < count; ++index) {
+        const OcbPlayoutCandidate& candidate = candidates[index];
+        if (candidate.streamGeneration != decision.generation) continue;
+        newestCaptureNs = (std::max)(newestCaptureNs, candidate.captureTimestampNs);
+    }
+    const uint64_t targetCaptureNs = newestCaptureNs > targetDelayNs
+        ? newestCaptureNs - targetDelayNs : 0;
+
+    bool found = false;
+    OcbPlayoutCandidate anchor = {};
+    for (size_t index = 0; index < count; ++index) {
+        const OcbPlayoutCandidate& candidate = candidates[index];
+        if (candidate.streamGeneration != decision.generation) continue;
+        if (candidate.captureTimestampNs > targetCaptureNs) continue;
+        if (!found || candidate.captureTimestampNs > anchor.captureTimestampNs) {
+            anchor = candidate;
+            found = true;
+        }
+    }
+    // A shallow ring may not contain a full target delay yet. Its oldest frame
+    // is still safe to display immediately; buffering can adapt from there.
+    if (!found) {
+        for (size_t index = 0; index < count; ++index) {
+            const OcbPlayoutCandidate& candidate = candidates[index];
+            if (candidate.streamGeneration != decision.generation) continue;
+            if (!found || candidate.captureTimestampNs < anchor.captureTimestampNs) {
+                anchor = candidate;
+                found = true;
+            }
+        }
+    }
+    if (!found) return false;
+
+    decision.anchorSourceNs = anchor.captureTimestampNs;
+    decision.anchorHostNs = nowNs;
+    decision.action = OcbPlayoutAction::Release;
+    decision.slotIndex = anchor.slotIndex;
+    decision.ringSequence = anchor.ringSequence;
+    decision.captureTimestampNs = anchor.captureTimestampNs;
+    decision.sampleTimeNs = nowNs;
+    decision.bufferDepthNs = newestCaptureNs > anchor.captureTimestampNs
+        ? newestCaptureNs - anchor.captureTimestampNs : 0;
+    decision.plannedDrops = 0;
+    decision.lateDrops = 0;
+    decision.arrivalHostNs = anchor.ringWriteTimestampNs;
+    decision.arrivalSlackNs = static_cast<int64_t>(decision.anchorHostNs) -
+        static_cast<int64_t>(anchor.ringWriteTimestampNs);
+    decision.pressure = false;
+    return true;
+}
+
 inline int64_t OcbPlayoutClamp(int64_t value, int64_t limit)
 {
     if (value > limit) return limit;
@@ -206,10 +282,12 @@ public:
         }
         uint64_t newestCaptureNs = 0;
         uint64_t oldestCaptureNs = UINT64_MAX;
+        uint64_t newestRingSequence = 0;
         for (size_t i = 0; i < count; ++i) {
             if (candidates[i].streamGeneration != generation) continue;
             if (candidates[i].captureTimestampNs > newestCaptureNs) newestCaptureNs = candidates[i].captureTimestampNs;
             if (candidates[i].captureTimestampNs < oldestCaptureNs) oldestCaptureNs = candidates[i].captureTimestampNs;
+            if (candidates[i].ringSequence > newestRingSequence) newestRingSequence = candidates[i].ringSequence;
         }
         if (oldestCaptureNs == UINT64_MAX) {
             // Nothing in the ring. Repeat if anything was ever shown, so a live consumer
@@ -229,11 +307,14 @@ public:
             anchorSourceNs = oldestCaptureNs;
             anchorHostNs = nowNs + target;
             decision.reset = true;
-        } else if (m_consecutiveUnderruns >= OCB_PLAYOUT_STALL_UNDERRUNS) {
-            // Playout has been unable to release anything for a sustained stretch while the
-            // ring holds frames. Recovering beats stalling for the rest of the session.
-            anchorSourceNs = oldestCaptureNs;
-            anchorHostNs = nowNs + target;
+        } else if (m_consecutiveUnderruns >= OCB_PLAYOUT_STALL_UNDERRUNS &&
+            newestRingSequence > m_lastRingSequence) {
+            // A stopped producer leaves its final committed slots in the ring. Resetting
+            // onto the oldest retained slot replayed that history forever, making OBS
+            // visibly alternate between stale frames. Recover only when the producer has
+            // advanced, and release the newest unseen frame immediately.
+            anchorSourceNs = newestCaptureNs;
+            anchorHostNs = nowNs;
             decision.reset = true;
         } else if (newestCaptureNs < m_lastSourceNs) {
             // The encoder restarted without the producer bumping the generation, so the
@@ -586,3 +667,81 @@ private:
     uint64_t m_bufferDepthNs = 0;
     int64_t m_minArrivalSlackNs = INT64_MAX;
 };
+
+inline bool OcbRunPlayoutBootstrapSelfTests()
+{
+    const OcbPlayoutTiming timing = { 33333333ULL, 33333333ULL, 16 };
+    const OcbPlayoutCandidate candidates[] = {
+        { 41, 1000000000ULL, 7, 1900000000ULL, 3 },
+        { 42, 1033333333ULL, 7, 1933333333ULL, 4 },
+    };
+    OcbPlayoutScheduler scheduler;
+    OcbPlayoutDecision decision = scheduler.Peek(2000000000ULL, candidates, 2, timing);
+    if (decision.action != OcbPlayoutAction::Starve || !decision.reset) return false;
+
+    if (!OcbBootstrapFirstFrame(
+        decision, candidates, 2, 2000000000ULL, scheduler.TargetDelayNs()))
+    {
+        return false;
+    }
+    if (decision.action != OcbPlayoutAction::Release || !decision.reset ||
+        decision.slotIndex != 3 || decision.ringSequence != 41 ||
+        decision.captureTimestampNs != 1000000000ULL ||
+        decision.sampleTimeNs != 2000000000ULL ||
+        decision.anchorSourceNs != decision.captureTimestampNs ||
+        decision.anchorHostNs != decision.sampleTimeNs)
+    {
+        return false;
+    }
+
+    scheduler.Commit(decision, timing);
+    const OcbPlayoutDecision repeat = scheduler.Peek(2000000001ULL, candidates, 2, timing);
+    if (repeat.action != OcbPlayoutAction::RepeatPlanned ||
+        repeat.ringSequence != decision.ringSequence ||
+        repeat.slotIndex != decision.slotIndex)
+    {
+        return false;
+    }
+
+    // Display the second frame, then simulate a stopped producer for longer than the
+    // recovery threshold. Retained slots must never be replayed.
+    const uint64_t secondDueNs = decision.anchorHostNs +
+        (candidates[1].captureTimestampNs - candidates[0].captureTimestampNs);
+    const OcbPlayoutDecision second = scheduler.Peek(secondDueNs, candidates, 2, timing);
+    if (second.action != OcbPlayoutAction::Release || second.ringSequence != 42) return false;
+    scheduler.Commit(second, timing);
+    const uint64_t resetsBefore = scheduler.SchedulerResets();
+    uint64_t nowNs = secondDueNs + timing.outputIntervalNs;
+    for (uint32_t index = 0; index < OCB_PLAYOUT_STALL_UNDERRUNS * 4; ++index) {
+        const OcbPlayoutDecision stalled = scheduler.Peek(nowNs, candidates, 2, timing);
+        if (stalled.action == OcbPlayoutAction::Release || stalled.ringSequence != 42) return false;
+        scheduler.Commit(stalled, timing);
+        nowNs += timing.outputIntervalNs;
+    }
+    if (scheduler.SchedulerResets() != resetsBefore) return false;
+
+    // A consumer attaching to a full ring must anchor near the requested target,
+    // not at the oldest retained frame where normal prefill would exceed the
+    // overwrite horizon.
+    const OcbPlayoutCandidate fullCandidates[] = {
+        { 41, 1000000000ULL, 7, 1900000000ULL, 0 },
+        { 42, 1033333333ULL, 7, 1933333333ULL, 1 },
+        { 43, 1066666666ULL, 7, 1966666666ULL, 2 },
+        { 44, 1099999999ULL, 7, 1999999999ULL, 3 },
+        { 45, 1133333332ULL, 7, 2033333332ULL, 4 },
+        { 46, 1166666665ULL, 7, 2066666665ULL, 5 },
+    };
+    OcbPlayoutScheduler fullScheduler;
+    OcbPlayoutDecision fullDecision =
+        fullScheduler.Peek(2100000000ULL, fullCandidates, 6, timing);
+    if (!OcbBootstrapFirstFrame(
+        fullDecision, fullCandidates, 6, 2100000000ULL, fullScheduler.TargetDelayNs()))
+    {
+        return false;
+    }
+    return fullDecision.action == OcbPlayoutAction::Release &&
+        fullDecision.ringSequence == 43 &&
+        fullDecision.bufferDepthNs == 99999999ULL &&
+        fullDecision.anchorSourceNs == fullDecision.captureTimestampNs &&
+        fullDecision.anchorHostNs == 2100000000ULL;
+}

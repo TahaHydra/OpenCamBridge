@@ -554,7 +554,7 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
     //
     // This is the change that removes the freeze-then-jump: instead of taking whatever
     // is newest at the instant Media Foundation happens to ask, each frame is released
-    // against its own capture timestamp from a bounded buffer. Scanning eight 128-byte
+    // against its own capture timestamp from a bounded buffer. Scanning the bounded 128-byte
     // slot headers per request is nothing next to copying a frame.
     const uint64_t writeSequence =
         static_cast<uint64_t>(InterlockedCompareExchange64(&ring->ringWriteSequence, 0, 0));
@@ -612,11 +612,27 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
     // because the producer may lap the slot in between. Advancing state here and copying
     // afterwards meant a failed copy still consumed the frame: the next request skipped
     // it and the failure surfaced as a diagnostic frame instead of being retried.
-    const OcbPlayoutDecision decision =
+    OcbPlayoutDecision decision =
         m_playout.Peek(nowNs, candidates, candidateCount, timing);
+    // Media Foundation clients can create short-lived stream instances while
+    // probing the camera. In that lifecycle, a conventional prefill can keep
+    // producing the neutral fallback because every instance starts with a new
+    // scheduler. Starting from the oldest slot in an already-full ring also
+    // schedules beyond its overwrite horizon. Release a target-buffered frame
+    // immediately, then follow the scheduler from that safe anchor.
+    OcbBootstrapFirstFrame(
+        decision, candidates, candidateCount, nowNs, m_playout.TargetDelayNs());
     if (decision.action == OcbPlayoutAction::Starve) {
-        // Prefill, or an empty ring. Reported so the caller repeats its last good image
-        // rather than presenting invented content.
+        // A prefill Starve decision can also carry the scheduler's initial or
+        // generation-change anchor. It has no frame copy to validate, so commit
+        // it here. Returning without this commit left the scheduler unanchored:
+        // every Media Foundation request moved the deadline to "now + target"
+        // again and the first real frame could never become due.
+        m_playout.Commit(decision, timing);
+        InterlockedExchange64(&ring->playoutTargetDelayNs, static_cast<LONG64>(m_playout.TargetDelayNs()));
+        InterlockedExchange64(&ring->playoutSchedulerResets, static_cast<LONG64>(m_playout.SchedulerResets()));
+        // Prefill, or an empty ring. Reported so the caller repeats its last good
+        // image rather than presenting invented content.
         return HRESULT_FROM_WIN32(ERROR_RETRY);
     }
 

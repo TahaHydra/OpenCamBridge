@@ -283,11 +283,10 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
-
-        // Development and cable-reconnect launches must bring the foreground
-        // service back without requiring a tap on the phone. If permissions
-        // are not granted yet this uses the normal permission launcher.
-        requestPermissionsAndStart()
+        // Opening the Activity is deliberately side-effect free. A stopped app
+        // stays stopped until the user presses Start. If a user-started
+        // foreground service is already streaming, the ViewModel observes that
+        // existing state without starting a second service.
     }
 
     private fun requestPermissionsAndStart() {
@@ -306,10 +305,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startCameraOrService() {
-        // Stop only tears down the camera pipeline; the foreground service and
-        // its HTTP control server deliberately stay alive. Restart that
-        // existing pipeline in-process instead of sending a second service
-        // start intent (which previously tried to bind port 8080 again).
+        // A remote control can stop only the camera while intentionally leaving
+        // the control server alive. In that case restart the existing pipeline
+        // in-process instead of trying to bind port 8080 a second time.
         if (ServiceBridge.isServiceRunning) {
             viewModel.startStream()
         } else {
@@ -327,16 +325,22 @@ class MainActivity : ComponentActivity() {
      * OrientationEventListener kept polling the accelerometer — which is a real
      * background drain and is why Android was killing the app's other work.
      *
-     * The pipeline is stopped first so the camera is released cleanly, then the
-     * service is stopped, which runs onDestroy: control server down, listener
-     * disabled, receiver unregistered, wakelock released, notification gone.
+     * The service's explicit stop action serializes camera shutdown through the
+     * pipeline controller before stopSelf(). onDestroy then takes down the
+     * control server, listener, receiver, wakelock, and notification.
      *
      * The cost is stated in the UI: with the server gone the desktop cannot start
      * the camera again, so the next start has to come from this phone.
      */
     private fun stopEverything() {
-        viewModel.stopStream()
-        stopService(StreamService.startIntent(this))
+        if (ServiceBridge.isServiceRunning) {
+            // The service is already a foreground service, so this is a normal
+            // command to that live instance, not a new background launch.
+            startService(StreamService.stopIntent(this))
+        } else {
+            // A stale UI snapshot must still leave no service behind.
+            stopService(StreamService.startIntent(this))
+        }
     }
 
     private fun startStreamService() {

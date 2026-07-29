@@ -8,6 +8,7 @@
 #include "InstallerCli.h"
 #include "../VirtualCameraMediaSource/BufferLockFallback.h"
 #include "../VirtualCameraMediaSource/Nv12ResizeFallback.h"
+#include "../VirtualCameraMediaSource/PlayoutScheduler.h"
 
 namespace
 {
@@ -174,11 +175,13 @@ int wmain(int argc, wchar_t* argv[])
     {
         const bool locksPassed = OcbRunBufferLockFallbackSelfTests();
         const bool resizePassed = OcbRunResizeFallbackSelfTests();
+        const bool playoutBootstrapPassed = OcbRunPlayoutBootstrapSelfTests();
         const bool cliPassed = OcbRunInstallerCliSelfTests();
         std::wcout << L"OCB_BUFFER_LOCK_FALLBACK_TEST=" << (locksPassed ? L"PASSED" : L"FAILED") << L"\n";
         std::wcout << L"OCB_NV12_RESIZE_FALLBACK_TEST=" << (resizePassed ? L"PASSED" : L"FAILED") << L"\n";
+        std::wcout << L"OCB_PLAYOUT_FIRST_FRAME_TEST=" << (playoutBootstrapPassed ? L"PASSED" : L"FAILED") << L"\n";
         std::wcout << L"OCB_INSTALLER_CLI_TEST=" << (cliPassed ? L"PASSED" : L"FAILED") << L"\n";
-        return locksPassed && resizePassed && cliPassed ? 0 : 1;
+        return locksPassed && resizePassed && playoutBootstrapPassed && cliPassed ? 0 : 1;
     }
     if (arguments.command == OcbInstallerCommand::DevMenu)
     {

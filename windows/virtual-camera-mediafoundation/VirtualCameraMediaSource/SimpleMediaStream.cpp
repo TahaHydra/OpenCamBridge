@@ -389,32 +389,35 @@ namespace winrt::WindowsSample::implementation
         if (fpsNum > 0) {
             duration = (10'000'000LL * fpsDen) / fpsNum;
         }
-        // ONE timeline, taken straight from the playout schedule.
+        // ONE timeline, taken straight from the playout schedule and translated
+        // onto Media Foundation's live clock.
         //
-        // The previous version kept a synthetic m_nextSampleTime alongside the scheduled
-        // value and used max() of the two. That silently discarded any correction wanting
-        // to move presentation EARLIER, which is half of what the clock servo does, so the
-        // servo was fighting a counter it could not influence. There is now a single
-        // series: the scheduler timestamps, rebased to a stream-relative epoch.
+        // FrameServer expects a live camera source to stamp samples in the
+        // MFGetSystemTime() domain. Rebasing the first scheduler timestamp to
+        // zero made every sample look ancient, so FrameServer requested and the
+        // source filled buffers successfully but dropped them before DirectShow
+        // clients (OBS/Teams) received anything. Keep the scheduler's exact
+        // deltas while applying one constant offset into the live MF clock.
         if (metadata.sampleTimeNs != 0) {
             const LONGLONG scheduled100ns = static_cast<LONGLONG>(metadata.sampleTimeNs / 100ULL);
             if (m_streamEpoch100ns == 0) {
-                // The first scheduled frame defines zero. The schedule is anchored on QPC
-                // while Media Foundation expects a stream-relative timeline, so that offset
-                // is removed once here instead of being carried forever.
-                m_streamEpoch100ns = scheduled100ns;
+                m_streamEpoch100ns = MFGetSystemTime() - scheduled100ns;
             }
-            LONGLONG relative = scheduled100ns - m_streamEpoch100ns;
-            if (relative < 0) relative = 0;
+            LONGLONG presentation100ns = scheduled100ns + m_streamEpoch100ns;
             // Media Foundation requires strictly increasing sample times.
-            if (relative <= m_lastSampleTime100ns) relative = m_lastSampleTime100ns + 1;
-            m_lastSampleTime100ns = relative;
+            if (presentation100ns <= m_lastSampleTime100ns) {
+                presentation100ns = m_lastSampleTime100ns + 1;
+            }
+            m_lastSampleTime100ns = presentation100ns;
             if (metadata.durationNs != 0) {
                 duration = static_cast<LONGLONG>(metadata.durationNs / 100ULL);
             }
         } else {
-            // No scheduled frame, because the ring read failed. Keep the series continuous.
-            m_lastSampleTime100ns += duration;
+            // No scheduled frame, because the ring read failed. Start in the
+            // live clock domain and keep that series continuous.
+            m_lastSampleTime100ns = m_lastSampleTime100ns == 0
+                ? MFGetSystemTime()
+                : m_lastSampleTime100ns + duration;
         }
         RETURN_IF_FAILED(sample->SetSampleTime(m_lastSampleTime100ns));
 

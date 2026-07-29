@@ -155,6 +155,59 @@ impl Sim {
 // ---- Frame-rate conversion must never be mistaken for jitter ----
 
 #[test]
+fn committing_the_initial_starve_anchor_allows_the_first_frame_to_release() {
+    let timing = PlayoutTiming {
+        output_interval_ns: FPS30_NS,
+        source_interval_ns: FPS30_NS,
+        slot_count: RING_SLOTS,
+    };
+    let mut scheduler = PlayoutScheduler::new(PLAYOUT_PROFILE_BALANCED);
+    let candidates = [
+        PlayoutCandidate {
+            ring_sequence: 1,
+            capture_timestamp_ns: FPS30_NS,
+            stream_generation: 1,
+            ring_write_timestamp_ns: 1_000_000_000,
+            slot_index: 0,
+        },
+        PlayoutCandidate {
+            ring_sequence: 2,
+            capture_timestamp_ns: FPS30_NS * 2,
+            stream_generation: 1,
+            ring_write_timestamp_ns: 1_000_000_000 + FPS30_NS,
+            slot_index: 1,
+        },
+    ];
+    let first_request_ns = 2_000_000_000;
+    let first = scheduler.peek(first_request_ns, &candidates, timing);
+    assert_eq!(PlayoutAction::Starve, first.action);
+    assert!(first.reset, "the first populated request must carry an anchor reset");
+
+    // This models the old C++ early-return integration: without committing the
+    // Starve decision, even waiting for the full target merely moves the anchor
+    // forward again and can never release a first frame.
+    let without_commit = scheduler.peek(
+        first_request_ns + scheduler.target_delay_ns,
+        &candidates,
+        timing,
+    );
+    assert_eq!(PlayoutAction::Starve, without_commit.action);
+    assert!(without_commit.reset);
+
+    scheduler.commit(&first, timing);
+    let after_prefill = scheduler.peek(
+        first_request_ns + scheduler.target_delay_ns,
+        &candidates,
+        timing,
+    );
+    assert_eq!(
+        PlayoutAction::Release,
+        after_prefill.action,
+        "committing the prefill anchor must make the first frame due"
+    );
+}
+
+#[test]
 fn thirty_into_thirty_runs_without_repeats_or_drops() {
     let mut sim = Sim::new(PLAYOUT_PROFILE_BALANCED, FPS30_NS, FPS30_NS);
     sim.run_steady(10_000_000_000);
@@ -405,6 +458,50 @@ fn a_real_underrun_is_classified_as_one_and_raises_the_target() {
     assert!(
         sim.scheduler.target_delay_ns > target_before,
         "a real underrun must raise the target"
+    );
+}
+
+#[test]
+fn a_stopped_source_repeats_its_last_frame_without_replaying_ring_history() {
+    let mut sim = Sim::new(PLAYOUT_PROFILE_BALANCED, FPS30_NS, FPS30_NS);
+    sim.run_steady(3_000_000_000);
+    let mut displayed_sequence = sim.scheduler.last_ring_sequence;
+    assert!(displayed_sequence > 0);
+
+    let mut now = sim.now_ns;
+    for _ in 0..(PLAYOUT_STALL_UNDERRUNS * 4) {
+        let decision = sim.request(now);
+        if decision.action == PlayoutAction::Release {
+            assert!(
+                decision.ring_sequence > displayed_sequence,
+                "a static ring release regressed from {} to {}",
+                displayed_sequence,
+                decision.ring_sequence
+            );
+            displayed_sequence = decision.ring_sequence;
+        } else {
+            assert_eq!(
+                displayed_sequence, decision.ring_sequence,
+                "a stopped producer must repeat only the last displayed frame"
+            );
+        }
+        now += FPS30_NS;
+    }
+
+    let resets_after_drain = sim.scheduler.scheduler_resets;
+    for _ in 0..(PLAYOUT_STALL_UNDERRUNS * 4) {
+        let decision = sim.request(now);
+        assert_ne!(
+            PlayoutAction::Release,
+            decision.action,
+            "fully drained retained history must never restart"
+        );
+        assert_eq!(displayed_sequence, decision.ring_sequence);
+        now += FPS30_NS;
+    }
+    assert_eq!(
+        resets_after_drain, sim.scheduler.scheduler_resets,
+        "retained slots are not evidence of new producer progress"
     );
 }
 

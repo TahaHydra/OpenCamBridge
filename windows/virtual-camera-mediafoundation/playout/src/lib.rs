@@ -484,12 +484,14 @@ impl PlayoutScheduler {
         }
         let mut newest_capture_ns = 0u64;
         let mut oldest_capture_ns = u64::MAX;
+        let mut newest_ring_sequence = 0u64;
         for candidate in candidates {
             if candidate.stream_generation != generation {
                 continue;
             }
             newest_capture_ns = newest_capture_ns.max(candidate.capture_timestamp_ns);
             oldest_capture_ns = oldest_capture_ns.min(candidate.capture_timestamp_ns);
+            newest_ring_sequence = newest_ring_sequence.max(candidate.ring_sequence);
         }
         let have_frames = oldest_capture_ns != u64::MAX;
 
@@ -516,12 +518,19 @@ impl PlayoutScheduler {
             anchor_source_ns = oldest_capture_ns;
             anchor_host_ns = now_ns + target;
             decision.reset = true;
-        } else if self.consecutive_underruns >= PLAYOUT_STALL_UNDERRUNS {
-            // Playout has been unable to release anything for a sustained stretch while
-            // the ring holds frames. Whatever the cause, recovering beats stalling for
-            // the rest of the session.
-            anchor_source_ns = oldest_capture_ns;
-            anchor_host_ns = now_ns + target;
+        } else if self.consecutive_underruns >= PLAYOUT_STALL_UNDERRUNS
+            && newest_ring_sequence > self.last_ring_sequence
+        {
+            // Only recover when the producer has actually advanced. A stopped producer
+            // leaves its final slots committed in the ring; resetting onto the oldest of
+            // those slots replayed the retained history forever and made OBS visibly
+            // alternate between stale frames.
+            //
+            // There is no useful prefill to rebuild here: this consumer has already
+            // displayed a frame. Re-anchor the newest unseen frame for immediate release
+            // and preserve the monotonic ring sequence.
+            anchor_source_ns = newest_capture_ns;
+            anchor_host_ns = now_ns;
             decision.reset = true;
         } else if newest_capture_ns < self.last_source_ns {
             // The encoder restarted without the producer bumping the generation, so the

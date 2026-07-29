@@ -28,7 +28,6 @@ import com.opencambridge.android.state.StreamState
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 
 private const val TAG = "StreamService"
@@ -186,7 +185,18 @@ class StreamService : LifecycleService() {
         super.onStartCommand(intent, flags, startId)
         if (intent?.action == ACTION_STOP) {
             Log.d(TAG, "Stop action received")
-            stopSelf()
+            // Stop is an orderly, serialized operation. Calling stopSelf()
+            // immediately used to race onDestroy against the controller and
+            // could leave camera/codec work alive while the service disappeared.
+            lifecycleScope.launch {
+                try {
+                    pipelineController.submit(PipelineCommand.Stop())
+                } catch (e: Exception) {
+                    AppLogger.e("System", "Orderly pipeline stop failed: ${e.javaClass.simpleName}: ${e.message}")
+                } finally {
+                    stopSelf(startId)
+                }
+            }
             return START_NOT_STICKY
         }
 
@@ -275,15 +285,28 @@ class StreamService : LifecycleService() {
     override fun onDestroy() {
         Log.d(TAG, "StreamService destroying")
         AppLogger.i("System", "StreamService stopping completely")
+        monitorJob?.cancel()
+        monitorJob = null
         ServiceBridge.clear()
         orientationListener?.disable()
         unlockReceiver?.let { try { unregisterReceiver(it) } catch (_: Exception) {} }
         unlockReceiver = null
         controlServer.stop()
-        runBlocking(Dispatchers.IO) {
-            try { pipelineController.submit(PipelineCommand.Stop()) } catch (_: Exception) {}
-        }
         pipelineController.close()
+        if (StreamState.lifecycleState.get() != LifecycleState.STOPPED) {
+            // Framework destruction can bypass ACTION_STOP. Do not submit back
+            // to the lifecycleScope actor from onDestroy and block waiting for
+            // it: that actor runs on the main thread, so doing so deadlocks.
+            // Release the owned resources directly as a final safety net.
+            runBlocking {
+                try { mjpegStreamer.stop() } catch (_: Exception) {}
+                try { h264Streamer.stop() } catch (_: Exception) {}
+            }
+            resetPipelineMetrics()
+            StreamState.lifecycleState.set(LifecycleState.STOPPED)
+            releaseStreamWakeLock()
+            setOrientationTracking(false)
+        }
         if (streamWakeLock?.isHeld == true) streamWakeLock?.release()
         streamWakeLock = null
         super.onDestroy()

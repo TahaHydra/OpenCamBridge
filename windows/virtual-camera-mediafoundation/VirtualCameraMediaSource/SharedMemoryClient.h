@@ -7,15 +7,11 @@
 #include <vector>
 
 #define OCBR_MAGIC 0x5242434F
-#define OCBR_VERSION 4
 #define OCBR_FORMAT_NV12 2
 #define OCBR_FORMAT_RGB32 3
-#define OCBR_HEADER_SIZE 320
-#define OCBR_SLOT_HEADER_SIZE 128
-#define OCBR_SLOT_COUNT 8
 
 // ABI source of truth: protocol/ring-abi.schema.json. The generated C++
-// assertions below and the two Rust generated files must move together.
+// constants/assertions below and the two Rust generated files must move together.
 
 #pragma pack(push, 8)
 struct OpenCamBridgeRingHeader {
