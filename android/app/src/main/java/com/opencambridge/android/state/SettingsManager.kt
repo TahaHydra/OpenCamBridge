@@ -27,7 +27,11 @@ class SettingsManager(context: Context) {
         StreamState.accessToken.set(token)
 
         StreamState.streamMode.set(prefs.getString("streamMode", "h264") ?: "h264")
-        StreamState.h264Bitrate.set(prefs.getInt("h264Bitrate", 4000000))
+        StreamState.h264Bitrate.set(prefs.getInt("h264Bitrate", 4000000).coerceIn(1_000_000, 50_000_000))
+        // Legacy flat default becomes Auto; preserve explicit non-default requests.
+        val migratedMode = if (StreamState.h264Bitrate.get() == 4_000_000) "auto" else "manual"
+        StreamState.h264BitrateMode.set(prefs.getString("h264BitrateMode", migratedMode)
+            ?.takeIf { it == "auto" || it == "manual" } ?: "auto")
         val savedKeyframeInterval = prefs.getInt(
             "h264KeyframeInterval",
             H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS
@@ -89,6 +93,7 @@ class SettingsManager(context: Context) {
             putString("accessToken", StreamState.accessToken.get())
             putString("streamMode", StreamState.streamMode.get())
             putInt("h264Bitrate", StreamState.h264Bitrate.get())
+            putString("h264BitrateMode", StreamState.h264BitrateMode.get())
             putInt("h264KeyframeInterval", StreamState.h264KeyframeInterval.get())
             putString("cameraId", StreamState.cameraId.get())
             putInt("width", StreamState.width.get())

@@ -1557,6 +1557,7 @@ class ControlServer(
                 resolution = "${activeWidth}x${activeHeight}",
                 fps = activeFps,
                 h264Bitrate = snapshot.desired.h264Bitrate,
+                h264BitrateMode = snapshot.desired.h264BitrateMode,
                 desired = StreamModeInfoDto(
                     mode = snapshot.desired.streamMode,
                     width = snapshot.desired.width,
@@ -1766,6 +1767,7 @@ data class UpdateSettingsRequest(
     val accessToken: String? = null,
     val streamMode: String? = null,
     val h264Bitrate: Int? = null,
+    val h264BitrateMode: String? = null,
     val h264KeyframeInterval: Int? = null,
     val targetBandwidthMbps: Int? = null
 )
@@ -1776,6 +1778,7 @@ private data class StreamInfoDto(
     val resolution: String,
     val fps: Int,
     val h264Bitrate: Int,
+    val h264BitrateMode: String = "auto",
     val desired: StreamModeInfoDto,
     val selected: StreamModeInfoDto?,
     val actual: StreamActualInfoDto?,

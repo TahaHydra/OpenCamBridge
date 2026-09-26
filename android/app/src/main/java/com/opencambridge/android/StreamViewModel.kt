@@ -80,6 +80,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _h264Bitrate = MutableStateFlow(4_000_000)
     val h264Bitrate: StateFlow<Int> = _h264Bitrate.asStateFlow()
+    private val _h264BitrateMode = MutableStateFlow("auto")
+    val h264BitrateMode: StateFlow<String> = _h264BitrateMode.asStateFlow()
 
     private val _h264KeyframeInterval = MutableStateFlow(
         com.opencambridge.android.state.H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS
@@ -247,6 +249,7 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 _previewRotation.value = StreamState.previewRotation.get()
                 _actualFps.value = StreamState.actualFps.get()
                 _h264Bitrate.value = config.h264Bitrate
+                _h264BitrateMode.value = config.h264BitrateMode
                 _h264KeyframeInterval.value = config.h264KeyframeInterval
                 val active = StreamState.activeStreamMode.get()
                 _activeStreamMode.value = active
@@ -322,7 +325,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     fun updateDisplayRotation(rotation: String) = controlPatch(UpdateSettingsRequest(displayRotation = rotation, clientType = "phone"))
     fun updateMirror(mirror: Boolean) = controlPatch(UpdateSettingsRequest(mirror = mirror, clientType = "phone"))
     fun updateStreamMode(mode: String) = controlPatch(UpdateSettingsRequest(streamMode = mode, clientType = "phone"))
-    fun updateH264Bitrate(bitrate: Int) = controlPatch(UpdateSettingsRequest(h264Bitrate = bitrate, clientType = "phone"))
+    fun updateH264Bitrate(bitrate: Int) = controlPatch(UpdateSettingsRequest(h264Bitrate = bitrate, h264BitrateMode = "manual", clientType = "phone"))
+    fun updateH264BitrateMode(mode: String) = controlPatch(UpdateSettingsRequest(h264BitrateMode = mode, clientType = "phone"))
     fun updateH264KeyframeInterval(seconds: Int) =
         controlPatch(UpdateSettingsRequest(h264KeyframeInterval = seconds, clientType = "phone"))
     fun updateAccessMode(mode: String) = controlPatch(UpdateSettingsRequest(accessMode = mode, clientType = "phone"))

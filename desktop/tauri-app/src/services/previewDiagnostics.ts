@@ -1,6 +1,12 @@
 export const PREVIEW_DIAGNOSTICS_EVENT = 'ocb-preview-diagnostics';
+export const PREVIEW_FALLBACK_EVENT = 'ocb-preview-fallback';
 
 export interface PreviewStageDiagnostics {
+  renderer: 'nv12' | 'webcodecs';
+  decodeMs: number;
+  queuedFrames: number;
+  decoderQueue: number;
+  bufferMs: number;
   ringAlive: boolean;
   ringWriteSequence: number;
   streamGeneration: number;
@@ -32,6 +38,11 @@ export interface PreviewStageDiagnostics {
 }
 
 export const EMPTY_PREVIEW_DIAGNOSTICS: PreviewStageDiagnostics = {
+  renderer: 'nv12',
+  decodeMs: 0,
+  queuedFrames: 0,
+  decoderQueue: 0,
+  bufferMs: 0,
   ringAlive: false,
   ringWriteSequence: 0,
   streamGeneration: 0,

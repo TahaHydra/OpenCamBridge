@@ -5,6 +5,7 @@ import { logEvent, logError, logTestMarker } from '../services/logging';
 import {
   EMPTY_PREVIEW_DIAGNOSTICS,
   PREVIEW_DIAGNOSTICS_EVENT,
+  PREVIEW_FALLBACK_EVENT,
   type PreviewStageDiagnostics,
 } from '../services/previewDiagnostics';
 import {
@@ -73,6 +74,7 @@ const INITIAL_SETTINGS: CameraSettings = {
   streamMode: 'h264',
   targetBandwidthMbps: 0,
   h264Bitrate: 4000000,
+  h264BitrateMode: 'auto',
   h264KeyframeInterval: 5,
 };
 
@@ -80,6 +82,15 @@ const newRequestId = () => globalThis.crypto?.randomUUID?.() || `tauri-${Date.no
 
 export function useCameraController({ baseUrl, token, previewEnabled }: CameraControllerOptions) {
   const previewOff = !previewEnabled;
+  // The WebCodecs preview reads the compressed stream itself. Only when it has
+  // fallen back to the native compatibility renderer does preview need the
+  // desktop producer (H264Preview announces that with PREVIEW_FALLBACK_EVENT).
+  const [nativePreviewFallback, setNativePreviewFallback] = useState(false);
+  useEffect(() => {
+    const onFallback = (event: Event) => setNativePreviewFallback(Boolean((event as CustomEvent).detail));
+    window.addEventListener(PREVIEW_FALLBACK_EVENT, onFallback);
+    return () => window.removeEventListener(PREVIEW_FALLBACK_EVENT, onFallback);
+  }, []);
 
   const [cameras, setCameras] = useState<CameraInfo[]>([]);
   const [settings, setSettings] = useState<CameraSettings>(INITIAL_SETTINGS);
@@ -223,6 +234,12 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
       linearZoom: zoomSettling ? current.linearZoom : status.linearZoom ?? current.linearZoom,
       targetBandwidthMbps: status.targetBandwidthMbps ?? current.targetBandwidthMbps,
       h264Bitrate: status.h264Bitrate ?? current.h264Bitrate,
+      // The phone omits h264BitrateMode while it is "auto" (kotlinx does not
+      // encode default values), so a full status that carries h264Bitrate but
+      // no mode means Automatic.
+      h264BitrateMode: status.h264BitrateMode === 'manual' || status.h264BitrateMode === 'auto'
+        ? status.h264BitrateMode
+        : status.h264Bitrate != null ? 'auto' : current.h264BitrateMode,
       // Mirror the phone's real interval, clamped to the range it accepts. It
       // used to be pinned to 5 here, and because every settings mutation posts
       // the interval, any other value chosen on the phone was silently reset
@@ -530,10 +547,8 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
     console.log('[Tauri UI] start_virtual_camera_feeder completed');
   };
 
-  // The H.264 preview reads decoded NV12 frames from the producer's shared
-  // ring. Keep that decoder/feed independent from the Media Foundation camera
-  // host: opening the desktop app starts preview decoding, but it does not
-  // activate the webcam for OBS until the user starts the virtual camera.
+  // WebCodecs owns its own compressed stream. Only the compatibility preview
+  // needs a native ring producer; preview never activates the webcam host.
   useEffect(() => {
     if (androidMetrics?.lifecycleState !== 'STREAMING') {
       // An explicit Stop suppresses the preview producer while the local
@@ -545,7 +560,7 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
       androidMetrics?.selectedFps || androidMetrics?.encodedFps || settings.fps || 0
     );
     const shouldStart = shouldStartH264PreviewProducer({
-      previewEnabled: !previewOff,
+      previewEnabled: !previewOff && nativePreviewFallback,
       settingsHydrated: settingsHydratedRef.current,
       lifecycleState: androidMetrics?.lifecycleState,
       activeStreamMode: androidMetrics?.activeStreamMode || settings.streamMode,
@@ -578,7 +593,7 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
       .finally(() => {
         previewProducerStartInFlightRef.current = false;
       });
-  }, [androidMetrics, previewOff, settings.fps, settings.streamMode, vcamState?.process_running, addDiag]);
+  }, [androidMetrics, previewOff, nativePreviewFallback, settings.fps, settings.streamMode, vcamState?.process_running, addDiag]);
 
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -741,7 +756,7 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
     const directKeys: (keyof CameraSettings)[] = [
       'profile', 'width', 'height', 'outputWidth', 'outputHeight', 'fps', 'jpegQuality',
       'cameraId', 'aspectRatio', 'displayRotation', 'mirror', 'streamMode',
-      'targetBandwidthMbps', 'h264Bitrate', 'h264KeyframeInterval'
+      'targetBandwidthMbps', 'h264Bitrate', 'h264BitrateMode', 'h264KeyframeInterval'
     ];
     for (const key of directKeys) {
       if (keysChanged.includes(key)) patch[key] = s[key];

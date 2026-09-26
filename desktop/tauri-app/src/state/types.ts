@@ -187,6 +187,8 @@ export interface CameraSettings {
   streamMode: string;
   targetBandwidthMbps: number;
   h264Bitrate: number;
+  /** 'auto': the phone picks a bitrate for the mode; 'manual': h264Bitrate is used. */
+  h264BitrateMode: 'auto' | 'manual';
   h264KeyframeInterval: number;
 }
 

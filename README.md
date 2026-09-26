@@ -11,13 +11,28 @@ Android Camera2
   -> MediaCodec H.264 surface encoder
   -> OCB2 framed access units over USB/ADB or authenticated LAN
   -> Windows Media Foundation H.264 decoder with D3D11 output
-  -> NV12 two/three-slot ring
+  -> NV12 16-slot ring
   -> Media Foundation virtual camera
 ```
 
 MJPEG remains a complete compatibility path when H.264 capture/encode/decode is unavailable or the user selects compatibility mode. The primary H.264 path does not pass camera frames through Kotlin YUV conversion, and the Windows virtual-camera path remains NV12 unless RGB32 compatibility is negotiated.
 
-Supported consumer formats are NV12 1920x1080 and 1280x720 at 60 or 30 FPS, plus RGB32 fallback. A mode is offered only when the selected camera and encoder expose a complete path. Adaptive preference is 1080p60, 720p60, 1080p30, 720p30, then a canonical MJPEG tuple; explicit profiles never silently adapt.
+The desktop preview independently streams compressed OCB2 into a WebCodecs worker
+and renders full-source-resolution video with OffscreenCanvas. Raw frames do not
+cross Tauri IPC on this path. A small decoded-frame presentation queue absorbs
+arrival bursts; the existing reduced-resolution NV12 preview is retained for
+WebViews that cannot decode/render the stream. Preview failure does not stop the
+native virtual camera. See [preview implementation and validation](docs/preview-engine-2026-09.md).
+
+Supported consumer formats include NV12 1920x1080, 1280x720 and 640x480 at 30 FPS,
+with 1080p/720p60 offered for a 60 FPS source, plus YUY2/RGB32 compatibility modes.
+The default follows a known source's dimensions/rate; a 30 FPS source does not
+advertise fake 60 FPS. Explicit camera profiles never silently adapt.
+
+H.264 bitrate has Automatic and Manual modes. Automatic selects a target from the
+actual resolution/FPS and encoder limits; Manual uses the same request at startup
+and on live changes, clamped to device capability. The default keyframe interval
+is five seconds, with immediate keyframes requested for new clients/recovery.
 
 See [architecture](docs/ARCHITECTURE.md), [protocol](protocol/SPEC.md), [native dependency map](docs/NATIVE_DEPENDENCY_MAP.md), and [validation checklist](docs/VALIDATION.md).
 

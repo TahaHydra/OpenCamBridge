@@ -12,7 +12,7 @@ Camera2 regular / constrained high-speed / high-speed GPU bridge
   -> Media Foundation H.264 MFT + D3D11 manager
   -> decoded NV12, optional one-time D3D11 video-processor resize
      (bounded CPU NV12 letterbox fallback after GPU failure)
-  -> validated NV12 ring, newest complete slot only
+  -> validated 16-slot NV12 ring, bounded sequence playback
   -> SimpleMediaStream NV12 sample
   -> Windows camera consumer
 ```
@@ -25,7 +25,7 @@ MJPEG uses CameraX ImageAnalysis, performs the authoritative NV21 rotation/mirro
 
 `PipelineSnapshot` is the authoritative immutable CAS state and contains revision, generation, lifecycle, desired, selected, actual, fallback, request identity/source, preview status, and update time. Generation-gated publications prevent status from mixing old actual values with new desired values.
 
-`H264Streamer` selects only complete Camera2/encoder tuples. Regular surface capture is attempted where valid; constrained high-speed direct surface and SurfaceTexture/EGL bridge paths cover public high-speed configurations. Encoder output is asynchronous, B-frames are disabled, keyframe interval is one second, and a new client requests a keyframe. OCB2 stream info carries the source transform.
+`H264Streamer` selects only complete Camera2/encoder tuples. Regular surface capture is attempted where valid; constrained high-speed direct surface and SurfaceTexture/EGL bridge paths cover public high-speed configurations. Encoder output is asynchronous, B-frames are disabled, the default keyframe interval is five seconds, and a new client requests a keyframe. OCB2 stream info carries the source transform and color metadata. One Auto/Manual bitrate policy handles configure and live updates.
 
 `MjpegStreamer` retains CameraX compatibility. Canonical MJPEG modes come from per-resolution camera FPS capability and internal H.264 fallback selects a valid tuple rather than retaining an impossible H.264 FPS.
 
@@ -41,7 +41,7 @@ The shared corpus in `protocol/conformance` runs against Kotlin, Rust, and the a
 
 The producer has observable states from `STARTING` through connection, stream-info/config/keyframe/decode, `WRITING_RING`, stalled/fallback/failed. Media Foundation D3D11 output is reported separately from hardware decode, which remains `unknown` unless acceleration can be proven.
 
-The ring ABI is generated from `protocol/ring-abi.schema.json`. It has a 256-byte header and aligned slot headers/data, atomic publication, ACL-restricted file/mapping access, producer/consumer heartbeats, build hashes, dimensions/strides/format/size/offset validation, and two or three reusable NV12 slots. Producer writes and camera reads never queue old presentation frames.
+The ring ABI is generated from `protocol/ring-abi.schema.json`. Version 4 has a 320-byte header, sixteen reusable NV12 slots and aligned 128-byte slot headers, atomic publication, ACL-restricted file/mapping access, producer/consumer heartbeats, build hashes and geometry/bounds validation. The production camera uses the fixed sequence queue (nominal 90 ms rounded to source frames). The older adaptive scheduler remains in the tree for historical simulations; it is not the production selection policy.
 
 ## Virtual camera
 
@@ -51,4 +51,24 @@ The ring ABI is generated from `protocol/ring-abi.schema.json`. It has a 256-byt
 
 ## Desktop orchestration
 
-Tauri chooses an explicit ADB device, applies revisioned complete tuples, starts the producer with Android selected/actual source properties and independent Windows output dimensions, verifies three ring commits plus host activation, and maintains current virtual-camera-consumer readiness separately. The desktop preview reads the newest NV12 slot at at most 30 FPS and cannot back-pressure the ring.
+Tauri chooses an explicit ADB device, applies revisioned complete tuples, starts the producer with Android selected/actual source properties and independent Windows output dimensions, verifies three ring commits plus host activation, and maintains current virtual-camera-consumer readiness separately.
+
+The primary desktop preview opens an independent authenticated OCB2 stream through
+the existing native HTTP plugin. Only compressed chunks cross IPC, with one chunk
+in flight to the worker. The shared OCB2 parser feeds an Annex-B WebCodecs decoder,
+preferring hardware with software allowed. Stream discontinuities reset decoding
+and wait for a keyframe. OCB2 SDR color metadata and rotation/mirror are preserved.
+Full-resolution VideoFrames are presented to an OffscreenCanvas on display rAF;
+the compositor scales the source to the UI rectangle. The bounded decoded-frame
+queue starts with two source intervals (at most 70 ms). Discarded/displayed frames
+are closed, and transport/worker resources are canceled on Stop/unmount.
+
+Unsupported or repeatedly failing WebCodecs uses the existing 960-edge NV12 ring
+preview. Only this fallback auto-starts a native preview producer. The lifecycle
+controller stays mounted when clean feed hides the controls. Neither preview
+path activates or stops the virtual-camera host on failure.
+
+Diagnostics distinguish producer processing, an unsynchronized phone-to-ring
+lower-bound estimate, WebCodecs submit-to-output callback time, and canvas draw
+submission time. None is a sensor-to-display measurement. Reader timestamps are
+taken when an OCB2 record is complete, before its bounded decoder queue.
