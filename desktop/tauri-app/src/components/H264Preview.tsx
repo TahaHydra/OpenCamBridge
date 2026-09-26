@@ -116,7 +116,7 @@ export default function H264Preview({ baseUrl, token, fitMode }: { baseUrl: stri
     if (canvas) canvas.className = `preview-img ${fitMode === 'fit' ? 'fit-contain' : 'fit-cover'}`;
   }, [fitMode]);
 
-  if (fallback) return <><Nv12RingPreview fitMode={fitMode} /><div className="vf-hud" title={fallback}>Compatibility preview · 960px maximum</div></>;
+  if (fallback) return <><Nv12RingPreview fitMode={fitMode} /><div className="vf-hud vf-hud--notice" title={fallback}>Compatibility preview · 960px maximum</div></>;
   // Create a canvas per effect, including React StrictMode's setup/cleanup probe.
   return <><div ref={surfaceRef} style={{ width: '100%', height: '100%' }} />
     {message && <div className="preview-overlay">{message}</div>}</>;

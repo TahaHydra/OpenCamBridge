@@ -169,7 +169,7 @@ function ThroughputTab({ controller }: { controller: CameraController }) {
   const metrics = controller.vcamState?.metrics;
   const ring = metrics?.ring;
   const { settings, androidMetrics } = controller;
-  if (!metrics) return <p className="hint">Waiting for producer metrics — start the preview decoder or the virtual camera.</p>;
+  if (!metrics) return <p className="hint">Waiting for producer metrics — they appear while the virtual camera or the compatibility preview runs.</p>;
   return (
     <>
       <Block title="Rates" icon={<Gauge size={14} />}>
@@ -186,7 +186,7 @@ function ThroughputTab({ controller }: { controller: CameraController }) {
           <Tel k="Transport bandwidth" v={`${metrics.transport_bandwidth_mbps ?? metrics.estimated_mbps} Mb/s`} />
           <Tel k="Decode time" v={`${metrics.decode_ms_avg} ms`} />
           <Tel k="Producer processing" v={`${metrics.producer_processing_ms ?? metrics.total_pipeline_ms} ms`} />
-          {metrics.source === 'ocb2-h264' && <Tel k="Phone→ring lower bound" v={`${metrics.phone_to_ring_latency_ms ?? metrics.latency_ms ?? 0} ms`} />}
+          {metrics.source === 'ocb2-h264' && <Tel k="Phone→ring estimate (lower bound)" v={`${metrics.phone_to_ring_latency_ms ?? metrics.latency_ms ?? 0} ms`} />}
         </div>
       </Block>
       <Block title="Decode & playout" icon={<Cpu size={14} />}>
@@ -207,7 +207,7 @@ function ThroughputTab({ controller }: { controller: CameraController }) {
         {ring && (
           <>
             <Tel k="Playout buffer / target" v={`${ring.playout_buffer_depth_ms} / ${ring.playout_target_delay_ms} ms`} />
-            <Tel k="Playout underruns / late drops" v={`${ring.playout_underruns} / ${ring.playout_late_dropped}`} tone={ring.playout_underruns || ring.playout_late_dropped ? 'warn' : 'ready'} />
+            <Tel k="Output underruns" v={ring.playout_underruns} tone={ring.playout_underruns ? 'warn' : 'ready'} />
             <Tel k="Scheduler resets / clock drift" v={`${ring.playout_scheduler_resets} / ${ring.playout_clock_ppm} ppm`} />
             <Tel k="Max output gap" v={`${ring.playout_max_output_gap_ms} ms`} />
           </>
@@ -231,10 +231,23 @@ function ThroughputTab({ controller }: { controller: CameraController }) {
 function PreviewTab({ controller }: { controller: CameraController }) {
   const previewDiagnostics = controller.previewDiagnostics;
   const producerRunning = controller.producerRunning;
+  const webCodecs = previewDiagnostics.renderer === 'webcodecs';
   return (
     <Block title="Desktop preview stages" icon={<Monitor size={14} />}>
       <div className="tel-grid">
         <Tel k="Preview state" v={previewDiagnostics.ready ? 'READY — frame displayed' : 'WAITING — no displayed frame'} tone={previewDiagnostics.ready ? 'ready' : 'warn'} />
+        <Tel k="Preview renderer" v={webCodecs ? 'WebCodecs · full source resolution' : 'Native NV12 compatibility · max 960px'} tone={webCodecs ? undefined : 'warn'} />
+        {webCodecs ? <>
+          <Tel k="Decoded / presented fps" v={`${previewDiagnostics.previewReceivedFps.toFixed(1)} / ${previewDiagnostics.previewDisplayedFps.toFixed(1)}`} tone={previewDiagnostics.ready && previewDiagnostics.previewDisplayedFps > 0 ? 'ready' : 'warn'} />
+          <Tel k="Rendered source size" v={`${previewDiagnostics.parsedWidth || '—'}×${previewDiagnostics.parsedHeight || '—'}`} />
+          <Tel k="Compressed bytes transferred" v={previewDiagnostics.ipcPayloadBytes} />
+          <Tel k="Decode callback / draw submission" v={`${previewDiagnostics.decodeMs.toFixed(2)} / ${previewDiagnostics.previewUploadMs.toFixed(2)} ms`} />
+          <Tel k="Decoded / decoder queue" v={`${previewDiagnostics.queuedFrames} / ${previewDiagnostics.decoderQueue}`} />
+          <Tel k="Initial presentation cushion" v={`${previewDiagnostics.bufferMs.toFixed(1)} ms`} />
+          <Tel k="Presentation skips" v={previewDiagnostics.previewSkippedSequences} tone={previewDiagnostics.previewSkippedSequences > 0 ? 'warn' : undefined} />
+          <Tel k="Source fps / colour" v={`${previewDiagnostics.sourceFps || '—'} / ${previewDiagnostics.colorMatrix || '—'} ${previewDiagnostics.colorRange || ''}`} />
+          <Tel k="Last preview error" v={previewDiagnostics.lastError || 'none'} tone={previewDiagnostics.lastError ? 'fail' : 'muted'} />
+        </> : <>
         <Tel k="Producer / ring" v={`${producerRunning ? 'running' : 'stopped'} / ${previewDiagnostics.ringAlive ? 'alive' : 'unavailable'}`} tone={producerRunning && previewDiagnostics.ringAlive ? 'ready' : 'warn'} />
         <Tel k="Ring write sequence / generation" v={`${previewDiagnostics.ringWriteSequence} / ${previewDiagnostics.streamGeneration}`} />
         <Tel k="Preview command calls" v={previewDiagnostics.previewCommandCalls} />
@@ -251,8 +264,9 @@ function PreviewTab({ controller }: { controller: CameraController }) {
         <Tel k="Primaries / transfer" v={`${previewDiagnostics.colorPrimaries || '—'} / ${previewDiagnostics.colorTransfer || '—'}`} />
         <Tel k="Torn slots rejected" v={previewDiagnostics.tornSlotsRejected} tone={previewDiagnostics.tornSlotsRejected > 0 ? 'warn' : undefined} />
         <Tel k="Last preview error" v={previewDiagnostics.lastError || 'none'} tone={previewDiagnostics.lastError ? 'fail' : 'muted'} />
+        </>}
       </div>
-      {previewDiagnostics.consumerStalled && (
+      {!webCodecs && previewDiagnostics.consumerStalled && (
         <Notice kind="fail" icon={<AlertTriangle size={13} />}>
           Preview consumer is not releasing frames; producer ring is healthy.
         </Notice>

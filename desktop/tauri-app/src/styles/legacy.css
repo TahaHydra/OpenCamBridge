@@ -102,6 +102,11 @@
   pointer-events: none;
   user-select: none;
 }
+/* The compatibility-preview notice sits apart from the source readout. */
+.vf-hud--notice {
+  top: var(--s-3);
+  bottom: auto;
+}
 .vf-hud b {
   color: var(--text);
   font-weight: 600;

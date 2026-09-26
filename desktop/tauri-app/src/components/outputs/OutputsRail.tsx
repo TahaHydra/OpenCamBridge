@@ -248,6 +248,7 @@ function PerformanceCard({ controller, onOpenDiagnostics }: { controller: Camera
     ? `${m.decoder_name || m.decode_backend || (m.source === 'mjpeg' ? 'MJPEG' : '—')}${m.hardware_decoder === false ? ' · software' : m.hardware_decoder ? ' · hardware' : m.d3d11_output ? ' · D3D11' : ''}`
     : '—';
   const colour = preview.colorMatrix ? `${preview.colorMatrix} ${preview.colorRange}` : '—';
+  const webCodecs = preview.renderer === 'webcodecs';
   const bandwidth = m?.transport_bandwidth_mbps ?? m?.estimated_mbps ?? am?.estimatedMbps;
   const vcamFps = controller.consumerAttached ? (m?.virtual_camera_unique_fps ?? m?.written_fps) : undefined;
 
@@ -266,11 +267,14 @@ function PerformanceCard({ controller, onOpenDiagnostics }: { controller: Camera
         <MetricRow label="Transport" value={producing ? m?.transport_received_fps ?? m?.transport_fps ?? '—' : '—'} unit="fps" tone={tone(m?.transport_received_fps ?? m?.transport_fps, producing)} />
         <MetricRow label="Ring" value={producing ? m?.ring_written_fps ?? m?.written_fps ?? '—' : '—'} unit="fps" tone={tone(m?.ring_written_fps ?? m?.written_fps, producing)} />
         <MetricRow label="Desktop preview" value={preview.ready ? preview.previewDisplayedFps : '—'} unit="fps" tone={tone(preview.previewDisplayedFps, preview.ready)} />
+        <MetricRow label="Preview renderer" value={preview.ready ? (webCodecs ? 'WebCodecs' : 'Compatibility') : '—'} tone={preview.ready && !webCodecs ? 'warn' : undefined} />
         <MetricRow label="Virtual camera" value={vcamFps ?? '—'} unit="fps" tone={tone(vcamFps, controller.consumerAttached)} />
         <MetricRow label="Bandwidth" value={bandwidth ?? '—'} unit="Mb/s" />
         <MetricRow label="Producer processing" value={m ? m.producer_processing_ms ?? m.total_pipeline_ms : '—'} unit="ms" />
-        <MetricRow label="Preview IPC / upload" value={preview.ready ? `${preview.ipcTransferMs.toFixed(1)} / ${preview.previewUploadMs.toFixed(1)}` : '—'} unit="ms" />
-        <MetricRow label="Decoder" value={decoder} tone={m?.hardware_decoder === false ? 'warn' : undefined} />
+        {webCodecs || !preview.ready
+          ? <MetricRow label="Preview decode / draw" value={preview.ready ? `${preview.decodeMs.toFixed(1)} / ${preview.previewUploadMs.toFixed(1)}` : '—'} unit="ms" />
+          : <MetricRow label="Preview IPC / upload" value={`${preview.ipcTransferMs.toFixed(1)} / ${preview.previewUploadMs.toFixed(1)}`} unit="ms" />}
+        <MetricRow label="Producer decoder" value={decoder} tone={m?.hardware_decoder === false ? 'warn' : undefined} />
         <MetricRow label="Colour" value={colour} />
       </div>
       <Button size="sm" variant="ghost" block icon={<Activity size={14} />} onClick={onOpenDiagnostics}>
