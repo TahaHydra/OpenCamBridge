@@ -382,6 +382,24 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
+     * Applies lens, format, size and rate as ONE authoritative patch. The phone
+     * validates the resulting combination as a whole, so switching lens or
+     * format together with a mode the new selection supports never trips over
+     * a half-applied intermediate state. Unchanged fields cause no rebind.
+     */
+    fun applyCaptureMode(cameraId: String, streamMode: String, width: Int, height: Int, fps: Int) =
+        controlPatch(
+            UpdateSettingsRequest(
+                cameraId = cameraId,
+                streamMode = streamMode,
+                width = width,
+                height = height,
+                fps = fps,
+                clientType = "phone"
+            )
+        )
+
+    /**
      * Applies a settings patch IN-PROCESS via the same serialized controller as
      * HTTP clients and awaits its authoritative result. There is intentionally
      * no second local mutation path: while the service is starting, controls

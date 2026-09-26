@@ -6,159 +6,112 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.DeviceFontFamilyName
-import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * "Camera body" — the phone's half of the OpenCamBridge design language.
+ * The phone half of the OpenCamBridge design system, matching the desktop app:
+ * dark charcoal surfaces, one accent colour, and status colours that only ever
+ * mean status — green healthy, yellow warning, red error or destructive.
  *
- * The desktop app is a rack instrument; this is the camera that feeds it, so it
- * shares the palette and the tally conventions (red = on air, green = ready,
- * amber = degraded) but is laid out viewfinder-first.
- *
- * The important constraint is the viewing distance. A phone propped up as a
- * webcam is read from across a desk, at an angle, in a glance that asks exactly
- * one question: is it live? So state is carried by large type and illuminated
- * colour rather than 12sp grey captions.
+ * The phone is mostly a capture appliance propped up across a desk, so the
+ * interface is sparse and legible at a glance: one state, one big action.
+ * No bundled fonts and no font CDN — the app never touches the network for UI.
  */
 object Ocb {
-    // Surfaces: anodised graphite, warm-neutral rather than blue-black.
-    val Void = Color(0xFF08090B)
-    val Panel = Color(0xFF14171D)
-    val PanelHigh = Color(0xFF1A1E26)
-    val PanelTop = Color(0xFF21262F)
-    val Inset = Color(0xFF090B0E)
+    // Surfaces, darkest to lightest.
+    val Bg = Color(0xFF0F1114)
+    val Surface = Color(0xFF181B21)
+    val Surface2 = Color(0xFF1F232A)
+    val Surface3 = Color(0xFF282D36)
+    val Surface4 = Color(0xFF313743)
 
-    val Rule = Color(0x14FFFFFF)
-    val Rule2 = Color(0x24FFFFFF)
+    val Border = Color(0x12FFFFFF)
+    val Border2 = Color(0x1CFFFFFF)
 
-    val Ink = Color(0xFFECEEF2)
-    val Ink2 = Color(0xFF98A0AC)
-    val Ink3 = Color(0xFF5D6673)
-    val Ink4 = Color(0xFF3D444E)
+    // Text.
+    val Text = Color(0xFFECEEF2)
+    val Text2 = Color(0xFFA8AFB9)
+    val Text3 = Color(0xFF737B86)
+    val Text4 = Color(0xFF4D545E)
 
-    // Signal semantics, borrowed from tally conventions.
-    val Tally = Color(0xFFFF2F2F)
-    val TallyDim = Color(0xFF3A1210)
-    val Ready = Color(0xFF2FD88A)
-    val Warn = Color(0xFFFFB020)
-    val Fail = Color(0xFFFF5C50)
-    val Signal = Color(0xFF4FD8D3)
-    val Key = Color(0xFFEEF1F5)
+    // The one accent.
+    val Accent = Color(0xFF4D8DFF)
+    val AccentText = Color(0xFF9CC0FF)
+    val AccentSoft = Color(0x244D8DFF)
 
-    val CornerPanel = 10.dp
-    val CornerControl = 6.dp
+    // Status — never decoration.
+    val Ok = Color(0xFF3FCF7F)
+    val OkSoft = Color(0x213FCF7F)
+    val Warn = Color(0xFFF3B33D)
+    val WarnSoft = Color(0x21F3B33D)
+    val Danger = Color(0xFFF2574C)
+    val DangerText = Color(0xFFFFAAA3)
+    val DangerSoft = Color(0x21F2574C)
+
+    // Spacing scale (8/12/16/24) and shapes.
+    val S1 = 4.dp
+    val S2 = 8.dp
+    val S3 = 12.dp
+    val S4 = 16.dp
+    val S5 = 24.dp
+    val S6 = 32.dp
+
+    val RadiusControl = 12.dp
+    val RadiusCard = 16.dp
+    val ControlHeight = 48.dp
 }
 
-/**
- * Silkscreen legends and large readouts use the device's condensed family
- * (Roboto Condensed on effectively every Android build). It carries the same
- * "equipment panel legend" character as the desktop's condensed display face
- * without bundling a font file or reaching out to a font CDN — which would
- * contradict this app's no-network promise.
- */
-val CondensedFamily = FontFamily(
-    Font(DeviceFontFamilyName("sans-serif-condensed"), weight = FontWeight.Normal),
-    Font(DeviceFontFamilyName("sans-serif-condensed"), weight = FontWeight.Medium),
-    Font(DeviceFontFamilyName("sans-serif-condensed"), weight = FontWeight.Bold)
-)
-
-/** Anything measured is monospaced, so digits do not jitter as values change. */
+/** Measured values use tabular figures so digits do not jitter as they change. */
 val MonoFamily = FontFamily.Monospace
 
-/** Uppercase legend above a group of controls. */
-val LegendStyle = TextStyle(
-    fontFamily = CondensedFamily,
-    fontWeight = FontWeight.Bold,
-    fontSize = 13.sp,
-    letterSpacing = 1.8.sp
-)
+val TelemetryStyle = TextStyle(fontFamily = MonoFamily, fontSize = 12.sp, lineHeight = 18.sp)
 
-/** Small silkscreen label for a single field. */
-val FieldLabelStyle = TextStyle(
-    fontFamily = CondensedFamily,
-    fontWeight = FontWeight.Medium,
+/** Small uppercase group heading. */
+val SectionLabelStyle = TextStyle(
+    fontWeight = FontWeight.SemiBold,
     fontSize = 12.sp,
-    letterSpacing = 1.2.sp
-)
-
-/** The big tally word. Sized to be read from across a desk. */
-val TallyStyle = TextStyle(
-    fontFamily = CondensedFamily,
-    fontWeight = FontWeight.Bold,
-    fontSize = 30.sp,
-    letterSpacing = 3.sp
-)
-
-/** A measured value. */
-val ReadoutStyle = TextStyle(
-    fontFamily = MonoFamily,
-    fontWeight = FontWeight.Medium,
-    fontSize = 15.sp
-)
-
-val ReadoutLargeStyle = TextStyle(
-    fontFamily = MonoFamily,
-    fontWeight = FontWeight.Medium,
-    fontSize = 22.sp
-)
-
-val TelemetryStyle = TextStyle(
-    fontFamily = MonoFamily,
-    fontSize = 12.sp,
-    lineHeight = 18.sp
+    letterSpacing = 0.8.sp
 )
 
 @Composable
 fun OpenCamBridgeTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = darkColorScheme(
-            background = Ocb.Void,
-            surface = Ocb.Panel,
-            surfaceVariant = Ocb.PanelHigh,
-            surfaceContainerHighest = Ocb.PanelTop,
-            primary = Ocb.Signal,
-            onPrimary = Ocb.Void,
-            secondary = Ocb.Ink2,
-            tertiary = Ocb.Ready,
-            onTertiary = Ocb.Void,
-            error = Ocb.Fail,
-            onError = Ocb.Void,
-            outline = Ocb.Rule2,
-            outlineVariant = Ocb.Rule,
-            onBackground = Ocb.Ink,
-            onSurface = Ocb.Ink,
-            onSurfaceVariant = Ocb.Ink2
+            background = Ocb.Bg,
+            surface = Ocb.Surface,
+            surfaceVariant = Ocb.Surface2,
+            surfaceContainer = Ocb.Surface,
+            surfaceContainerHigh = Ocb.Surface2,
+            surfaceContainerHighest = Ocb.Surface3,
+            primary = Ocb.Accent,
+            onPrimary = Color.White,
+            primaryContainer = Ocb.AccentSoft,
+            onPrimaryContainer = Ocb.AccentText,
+            secondary = Ocb.Text2,
+            tertiary = Ocb.Ok,
+            error = Ocb.Danger,
+            onError = Color.White,
+            outline = Ocb.Border2,
+            outlineVariant = Ocb.Border,
+            onBackground = Ocb.Text,
+            onSurface = Ocb.Text,
+            onSurfaceVariant = Ocb.Text2
         ),
         typography = Typography(
-            // Body text stays in the platform sans; only legends, readouts and
-            // the tally deliberately break away from it.
-            bodyLarge = TextStyle(fontSize = 15.sp, lineHeight = 22.sp),
-            bodyMedium = TextStyle(fontSize = 13.5.sp, lineHeight = 20.sp),
-            bodySmall = TextStyle(fontSize = 12.sp, lineHeight = 17.sp, color = Ocb.Ink2),
-            titleLarge = TextStyle(
-                fontFamily = CondensedFamily,
-                fontWeight = FontWeight.Bold,
-                fontSize = 22.sp,
-                letterSpacing = 1.sp
-            ),
-            labelLarge = TextStyle(
-                fontFamily = CondensedFamily,
-                fontWeight = FontWeight.Bold,
-                fontSize = 14.sp,
-                letterSpacing = 1.2.sp
-            ),
-            labelMedium = FieldLabelStyle,
-            labelSmall = TextStyle(
-                fontFamily = CondensedFamily,
-                fontWeight = FontWeight.Medium,
-                fontSize = 10.sp,
-                letterSpacing = 1.sp
-            )
+            displaySmall = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 30.sp, lineHeight = 36.sp, letterSpacing = (-0.3).sp),
+            headlineSmall = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 22.sp, lineHeight = 28.sp),
+            titleLarge = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 20.sp, lineHeight = 26.sp),
+            titleMedium = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 16.sp, lineHeight = 22.sp),
+            titleSmall = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 14.sp, lineHeight = 20.sp),
+            bodyLarge = TextStyle(fontSize = 16.sp, lineHeight = 23.sp),
+            bodyMedium = TextStyle(fontSize = 14.sp, lineHeight = 20.sp),
+            bodySmall = TextStyle(fontSize = 12.5.sp, lineHeight = 18.sp, color = Ocb.Text3),
+            labelLarge = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 15.sp, letterSpacing = 0.2.sp),
+            labelMedium = TextStyle(fontWeight = FontWeight.Medium, fontSize = 13.sp),
+            labelSmall = TextStyle(fontWeight = FontWeight.Medium, fontSize = 11.5.sp, letterSpacing = 0.3.sp)
         ),
         content = content
     )
