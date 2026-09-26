@@ -38,6 +38,8 @@ android {
         compose = true
     }
 
+    sourceSets.getByName("test").resources.directories.add("../../protocol/conformance")
+
     packaging {
         resources {
             // Ktor brings duplicate META-INF files; exclude them.
@@ -80,4 +82,6 @@ dependencies {
     // Kotlinx
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.android)
+
+    testImplementation("junit:junit:4.13.2")
 }

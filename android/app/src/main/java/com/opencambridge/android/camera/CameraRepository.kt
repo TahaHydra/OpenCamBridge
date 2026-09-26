@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.media.MediaCodec
 import android.os.Build
 import android.util.Log
 
@@ -153,27 +154,43 @@ class CameraRepository(private val context: Context) {
             .contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MONOCHROME)
         val isMonochrome = monoByCfa || monoByCap
 
-        // Honest per-resolution max FPS. The AE target-fps ranges advertise what
-        // the sensor *can* do in principle, but the achievable rate at a given
-        // capture size is bounded by that size's minimum frame duration. This is
-        // the signal the UI uses to decide whether 60 fps is real for a given
-        // lens + resolution (instead of assuming every phone can do it).
+        // Build complete regular-session tuples. A camera-wide AE range cannot
+        // prove that a particular resolution or output path can sustain its
+        // upper bound; the exact output's minimum frame duration must agree.
         val standardSizes = listOf(640 to 480, 960 to 540, 1280 to 720, 1920 to 1080)
-        val maxAeFps = fpsRanges.maxOfOrNull { it.max } ?: 30
-        val fpsByResolution = standardSizes.mapNotNull { (w, h) ->
-            val match = outputSizes.firstOrNull { it.width == w && it.height == h }
-                ?: return@mapNotNull null
-            val minDurNs = try {
-                configMap?.getOutputMinFrameDuration(ImageFormat.YUV_420_888, match) ?: 0L
-            } catch (e: Exception) {
-                0L
+        val aeEvidence = fpsRanges.map { RegularModePolicy.AeRange(it.min, it.max) }
+        fun regularOutputs(
+            formatName: String,
+            candidates: List<android.util.Size>,
+            duration: (android.util.Size) -> Long,
+        ): List<RegularCameraModeDto> {
+            val outputs = standardSizes.mapNotNull { (w, h) ->
+                val match = candidates.firstOrNull { it.width == w && it.height == h }
+                    ?: return@mapNotNull null
+                val minDuration = try { duration(match) } catch (_: Exception) { 0L }
+                RegularModePolicy.Output(w, h, minDuration)
             }
-            val durFps = if (minDurNs > 0L) (1_000_000_000.0 / minDurNs).toInt() else maxAeFps
-            // The real ceiling is the lower of what the size allows and what the
-            // sensor's AE ranges advertise.
-            val maxFps = minOf(durFps, maxAeFps).coerceAtLeast(1)
-            ResolutionFpsDto(w, h, maxFps)
+            return RegularModePolicy.build(id, formatName, outputs, aeEvidence)
         }
+        val yuvRegularModes = regularOutputs(
+            "YUV_420_888",
+            outputSizes,
+        ) { size -> configMap?.getOutputMinFrameDuration(ImageFormat.YUV_420_888, size) ?: 0L }
+        val codecOutputSizes = try {
+            configMap?.getOutputSizes(MediaCodec::class.java)?.toList().orEmpty()
+        } catch (_: Exception) {
+            emptyList()
+        }
+        val codecRegularModes = regularOutputs(
+            "MEDIA_CODEC_SURFACE",
+            codecOutputSizes,
+        ) { size -> configMap?.getOutputMinFrameDuration(MediaCodec::class.java, size) ?: 0L }
+        val regularModes = yuvRegularModes + codecRegularModes
+        val fpsByResolution = yuvRegularModes
+            .groupBy { it.width to it.height }
+            .map { (size, modes) -> ResolutionFpsDto(size.first, size.second, modes.maxOf { it.fps }) }
+            .sortedByDescending { it.width.toLong() * it.height }
+        val mjpegModes = yuvRegularModes.map { H264ModeDto(it.width, it.height, it.fps) }
 
         // Zoom ratio range (API 30+); older devices only report max digital zoom.
         var zoomMin = 1.0f
@@ -185,9 +202,9 @@ class CameraRepository(private val context: Context) {
             }
         }
 
-        // High-speed (constrained slow-motion) capability — diagnostics only.
-        // The normal ImageAnalysis/YUV path cannot use these modes, so a device
-        // may report 30 fps max above yet expose 120/240 fps here.
+        // High-speed Camera2 evidence. MJPEG/ImageAnalysis cannot use these
+        // modes, while the H.264 engine may use a direct constrained surface or
+        // the GPU surface bridge.
         val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
         val supportsHighSpeed = caps.contains(
             CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO
@@ -208,6 +225,9 @@ class CameraRepository(private val context: Context) {
             }
         }
 
+        val h264PathCapabilities = H264Capabilities.preferredModes.map { mode ->
+            H264ModePathDto(mode, H264Capabilities.inspectPathCapabilities(context, id, mode))
+        }
         return CameraInfoDto(
             id = id,
             facing = facing,
@@ -224,10 +244,14 @@ class CameraRepository(private val context: Context) {
             hasTorch = hasTorch,
             lensType = "",
             isMonochrome = isMonochrome,
+            regularModes = regularModes,
             fpsByResolution = fpsByResolution,
+            mjpegModes = mjpegModes,
             supportsHighSpeed = supportsHighSpeed,
             highSpeedSizes = highSpeedSizes,
-            highSpeedFpsRanges = highSpeedFpsRanges
+            highSpeedFpsRanges = highSpeedFpsRanges,
+            h264Modes = h264PathCapabilities.filter { candidate -> candidate.paths.any { it.supported } }.map { it.mode },
+            h264PathCapabilities = h264PathCapabilities
         )
     }
 }

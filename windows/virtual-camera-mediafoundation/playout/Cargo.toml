@@ -1,0 +1,11 @@
+[package]
+name = "ocb-playout"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Shared by the producer (which carries the simulations) and the Tauri desktop
+# preview, so both consumers pace from one implementation instead of two copies
+# that drift. The C++ virtual camera has a transliteration of the same algorithm,
+# pinned by a constant-comparison test in this crate.
+[dependencies]

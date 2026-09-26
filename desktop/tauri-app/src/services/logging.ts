@@ -6,7 +6,7 @@
 //   - every error immediately
 //   - a metrics summary every ~10s
 //   - TEST_START / TEST_END markers around mode changes
-import { invoke } from '@tauri-apps/api/core';
+import { desktopInvoke as invoke } from './desktopBridge';
 
 function two(n: number) { return n.toString().padStart(2, '0'); }
 

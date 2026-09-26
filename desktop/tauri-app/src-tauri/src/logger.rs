@@ -19,7 +19,9 @@ pub struct SessionLog {
 
 impl SessionLog {
     pub fn new() -> Self {
-        Self { path: Mutex::new(None) }
+        Self {
+            path: Mutex::new(None),
+        }
     }
 }
 
@@ -31,12 +33,23 @@ fn logs_dir() -> PathBuf {
 /// "YYYYMMDD-HHMMSS" string (the frontend has local time; Rust std does not
 /// without extra deps). `header` is written as the first block.
 #[tauri::command]
-pub fn start_log_session(state: State<'_, SessionLog>, stamp: String, header: String) -> Result<String, String> {
+pub fn start_log_session(
+    state: State<'_, SessionLog>,
+    stamp: String,
+    header: String,
+) -> Result<String, String> {
     let dir = logs_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
     // Sanitize the stamp so it can never escape the folder.
-    let safe: String = stamp.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
-    let name = if safe.is_empty() { "session".to_string() } else { safe };
+    let safe: String = stamp
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let name = if safe.is_empty() {
+        "session".to_string()
+    } else {
+        safe
+    };
     let file = dir.join(format!("opencambridge-session-{}.log", name));
 
     fs::write(&file, format!("{}\n", header)).map_err(|e| format!("write header: {}", e))?;
@@ -53,14 +66,23 @@ pub fn append_log(state: State<'_, SessionLog>, line: String) -> Result<(), Stri
         Some(p) => p.clone(),
         None => return Ok(()),
     };
-    let mut f = OpenOptions::new().create(true).append(true).open(&path).map_err(|e| e.to_string())?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
     writeln!(f, "{}", line).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 pub fn get_log_path(state: State<'_, SessionLog>) -> Option<String> {
-    state.path.lock().unwrap().as_ref().map(|p| p.to_string_lossy().to_string())
+    state
+        .path
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 /// Returns the last `max_lines` lines for the in-app Logs tab.

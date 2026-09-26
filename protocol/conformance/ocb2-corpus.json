@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "fragmented_record",
+      "actions": [
+        {
+          "hex": "4f43423202003000030000000200000007000000000000007b00000000000000c80100000000000005000000000000006672616d65",
+          "fragmentSizes": [1, 2, 7, 38, 5]
+        }
+      ],
+      "expectedRecords": [
+        {"type": 3, "flags": 2, "sequence": 7, "payloadHex": "6672616d65"}
+      ],
+      "acceptedVideoSequences": [7]
+    },
+    {
+      "id": "multiple_records_one_read",
+      "actions": [
+        {
+          "hex": "4f43423202003000020000000500000001000000000000007b00000000000000c80100000000000003000000000000006366674f43423202003000030000000200000002000000000000007b00000000000000c8010000000000000300000000000000696472"
+        }
+      ],
+      "expectedRecords": [
+        {"type": 2, "flags": 5, "sequence": 1, "payloadHex": "636667"},
+        {"type": 3, "flags": 2, "sequence": 2, "payloadHex": "696472"}
+      ],
+      "acceptedVideoSequences": [2]
+    },
+    {
+      "id": "mid_record_reconnect",
+      "actions": [
+        {"hex": "4f43423202003000030000000000000001000000"},
+        {"reset": true},
+        {"hex": "4f43423202003000010000000400000009000000000000007b00000000000000c80100000000000003000000000000006e6577"}
+      ],
+      "expectedRecords": [
+        {"type": 1, "flags": 4, "sequence": 9, "payloadHex": "6e6577"}
+      ],
+      "acceptedVideoSequences": []
+    },
+    {
+      "id": "codec_discontinuity_keyframe_requirement",
+      "actions": [
+        {
+          "hex": "4f43423202003000010000000400000001000000000000007b00000000000000c8010000000000000400000000000000696e666f4f43423202003000030000000000000002000000000000007b00000000000000c8010000000000000100000000000000704f43423202003000030000000200000003000000000000007b00000000000000c80100000000000001000000000000006b"
+        }
+      ],
+      "expectedRecords": [
+        {"type": 1, "flags": 4, "sequence": 1, "payloadHex": "696e666f"},
+        {"type": 3, "flags": 0, "sequence": 2, "payloadHex": "70"},
+        {"type": 3, "flags": 2, "sequence": 3, "payloadHex": "6b"}
+      ],
+      "acceptedVideoSequences": [3]
+    },
+    {
+      "id": "end_of_stream_and_error",
+      "actions": [
+        {
+          "hex": "4f43423202003000050000000800000004000000000000007b00000000000000c8010000000000000400000000000000646f6e654f43423202003000060000000000000004000000000000007b00000000000000c8010000000000000400000000000000626f6f6d"
+        }
+      ],
+      "expectedRecords": [
+        {"type": 5, "flags": 8, "sequence": 4, "payloadHex": "646f6e65"},
+        {"type": 6, "flags": 0, "sequence": 4, "payloadHex": "626f6f6d"}
+      ],
+      "acceptedVideoSequences": []
+    },
+    {
+      "id": "unknown_magic",
+      "actions": [
+        {"hex": "5843423202003000040000000000000000000000000000007b00000000000000c8010000000000000000000000000000"}
+      ],
+      "expectedError": "BAD_MAGIC"
+    },
+    {
+      "id": "unknown_version",
+      "actions": [
+        {"hex": "4f43423263003000040000000000000000000000000000007b00000000000000c8010000000000000000000000000000"}
+      ],
+      "expectedError": "UNSUPPORTED_VERSION"
+    },
+    {
+      "id": "unknown_header_size",
+      "actions": [
+        {"hex": "4f43423202002f00040000000000000000000000000000007b00000000000000c8010000000000000000000000000000"}
+      ],
+      "expectedError": "INVALID_HEADER_SIZE"
+    },
+    {
+      "id": "oversized_payload",
+      "actions": [
+        {"hex": "4f43423202003000030000000000000001000000000000007b00000000000000c8010000000000000100000100000000"}
+      ],
+      "expectedError": "PAYLOAD_TOO_LARGE"
+    },
+    {
+      "id": "send_delta_is_read_from_the_former_reserved_field",
+      "actions": [
+        {"hex": "4f4342320200300003000000020000002900000000000000d2040000000000002e1600000000000003000000000000006b65794f4342320200300003000000000000002a00000000000000ba08000000000000e99700000000000004000000578200006c6174654f4342320200300003000000000000002b00000000000000a20c0000000000001e1a01000000000007000000000000006e6f64656c7461"}
+      ],
+      "expectedRecords": [
+        {"type": 3, "flags": 2, "sequence": 41, "sendDeltaUs": 0, "payloadHex": "6b6579"},
+        {"type": 3, "flags": 0, "sequence": 42, "sendDeltaUs": 33367, "payloadHex": "6c617465"},
+        {"type": 3, "flags": 0, "sequence": 43, "sendDeltaUs": 0, "payloadHex": "6e6f64656c7461"}
+      ],
+      "acceptedVideoSequences": [41, 42, 43]
+    }
+  ]
+}

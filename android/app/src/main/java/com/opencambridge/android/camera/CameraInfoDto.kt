@@ -25,12 +25,19 @@ data class CameraInfoDto(
      *  which produce a grayscale image. Kept out of the ultrawide/main/telephoto
      *  classification so users don't pick it thinking it's the ultrawide. */
     val isMonochrome: Boolean = false,
+    /** Complete evidence for every selectable regular-session mode. This is
+     * deliberately not a camera-wide "max FPS": an AE range and minimum frame
+     * duration only prove a rate for one camera + output format + size tuple. */
+    val regularModes: List<RegularCameraModeDto> = emptyList(),
     /** Honest max FPS achievable at each standard resolution for this lens,
      *  derived from the sensor's minimum frame duration. maxFps == 0 means the
      *  size is not supported (or the duration is unknown). Used to enable/disable
      *  60 fps in the UI per lens+resolution instead of pretending every phone
      *  can do it. */
     val fpsByResolution: List<ResolutionFpsDto> = emptyList(),
+    /** Canonical selectable MJPEG tuples. UIs must not synthesize their own
+     * resolution/FPS Cartesian product. */
+    val mjpegModes: List<H264ModeDto> = emptyList(),
 
     /** Diagnostics only (NOT used by the MJPEG webcam path). Whether the camera
      *  advertises CONSTRAINED_HIGH_SPEED_VIDEO and the slow-motion sizes/ranges
@@ -39,7 +46,18 @@ data class CameraInfoDto(
      *  fps slow-motion modes the standard capture path cannot use. */
     val supportsHighSpeed: Boolean = false,
     val highSpeedSizes: List<SizeDto> = emptyList(),
-    val highSpeedFpsRanges: List<FpsRangeDto> = emptyList()
+    val highSpeedFpsRanges: List<FpsRangeDto> = emptyList(),
+    /** Modes supported by both this Camera2 surface path and a hardware AVC encoder. */
+    val h264Modes: List<H264ModeDto> = emptyList(),
+    /** Per-mode public Camera2 path evidence, including exact reasons for every
+     * regular/high-speed engine that is unavailable. */
+    val h264PathCapabilities: List<H264ModePathDto> = emptyList()
+)
+
+@Serializable
+data class H264ModePathDto(
+    val mode: H264ModeDto,
+    val paths: List<H264PathCapability>
 )
 
 @Serializable
@@ -50,3 +68,15 @@ data class FpsRangeDto(val min: Int, val max: Int)
 
 @Serializable
 data class ResolutionFpsDto(val width: Int, val height: Int, val maxFps: Int)
+
+@Serializable
+data class RegularCameraModeDto(
+    val cameraId: String,
+    val width: Int,
+    val height: Int,
+    val outputFormat: String,
+    val fps: Int,
+    val aeFpsMin: Int,
+    val aeFpsMax: Int,
+    val minFrameDurationNs: Long
+)

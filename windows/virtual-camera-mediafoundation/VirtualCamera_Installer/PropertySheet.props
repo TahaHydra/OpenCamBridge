@@ -4,7 +4,7 @@
   <PropertyGroup />
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>..\VirtualCameraMediaSource; ..\VirtualCameraTest</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>..\VirtualCameraMediaSource</AdditionalIncludeDirectories>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup />

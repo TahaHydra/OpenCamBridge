@@ -8,7 +8,9 @@ HRESULT SimpleFrameGenerator::Initialize(_In_ IMFMediaType* pMediaType)
     RETURN_HR_IF_NULL(E_INVALIDARG, pMediaType);
 
     RETURN_IF_FAILED(pMediaType->GetGUID(MF_MT_SUBTYPE, &m_subType));
-    if (m_subType != MFVideoFormat_RGB32 && m_subType != MFVideoFormat_NV12)
+    if (m_subType != MFVideoFormat_RGB32 &&
+        m_subType != MFVideoFormat_NV12 &&
+        m_subType != MFVideoFormat_YUY2)
     {
         RETURN_HR_MSG(MF_E_UNSUPPORTED_FORMAT, "Unsupported format: %s", winrt::to_hstring(m_subType).data());
     }
@@ -41,13 +43,35 @@ HRESULT SimpleFrameGenerator::CreateFrame(
     else if(m_subType == MFVideoFormat_NV12)
     {
         DEBUG_MSG(L"NV12 frames %s \n", winrt::to_hstring(MFVideoFormat_NV12).data());
-
-        DWORD frameBuffLen = m_width * m_height * 4;
-        wil::unique_cotaskmem_ptr<BYTE[]> spBuff = wil::make_unique_cotaskmem_nothrow<BYTE[]>(frameBuffLen);
-        RETURN_IF_NULL_ALLOC(spBuff.get());
-
-        RETURN_IF_FAILED(_CreateRGB32Frame(spBuff.get(), frameBuffLen, m_width * 4, m_width, m_height, rgbMask));
-        RETURN_IF_FAILED(RGB32ToNV12Frame(spBuff.get(), frameBuffLen, m_width * 4, m_width, m_height, pBuf, len, pitch));
+        RETURN_HR_IF(E_INVALIDARG, pitch <= 0 || static_cast<DWORD>(pitch) < m_width);
+        RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+            static_cast<uint64_t>(pitch) * (m_height + m_height / 2) > len);
+        const BYTE offset = static_cast<BYTE>((MFGetSystemTime() / 1000000) & 0xff);
+        for (DWORD row = 0; row < m_height; ++row) {
+            BYTE* y = pBuf + static_cast<size_t>(row) * pitch;
+            for (DWORD col = 0; col < m_width; ++col) y[col] = static_cast<BYTE>(16 + ((row + col + offset) % 220));
+        }
+        BYTE* uv = pBuf + static_cast<size_t>(pitch) * m_height;
+        for (DWORD row = 0; row < m_height / 2; ++row) {
+            BYTE* line = uv + static_cast<size_t>(row) * pitch;
+            for (DWORD col = 0; col < m_width; col += 2) { line[col] = 128; line[col + 1] = 128; }
+        }
+    }
+    else if (m_subType == MFVideoFormat_YUY2)
+    {
+        RETURN_HR_IF(E_INVALIDARG, pitch <= 0 || static_cast<DWORD>(pitch) < m_width * 2);
+        RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+            static_cast<uint64_t>(pitch) * m_height > len);
+        const BYTE offset = static_cast<BYTE>((MFGetSystemTime() / 1000000) & 0xff);
+        for (DWORD row = 0; row < m_height; ++row) {
+            BYTE* line = pBuf + static_cast<size_t>(row) * pitch;
+            for (DWORD col = 0; col < m_width; col += 2) {
+                line[col * 2] = static_cast<BYTE>(16 + ((row + col + offset) % 220));
+                line[col * 2 + 1] = 128;
+                line[col * 2 + 2] = static_cast<BYTE>(16 + ((row + col + 1 + offset) % 220));
+                line[col * 2 + 3] = 128;
+            }
+        }
     }
     else
     {
@@ -69,17 +93,20 @@ HRESULT SimpleFrameGenerator::_CreateRGB32Frame(
     _In_ ULONG rgbMask )
 {
     RETURN_HR_IF_NULL(E_INVALIDARG, pBuf);
-    if (len < (abs(pitch) * height ))
-    {
-        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-    }
+    RETURN_HR_IF(E_INVALIDARG, pitch == 0);
+    const uint64_t absolutePitch = pitch < 0
+        ? static_cast<uint64_t>(-static_cast<int64_t>(pitch))
+        : static_cast<uint64_t>(pitch);
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+        absolutePitch < static_cast<uint64_t>(width) * 4 || absolutePitch * height > len);
 
     LONGLONG curSysTimeInS = MFGetSystemTime() / (MFTIME)10000000;
     int offset = curSysTimeInS % height;
 
     for (unsigned int r = 0; r < height; r++)
     {
-        uint32_t* p = (uint32_t*)(pBuf + (r * pitch));
+        uint32_t* p = reinterpret_cast<uint32_t*>(
+            pBuf + static_cast<ptrdiff_t>(r) * static_cast<ptrdiff_t>(pitch));
         for (unsigned int c = 0; c < width; c++)
         {
             BYTE gray = (BYTE)(r + offset);
