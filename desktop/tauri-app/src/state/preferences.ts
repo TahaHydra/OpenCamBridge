@@ -30,6 +30,8 @@ export interface CustomProfile {
   height: number;
   fps: number;
   streamMode: 'h264' | 'mjpeg';
+  /** Missing on profiles saved before bitrate modes: those pinned a bitrate. */
+  h264BitrateMode?: 'auto' | 'manual';
   h264BitrateMbps?: number;
   jpegQuality?: number;
 }

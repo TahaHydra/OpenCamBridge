@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import DevicePicker from './DevicePicker';
 import CommitSlider from './CommitSlider';
+import { BITRATE_HINT, BitrateModeSwitch, ManualBitrateSlider, automaticBitrateLabel } from './BitrateControl';
 import { Field, Group, IconButton, MetricRow, Segmented, Select, Slider, SwitchRow } from '../primitives';
 import { codecLabel, heightLabel, matchProfile } from '../../services/profilePolicy.js';
 import { useProfiles } from '../../state/profiles';
@@ -292,6 +293,7 @@ function ToolTile({
 function EncodingGroup({ controller, disabled }: { controller: CameraController; disabled: boolean }) {
   const { settings, activeCam, androidMetrics } = controller;
   const h264 = settings.streamMode !== 'mjpeg';
+  const autoBitrate = settings.h264BitrateMode !== 'manual';
   const summarize = (modes?: { width: number; height: number; fps: number }[]) =>
     modes && modes.length
       ? Array.from(new Set(modes.map(m => `${heightLabel(m.height)}${m.fps}`))).join(' · ')
@@ -300,16 +302,11 @@ function EncodingGroup({ controller, disabled }: { controller: CameraController;
   return (
     <Group title="Quality" aside={<span className="rail__advanced-tag">Advanced</span>}>
       {h264 ? (
-        <Field label="Bitrate" hint="Applies live, without restarting the camera.">
-          <CommitSlider
-            label="H.264 bitrate"
-            value={Math.round(settings.h264Bitrate / 1_000_000)}
-            min={1}
-            max={20}
-            disabled={disabled}
-            format={value => `${value} Mb/s`}
-            onCommit={value => void controller.updateSetting('h264Bitrate', value * 1_000_000)}
-          />
+        <Field label="Bitrate" hint={autoBitrate ? BITRATE_HINT.auto : BITRATE_HINT.manual}>
+          <BitrateModeSwitch controller={controller} disabled={disabled} />
+          {autoBitrate
+            ? <div className="ui-static tabular">{automaticBitrateLabel(settings)}</div>
+            : <ManualBitrateSlider controller={controller} disabled={disabled} />}
         </Field>
       ) : (
         <>

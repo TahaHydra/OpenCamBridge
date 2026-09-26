@@ -176,6 +176,12 @@
 .settings-row__slider {
   width: 260px;
 }
+.settings-row__value {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--text);
+}
 .settings-row__input {
   display: flex;
   gap: var(--s-2);

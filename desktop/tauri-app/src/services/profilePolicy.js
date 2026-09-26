@@ -11,6 +11,12 @@
  *
  * Most presets are fixed. Smooth Motion is capability-aware: it resolves, per
  * camera, to the best genuine 60 FPS mode (see `resolveProfile`).
+ *
+ * H.264 quality: a profile either leaves the bitrate to the phone
+ * (`h264BitrateMode: 'auto'`, the phone's recommended rate for the mode) or
+ * pins one (`'manual'` + `h264BitrateMbps`). Applying a profile always sends
+ * the mode explicitly, so a pinned rate never flips the phone to Manual by
+ * implication and an automatic profile never keeps a stale manual rate.
  */
 
 /** Built-in profiles. Ids are persisted (default profile), so keep them stable. */
@@ -18,53 +24,55 @@ export const BUILT_IN_PROFILES = Object.freeze([
   {
     id: 'meeting-hd',
     name: 'Meeting HD',
-    description: 'Sharp 1080p for calls and meetings',
+    description: 'Sharp 1080p for calls and meetings, at the recommended bitrate',
     builtIn: true,
     width: 1920,
     height: 1080,
     fps: 30,
     streamMode: 'h264',
-    h264BitrateMbps: 8,
+    h264BitrateMode: 'auto',
   },
   {
     id: 'low-latency',
     name: 'Low Latency',
-    description: 'Lightest load and the quickest response',
+    description: 'Lightest load: 720p at a fixed, low bitrate',
     builtIn: true,
     width: 1280,
     height: 720,
     fps: 30,
     streamMode: 'h264',
+    h264BitrateMode: 'manual',
     h264BitrateMbps: 4,
   },
   {
     id: 'high-quality',
     name: 'High Quality',
-    description: 'Most detail, for recording and streaming',
+    description: 'Most detail, for recording and streaming: a fixed high bitrate',
     builtIn: true,
     width: 1920,
     height: 1080,
     fps: 30,
     streamMode: 'h264',
+    h264BitrateMode: 'manual',
     h264BitrateMbps: 16,
   },
   {
     id: 'smooth-motion',
     name: 'Smooth Motion',
-    description: '60 FPS — 1080p where the camera supports it, otherwise 720p',
+    description: '60 FPS — 1080p where the camera supports it, otherwise 720p — at the recommended bitrate',
     builtIn: true,
     // Placeholder geometry: always resolved against the selected camera.
     width: 1920,
     height: 1080,
     fps: 60,
     streamMode: 'h264',
-    h264BitrateMbps: 16,
+    // The phone picks the bitrate for whichever size is chosen.
+    h264BitrateMode: 'auto',
     adaptive: {
-      // Best first; the first one the camera reports as a regular H.264 mode
-      // wins. Bitrates match the phone encoder's floor for each mode.
+      // Best first; the first one the camera reports as a regular H.264 mode wins.
       candidates: [
-        { width: 1920, height: 1080, h264BitrateMbps: 16 },
-        { width: 1280, height: 720, h264BitrateMbps: 10 },
+        { width: 1920, height: 1080 },
+        { width: 1280, height: 720 },
       ],
     },
   },
@@ -98,9 +106,35 @@ export function describeMode(_width, height, fps, streamMode) {
 export function describeProfile(profile, { withQuality = false } = {}) {
   const base = describeMode(profile.width, profile.height, profile.fps, profile.streamMode);
   if (!withQuality) return base;
-  if (profile.streamMode === 'h264' && profile.h264BitrateMbps) return `${base} · ${profile.h264BitrateMbps} Mb/s`;
+  if (profile.streamMode === 'h264') {
+    return profileBitrateMode(profile) === 'manual' ? `${base} · ${profile.h264BitrateMbps} Mb/s` : `${base} · auto bitrate`;
+  }
   if (profile.streamMode === 'mjpeg' && profile.jpegQuality) return `${base} · quality ${profile.jpegQuality}%`;
   return base;
+}
+
+/**
+ * A profile's H.264 bitrate mode. Profiles saved before modes existed always
+ * pinned a bitrate, so they read as Manual.
+ * @returns {'auto' | 'manual'}
+ */
+export function profileBitrateMode(profile) {
+  if (profile.h264BitrateMode === 'auto') return 'auto';
+  if (profile.h264BitrateMode === 'manual' && profile.h264BitrateMbps) return 'manual';
+  return profile.h264BitrateMode == null && profile.h264BitrateMbps ? 'manual' : 'auto';
+}
+
+/**
+ * The bitrate the phone's Automatic mode targets for a mode, in Mb/s — a copy
+ * of H264BitratePolicy.kt for display. The phone also keeps it inside what
+ * its encoder supports, which the desktop cannot see.
+ */
+export function automaticBitrateMbps(width, height, fps) {
+  const pixels = (Number(width) || 0) * (Number(height) || 0);
+  const smooth = (Number(fps) || 0) >= 50;
+  if (pixels >= 1920 * 1080) return smooth ? 16 : 10;
+  if (pixels >= 1280 * 720) return smooth ? 9 : 6;
+  return 3;
 }
 
 function modesFor(camera, streamMode) {
@@ -202,16 +236,21 @@ const BITRATE_TOLERANCE = 500_000;
 /**
  * The profile the phone's current settings correspond to, or null ("Custom").
  * Pass resolved profiles so capability-aware presets match what they would
- * actually apply. Bitrate / JPEG quality take part only when a profile pins them.
+ * actually apply. For H.264 the bitrate mode must match, and a Manual profile
+ * also its bitrate; JPEG quality takes part only when a profile pins it.
  */
 export function matchProfile(profiles, settings) {
   if (!settings) return null;
+  const settingsBitrateMode = settings.h264BitrateMode === 'manual' ? 'manual' : 'auto';
   return profiles.find(profile => {
     if (profile.unavailableReason) return false;
     if (profile.width !== Number(settings.width) || profile.height !== Number(settings.height)) return false;
     if (profile.fps !== Number(settings.fps) || profile.streamMode !== settings.streamMode) return false;
-    if (profile.streamMode === 'h264' && profile.h264BitrateMbps) {
-      return Math.abs(profile.h264BitrateMbps * 1_000_000 - Number(settings.h264Bitrate)) < BITRATE_TOLERANCE;
+    if (profile.streamMode === 'h264') {
+      const mode = profileBitrateMode(profile);
+      if (mode !== settingsBitrateMode) return false;
+      return mode === 'auto'
+        || Math.abs(profile.h264BitrateMbps * 1_000_000 - Number(settings.h264Bitrate)) < BITRATE_TOLERANCE;
     }
     if (profile.streamMode === 'mjpeg' && profile.jpegQuality) {
       return profile.jpegQuality === Number(settings.jpegQuality);
@@ -233,7 +272,9 @@ export function phoneProfileForResolution(width) {
 /**
  * Settings that apply `profile` (already resolved), plus the keys that
  * actually change. Only changed keys are reported so, e.g., a bitrate-only
- * switch stays a live update instead of rebinding the camera.
+ * switch stays a live update instead of rebinding the camera. H.264 profiles
+ * always set the bitrate mode; an automatic profile leaves the stored manual
+ * bitrate alone. MJPEG profiles do not touch H.264 settings.
  */
 export function buildProfileChange(profile, settings) {
   const next = {
@@ -246,13 +287,17 @@ export function buildProfileChange(profile, settings) {
     fps: profile.fps,
     streamMode: profile.streamMode,
   };
-  if (profile.streamMode === 'h264' && profile.h264BitrateMbps) {
-    next.h264Bitrate = Math.round(profile.h264BitrateMbps * 1_000_000);
+  if (profile.streamMode === 'h264') {
+    next.h264BitrateMode = profileBitrateMode(profile);
+    if (next.h264BitrateMode === 'manual') next.h264Bitrate = Math.round(profile.h264BitrateMbps * 1_000_000);
   }
   if (profile.streamMode === 'mjpeg' && profile.jpegQuality) {
     next.jpegQuality = profile.jpegQuality;
   }
-  const candidates = ['profile', 'width', 'height', 'outputWidth', 'outputHeight', 'fps', 'streamMode', 'h264Bitrate', 'jpegQuality'];
+  const candidates = [
+    'profile', 'width', 'height', 'outputWidth', 'outputHeight', 'fps', 'streamMode',
+    'h264Bitrate', 'h264BitrateMode', 'jpegQuality',
+  ];
   const keys = candidates.filter(key => next[key] !== settings[key]);
   return { next, keys };
 }
@@ -267,6 +312,8 @@ export function describeSettingsChange(keys, next, cameraLabel) {
   }
   if (touches('mirror')) return next.mirror ? 'Mirroring the output…' : 'Removing the output mirror…';
   if (touches('displayRotation')) return 'Rotating…';
-  if (touches('h264Bitrate') || touches('jpegQuality') || touches('targetBandwidthMbps')) return 'Updating quality…';
+  if (touches('h264Bitrate') || touches('h264BitrateMode') || touches('jpegQuality') || touches('targetBandwidthMbps')) {
+    return 'Updating quality…';
+  }
   return 'Applying settings…';
 }

@@ -2,11 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   BUILT_IN_PROFILES,
+  automaticBitrateMbps,
   buildProfileChange,
+  describeProfile,
   describeSettingsChange,
   matchProfile,
   phoneProfileForResolution,
   profileAvailability,
+  profileBitrateMode,
   regularH264Modes,
   resolveProfile,
   resolveProfiles,
@@ -96,6 +99,7 @@ const baseSettings = {
   streamMode: 'h264',
   targetBandwidthMbps: 0,
   h264Bitrate: 8_000_000,
+  h264BitrateMode: 'auto',
   h264KeyframeInterval: 5,
 };
 
@@ -119,15 +123,15 @@ test('Smooth Motion uses 1080p60 when the camera genuinely offers it', () => {
   const resolved = resolveProfile(byId('smooth-motion'), fullHd60);
   assert.equal(resolved.id, 'smooth-motion');
   assert.deepEqual(
-    [resolved.width, resolved.height, resolved.fps, resolved.streamMode, resolved.h264BitrateMbps],
-    [1920, 1080, 60, 'h264', 16],
+    [resolved.width, resolved.height, resolved.fps, resolved.streamMode, profileBitrateMode(resolved)],
+    [1920, 1080, 60, 'h264', 'auto'],
   );
   assert.deepEqual(profileAvailability(resolved, fullHd60), { available: true });
 });
 
 test('Smooth Motion falls back to 720p60 when that is the best 60 FPS mode', () => {
   const resolved = resolveProfile(byId('smooth-motion'), hd60Only);
-  assert.deepEqual([resolved.width, resolved.height, resolved.fps, resolved.h264BitrateMbps], [1280, 720, 60, 10]);
+  assert.deepEqual([resolved.width, resolved.height, resolved.fps, profileBitrateMode(resolved)], [1280, 720, 60, 'auto']);
   assert.deepEqual(profileAvailability(byId('smooth-motion'), hd60Only), { available: true });
 });
 
@@ -176,19 +180,22 @@ test('fixed profiles resolve to themselves', () => {
 });
 
 test('settings read as Smooth Motion only when they equal what it resolves to', () => {
-  const sixty = { ...baseSettings, fps: 60, h264Bitrate: 16_000_000 };
+  const sixty = { ...baseSettings, fps: 60 };
   assert.equal(matchProfile(resolveProfiles(BUILT_IN_PROFILES, fullHd60), sixty)?.id, 'smooth-motion');
-  const hd = { ...sixty, width: 1280, height: 720, outputWidth: 1280, outputHeight: 720, h264Bitrate: 10_000_000 };
+  const hd = { ...sixty, width: 1280, height: 720, outputWidth: 1280, outputHeight: 720 };
   assert.equal(matchProfile(resolveProfiles(BUILT_IN_PROFILES, hd60Only), hd)?.id, 'smooth-motion');
   assert.equal(matchProfile(resolveProfiles(BUILT_IN_PROFILES, fullHd60), hd), null, '720p60 is Custom on a 1080p60 camera');
   assert.equal(matchProfile(resolveProfiles(BUILT_IN_PROFILES, thirtyOnly), sixty), null);
+  const pinned = { ...sixty, h264BitrateMode: 'manual', h264Bitrate: 16_000_000 };
+  assert.equal(matchProfile(resolveProfiles(BUILT_IN_PROFILES, fullHd60), pinned), null, 'a manual rate is Custom');
 });
 
-test('applying Smooth Motion sends the resolved mode', () => {
-  const current = { ...baseSettings, profile: 'quality' };
+test('applying Smooth Motion sends the resolved mode with automatic bitrate', () => {
+  const current = { ...baseSettings, profile: 'quality', h264BitrateMode: 'manual', h264Bitrate: 12_000_000 };
   const { next, keys } = buildProfileChange(resolveProfile(byId('smooth-motion'), hd60Only), current);
-  assert.deepEqual(keys, ['profile', 'width', 'height', 'outputWidth', 'outputHeight', 'fps', 'h264Bitrate']);
-  assert.deepEqual([next.profile, next.width, next.height, next.fps, next.h264Bitrate], ['balanced', 1280, 720, 60, 10_000_000]);
+  assert.deepEqual(keys, ['profile', 'width', 'height', 'outputWidth', 'outputHeight', 'fps', 'h264BitrateMode']);
+  assert.deepEqual([next.profile, next.width, next.height, next.fps, next.h264BitrateMode], ['balanced', 1280, 720, 60, 'auto']);
+  assert.equal(next.h264Bitrate, 12_000_000, 'the stored manual rate is left alone');
 });
 
 test('a missing resolution names the resolution', () => {
@@ -207,16 +214,44 @@ test('availability is unknown until capabilities arrive', () => {
   assert.equal(profileAvailability(byId('meeting-hd'), undefined).available, false);
 });
 
-test('the current settings match the profile that pins the same bitrate', () => {
+test('automatic settings match the automatic profile whatever the stored manual rate', () => {
   assert.equal(matchProfile(BUILT_IN_PROFILES, baseSettings)?.id, 'meeting-hd');
-  assert.equal(matchProfile(BUILT_IN_PROFILES, { ...baseSettings, h264Bitrate: 16_000_000 })?.id, 'high-quality');
+  assert.equal(matchProfile(BUILT_IN_PROFILES, { ...baseSettings, h264Bitrate: 16_000_000 })?.id, 'meeting-hd');
+});
+
+test('manual settings match the profile that pins the same bitrate', () => {
+  const manual = { ...baseSettings, h264BitrateMode: 'manual' };
+  assert.equal(matchProfile(BUILT_IN_PROFILES, { ...manual, h264Bitrate: 16_000_000 })?.id, 'high-quality');
+  assert.equal(matchProfile(BUILT_IN_PROFILES, { ...manual, h264Bitrate: 10_000_000 }), null, 'manual 10 Mb/s is not Meeting HD');
 });
 
 test('settings that no profile describes read as custom', () => {
   const profiles = resolveProfiles(BUILT_IN_PROFILES, fullHd60);
-  assert.equal(matchProfile(profiles, { ...baseSettings, h264Bitrate: 12_000_000 }), null);
-  assert.equal(matchProfile(profiles, { ...baseSettings, fps: 60 }), null);
+  assert.equal(matchProfile(profiles, { ...baseSettings, h264BitrateMode: 'manual', h264Bitrate: 12_000_000 }), null);
+  assert.equal(matchProfile(profiles, { ...baseSettings, fps: 60, h264BitrateMode: 'manual' }), null);
   assert.equal(matchProfile(profiles, { ...baseSettings, streamMode: 'mjpeg' }), null);
+});
+
+test('profiles saved before bitrate modes pinned a bitrate', () => {
+  const legacy = { id: 'custom-old', name: 'Old', width: 1920, height: 1080, fps: 30, streamMode: 'h264', h264BitrateMbps: 12 };
+  assert.equal(profileBitrateMode(legacy), 'manual');
+  assert.equal(matchProfile([legacy], { ...baseSettings, h264BitrateMode: 'manual', h264Bitrate: 12_000_000 })?.id, 'custom-old');
+  assert.equal(matchProfile([legacy], baseSettings), null);
+});
+
+test('profile descriptions say which bitrate mode they use', () => {
+  assert.equal(describeProfile(byId('meeting-hd'), { withQuality: true }), '1080p · 30 FPS · H.264 · auto bitrate');
+  assert.equal(describeProfile(byId('high-quality'), { withQuality: true }), '1080p · 30 FPS · H.264 · 16 Mb/s');
+  assert.equal(describeProfile(byId('compatibility'), { withQuality: true }), '720p · 30 FPS · MJPEG · quality 80%');
+});
+
+test('the automatic bitrate table matches the phone policy', () => {
+  // H264BitratePolicy.kt: 1080p 10/16, 720p 6/9, smaller 3 Mb/s (30 / 60 FPS).
+  assert.equal(automaticBitrateMbps(1920, 1080, 30), 10);
+  assert.equal(automaticBitrateMbps(1920, 1080, 60), 16);
+  assert.equal(automaticBitrateMbps(1280, 720, 30), 6);
+  assert.equal(automaticBitrateMbps(1280, 720, 60), 9);
+  assert.equal(automaticBitrateMbps(960, 540, 30), 3);
 });
 
 test('MJPEG profiles match on quality', () => {
@@ -231,16 +266,30 @@ test('phone capture policy follows resolution exactly as the resolution picker d
   assert.equal(phoneProfileForResolution(960), 'low-latency');
 });
 
-test('a bitrate-only profile switch does not report capture keys', () => {
+test('a profile that pins a bitrate applies it as Manual, without capture keys', () => {
   const current = { ...baseSettings, profile: 'quality' };
   const { next, keys } = buildProfileChange(byId('high-quality'), current);
-  assert.deepEqual(keys, ['h264Bitrate']);
-  assert.equal(next.h264Bitrate, 16_000_000);
+  assert.deepEqual(keys, ['h264Bitrate', 'h264BitrateMode']);
+  assert.deepEqual([next.h264BitrateMode, next.h264Bitrate], ['manual', 16_000_000]);
+});
+
+test('an automatic profile moves a manual phone back to Automatic', () => {
+  const current = { ...baseSettings, profile: 'quality', h264BitrateMode: 'manual', h264Bitrate: 16_000_000 };
+  const { next, keys } = buildProfileChange(byId('meeting-hd'), current);
+  assert.deepEqual(keys, ['h264BitrateMode']);
+  assert.equal(next.h264BitrateMode, 'auto');
+});
+
+test('MJPEG profiles leave the H.264 bitrate settings alone', () => {
+  const current = { ...baseSettings, profile: 'quality', h264BitrateMode: 'manual', h264Bitrate: 16_000_000 };
+  const { next, keys } = buildProfileChange(byId('compatibility'), current);
+  assert.ok(!keys.includes('h264BitrateMode') && !keys.includes('h264Bitrate'));
+  assert.deepEqual([next.h264BitrateMode, next.h264Bitrate], ['manual', 16_000_000]);
 });
 
 test('a resolution change reports size, output and policy keys', () => {
   const { next, keys } = buildProfileChange(byId('low-latency'), { ...baseSettings, profile: 'quality' });
-  assert.deepEqual(keys, ['profile', 'width', 'height', 'outputWidth', 'outputHeight', 'h264Bitrate']);
+  assert.deepEqual(keys, ['profile', 'width', 'height', 'outputWidth', 'outputHeight', 'h264Bitrate', 'h264BitrateMode']);
   assert.equal(next.profile, 'balanced');
   assert.equal(next.width, 1280);
 });
@@ -257,4 +306,5 @@ test('the switching summary names the most significant change', () => {
   assert.equal(describeSettingsChange(['streamMode'], { ...next, streamMode: 'mjpeg' }), 'Switching to MJPEG…');
   assert.equal(describeSettingsChange(['cameraId', 'width'], next, 'Front camera 1'), 'Switching to Front camera 1…');
   assert.equal(describeSettingsChange(['h264Bitrate'], next), 'Updating quality…');
+  assert.equal(describeSettingsChange(['h264BitrateMode'], next), 'Updating quality…');
 });

@@ -1,5 +1,6 @@
 import { Segmented, Select, Switch } from '../../primitives';
 import CommitSlider from '../../camera/CommitSlider';
+import { BITRATE_HINT, BitrateModeSwitch, ManualBitrateSlider, automaticBitrateLabel } from '../../camera/BitrateControl';
 import { SettingsPage, SettingsRow, SettingsSection } from '../SettingsPage';
 import { setPreferences, usePreferences } from '../../../state/preferences';
 import type { SettingsContext } from '../context';
@@ -48,19 +49,25 @@ export default function VideoPage({ controller }: SettingsContext) {
 
       <SettingsSection title="Quality">
         {h264 ? (
-          <SettingsRow label="Bitrate" description="Higher keeps more detail. Applies live without restarting the camera.">
-            <div className="settings-row__slider">
-              <CommitSlider
-                label="H.264 bitrate"
-                value={Math.round(settings.h264Bitrate / 1_000_000)}
-                min={1}
-                max={20}
-                disabled={locked}
-                format={value => `${value} Mb/s`}
-                onCommit={value => void controller.updateSetting('h264Bitrate', value * 1_000_000)}
-              />
-            </div>
-          </SettingsRow>
+          <>
+            <SettingsRow
+              label="Bitrate"
+              description="Automatic uses the phone's recommended bitrate for the resolution and frame rate. Manual keeps one you choose. Both apply live, without restarting the camera."
+            >
+              <BitrateModeSwitch controller={controller} disabled={locked} />
+            </SettingsRow>
+            {settings.h264BitrateMode === 'manual' ? (
+              <SettingsRow label="Manual bitrate" description={BITRATE_HINT.manual}>
+                <div className="settings-row__slider">
+                  <ManualBitrateSlider controller={controller} disabled={locked} />
+                </div>
+              </SettingsRow>
+            ) : (
+              <SettingsRow label="Automatic bitrate" description={BITRATE_HINT.auto}>
+                <span className="settings-row__value">{automaticBitrateLabel(settings)}</span>
+              </SettingsRow>
+            )}
+          </>
         ) : (
           <>
             <SettingsRow label="JPEG quality" description="Every MJPEG frame is a full picture, so quality costs bandwidth on every frame.">

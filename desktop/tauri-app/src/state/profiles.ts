@@ -16,21 +16,18 @@ export function useProfiles(camera: CameraInfo | null | undefined): CaptureProfi
   );
 }
 
-/** What a profile saved from these settings would contain. */
+/** What a profile saved from these settings would contain, bitrate mode included. */
 function captureFields(settings: CameraSettings): Omit<CustomProfile, 'id' | 'name'> {
   const streamMode = settings.streamMode === 'mjpeg' ? 'mjpeg' : 'h264';
-  return {
-    width: settings.width,
-    height: settings.height,
-    fps: settings.fps,
-    streamMode,
-    ...(streamMode === 'h264'
-      ? { h264BitrateMbps: Math.max(1, Math.round(settings.h264Bitrate / 1_000_000)) }
-      : { jpegQuality: settings.jpegQuality }),
-  };
+  const quality: Partial<CustomProfile> = streamMode === 'mjpeg'
+    ? { jpegQuality: settings.jpegQuality }
+    : settings.h264BitrateMode === 'manual'
+      ? { h264BitrateMode: 'manual', h264BitrateMbps: Math.max(1, Math.round(settings.h264Bitrate / 1_000_000)) }
+      : { h264BitrateMode: 'auto' };
+  return { width: settings.width, height: settings.height, fps: settings.fps, streamMode, ...quality };
 }
 
-/** "1080p · 60 FPS · H.264 · 12 Mb/s": the settings in use, as a profile would describe them. */
+/** "1080p · 60 FPS · H.264 · 12 Mb/s" (or "· auto bitrate"): the settings in use, as a profile would describe them. */
 export function describeCurrentSettings(settings: CameraSettings): string {
   return describeProfile({ id: 'current', name: 'Current', ...captureFields(settings) }, { withQuality: true });
 }

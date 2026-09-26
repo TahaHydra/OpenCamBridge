@@ -11,6 +11,10 @@
  *
  * Scenarios: ?mock (streaming), ?mock=stopped, ?mock=offline, ?mock=failed,
  * ?mock=unregistered, ?mock=nodevice. Add &connected to skip the connect screen.
+ *
+ * The compressed /stream.ocb2 feed is not simulated, so the WebCodecs preview
+ * fails over to the native compatibility renderer (mock NV12 frames), which
+ * also exercises the fallback path.
  */
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { setPreferences } from '../state/preferences';
@@ -80,7 +84,7 @@ export function installMockRuntime(scenario: string) {
     settings: {
       cameraId: '0', profile: 'quality', width: 1920, height: 1080, outputWidth: 1920, outputHeight: 1080, fps: 30,
       jpegQuality: 80, displayRotation: '0', aspectRatio: 'auto', mirror: false, torchEnabled: false, linearZoom: 0,
-      streamMode: 'h264', targetBandwidthMbps: 0, h264Bitrate: 8_000_000, h264KeyframeInterval: 5,
+      streamMode: 'h264', targetBandwidthMbps: 0, h264Bitrate: 8_000_000, h264BitrateMode: 'auto', h264KeyframeInterval: 5,
     } as Record<string, any>,
   };
   const desktop = {
@@ -100,6 +104,13 @@ export function installMockRuntime(scenario: string) {
     });
   }
   if (params.has('advanced')) setPreferences({ advancedMode: params.get('advanced') !== '0' });
+
+  // Like the phone's kotlinx JSON: fields equal to their default are omitted,
+  // so h264BitrateMode only appears while it is "manual".
+  const withoutDefaults = (settings: Record<string, any>) => {
+    const { h264BitrateMode, ...rest } = settings;
+    return h264BitrateMode === 'manual' ? { ...rest, h264BitrateMode } : rest;
+  };
 
   const zoomRatio = () => {
     const camera = cameras.find(c => c.id === phone.settings.cameraId) ?? cameras[0];
@@ -122,7 +133,7 @@ export function installMockRuntime(scenario: string) {
     zoomRatio: zoomRatio(),
     rotationDegrees: Number(phone.settings.displayRotation) || 0,
     snapshot: { actual: { encodedFps: phone.settings.fps }, selected: { fps: phone.settings.fps }, generation: phone.generation },
-    ...phone.settings,
+    ...withoutDefaults(phone.settings),
   });
 
   const metrics = () => {
@@ -368,6 +379,7 @@ export function installMockRuntime(scenario: string) {
       case 'plugin:app|tauri_version': return '2.11.3';
       case 'plugin:app|name': return 'OpenCamBridge';
       case 'plugin:opener|open_url': window.open(args?.url, '_blank'); return null;
+      case 'plugin:http|fetch': throw new Error('The mock phone does not serve /stream.ocb2');
       default:
         console.warn('[mock] unhandled command', cmd, args);
         return null;
@@ -404,6 +416,8 @@ export function installMockRuntime(scenario: string) {
       if (Number(body.baseRevision) !== phone.revision) return conflict();
       const { baseRevision: _b, requestId: _r, clientType: _c, ...patch } = body;
       const captureChanged = CAPTURE_KEYS.some(key => key in patch && patch[key] !== phone.settings[key]);
+      // As on the phone: a bitrate sent without a mode means Manual.
+      if ('h264Bitrate' in patch && !('h264BitrateMode' in patch)) patch.h264BitrateMode = 'manual';
       Object.assign(phone.settings, patch);
       phone.revision += 1;
       if (captureChanged && phone.lifecycle === 'STREAMING') {

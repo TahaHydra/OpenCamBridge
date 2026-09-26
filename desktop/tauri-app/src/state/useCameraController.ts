@@ -17,6 +17,7 @@ import {
   shouldImportAuthoritativeState,
 } from '../services/pipelineSyncPolicy.js';
 import {
+  automaticBitrateMbps,
   buildProfileChange,
   describeSettingsChange,
   phoneProfileForResolution,
@@ -1167,6 +1168,37 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
     await applySettingsAndRefreshPreview(next, ['width', 'height', 'outputWidth', 'outputHeight', 'profile', 'fps']);
   };
 
+  /**
+   * Automatic lets the phone pick the bitrate for the mode. Manual starts from
+   * the rate Automatic uses now, so switching changes nothing until the user
+   * moves the slider. The mode is always sent explicitly: the phone would
+   * otherwise infer Manual from any bitrate it receives.
+   */
+  const updateBitrateMode = async (mode: 'auto' | 'manual') => {
+    const current = settingsRef.current;
+    if (current.h264BitrateMode === mode) return;
+    if (mode === 'auto') {
+      addDiag('bitrate', 'H.264 bitrate -> Automatic');
+      await applySettingsAndRefreshPreview({ ...current, h264BitrateMode: 'auto' }, ['h264BitrateMode']);
+      return;
+    }
+    const start = automaticBitrateMbps(current.width, current.height, current.fps) * 1_000_000;
+    addDiag('bitrate', `H.264 bitrate -> Manual, starting at ${start / 1_000_000} Mb/s`);
+    await applySettingsAndRefreshPreview(
+      { ...current, h264BitrateMode: 'manual', h264Bitrate: start },
+      ['h264BitrateMode', 'h264Bitrate'],
+    );
+  };
+
+  /** A manual bitrate (bits/s), sent together with the Manual mode. */
+  const updateManualBitrate = async (bitrate: number) => {
+    const current = settingsRef.current;
+    await applySettingsAndRefreshPreview(
+      { ...current, h264BitrateMode: 'manual', h264Bitrate: bitrate },
+      ['h264BitrateMode', 'h264Bitrate'],
+    );
+  };
+
   const updateFps = async (fps: number) => {
     const next = { ...settingsRef.current, fps };
     logTestMarker('START', `${next.streamMode} ${next.width}x${next.height}@${fps} lens=${next.cameraId} q${next.jpegQuality}`);
@@ -1260,6 +1292,8 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
     rotateOutput,
     updateOrientationMode,
     applyProfile,
+    updateBitrateMode,
+    updateManualBitrate,
     refreshCapabilities,
     // actions: pipeline
     startVirtualCamera: handleStartNativeCamera,
