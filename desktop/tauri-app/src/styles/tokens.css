@@ -1,0 +1,102 @@
+/* ============================================================================
+   OpenCamBridge design tokens
+
+   Dark charcoal surfaces, one accent, and colour that always means the same
+   thing: accent = primary action or selection, green = healthy, yellow =
+   warning, red = error or destructive. Spacing is an 8/12/16/24 scale; controls
+   are 36px tall with 8px corners; cards and panels use 12px corners.
+
+   System fonts only. The app is privacy-first and offline, so it never reaches
+   out to a font CDN (the CSP would block it anyway).
+   ============================================================================ */
+
+:root {
+  color-scheme: dark;
+
+  /* surfaces, darkest to lightest */
+  --bg: #0f1114;
+  --bg-rail: #13151a;
+  --surface: #181b21;
+  --surface-2: #1f232a;
+  --surface-3: #282d36;
+  --surface-4: #313743;
+  --stage: #08090b;
+  --overlay: rgba(6, 7, 9, 0.72);
+
+  --border: rgba(255, 255, 255, 0.07);
+  --border-2: rgba(255, 255, 255, 0.11);
+  --border-3: rgba(255, 255, 255, 0.18);
+
+  /* text */
+  --text: #eceef2;
+  --text-2: #a8afb9;
+  --text-3: #737b86;
+  --text-4: #4d545e;
+
+  /* the one accent */
+  --accent: #4d8dff;
+  --accent-hover: #6a9fff;
+  --accent-press: #3a79ec;
+  --accent-text: #9cc0ff;
+  --accent-soft: rgba(77, 141, 255, 0.14);
+  --accent-ring: rgba(77, 141, 255, 0.5);
+
+  /* status — never decoration */
+  --ok: #3fcf7f;
+  --ok-soft: rgba(63, 207, 127, 0.13);
+  --ok-text: #8fe3b4;
+  --warn: #f3b33d;
+  --warn-soft: rgba(243, 179, 61, 0.13);
+  --warn-text: #f7d38f;
+  --danger: #f2574c;
+  --danger-soft: rgba(242, 87, 76, 0.13);
+  --danger-text: #ffaaa3;
+
+  /* spacing scale */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+
+  --r-sm: 6px;
+  --r: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+
+  --control-h: 36px;
+  --control-h-sm: 30px;
+  --control-h-lg: 44px;
+
+  --font: 'Segoe UI Variable Text', 'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif;
+  --font-display: 'Segoe UI Variable Display', 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'Cascadia Mono', 'Cascadia Code', Consolas, ui-monospace, monospace;
+
+  --shadow-pop: 0 16px 40px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.45);
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
+
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --rail-left: 264px;
+  --rail-right: 284px;
+  --topbar-h: 52px;
+}
+
+/* A true-black variant for OLED panels and dim rooms. */
+[data-theme='black'] {
+  --bg: #000000;
+  --bg-rail: #060607;
+  --surface: #0e0f12;
+  --surface-2: #15171b;
+  --surface-3: #1d2025;
+  --surface-4: #262a31;
+  --stage: #000000;
+  --border: rgba(255, 255, 255, 0.075);
+}
+
+@media (max-width: 1240px) {
+  :root {
+    --rail-left: 244px;
+    --rail-right: 260px;
+  }
+}

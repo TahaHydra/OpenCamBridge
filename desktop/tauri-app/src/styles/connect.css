@@ -1,0 +1,210 @@
+/* ============================================================================
+   Connect screen
+   ============================================================================ */
+
+.connect {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  height: 100vh;
+  overflow-y: auto;
+  background:
+    radial-gradient(60% 45% at 50% 0%, rgba(77, 141, 255, 0.08), transparent 70%),
+    var(--bg);
+}
+.connect__brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: var(--s-4) var(--s-5);
+}
+.connect__main {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: var(--s-4) var(--s-5) var(--s-6);
+}
+.connect__hero {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  margin-bottom: var(--s-5);
+}
+.connect__device {
+  display: grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+  border-radius: var(--r-xl);
+  border: 1px solid var(--border-2);
+  background: var(--surface);
+  color: var(--text-2);
+}
+.connect__link {
+  display: flex;
+  gap: 6px;
+}
+.connect__link span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: ui-pulse 1.4s ease-in-out infinite;
+}
+.connect__link span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.connect__link span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+.connect__title {
+  font-family: var(--font-display);
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  text-align: center;
+}
+.connect__subtitle {
+  margin-top: 8px;
+  font-size: 14px;
+  color: var(--text-2);
+  text-align: center;
+}
+.connect__subtitle b {
+  color: var(--text);
+  font-weight: 600;
+}
+.connect__card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-4);
+  width: 100%;
+  max-width: 440px;
+  margin-top: var(--s-5);
+  padding: var(--s-5);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  background: var(--bg-rail);
+  box-shadow: 0 24px 60px -30px rgba(0, 0, 0, 0.8);
+}
+.connect__section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-2);
+  margin-bottom: -6px;
+}
+.connect__refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+  cursor: pointer;
+}
+.connect__refresh:hover {
+  color: var(--text);
+}
+.connect__empty {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px;
+  border: 1px dashed var(--border-2);
+  border-radius: var(--r-lg);
+  font-size: 13px;
+  color: var(--text-3);
+}
+.connect__devices {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+.connect__device-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  min-height: 48px;
+  padding: 0 14px;
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--text-2);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 120ms var(--ease), background 120ms var(--ease);
+}
+.connect__device-row:hover {
+  background: var(--surface-2);
+}
+.connect__device-row.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.connect__device-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.connect__device-serial {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.connect__disclosure {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  align-self: flex-start;
+  margin: -6px 0;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.connect__disclosure:hover {
+  color: var(--text);
+}
+.connect__steps {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+.connect__steps b {
+  color: var(--text);
+  font-weight: 600;
+}
+.connect__lede {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.connect__lede b {
+  color: var(--text);
+  font-weight: 600;
+}
+.connect__token-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.connect__note {
+  font-size: 12px;
+  color: var(--text-3);
+  text-align: center;
+}
+.connect__footer {
+  padding: var(--s-4);
+  font-size: 12px;
+  color: var(--text-4);
+  text-align: center;
+  letter-spacing: 0.02em;
+}

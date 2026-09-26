@@ -1,0 +1,556 @@
+/* ============================================================================
+   Class names used by components that were deliberately left unchanged:
+   Preview / Nv12RingPreview (the isolated preview implementation), SignalChain,
+   ui.tsx telemetry primitives and LogsView. They are restyled here into the new
+   visual language so those components keep working byte-for-byte.
+   ============================================================================ */
+
+/* --- preview (Preview.tsx, Nv12RingPreview.tsx) --- */
+.preview-wrapper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+/* The stage is the largest box of the target aspect that fits the pane: one
+   dimension is driven by the container, the other follows aspect-ratio, and
+   the max-* cap handles unusually shaped panes. `flex: 1` must NOT be set
+   here — an explicit flex height fights aspect-ratio and collapses the
+   portrait box into a small strip surrounded by dead space. */
+.preview-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--r-lg);
+  background: #000;
+}
+.preview-stage.layout-landscape {
+  width: 100%;
+  height: auto;
+  max-height: 100%;
+  aspect-ratio: 16 / 9;
+}
+.preview-stage.layout-portrait {
+  height: 100%;
+  width: auto;
+  max-width: 100%;
+  aspect-ratio: 9 / 16;
+}
+
+.stream-rotator {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform-origin: center center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.preview-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.preview-img.fit-contain {
+  object-fit: contain;
+}
+.preview-img.fit-cover {
+  object-fit: cover;
+}
+
+.preview-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-3);
+  padding: var(--s-5);
+  background: rgba(8, 9, 11, 0.86);
+  color: var(--text-2);
+  font-size: 13px;
+  text-align: center;
+}
+.preview-overlay svg {
+  color: var(--text-3);
+}
+
+/* Readout of what is being encoded, on the glass. */
+.vf-hud {
+  position: absolute;
+  z-index: 3;
+  left: var(--s-3);
+  bottom: var(--s-3);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: var(--overlay);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+  pointer-events: none;
+  user-select: none;
+}
+.vf-hud b {
+  color: var(--text);
+  font-weight: 600;
+}
+.vf-hud i {
+  font-style: normal;
+  color: var(--text-4);
+}
+
+.vf-actions {
+  position: absolute;
+  z-index: 3;
+  top: var(--s-3);
+  right: var(--s-3);
+  display: flex;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 160ms var(--ease);
+}
+.preview-stage:hover .vf-actions,
+.vf-actions:focus-within {
+  opacity: 1;
+}
+
+/* --- legacy buttons (preview overlay/actions, logs sheet) --- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: var(--control-h);
+  padding: 0 14px;
+  border: 1px solid var(--border-2);
+  border-radius: var(--r);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms var(--ease), border-color 120ms var(--ease);
+}
+.btn:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--border-3);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn--sm {
+  height: var(--control-h-sm);
+  padding: 0 10px;
+  font-size: 12px;
+}
+.vf-actions .btn {
+  background: var(--overlay);
+  border-color: var(--border-2);
+}
+.btn-primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
+.btn-danger {
+  background: transparent;
+  border-color: rgba(242, 87, 76, 0.35);
+  color: var(--danger-text);
+}
+.btn--block {
+  width: 100%;
+}
+
+.animate-fade {
+  animation: ui-fade-in 220ms var(--ease) both;
+}
+.animate-spin {
+  animation: ui-spin 900ms linear infinite;
+}
+
+/* --- lamps (ui.tsx) --- */
+.lamp {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--surface-4);
+}
+.lamp--on {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px var(--ok-soft);
+}
+.lamp--live {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px var(--ok-soft);
+  animation: ui-pulse 1.6s ease-in-out infinite;
+}
+.lamp--warn {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px var(--warn-soft);
+}
+.lamp--fail {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+.lamp--busy {
+  background: var(--warn);
+  animation: ui-pulse 1.1s ease-in-out infinite;
+}
+
+/* --- telemetry rows (ui.tsx Tel / Notice) --- */
+.tel {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-3);
+  min-height: 26px;
+  padding: 3px 0;
+  font-size: 12.5px;
+  line-height: 1.4;
+  border-bottom: 1px solid var(--border);
+}
+.tel:last-child {
+  border-bottom: 0;
+}
+.tel__k {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-3);
+}
+.tel__v {
+  max-width: 62%;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--text);
+  text-align: right;
+  word-break: break-word;
+}
+.tel__v.is-ready {
+  color: var(--ok-text);
+}
+.tel__v.is-warn {
+  color: var(--warn-text);
+}
+.tel__v.is-fail {
+  color: var(--danger-text);
+}
+.tel__v.is-muted {
+  color: var(--text-3);
+}
+.tel__v.is-link {
+  color: var(--accent-text);
+  text-decoration: underline dotted;
+  cursor: pointer;
+}
+.tel-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 var(--s-5);
+}
+
+.notice {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--r);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.notice svg {
+  flex: none;
+  margin-top: 2px;
+}
+.notice + .notice {
+  margin-top: var(--s-2);
+}
+.notice__body {
+  min-width: 0;
+}
+.notice__title {
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 2px;
+}
+.notice code {
+  display: block;
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: var(--r-sm);
+  background: rgba(0, 0, 0, 0.35);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text);
+  white-space: pre-wrap;
+  user-select: text;
+}
+.notice--warn {
+  border-color: rgba(243, 179, 61, 0.25);
+  background: var(--warn-soft);
+}
+.notice--warn svg,
+.notice--warn .notice__title {
+  color: var(--warn-text);
+}
+.notice--fail {
+  border-color: rgba(242, 87, 76, 0.28);
+  background: var(--danger-soft);
+}
+.notice--fail svg,
+.notice--fail .notice__title {
+  color: var(--danger-text);
+}
+.notice--info {
+  border-color: rgba(77, 141, 255, 0.25);
+  background: var(--accent-soft);
+}
+.notice--info svg,
+.notice--info .notice__title {
+  color: var(--accent-text);
+}
+
+.hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+.hint strong {
+  color: var(--text-2);
+}
+.micro {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+.stack {
+  display: flex;
+  flex-direction: column;
+}
+.stack--8 {
+  gap: var(--s-2);
+}
+
+/* --- event log --- */
+.log {
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 8px 12px;
+  border-radius: var(--r);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--text-2);
+  user-select: text;
+}
+.log--tall {
+  max-height: none;
+  min-height: 320px;
+  height: calc(100vh - 300px);
+}
+.log__empty {
+  color: var(--text-4);
+  font-family: var(--font);
+}
+.log__line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.log__line + .log__line {
+  border-top: 1px solid var(--border);
+}
+
+/* --- signal chain (SignalChain.tsx) --- */
+.chain {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--r);
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+.stage__top {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.chain .stage {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 6px;
+  border-radius: 6px;
+  background: transparent;
+  text-align: center;
+  overflow: visible;
+}
+.stage__name {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stage__value {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--text-4);
+}
+.stage__value small {
+  display: block;
+  margin-top: 3px;
+  font-family: var(--font);
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text-4);
+}
+.chain .stage.is-ok .stage__value {
+  color: var(--text);
+}
+.chain .stage.is-ok .stage__name {
+  color: var(--text-2);
+}
+.chain .stage.is-degraded .stage__value {
+  color: var(--warn-text);
+}
+.chain .stage.is-down .stage__value {
+  color: var(--danger-text);
+}
+.chain .stage.is-bottleneck {
+  background: var(--warn-soft);
+}
+.chain .stage.is-flowing::before,
+.chain .stage.is-stalled::before {
+  content: '';
+  position: absolute;
+  left: -2px;
+  top: 16px;
+  bottom: 12px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.chain .stage.is-stalled::before {
+  background: var(--danger);
+}
+.stage__detail {
+  font-size: 10.5px;
+  line-height: 1.3;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chain-verdict {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: var(--r);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-2);
+}
+.chain-verdict svg {
+  flex: none;
+}
+.chain-verdict.is-warn {
+  background: var(--warn-soft);
+  border-color: rgba(243, 179, 61, 0.25);
+  color: var(--warn-text);
+}
+.chain-verdict.is-fail {
+  background: var(--danger-soft);
+  border-color: rgba(242, 87, 76, 0.28);
+  color: var(--danger-text);
+}
+.chain-verdict.is-ok {
+  background: var(--ok-soft);
+  border-color: rgba(63, 207, 127, 0.22);
+  color: var(--ok-text);
+}
+
+/* --- session log sheet (LogsView.tsx) --- */
+.sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  flex-direction: column;
+  padding: var(--s-4);
+  background: rgba(6, 7, 9, 0.94);
+  animation: ui-fade-in 160ms var(--ease);
+}
+.sheet__bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: var(--s-3);
+}
+.legend {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.sheet__path {
+  flex: 1;
+  min-width: 0;
+  padding: 0 var(--s-2);
+  font-size: 11.5px;
+  color: var(--text-3);
+  word-break: break-all;
+}
+.sheet__body {
+  flex: 1;
+  margin: 0;
+  padding: 12px 14px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
