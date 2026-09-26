@@ -11,7 +11,8 @@ import {
 import DevicePicker from './DevicePicker';
 import CommitSlider from './CommitSlider';
 import { Field, Group, IconButton, MetricRow, Segmented, Select, Slider, SwitchRow } from '../primitives';
-import { codecLabel, heightLabel } from '../../services/profilePolicy.js';
+import { codecLabel, heightLabel, matchProfile } from '../../services/profilePolicy.js';
+import { useProfiles } from '../../state/profiles';
 import type { CameraController } from '../../state/useCameraController';
 import type { AdbDevice, ConnectionInfo } from '../../state/types';
 
@@ -51,6 +52,10 @@ export default function CameraRail({
   const zoomSupported = !activeCam || zoomRatioMax > 1;
   const zoomRatio = Number(controller.serverStatus?.zoomRatio ?? 0);
   const rotation = parseInt(settings.displayRotation, 10) || 0;
+  // The profile menu and these controls are one system: say which profile the
+  // settings below amount to, or that they are Custom.
+  const profiles = useProfiles(activeCam);
+  const matchedProfile = matchProfile(profiles, settings);
 
   return (
     <aside className="rail rail--left" aria-label="Camera controls">
@@ -76,7 +81,19 @@ export default function CameraRail({
         </Field>
       </Group>
 
-      <Group title="Video">
+      <Group
+        title="Video"
+        aside={reachable ? (
+          <span
+            className={`rail__profile-tag${matchedProfile ? '' : ' is-custom'}`}
+            title={matchedProfile
+              ? `These settings are the ${matchedProfile.name} profile.`
+              : 'These settings match no profile. Pick one from the profile menu at the top, or save these as a new one.'}
+          >
+            {matchedProfile ? matchedProfile.name : 'Custom'}
+          </span>
+        ) : undefined}
+      >
         <Field label="Resolution">
           <Select
             label="Resolution"
@@ -197,25 +214,25 @@ export default function CameraRail({
       </Group>
 
       <Group title="Preview">
-        <Field label="Framing" hint="Only this window — apps always receive the full picture.">
+        <Field label="Preview framing" hint="Affects only this preview.">
           <Segmented
             label="Preview framing"
             value={fitMode}
             options={[
-              { value: 'fit', label: 'Fit', icon: <Shrink size={14} />, title: 'Show the whole picture' },
-              { value: 'fill', label: 'Fill', icon: <Expand size={14} />, title: 'Crop to fill the preview' },
+              { value: 'fit', label: 'Fit', icon: <Shrink size={14} />, title: 'Show the whole picture in this preview' },
+              { value: 'fill', label: 'Fill', icon: <Expand size={14} />, title: 'Fill this preview, cropping the edges' },
             ]}
             onChange={onFitModeChange}
           />
         </Field>
         <SwitchRow
           label="Mirror preview"
-          description="Flips only what you see here, like a mirror."
+          description="Flips only this preview, like a mirror."
           checked={mirrorPreview}
           onChange={onMirrorPreviewChange}
         />
         {advanced && (
-          <Field label="Preview layout" hint="Shapes this preview box. Apps always receive a landscape camera.">
+          <Field label="Preview layout" hint="Shapes only this preview. Choosing one also resets Rotate.">
             <Segmented
               size="sm"
               label="Preview layout"
@@ -267,7 +284,11 @@ function ToolTile({
   );
 }
 
-/** Advanced only: the encoder knobs and what the selected lens can really do. */
+/**
+ * Advanced only: quality knobs and what the selected lens can really do.
+ * Rarely needed encoder internals (the keyframe safety interval) live in
+ * Settings › Advanced › Developer options instead.
+ */
 function EncodingGroup({ controller, disabled }: { controller: CameraController; disabled: boolean }) {
   const { settings, activeCam, androidMetrics } = controller;
   const h264 = settings.streamMode !== 'mjpeg';
@@ -277,32 +298,19 @@ function EncodingGroup({ controller, disabled }: { controller: CameraController;
       : 'none';
 
   return (
-    <Group title="Encoding" aside={<span className="rail__advanced-tag">Advanced</span>}>
+    <Group title="Quality" aside={<span className="rail__advanced-tag">Advanced</span>}>
       {h264 ? (
-        <>
-          <Field label="Bitrate" hint="Applies live, without restarting the camera.">
-            <CommitSlider
-              label="H.264 bitrate"
-              value={Math.round(settings.h264Bitrate / 1_000_000)}
-              min={1}
-              max={20}
-              disabled={disabled}
-              format={value => `${value} Mb/s`}
-              onCommit={value => void controller.updateSetting('h264Bitrate', value * 1_000_000)}
-            />
-          </Field>
-          <Field label="Keyframe interval" hint="A safety net — keyframes are also sent whenever an app connects.">
-            <CommitSlider
-              label="Keyframe interval"
-              value={settings.h264KeyframeInterval}
-              min={1}
-              max={10}
-              disabled={disabled}
-              format={value => `${value} s`}
-              onCommit={value => void controller.updateSetting('h264KeyframeInterval', value)}
-            />
-          </Field>
-        </>
+        <Field label="Bitrate" hint="Applies live, without restarting the camera.">
+          <CommitSlider
+            label="H.264 bitrate"
+            value={Math.round(settings.h264Bitrate / 1_000_000)}
+            min={1}
+            max={20}
+            disabled={disabled}
+            format={value => `${value} Mb/s`}
+            onCommit={value => void controller.updateSetting('h264Bitrate', value * 1_000_000)}
+          />
+        </Field>
       ) : (
         <>
           <Field label="JPEG quality">
@@ -333,7 +341,6 @@ function EncodingGroup({ controller, disabled }: { controller: CameraController;
         <MetricRow label="H.264 modes" value={summarize(activeCam?.h264Modes)} />
         <MetricRow label="MJPEG modes" value={summarize(activeCam?.mjpegModes)} />
         <MetricRow label="Capture path" value={captureEngineLabel(androidMetrics?.captureEngine)} tone="muted" />
-        <MetricRow label="Phone profile" value={settings.profile} tone="muted" />
         <MetricRow label="Active format" value={codecLabel(androidMetrics?.activeStreamMode || settings.streamMode)} tone="muted" />
       </div>
     </Group>

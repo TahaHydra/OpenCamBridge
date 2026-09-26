@@ -29,7 +29,7 @@ export default function PerformancePage({ controller }: SettingsContext) {
 
       <SettingsSection
         title="Decoding on this PC"
-        description={m ? undefined : 'Shown once the decoder is running (H.264 preview or OpenCamBridge Camera).'}
+        description={m ? undefined : 'Shown once the decoder is running (H.264 preview or the virtual camera).'}
       >
         <div className="settings-metrics">
           <MetricRow label="Decoder" value={m?.decoder_name || m?.decode_backend || '—'} />

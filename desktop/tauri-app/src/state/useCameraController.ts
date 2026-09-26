@@ -20,6 +20,7 @@ import {
   describeSettingsChange,
   phoneProfileForResolution,
   profileAvailability,
+  resolveProfile,
   type CaptureProfile,
 } from '../services/profilePolicy.js';
 import { normalizeAndroidMetrics } from './androidMetrics';
@@ -1117,9 +1118,11 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
 
   /**
    * Applies a capture profile — only when the selected lens reports that exact
-   * mode. An unavailable profile is explained, never approximated.
+   * mode. An unavailable profile is explained, never approximated. Capability-
+   * aware profiles (Smooth Motion) are resolved for the selected lens here.
    */
-  const applyProfile = async (profile: CaptureProfile): Promise<boolean> => {
+  const applyProfile = async (requested: CaptureProfile): Promise<boolean> => {
+    const profile = resolveProfile(requested, activeCam);
     const availability = profileAvailability(profile, activeCam);
     if (!availability.available) {
       setVcamMessage(availability.reason || `${profile.name} is not available on this camera.`);

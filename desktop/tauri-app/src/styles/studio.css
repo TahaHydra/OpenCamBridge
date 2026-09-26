@@ -157,6 +157,13 @@
   text-transform: uppercase;
   color: var(--text-3);
 }
+.profile-menu__intro {
+  margin: 0;
+  padding: 0 10px 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-3);
+}
 .profile-menu__new {
   display: flex;
   gap: var(--s-2);
@@ -193,6 +200,19 @@
   display: flex;
   justify-content: flex-end;
   margin-top: -4px;
+}
+.rail__profile-tag {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.rail__profile-tag.is-custom {
+  font-weight: 500;
+  color: var(--text-3);
 }
 .rail__advanced-tag {
   font-size: 10.5px;

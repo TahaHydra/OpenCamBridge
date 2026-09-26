@@ -61,7 +61,7 @@ export default function PreviewStage({
       <StageMessage
         icon={<CameraOff size={28} />}
         title="The phone camera is off"
-        text="The phone is connected and waiting. Start the camera to see the picture."
+        text="The phone is connected and waiting. Start the phone camera to see the picture."
         action={<Button variant="primary" onClick={() => void controller.startPhoneCamera()}>Start phone camera</Button>}
       />
     );
@@ -84,7 +84,7 @@ export default function PreviewStage({
       <div className={`viewer__viewport${mirrorPreview ? ' is-mirrored' : ''}`}>{content}</div>
 
       {!compact && controller.isLive && !controller.isSyncing && phoneState === 'streaming' && previewEnabled && (
-        <div className="viewer__live" title="An app is reading OpenCamBridge Camera">
+        <div className="viewer__live" title="An app is using the virtual camera">
           <span className="viewer__live-dot" /> Live in apps
         </div>
       )}

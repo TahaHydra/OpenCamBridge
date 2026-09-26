@@ -152,6 +152,19 @@ export interface CameraInfo {
   highSpeedFpsRanges?: { min: number; max: number }[];
   h264Modes?: CameraMode[];
   mjpegModes?: CameraMode[];
+  /** Per H.264 mode: which phone capture paths can deliver it, and why not. */
+  h264PathCapabilities?: H264ModePaths[];
+}
+
+export interface H264ModePaths {
+  mode: CameraMode;
+  paths: {
+    /** 'REGULAR_SURFACE' | 'HIGH_SPEED_SURFACE' | 'HIGH_SPEED_GPU_BRIDGE' */
+    engine: string;
+    supported: boolean;
+    reason?: string;
+    cameraFps?: number;
+  }[];
 }
 
 export type StreamMode = 'h264' | 'mjpeg';

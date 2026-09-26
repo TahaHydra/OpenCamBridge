@@ -77,7 +77,7 @@ export default function SettingsModal({
 
 function renderPage(page: SettingsPageId, context: SettingsContext) {
   switch (page) {
-    case 'general': return <GeneralPage />;
+    case 'general': return <GeneralPage {...context} />;
     case 'profiles': return <ProfilesPage {...context} />;
     case 'devices': return <DevicesPage {...context} />;
     case 'video': return <VideoPage {...context} />;

@@ -17,7 +17,7 @@ export default function VideoPage({ controller }: SettingsContext) {
       title="Video"
       description="What apps receive, and how this window shows it. Camera settings are stored on the phone and apply to every app."
     >
-      <SettingsSection title="Output" description="Changes here affect OpenCamBridge Camera, OBS and every other output.">
+      <SettingsSection title="Output" description="Applied on the phone, so the virtual camera, OBS and this preview all get them.">
         <SettingsRow label="Format" description="H.264 is hardware-encoded and recommended. MJPEG is a compatibility mode that uses much more bandwidth.">
           <Segmented
             label="Format"
@@ -48,34 +48,19 @@ export default function VideoPage({ controller }: SettingsContext) {
 
       <SettingsSection title="Quality">
         {h264 ? (
-          <>
-            <SettingsRow label="Bitrate" description="Higher keeps more detail. Applies live without restarting the camera.">
-              <div className="settings-row__slider">
-                <CommitSlider
-                  label="H.264 bitrate"
-                  value={Math.round(settings.h264Bitrate / 1_000_000)}
-                  min={1}
-                  max={20}
-                  disabled={locked}
-                  format={value => `${value} Mb/s`}
-                  onCommit={value => void controller.updateSetting('h264Bitrate', value * 1_000_000)}
-                />
-              </div>
-            </SettingsRow>
-            <SettingsRow label="Keyframe interval" description="A safety net only — keyframes are also sent whenever an app connects.">
-              <div className="settings-row__slider">
-                <CommitSlider
-                  label="Keyframe interval"
-                  value={settings.h264KeyframeInterval}
-                  min={1}
-                  max={10}
-                  disabled={locked}
-                  format={value => `${value} s`}
-                  onCommit={value => void controller.updateSetting('h264KeyframeInterval', value)}
-                />
-              </div>
-            </SettingsRow>
-          </>
+          <SettingsRow label="Bitrate" description="Higher keeps more detail. Applies live without restarting the camera.">
+            <div className="settings-row__slider">
+              <CommitSlider
+                label="H.264 bitrate"
+                value={Math.round(settings.h264Bitrate / 1_000_000)}
+                min={1}
+                max={20}
+                disabled={locked}
+                format={value => `${value} Mb/s`}
+                onCommit={value => void controller.updateSetting('h264Bitrate', value * 1_000_000)}
+              />
+            </div>
+          </SettingsRow>
         ) : (
           <>
             <SettingsRow label="JPEG quality" description="Every MJPEG frame is a full picture, so quality costs bandwidth on every frame.">
@@ -108,19 +93,19 @@ export default function VideoPage({ controller }: SettingsContext) {
         )}
       </SettingsSection>
 
-      <SettingsSection title="Preview on this PC" description="Only this window. Apps always receive the full, unmirrored output.">
-        <SettingsRow label="Framing" description="Fit shows the whole picture; Fill crops to fill the preview.">
+      <SettingsSection title="Preview on this PC" description="These affect only this preview and the clean feed — not what the virtual camera sends to apps.">
+        <SettingsRow label="Preview framing" description="Fit shows the whole picture; Fill crops the edges to fill the preview.">
           <Segmented
-            label="Framing"
+            label="Preview framing"
             value={prefs.fitMode}
             options={[{ value: 'fit', label: 'Fit' }, { value: 'fill', label: 'Fill' }]}
             onChange={fitMode => setPreferences({ fitMode })}
           />
         </SettingsRow>
-        <SettingsRow label="Mirror preview" description="Show yourself as in a mirror while apps see the normal picture.">
+        <SettingsRow label="Mirror preview" description="Flips only this preview, like a mirror. To flip what apps receive, use Mirror output.">
           <Switch label="Mirror preview" checked={prefs.mirrorPreview} onChange={mirrorPreview => setPreferences({ mirrorPreview })} />
         </SettingsRow>
-        <SettingsRow label="Preview layout" description="Auto follows how the phone is held. Apps always receive a landscape camera.">
+        <SettingsRow label="Preview layout" description="Shapes this preview. Auto follows how the phone is held. Choosing a layout also resets Rotation to 0°.">
           <Segmented
             label="Preview layout"
             value={controller.orientationMode}

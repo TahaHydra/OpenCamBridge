@@ -30,7 +30,7 @@ const TABS: { id: TabId; label: string; icon: ReactNode }[] = [
   { id: 'throughput', label: 'Throughput', icon: <Gauge size={16} /> },
   { id: 'preview', label: 'Desktop preview', icon: <Monitor size={16} /> },
   { id: 'phone', label: 'Phone pipeline', icon: <Smartphone size={16} /> },
-  { id: 'windows', label: 'Windows camera', icon: <Layers size={16} /> },
+  { id: 'windows', label: 'Virtual camera', icon: <Layers size={16} /> },
   { id: 'events', label: 'Event log', icon: <Terminal size={16} /> },
   { id: 'developer', label: 'Developer', icon: <Wrench size={16} /> },
 ];
@@ -169,7 +169,7 @@ function ThroughputTab({ controller }: { controller: CameraController }) {
   const metrics = controller.vcamState?.metrics;
   const ring = metrics?.ring;
   const { settings, androidMetrics } = controller;
-  if (!metrics) return <p className="hint">Waiting for producer metrics — start the preview decoder or OpenCamBridge Camera.</p>;
+  if (!metrics) return <p className="hint">Waiting for producer metrics — start the preview decoder or the virtual camera.</p>;
   return (
     <>
       <Block title="Rates" icon={<Gauge size={14} />}>
@@ -317,7 +317,7 @@ function PhoneTab({ controller }: { controller: CameraController }) {
         )}
         <Tel k="Source generation" v={dash(androidMetrics?.generation)} tone="muted" />
         <Tel k="Lifecycle" v={dash(androidMetrics?.lifecycleState)} tone="muted" />
-        <Tel k="Phone profile" v={settings.profile} tone="muted" />
+        <Tel k="Phone capture policy" v={settings.profile} tone="muted" />
       </Block>
     </>
   );
@@ -417,10 +417,10 @@ function DeveloperTab({ controller }: { controller: CameraController }) {
   return (
     <>
       <Notice kind="warn" icon={<AlertTriangle size={14} />} title="Granular pipeline controls">
-        These drive single layers of the pipeline for debugging. Normal use goes through the OpenCamBridge Camera card.
+        These drive single layers of the pipeline for debugging. Normal use goes through the Virtual camera card in Outputs.
       </Notice>
       <Block title="Phone feed only" icon={<Smartphone size={14} />}>
-        <p className="hint">Phone stream plus the decoded producer, without publishing a Windows camera.</p>
+        <p className="hint">Phone stream plus the decoded producer, without publishing the virtual camera.</p>
         <div className="settings-actions">
           <Button size="sm" icon={<Play size={12} />} onClick={() => void controller.startFeedOnly()} disabled={vcamState?.process_running}>Start</Button>
           <Button size="sm" icon={<Square size={12} />} onClick={() => void controller.stopFeedOnly()} disabled={!vcamState?.process_running}>Stop</Button>

@@ -17,9 +17,9 @@ import type { CameraController } from '../../state/useCameraController';
 import type { ObsIntegration } from '../../state/useObs';
 
 /**
- * Outputs: where the picture goes. OpenCamBridge Camera and OBS are the
- * product's primary workflows, so they sit on the main screen rather than
- * under diagnostics.
+ * Outputs: where the picture goes. The virtual camera (seen by apps as
+ * "OpenCamBridge Camera") and OBS are the product's primary workflows, so they
+ * sit on the main screen rather than under diagnostics.
  */
 export default function OutputsRail({
   controller,
@@ -99,16 +99,16 @@ function VirtualCameraCard({ controller, onOpenDiagnostics }: { controller: Came
   };
 
   const description =
-    virtualCamera === 'live' ? 'An app is using the camera right now.'
+    virtualCamera === 'live' ? `An app is using “${VIRTUAL_CAMERA_NAME}” right now.`
       : virtualCamera === 'ready' ? `Select “${VIRTUAL_CAMERA_NAME}” in Zoom, Teams, Discord, OBS or your browser.`
-        : virtualCamera === 'starting' ? 'Starting the Windows camera…'
-          : virtualCamera === 'not-installed' ? 'The Windows camera driver has to be registered once before apps can see it.'
-            : `Makes your phone available as “${VIRTUAL_CAMERA_NAME}” in Zoom, Teams, Discord, OBS and browsers.`;
+        : virtualCamera === 'starting' ? 'Starting the virtual camera…'
+          : virtualCamera === 'not-installed' ? `Install it once (needs administrator approval) so apps can find “${VIRTUAL_CAMERA_NAME}”.`
+            : `Shows your phone as “${VIRTUAL_CAMERA_NAME}” in Zoom, Teams, Discord, OBS and browsers.`;
 
   return (
     <OutputCard
       icon={<Webcam size={17} />}
-      title={VIRTUAL_CAMERA_NAME}
+      title="Virtual camera"
       status={{ tone: VIRTUAL_CAMERA_TONE[virtualCamera], label: VIRTUAL_CAMERA_LABEL[virtualCamera] }}
       description={description}
     >
@@ -127,11 +127,11 @@ function VirtualCameraCard({ controller, onOpenDiagnostics }: { controller: Came
           onClick={() => void controller.registerVirtualCamera()}
           title="Requires an administrator prompt"
         >
-          Install camera driver
+          Install virtual camera
         </Button>
       ) : vcamState?.host_running ? (
         <Button block variant="secondary" loading={busy} onClick={() => void run(controller.stopVirtualCamera)}>
-          Stop camera
+          Stop virtual camera
         </Button>
       ) : (
         <Button
@@ -141,7 +141,7 @@ function VirtualCameraCard({ controller, onOpenDiagnostics }: { controller: Came
           disabled={virtualCamera === 'checking' || controller.phoneState === 'offline'}
           onClick={() => void run(controller.startVirtualCamera)}
         >
-          Start camera
+          Start virtual camera
         </Button>
       )}
 
@@ -149,17 +149,17 @@ function VirtualCameraCard({ controller, onOpenDiagnostics }: { controller: Came
         <Callout
           tone="danger"
           icon={<AlertTriangle size={14} />}
-          title="Camera files are out of date"
+          title="Virtual camera files are out of date"
           action={<Button size="sm" variant="ghost" onClick={onOpenDiagnostics}>Details</Button>}
         >
-          {vcamState.binary_identity.error || 'The installed camera DLL does not match this build.'}
+          {vcamState.binary_identity.error || 'The installed virtual camera does not match this version of the app.'}
         </Callout>
       )}
       {controller.activeError && !controller.binariesBlocked && (
         <Callout
           tone="danger"
           icon={<AlertTriangle size={14} />}
-          title="Camera problem"
+          title="Virtual camera problem"
           action={<Button size="sm" variant="ghost" onClick={onOpenDiagnostics}>Details</Button>}
         >
           {controller.activeError}
@@ -204,7 +204,7 @@ function ObsCard({
         <Callout tone="danger" icon={<AlertTriangle size={14} />}>{state.error}</Callout>
       )}
       {needsCamera && state.phase !== 'error' && (
-        <p className="output-card__note">Start {VIRTUAL_CAMERA_NAME} first so OBS can find it.</p>
+        <p className="output-card__note">Start the virtual camera first so OBS can find it.</p>
       )}
       <Button
         block
@@ -221,7 +221,7 @@ function ObsCard({
       </button>
       {guideOpen && (
         <ol className="output-card__steps">
-          <li>Start {VIRTUAL_CAMERA_NAME} above.</li>
+          <li>Start the virtual camera above.</li>
           <li>In OBS, add a <b>Video Capture Device</b> source.</li>
           <li>Pick <b>{VIRTUAL_CAMERA_NAME}</b> as the device.</li>
           <li>Set Resolution/FPS Type to <b>Custom</b> and match {controller.settings.width}×{controller.settings.height} at {controller.settings.fps} FPS.</li>

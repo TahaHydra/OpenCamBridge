@@ -20,25 +20,51 @@ const PHONE = 'http://127.0.0.1:8080';
 type Mode = { width: number; height: number; fps: number };
 const m = (width: number, height: number, fps: number): Mode => ({ width, height, fps });
 
+/**
+ * H.264 modes the way CameraRepository reports them: path evidence for every
+ * preferred mode (high-speed is disabled on the phone), and `h264Modes` = the
+ * modes a path supports.
+ */
+function h264(regular: Mode[]) {
+  const same = (a: Mode, b: Mode) => a.width === b.width && a.height === b.height && a.fps === b.fps;
+  const h264PathCapabilities = [m(1920, 1080, 60), m(1280, 720, 60), m(1920, 1080, 30), m(1280, 720, 30)].map(mode => {
+    const supported = regular.some(r => same(r, mode));
+    return {
+      mode,
+      paths: [
+        { engine: 'REGULAR_SURFACE', supported, reason: supported ? 'Regular session AE range covers the mode' : 'No regular AE range reaches this rate', cameraFps: supported ? mode.fps : undefined },
+        { engine: 'HIGH_SPEED_SURFACE', supported: false, reason: 'High-speed capture is disabled' },
+        { engine: 'HIGH_SPEED_GPU_BRIDGE', supported: false, reason: 'High-speed capture is disabled' },
+      ],
+    };
+  });
+  return {
+    h264Modes: h264PathCapabilities.filter(entry => entry.paths.some(path => path.supported)).map(entry => entry.mode),
+    h264PathCapabilities,
+  };
+}
+
+// Back main: genuine 1080p60 (like a Galaxy S24). Ultrawide: 60 FPS only at
+// 720p. Front: 30 FPS only. Together they cover every Smooth Motion outcome.
 const cameras = [
   {
     id: '0', facing: 'back', label: 'Back main', lensType: 'wide', hasTorch: true, zoomRatioMin: 1, zoomRatioMax: 8,
     sensorOrientation: 90, supportedSizes: [], supportedFpsRanges: [],
-    h264Modes: [m(1920, 1080, 30), m(1280, 720, 30)],
+    ...h264([m(1920, 1080, 60), m(1280, 720, 60), m(1920, 1080, 30), m(1280, 720, 30)]),
     mjpegModes: [m(1920, 1080, 30), m(1280, 720, 30), m(1280, 720, 15)],
-    fpsByResolution: [{ width: 1920, height: 1080, maxFps: 30 }, { width: 1280, height: 720, maxFps: 30 }],
+    fpsByResolution: [{ width: 1920, height: 1080, maxFps: 60 }, { width: 1280, height: 720, maxFps: 60 }],
     supportsHighSpeed: true, highSpeedFpsRanges: [{ min: 120, max: 120 }, { min: 240, max: 240 }],
   },
   {
     id: '2', facing: 'back', label: 'Back ultrawide', lensType: 'ultrawide', hasTorch: true, zoomRatioMin: 1, zoomRatioMax: 2,
     sensorOrientation: 90, supportedSizes: [], supportedFpsRanges: [],
-    h264Modes: [m(1920, 1080, 30), m(1280, 720, 30), m(1280, 720, 60)],
+    ...h264([m(1280, 720, 60), m(1920, 1080, 30), m(1280, 720, 30)]),
     mjpegModes: [m(1280, 720, 30)],
   },
   {
     id: '1', facing: 'front', label: 'Front camera 1', lensType: '', hasTorch: false, zoomRatioMin: 1, zoomRatioMax: 4,
     sensorOrientation: 270, supportedSizes: [], supportedFpsRanges: [],
-    h264Modes: [m(1920, 1080, 30), m(1280, 720, 30)],
+    ...h264([m(1920, 1080, 30), m(1280, 720, 30)]),
     mjpegModes: [m(1280, 720, 30)],
   },
 ];

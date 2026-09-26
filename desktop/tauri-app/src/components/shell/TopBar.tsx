@@ -37,7 +37,7 @@ export default function TopBar({
       </div>
 
       <div className="topbar__center">
-        <ProfileMenu controller={controller} advanced={advanced} onManage={onManageProfiles} />
+        <ProfileMenu controller={controller} onManage={onManageProfiles} />
       </div>
 
       <div className="topbar__actions">

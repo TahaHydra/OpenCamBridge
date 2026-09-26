@@ -83,7 +83,7 @@ export default function DevicePicker({
               <MenuItem
                 key={device.serial}
                 icon={<Usb size={15} />}
-                description={controller.isLive ? 'Switching stops OpenCamBridge Camera' : device.serial}
+                description={controller.isLive ? 'Switching stops the virtual camera' : device.serial}
                 onSelect={() => { setOpen(false); onSwitchDevice(device); }}
               >
                 {device.model ? device.model.replace(/_/g, ' ') : 'Android phone'}
@@ -96,7 +96,7 @@ export default function DevicePicker({
         {(controller.phoneState === 'streaming' || controller.phoneState === 'busy') && (
           <MenuItem
             icon={<CameraOff size={15} />}
-            description="Also stops OpenCamBridge Camera. Start it again from here."
+            description="Also stops the virtual camera. You can start the phone camera again here."
             onSelect={() => { setOpen(false); void controller.stopEverything(); }}
           >
             Stop phone camera

@@ -2,9 +2,10 @@
 
 The desktop and Android UIs were reorganised from engineering dashboards into
 product interfaces: the camera preview dominates, everyday controls are plain,
-OBS and OpenCamBridge Camera are first-class, and engineering detail lives
-behind **Advanced** and **Diagnostics**. The streaming engine, protocols and
-backend APIs are unchanged.
+OBS and the virtual camera (which apps list as "OpenCamBridge Camera") are
+first-class, and engineering detail lives behind **Advanced** and
+**Diagnostics**. The streaming engine, protocols and backend APIs are
+unchanged.
 
 ## Desktop (`desktop/tauri-app/src`)
 
@@ -13,16 +14,16 @@ backend APIs are unchanged.
 | logo OpenCamBridge        [ Meeting HD  1080p · 30 FPS · H.264 v ]  Advanced o  (gear) |
 +--------------+----------------------------------------+---------------+
 | DEVICE       |                                        | OUTPUTS       |
-| phone v      |                                        | OpenCamBridge |
-| Camera v     |              PREVIEW                   |   Camera      |
-| VIDEO        |      (untouched <Preview> in a         | OBS Studio    |
+| phone v      |                                        | Virtual       |
+| Camera v     |              PREVIEW                   |   camera      |
+| VIDEO  preset|      (untouched <Preview> in a         | OBS Studio    |
 | Resolution v |       PreviewStage slot)               | Clean feed    |
 | Frame rate   |                                        | (Advanced:    |
 | H.264|MJPEG  |                                        |  Performance) |
 | ADJUST       |                                        |               |
 | Torch Rotate Mirror-output, Zoom                      |               |
-| PREVIEW Fit|Fill, Mirror preview                      |               |
-| (Advanced: Encoding)                                  |               |
+| PREVIEW Preview framing Fit|Fill, Mirror preview      |               |
+| (Advanced: Quality)                                   |               |
 +--------------+----------------------------------------+---------------+
 ```
 
@@ -52,12 +53,13 @@ modals.
 | Old location | New location |
 |---|---|
 | Header meters (Source / Rate / Codec) | Preview HUD (normal), top-bar live stats (Advanced) |
-| Signal › Publish to Windows | Outputs › OpenCamBridge Camera card |
+| Signal › Publish to Windows | Outputs › Virtual camera card |
 | Signal › granular pipeline (developer) | Diagnostics › Developer |
 | Signal › Signal chain, Session | Diagnostics › Overview; Settings › Devices |
 | Output › Resolution, Frame rate, Codec | Camera rail › Video |
 | Output › Capture profile (developer presets) | Top-bar profile menu, Settings › Profiles |
-| Output › Bitrate, Keyframes, JPEG quality, Target bandwidth | Camera rail › Encoding (Advanced), Settings › Video › Quality |
+| Output › Bitrate, JPEG quality, Target bandwidth | Camera rail › Quality (Advanced), Settings › Video › Quality |
+| Output › Keyframes | Settings › Advanced › Developer options ("H.264 keyframe safety interval") |
 | Output › Desktop preview on/off | Settings › Performance (and the paused-preview stage message) |
 | Output › Developer mode | Advanced switch (top bar, Settings › General/Advanced) |
 | Image › Lens, Zoom | Camera rail › Device / Adjust |
@@ -71,17 +73,22 @@ modals.
 
 ### Intentional behaviour changes
 
-- **Stop on the OpenCamBridge Camera card** stops the decoded feed and Windows
-  camera host but leaves the phone streaming, so the preview continues
+- **Stop virtual camera** (Virtual camera card) stops the decoded feed and the
+  Windows camera host but leaves the phone streaming, so the preview continues
   (`stopVirtualCamera`). The old full stop (feed + host + phone stream) is
   still available as *Stop phone camera* in the device menu (`stopEverything`).
-- **Profiles** are exact: a profile the selected lens does not report is
-  disabled with the reason ("60 FPS unavailable on Back main at 720p").
-  Applying one sends an explicit phone profile (same resolution→profile mapping
-  the resolution picker always used) and only the keys that change, so a
-  bitrate-only switch never rebinds the camera.
+  Neither is the phone's own Stop button, which still ends everything on the
+  phone and cannot be undone from the desktop.
+- **Profiles** are shortcuts, not a second set of settings (see below). They
+  are exact: a profile the selected lens does not report is disabled with the
+  reason. Applying one sends an explicit phone profile (same
+  resolution→profile mapping the resolution picker always used) and only the
+  keys that change, so a bitrate-only switch never rebinds the camera.
 - **Keyframe interval** is imported from the phone instead of being pinned to 5
-  (the pin silently reset phone-side choices on the next desktop change).
+  (the pin silently reset phone-side choices on the next desktop change). It
+  is no longer on the camera rail or Settings › Video, even in Advanced mode:
+  it lives in Settings › Advanced › Developer options with a Default button.
+  The 5 s default and the encoder logic are unchanged.
 - **Zoom** is single-flight/latest-wins; quality sliders commit on release.
 - **OBS**: the default setup method adds OpenCamBridge Camera itself as a Video
   Capture Device (`dshow_input`); browser-source and window-capture remain as
@@ -93,10 +100,37 @@ modals.
 - Google Fonts were removed (offline/privacy); system fonts only.
 - Default window 1440×900, minimum 1024×640.
 
+### Profiles and Custom
+
+`services/profilePolicy.js` is the single source of truth (unit-tested).
+
+- A profile sets resolution, frame rate, format and quality — the same values
+  the camera rail edits. When the current settings match no profile, the top
+  bar, the rail's Video header and Settings › Profiles all say **Custom** and
+  show the settings in use (for example `720p · 60 FPS · H.264 · 16 Mb/s`), with
+  a one-click "Save as profile". User-made profiles are tagged "Yours" and
+  default to "My profile N" so they are never confused with Custom.
+- **Smooth Motion** (`smooth-motion`, id unchanged) is the only
+  capability-aware preset. `resolveProfile(profile, camera)` picks the first of
+  its candidates that the selected camera reports as a *genuine regular* H.264
+  60 FPS mode: 1920×1080 @ 16 Mb/s, else 1280×720 @ 10 Mb/s (the phone
+  encoder's floor for each mode). "Genuine regular" means listed in
+  `h264Modes` **and**, when the phone sends `h264PathCapabilities`, backed by a
+  supported `REGULAR_SURFACE` path — a rate only a high-speed session reaches
+  does not count. Phones without path evidence are judged by `h264Modes`.
+  With no such mode it stays in the list, disabled, with the reason
+  ("Needs 60 FPS — Front camera supports up to 30 FPS").
+- `useProfiles(camera)` returns every profile resolved for the selected lens;
+  `profileAvailability` and the controller's `applyProfile` resolve again for
+  the lens they are given, so a profile resolved for another camera is never
+  applied by mistake.
+
 ### Preview slot contract
 
 `PreviewStage` owns product states (connecting, unreachable, stopped, failed,
-paused) and local presentation (Fit/Fill, mirror preview); it mounts
+paused) and local presentation (Preview framing Fit/Fill, mirror preview —
+both affect only this preview and the clean feed, never the virtual camera
+output); it mounts
 `<Preview baseUrl token fitMode serverStatus />` unchanged inside
 `.viewer__viewport`. A replacement renderer only needs to:
 
@@ -120,7 +154,7 @@ The other branch touched `ControlPanel.tsx`, `Preview.tsx`,
 | `ControlPanel.tsx`: `nativePreviewFallback` state + listener, `previewEnabled: !previewOff && nativePreviewFallback`, dependency | Same code in `useCameraController.ts` (preview auto-start effect). |
 | `ControlPanel.tsx`: `h264BitrateMode` in settings, import, `directKeys` | `CameraSettings` in `state/types.ts`, `INITIAL_SETTINGS`, `importAuthoritativeState`, `postSettingsToAndroid` in `useCameraController.ts`. |
 | `ControlPanel.tsx`: keyframe import fix | Already applied here (identical expression). |
-| `ControlPanel.tsx`: bitrate mode select + hints | `EncodingGroup` in `CameraRail.tsx` and Settings › Video › Quality; profiles that pin a bitrate should also send `h264BitrateMode: 'manual'`, others `'auto'` (`buildProfileChange`). |
+| `ControlPanel.tsx`: bitrate mode select + hints | `EncodingGroup` (titled "Quality") in `CameraRail.tsx` and Settings › Video › Quality; profiles that pin a bitrate should also send `h264BitrateMode: 'manual'`, others `'auto'` (`buildProfileChange`). |
 | `ControlPanel.tsx`: WebCodecs diagnostics `Tel` rows | Diagnostics › Desktop preview tab (`PreviewTab`), same `Tel` components. |
 
 ### Dev mock
@@ -129,7 +163,9 @@ The other branch touched `ControlPanel.tsx`, `Preview.tsx`,
 auto-connect, `&advanced` for Advanced mode; scenarios `?mock=stopped`,
 `offline`, `failed`, `unregistered`, `nodevice`). It simulates the phone API and
 the Tauri commands, including NV12 frames through the real preview renderer.
-It is compiled out of production builds.
+Its lenses cover every Smooth Motion outcome: Back main has regular 1080p60,
+Back ultrawide only 720p60, Front camera 1 only 30 FPS. It is compiled out of
+production builds.
 
 ## Android (`android/app/src/main/java/com/opencambridge/android`)
 

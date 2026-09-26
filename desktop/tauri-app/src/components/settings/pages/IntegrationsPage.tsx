@@ -9,7 +9,7 @@ import type { SettingsContext } from '../context';
 
 const METHOD_HELP: Record<ObsSetupMode, string> = {
   camera: `Adds ${VIRTUAL_CAMERA_NAME} as a Video Capture Device. Full quality, lowest latency.`,
-  browser: 'Adds a Browser Source reading MJPEG straight from the phone. For PCs where the virtual camera is blocked.',
+  browser: 'Adds a Browser Source reading MJPEG straight from the phone, framed like this preview when added. For PCs where the virtual camera is blocked.',
   window: "Captures this app's clean feed window. A last resort when neither of the others works.",
 };
 
@@ -26,7 +26,7 @@ export default function IntegrationsPage({ controller, obs }: SettingsContext) {
   const saveConnection = () => setPreferences({ obsUrl: url.trim() || 'ws://127.0.0.1:4455', obsPassword: password });
 
   return (
-    <SettingsPage title="Integrations" description="OBS Studio and the Windows camera that Zoom, Teams, Discord and browsers use.">
+    <SettingsPage title="Integrations" description="OBS Studio and the virtual camera that Zoom, Teams, Discord and browsers use.">
       <SettingsSection
         title="OBS Studio"
         description="Uses OBS WebSocket (OBS 28 or newer: Tools › WebSocket Server Settings)."
@@ -74,13 +74,13 @@ export default function IntegrationsPage({ controller, obs }: SettingsContext) {
       </SettingsSection>
 
       <SettingsSection
-        title={VIRTUAL_CAMERA_NAME}
-        description="The Windows camera device apps select. Installing it needs administrator approval once."
+        title="Virtual camera"
+        description={`Apps see it as “${VIRTUAL_CAMERA_NAME}”. Installing it needs administrator approval once.`}
         aside={<Badge tone={VIRTUAL_CAMERA_TONE[controller.virtualCamera]}>{VIRTUAL_CAMERA_LABEL[controller.virtualCamera]}</Badge>}
       >
         {controller.virtualCamera === 'not-installed' ? (
           <Button variant="primary" icon={<ShieldAlert size={15} />} loading={controller.isVcamRegistering} onClick={() => void controller.registerVirtualCamera()}>
-            Install camera driver
+            Install virtual camera
           </Button>
         ) : (
           <div className="settings-actions">
@@ -88,10 +88,10 @@ export default function IntegrationsPage({ controller, obs }: SettingsContext) {
             <Button
               variant="danger"
               disabled={!!(controller.vcamState?.process_running || controller.vcamState?.host_running) || controller.isVcamRegistering}
-              title={controller.vcamState?.host_running ? 'Stop the camera first' : undefined}
+              title={controller.vcamState?.host_running ? 'Stop the virtual camera first' : undefined}
               onClick={() => void controller.unregisterVirtualCamera()}
             >
-              Remove camera driver
+              Remove virtual camera
             </Button>
           </div>
         )}

@@ -35,7 +35,6 @@ export default function Studio({
   onSwitchDevice: (device: AdbDevice) => void;
 }) {
   const prefs = usePreferences();
-  const profiles = useProfiles();
   const [cleanFeed, setCleanFeed] = useState(false);
   const [settingsPage, setSettingsPage] = useState<SettingsPageId | null>(null);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
@@ -47,17 +46,18 @@ export default function Studio({
     token,
     previewEnabled: prefs.previewEnabled || cleanFeed,
   });
+  const profiles = useProfiles(controller.activeCam);
   const enterCleanFeed = useCallback(() => setCleanFeed(true), []);
   const obs = useObs({ baseUrl, token, fitMode: prefs.fitMode, onEnterCleanFeed: enterCleanFeed });
 
-  // "Start the camera after connecting": once per connection, when the phone
-  // first streams and the Windows camera is installed but off.
+  // "Start the virtual camera after connecting": once per connection, when the
+  // phone first streams and the virtual camera is installed but off.
   const autoStartedRef = useRef(false);
   useEffect(() => {
     if (autoStartedRef.current || !prefs.autoStartVirtualCamera) return;
     if (controller.phoneState !== 'streaming' || controller.virtualCamera !== 'off') return;
     autoStartedRef.current = true;
-    controller.addDiag('startup', 'Starting OpenCamBridge Camera automatically');
+    controller.addDiag('startup', 'Starting the virtual camera automatically');
     void controller.startVirtualCamera();
   }, [prefs.autoStartVirtualCamera, controller.phoneState, controller.virtualCamera, controller]);
 
@@ -69,8 +69,9 @@ export default function Studio({
     defaultAppliedRef.current = true;
     const profile = profiles.find(candidate => candidate.id === prefs.defaultProfileId);
     if (!profile || matchProfile([profile], controller.settings)) return;
-    if (!profileAvailability(profile, controller.activeCam).available) {
-      controller.addDiag('profile', `Default profile "${profile.name}" is not available on ${controller.activeCam.label}`);
+    const availability = profileAvailability(profile, controller.activeCam);
+    if (!availability.available) {
+      controller.addDiag('profile', `Default profile "${profile.name}" not applied: ${availability.reason}`);
       return;
     }
     void controller.applyProfile(profile);
