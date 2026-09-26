@@ -55,7 +55,7 @@ export default function DevicePicker({
       <button type="button" className={`device-picker__trigger${open ? ' is-open' : ''}`} onClick={toggle} aria-expanded={open}>
         <span className="device-picker__icon"><Smartphone size={18} /></span>
         <span className="device-picker__text">
-          <span className="device-picker__name truncate">{name}</span>
+          <span className="device-picker__name truncate" title={name}>{name}</span>
           <span className="device-picker__status">
             <span className="device-picker__state"><StatusDot tone={tone} />{PHONE_STATE_LABEL[controller.phoneState]}</span>
             <span className="device-picker__transport">
@@ -66,7 +66,7 @@ export default function DevicePicker({
         <ChevronDown size={15} className="device-picker__chevron" />
       </button>
 
-      <Popover open={open} onClose={() => setOpen(false)} anchorRef={anchorRef} width={280} label="Phones">
+      <Popover open={open} onClose={() => setOpen(false)} anchorRef={anchorRef} label="Phones">
         <MenuItem
           selected
           icon={<Check size={15} />}

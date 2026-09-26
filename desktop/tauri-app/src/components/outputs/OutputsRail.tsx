@@ -73,7 +73,7 @@ function OutputCard({
       <header className="output-card__head">
         <span className="output-card__icon">{icon}</span>
         <div className="output-card__heading">
-          <h3 className="output-card__title">{title}</h3>
+          <h3 className="output-card__title" title={title}>{title}</h3>
           {status && (
             <div className={`output-card__status is-${status.tone}`}>
               <StatusDot tone={status.tone} />

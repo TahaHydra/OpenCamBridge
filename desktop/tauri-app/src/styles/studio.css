@@ -278,6 +278,12 @@
   flex: none;
   color: var(--text-3);
 }
+/* The rail scrolls, which clips anything wider than it: match its width. */
+.device-picker .ui-popover {
+  left: 0;
+  right: 0;
+  min-width: 0;
+}
 .device-picker__loading {
   display: flex;
   align-items: center;
