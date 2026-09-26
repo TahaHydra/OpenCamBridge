@@ -35,6 +35,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.opencambridge.android.StreamViewModel
+import com.opencambridge.android.state.H264BitratePolicy
 import com.opencambridge.android.state.H264SettingsPolicy
 import com.opencambridge.android.state.LogEntry
 import com.opencambridge.android.ui.MonoFamily
@@ -91,6 +92,10 @@ fun AdvancedSettingsPage(
 private fun EncodingGroup(viewModel: StreamViewModel) {
     val streamMode by viewModel.streamMode.collectAsState()
     val bitrate by viewModel.h264Bitrate.collectAsState()
+    val bitrateMode by viewModel.h264BitrateMode.collectAsState()
+    val width by viewModel.width.collectAsState()
+    val height by viewModel.height.collectAsState()
+    val fps by viewModel.fps.collectAsState()
     val keyframeInterval by viewModel.h264KeyframeInterval.collectAsState()
     val jpegQuality by viewModel.jpegQuality.collectAsState()
     val encoderName by viewModel.encoderName.collectAsState()
@@ -101,19 +106,41 @@ private fun EncodingGroup(viewModel: StreamViewModel) {
 
     SettingsGroup(title = "Encoding") {
         if (streamMode == "h264") {
-            var mbps by remember { mutableFloatStateOf((bitrate / 1_000_000).toFloat()) }
-            LaunchedEffect(bitrate) { mbps = (bitrate / 1_000_000).toFloat() }
-            SliderRow(
+            // The rate Automatic targets for the selected mode (before the
+            // encoder's own limits, which only the running encoder knows).
+            val automatic = H264BitratePolicy.resolve("auto", bitrate, width, height, fps, 1, Int.MAX_VALUE)
+            SegmentedRow(
                 title = "Bitrate",
-                readout = "${mbps.roundToInt()} Mb/s",
-                value = mbps,
-                range = 1f..20f,
-                steps = 18,
+                options = listOf("auto" to "Automatic", "manual" to "Manual"),
+                selected = if (bitrateMode == "manual") "manual" else "auto",
                 enabled = enabled,
-                onChange = { mbps = it },
-                onCommit = { viewModel.updateH264Bitrate(mbps.roundToInt() * 1_000_000) },
-                subtitle = "Applies live. Very low values are raised to a floor for the resolution."
+                // Manual starts from the automatic rate, so switching changes
+                // nothing until the slider moves.
+                onSelect = { mode ->
+                    if (mode == "manual") viewModel.updateH264Bitrate(automatic)
+                    else viewModel.updateH264BitrateMode("auto")
+                },
+                subtitle = if (bitrateMode == "manual") "Your fixed bitrate, applied live and kept after restarts."
+                else "Recommended. Picked from the resolution, frame rate and what the encoder supports."
             )
+            RowDivider()
+            if (bitrateMode == "manual") {
+                var mbps by remember { mutableFloatStateOf((bitrate / 1_000_000).toFloat()) }
+                LaunchedEffect(bitrate) { mbps = (bitrate / 1_000_000).toFloat() }
+                SliderRow(
+                    title = "Manual bitrate",
+                    readout = "${mbps.roundToInt()} Mb/s",
+                    value = mbps,
+                    range = 1f..50f,
+                    steps = 48,
+                    enabled = enabled,
+                    onChange = { mbps = it },
+                    onCommit = { viewModel.updateH264Bitrate(mbps.roundToInt() * 1_000_000) },
+                    subtitle = "The encoder may cap it."
+                )
+            } else {
+                ValueRow("Automatic bitrate", "${formatMbps(automatic, 0)} for ${height}p$fps", mono = true)
+            }
             RowDivider()
             var seconds by remember { mutableFloatStateOf(keyframeInterval.toFloat()) }
             LaunchedEffect(keyframeInterval) { seconds = keyframeInterval.toFloat() }
