@@ -634,23 +634,28 @@
 }
 
 /* --- clean feed --- */
+/* Always wraps the stage; only takes over the window while active. */
 .clean-feed {
+  display: contents;
+}
+.clean-feed.is-active {
   position: fixed;
   inset: 0;
+  z-index: 100;
   display: flex;
   background: #000;
 }
-.clean-feed .viewer {
+.clean-feed.is-active .viewer {
   border-radius: 0;
   background: #000;
 }
-.clean-feed .preview-stage {
+.clean-feed.is-active .preview-stage {
   border-radius: 0 !important;
   border: 0 !important;
   background: transparent !important;
 }
-.clean-feed .vf-hud,
-.clean-feed .vf-actions {
+.clean-feed.is-active .vf-hud,
+.clean-feed.is-active .vf-actions {
   display: none;
 }
 .clean-feed__exit {

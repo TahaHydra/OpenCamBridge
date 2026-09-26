@@ -1,23 +1,23 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Minimize2 } from 'lucide-react';
-import PreviewStage from './PreviewStage';
-import type { CameraController } from '../../state/useCameraController';
 
 /**
- * Chrome-free, full-window picture for OBS window capture. The exit control
- * only appears while the mouse moves, so a capture never records it; Escape
- * always exits.
+ * Chrome-free, full-window picture for OBS window capture.
+ *
+ * It always wraps the preview stage — as `display: contents` while inactive —
+ * so entering or leaving clean feed never remounts the preview: the WebCodecs
+ * stream (or the native fallback) keeps running instead of reconnecting. The
+ * exit control only appears while the mouse moves, so a capture never records
+ * it; Escape always exits.
  */
 export default function CleanFeed({
-  controller,
-  fitMode,
-  mirrorPreview,
+  active,
   onExit,
+  children,
 }: {
-  controller: CameraController;
-  fitMode: 'fit' | 'fill';
-  mirrorPreview: boolean;
+  active: boolean;
   onExit: () => void;
+  children: ReactNode;
 }) {
   const [controlsVisible, setControlsVisible] = useState(true);
   const hideTimer = useRef(0);
@@ -27,6 +27,7 @@ export default function CleanFeed({
   onExitRef.current = onExit;
 
   useEffect(() => {
+    if (!active) return;
     const reveal = () => {
       setControlsVisible(true);
       window.clearTimeout(hideTimer.current);
@@ -43,21 +44,16 @@ export default function CleanFeed({
       window.removeEventListener('mousemove', reveal);
       window.removeEventListener('keydown', onKey);
     };
-  }, []);
+  }, [active]);
 
   return (
-    <div className={`clean-feed${controlsVisible ? '' : ' is-idle'}`}>
-      <PreviewStage
-        controller={controller}
-        fitMode={fitMode}
-        mirrorPreview={mirrorPreview}
-        previewEnabled
-        onEnablePreview={() => undefined}
-        compact
-      />
-      <button type="button" className="clean-feed__exit" onClick={() => onExitRef.current()}>
-        <Minimize2 size={14} /> Exit clean feed <kbd>Esc</kbd>
-      </button>
+    <div className={`clean-feed${active ? ' is-active' : ''}${active && !controlsVisible ? ' is-idle' : ''}`}>
+      {children}
+      {active && (
+        <button type="button" className="clean-feed__exit" onClick={() => onExitRef.current()}>
+          <Minimize2 size={14} /> Exit clean feed <kbd>Esc</kbd>
+        </button>
+      )}
     </div>
   );
 }

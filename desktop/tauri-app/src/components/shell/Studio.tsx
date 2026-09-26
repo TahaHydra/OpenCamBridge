@@ -19,7 +19,9 @@ import type { AdbDevice, ConnectionInfo } from '../../state/types';
  * The main window: camera controls on the left, the preview in the middle
  * (always the largest thing on screen), outputs on the right. Owns the camera
  * controller for as long as a phone is connected, so its state survives the
- * clean feed, settings and diagnostics.
+ * clean feed, settings and diagnostics. The preview stage keeps its place in
+ * the tree in clean feed too, so the preview stream is never reconnected just
+ * because the chrome is hidden.
  */
 export default function Studio({
   baseUrl,
@@ -83,69 +85,67 @@ export default function Studio({
 
   const openSettings = (page: SettingsPageId = 'general') => setSettingsPage(page);
 
-  if (cleanFeed) {
-    return (
-      <CleanFeed
-        controller={controller}
-        fitMode={prefs.fitMode}
-        mirrorPreview={prefs.mirrorPreview}
-        onExit={() => setCleanFeed(false)}
-      />
-    );
-  }
-
   return (
     <div className="studio">
-      <TopBar
-        controller={controller}
-        advanced={prefs.advancedMode}
-        onAdvancedChange={advancedMode => setPreferences({ advancedMode })}
-        onOpenSettings={() => openSettings('general')}
-        onOpenDiagnostics={() => setDiagnosticsOpen(true)}
-        onManageProfiles={() => openSettings('profiles')}
-      />
+      {!cleanFeed && (
+        <TopBar
+          controller={controller}
+          advanced={prefs.advancedMode}
+          onAdvancedChange={advancedMode => setPreferences({ advancedMode })}
+          onOpenSettings={() => openSettings('general')}
+          onOpenDiagnostics={() => setDiagnosticsOpen(true)}
+          onManageProfiles={() => openSettings('profiles')}
+        />
+      )}
 
       <div className="studio__body">
-        <CameraRail
-          controller={controller}
-          connection={connection}
-          advanced={prefs.advancedMode}
-          fitMode={prefs.fitMode}
-          onFitModeChange={fitMode => setPreferences({ fitMode })}
-          mirrorPreview={prefs.mirrorPreview}
-          onMirrorPreviewChange={mirrorPreview => setPreferences({ mirrorPreview })}
-          onSwitchDevice={async device => {
-            // Leave nothing of the old phone's pipeline running on this PC.
-            if (controller.vcamState?.process_running || controller.vcamState?.host_running) {
-              await controller.stopVirtualCamera();
-            }
-            onSwitchDevice(device);
-          }}
-          onDisconnect={onDisconnect}
-        />
+        {!cleanFeed && (
+          <CameraRail
+            controller={controller}
+            connection={connection}
+            advanced={prefs.advancedMode}
+            fitMode={prefs.fitMode}
+            onFitModeChange={fitMode => setPreferences({ fitMode })}
+            mirrorPreview={prefs.mirrorPreview}
+            onMirrorPreviewChange={mirrorPreview => setPreferences({ mirrorPreview })}
+            onSwitchDevice={async device => {
+              // Leave nothing of the old phone's pipeline running on this PC.
+              if (controller.vcamState?.process_running || controller.vcamState?.host_running) {
+                await controller.stopVirtualCamera();
+              }
+              onSwitchDevice(device);
+            }}
+            onDisconnect={onDisconnect}
+          />
+        )}
 
         <main className="studio__stage">
-          <PreviewStage
-            controller={controller}
-            fitMode={prefs.fitMode}
-            mirrorPreview={prefs.mirrorPreview}
-            previewEnabled={prefs.previewEnabled}
-            onEnablePreview={() => setPreferences({ previewEnabled: true })}
-          />
+          <CleanFeed active={cleanFeed} onExit={() => setCleanFeed(false)}>
+            <PreviewStage
+              controller={controller}
+              fitMode={prefs.fitMode}
+              mirrorPreview={prefs.mirrorPreview}
+              previewEnabled={prefs.previewEnabled || cleanFeed}
+              onEnablePreview={() => setPreferences({ previewEnabled: true })}
+              compact={cleanFeed}
+            />
+          </CleanFeed>
         </main>
 
-        <OutputsRail
-          controller={controller}
-          obs={obs}
-          advanced={prefs.advancedMode}
-          onEnterCleanFeed={enterCleanFeed}
-          onOpenIntegrations={() => openSettings('integrations')}
-          onOpenDiagnostics={() => setDiagnosticsOpen(true)}
-        />
+        {!cleanFeed && (
+          <OutputsRail
+            controller={controller}
+            obs={obs}
+            advanced={prefs.advancedMode}
+            onEnterCleanFeed={enterCleanFeed}
+            onOpenIntegrations={() => openSettings('integrations')}
+            onOpenDiagnostics={() => setDiagnosticsOpen(true)}
+          />
+        )}
       </div>
 
       <SettingsModal
-        open={settingsPage !== null}
+        open={settingsPage !== null && !cleanFeed}
         page={settingsPage ?? 'general'}
         onClose={() => setSettingsPage(null)}
         context={{
@@ -160,13 +160,13 @@ export default function Studio({
       />
 
       <DiagnosticsModal
-        open={diagnosticsOpen}
+        open={diagnosticsOpen && !cleanFeed}
         onClose={() => setDiagnosticsOpen(false)}
         controller={controller}
         onOpenLogs={() => setLogsOpen(true)}
       />
 
-      {logsOpen && <LogsView onClose={() => setLogsOpen(false)} />}
+      {logsOpen && !cleanFeed && <LogsView onClose={() => setLogsOpen(false)} />}
     </div>
   );
 }
