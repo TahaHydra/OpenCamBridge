@@ -58,7 +58,7 @@ modals.
 | Signal › Signal chain, Session | Diagnostics › Overview; Settings › Devices |
 | Output › Resolution, Frame rate, Codec | Camera rail › Video |
 | Output › Capture profile (developer presets) | Top-bar profile menu, Settings › Profiles |
-| Output › Bitrate, JPEG quality, Target bandwidth | Camera rail › Quality (Advanced), Settings › Video › Quality |
+| Output › Bitrate (Automatic / Manual), JPEG quality, Target bandwidth | Camera rail › Quality (Advanced), Settings › Video › Quality |
 | Output › Keyframes | Settings › Advanced › Developer options ("H.264 keyframe safety interval") |
 | Output › Desktop preview on/off | Settings › Performance (and the paused-preview stage message) |
 | Output › Developer mode | Advanced switch (top bar, Settings › General/Advanced) |
@@ -110,11 +110,19 @@ modals.
   show the settings in use (for example `720p · 60 FPS · H.264 · 16 Mb/s`), with
   a one-click "Save as profile". User-made profiles are tagged "Yours" and
   default to "My profile N" so they are never confused with Custom.
+- **H.264 bitrate mode is part of a profile.** Meeting HD and Smooth Motion
+  use *Automatic* (the phone's recommended rate for the mode); Low Latency
+  (4 Mb/s) and High Quality (16 Mb/s) pin a *Manual* rate. Applying a profile
+  always sends `h264BitrateMode` explicitly — Automatic profiles leave the
+  stored manual rate alone, MJPEG profiles leave H.264 settings alone.
+  Matching requires the same mode (and, for Manual, the same rate), so
+  switching Meeting HD to Manual reads as Custom. Saved profiles keep the mode;
+  ones saved before modes existed pinned a rate and count as Manual.
 - **Smooth Motion** (`smooth-motion`, id unchanged) is the only
   capability-aware preset. `resolveProfile(profile, camera)` picks the first of
   its candidates that the selected camera reports as a *genuine regular* H.264
-  60 FPS mode: 1920×1080 @ 16 Mb/s, else 1280×720 @ 10 Mb/s (the phone
-  encoder's floor for each mode). "Genuine regular" means listed in
+  60 FPS mode: 1920×1080, else 1280×720, both at Automatic bitrate (16 and
+  9 Mb/s on the phone). "Genuine regular" means listed in
   `h264Modes` **and**, when the phone sends `h264PathCapabilities`, backed by a
   supported `REGULAR_SURFACE` path — a rate only a high-speed session reaches
   does not count. Phones without path evidence are judged by `h264Modes`.
@@ -125,14 +133,46 @@ modals.
   the lens they are given, so a profile resolved for another camera is never
   applied by mistake.
 
+### H.264 bitrate: Automatic / Manual
+
+The phone owns the policy (`H264BitratePolicy.kt`): Automatic targets
+16 / 10 Mb/s for 1080p at 60 / 30 FPS, 9 / 6 Mb/s for 720p and 3 Mb/s below,
+clamped to the encoder's range; Manual uses the user's rate (1–50 Mb/s),
+clamped the same way, at startup and live. The desktop shows it in the rail's
+Quality group (Advanced) and Settings › Video › Quality
+(`components/camera/BitrateControl.tsx`):
+
+- a Segmented **Automatic | Manual** control;
+- Automatic shows the target read-only ("10 Mb/s for 1080p · 30 FPS", from
+  `automaticBitrateMbps`, a copy of the phone table);
+- the slider exists only in Manual. Choosing Manual starts it at the current
+  automatic rate, so nothing changes until the slider moves.
+
+`updateBitrateMode` / `updateManualBitrate` in the controller always send the
+mode with the rate: the phone would otherwise infer Manual from any bare
+`h264Bitrate`. The phone omits `h264BitrateMode` from JSON while it is
+"auto" (kotlinx does not encode defaults), so `importAuthoritativeState`
+reads a status with `h264Bitrate` and no mode as Automatic. The Android app
+has the same control at the top of Settings › Advanced › Encoding.
+
 ### Preview slot contract
 
 `PreviewStage` owns product states (connecting, unreachable, stopped, failed,
 paused) and local presentation (Preview framing Fit/Fill, mirror preview —
 both affect only this preview and the clean feed, never the virtual camera
 output); it mounts
-`<Preview baseUrl token fitMode serverStatus />` unchanged inside
-`.viewer__viewport`. A replacement renderer only needs to:
+`<Preview baseUrl token fitMode serverStatus />` inside `.viewer__viewport`.
+`Preview` renders Codex's `H264Preview` for H.264 (worker-parsed OCB2,
+WebCodecs decode, full-resolution `VideoFrame`s drawn to an
+`OffscreenCanvas`, timestamp-driven presentation with bounded queues and its
+own reconnects). After repeated failures, or without WebCodecs /
+`OffscreenCanvas`, it falls back to the native `Nv12RingPreview` (max 960 px,
+flagged by a "Compatibility preview" badge) and announces that with
+`PREVIEW_FALLBACK_EVENT`; only then does the controller start the desktop
+producer for preview. The stage keeps its place in the tree in clean feed
+(`CleanFeed` wraps it as `display: contents` until active), so entering or
+leaving clean feed never reconnects the preview. A replacement renderer only
+needs to:
 
 - fill its parent (`.preview-wrapper` → `.preview-stage` sizing is in
   `styles/legacy.css`),
@@ -141,28 +181,31 @@ output); it mounts
 - honour `fitMode` (`'fit' | 'fill'`),
 - keep publishing `PREVIEW_DIAGNOSTICS_EVENT`; the controller consumes it.
 
-### Integrating the `v2/streaming-engine` preview work
+### Integrated `v2/streaming-engine` work (3f3aa45)
 
-The other branch touched `ControlPanel.tsx`, `Preview.tsx`,
-`previewDiagnostics.ts` and `package.json`. Mapping:
+Merged into this branch; where each upstream change lives now:
 
-| Their change | Apply here |
+| Upstream change | Here |
 |---|---|
-| `Preview.tsx`: `Nv12RingPreview` → `H264Preview` | Take as-is; `PreviewStage` renders `Preview` unchanged. |
-| `previewDiagnostics.ts`: renderer/decodeMs/queue fields, `PREVIEW_FALLBACK_EVENT` | Take as-is. |
-| `package.json` test glob | Identical line on both branches. |
-| `ControlPanel.tsx`: `nativePreviewFallback` state + listener, `previewEnabled: !previewOff && nativePreviewFallback`, dependency | Same code in `useCameraController.ts` (preview auto-start effect). |
-| `ControlPanel.tsx`: `h264BitrateMode` in settings, import, `directKeys` | `CameraSettings` in `state/types.ts`, `INITIAL_SETTINGS`, `importAuthoritativeState`, `postSettingsToAndroid` in `useCameraController.ts`. |
-| `ControlPanel.tsx`: keyframe import fix | Already applied here (identical expression). |
-| `ControlPanel.tsx`: bitrate mode select + hints | `EncodingGroup` (titled "Quality") in `CameraRail.tsx` and Settings › Video › Quality; profiles that pin a bitrate should also send `h264BitrateMode: 'manual'`, others `'auto'` (`buildProfileChange`). |
-| `ControlPanel.tsx`: WebCodecs diagnostics `Tel` rows | Diagnostics › Desktop preview tab (`PreviewTab`), same `Tel` components. |
+| `H264Preview`, `h264Preview.worker.ts`, `h264PreviewPolicy.*` (+ tests), `Preview.tsx`, `previewDiagnostics.ts` | Taken as-is. The fallback badge got a `vf-hud--notice` class so it no longer covers the source readout. |
+| `ControlPanel.tsx`: `nativePreviewFallback` listener, producer gated on fallback | `useCameraController.ts`, preview auto-start effect. |
+| `ControlPanel.tsx`: `h264BitrateMode` in settings, import, posted keys | `state/types.ts`, `useCameraController.ts` (import treats a missing mode as Automatic, see above). |
+| `ControlPanel.tsx`: Automatic / Manual select, 1–50 Mb/s | `BitrateControl.tsx` in the rail's Quality group and Settings › Video › Quality; profiles carry the mode. |
+| `ControlPanel.tsx`: renderer-aware preview diagnostics | Diagnostics › Desktop preview (WebCodecs rows, or the native NV12 rows in fallback); Performance card and Settings › Performance show the renderer and decode / draw times instead of raw IPC figures. |
+| `ControlPanel.tsx`: "Phone→ring estimate (lower bound)", "Output underruns" | Diagnostics › Throughput. |
+| `App.tsx`: controller stays mounted in clean feed | Already true: `Studio` owns the controller for the whole connection. |
+| `MainActivity.kt` `OutputTab`: Automatic / Manual | `AdvancedSettingsPage.kt` › Encoding (the old tab UI stays deleted). |
+| Phone bitrate policy, persistence, `StreamViewModel`, Tauri `http` allowlist, frame producer, docs | Taken as-is. |
 
 ### Dev mock
 
 `npm run dev`, then open `http://localhost:1420/?mock` (add `&connected` to
 auto-connect, `&advanced` for Advanced mode; scenarios `?mock=stopped`,
 `offline`, `failed`, `unregistered`, `nodevice`). It simulates the phone API and
-the Tauri commands, including NV12 frames through the real preview renderer.
+the Tauri commands, including NV12 frames through the native preview renderer:
+`/stream.ocb2` is not simulated, so the WebCodecs preview falls back after its
+retries, which exercises the fallback path. Like the phone, it omits
+`h264BitrateMode` while Automatic and treats a bare bitrate as Manual.
 Its lenses cover every Smooth Motion outcome: Back main has regular 1080p60,
 Back ultrawide only 720p60, Front camera 1 only 30 FPS. It is compiled out of
 production builds.
@@ -195,9 +238,10 @@ zoom speed) and Display & power (phone preview, mirror preview); Link →
 Settings › Connection; Logs → Settings › Advanced › Diagnostics / Logs. The
 developer-mode toggle is replaced by the Logs page's Problems/Everything filter.
 
-Integration note: the other branch adds `h264BitrateMode` to `StreamViewModel`
-and an Automatic/Manual segmented control in the old `OutputTab`; put that
-control at the top of `EncodingGroup` in `AdvancedSettingsPage.kt`.
+Settings › Advanced › Encoding has the Automatic / Manual control from
+`v2/streaming-engine`: Automatic shows the rate `H264BitratePolicy` targets
+for the current mode; Manual shows a 1–50 Mb/s slider and, when chosen,
+starts at that automatic rate.
 
 ## Backend gaps the UI cannot expose cleanly
 
