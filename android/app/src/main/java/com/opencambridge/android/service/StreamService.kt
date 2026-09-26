@@ -626,6 +626,7 @@ class StreamService : LifecycleService() {
             accessToken = req.accessToken ?: previous.accessToken,
             streamMode = req.streamMode ?: previous.streamMode,
             h264Bitrate = req.h264Bitrate ?: previous.h264Bitrate,
+            h264BitrateMode = req.h264BitrateMode ?: (if (req.h264Bitrate != null) "manual" else previous.h264BitrateMode),
             h264KeyframeInterval = H264SettingsPolicy.normalizeKeyframeInterval(
                 req.h264KeyframeInterval ?: previous.h264KeyframeInterval
             ),
@@ -645,6 +646,9 @@ class StreamService : LifecycleService() {
             localPreviewEnabled = req.phonePreviewEnabled ?: req.localPreviewEnabled ?: previous.localPreviewEnabled,
             targetBandwidthMbps = req.targetBandwidthMbps ?: previous.targetBandwidthMbps
         )
+        if (next.h264BitrateMode !in listOf("auto", "manual") || next.h264Bitrate !in 1_000_000..50_000_000) {
+            return rememberRequest(req.requestId, pipelineResult("Invalid H.264 bitrate mode or manual value (1–50 Mbps)", PipelineResultCode.UNPROCESSABLE))
+        }
         val touchesPath = req.cameraId != null || req.streamMode != null || req.width != null ||
             req.height != null || req.fps != null || req.profile != null
         validateRequestedPath(next, touchesPath)?.let { rejection ->
@@ -676,10 +680,10 @@ class StreamService : LifecycleService() {
         if (previous.accessMode != next.accessMode || previous.port != next.port) {
             AppLogger.w("Security", "Bind settings changed; restart the service to bind ${next.accessMode}:${next.port}")
         }
-        if (!requiresRebind && previous.h264Bitrate != next.h264Bitrate &&
+        if (!requiresRebind && (previous.h264Bitrate != next.h264Bitrate || previous.h264BitrateMode != next.h264BitrateMode) &&
             StreamState.activeStreamMode.get() == "h264" &&
             StreamState.lifecycleState.get() == LifecycleState.STREAMING &&
-            !h264Streamer.updateBitrate(next.h264Bitrate)
+            !h264Streamer.updateBitrate(next)
         ) {
             requiresRebind = true
         }

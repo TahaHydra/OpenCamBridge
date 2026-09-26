@@ -73,7 +73,7 @@ internal object ApplyPatchCoalescingPolicy {
         if (request.displayRotation != null || request.mirror != null) mask = mask or TRANSFORM
         if (request.localPreviewEnabled != null || request.phonePreviewEnabled != null) mask = mask or PREVIEW
         if (request.accessMode != null || request.port != null || request.accessToken != null) mask = mask or NETWORK
-        if (request.jpegQuality != null || request.h264Bitrate != null ||
+        if (request.jpegQuality != null || request.h264Bitrate != null || request.h264BitrateMode != null ||
             request.h264KeyframeInterval != null || request.targetBandwidthMbps != null
         ) mask = mask or ENCODING
         if (request.previewFitMode != null || request.aspectRatio != null || request.zoomSpeed != null) {
@@ -294,6 +294,7 @@ class PipelineController(
         accessToken = newer.accessToken ?: older.accessToken,
         streamMode = newer.streamMode ?: older.streamMode,
         h264Bitrate = newer.h264Bitrate ?: older.h264Bitrate,
+        h264BitrateMode = newer.h264BitrateMode ?: (if (newer.h264Bitrate != null) "manual" else older.h264BitrateMode),
         h264KeyframeInterval = newer.h264KeyframeInterval ?: older.h264KeyframeInterval,
         targetBandwidthMbps = newer.targetBandwidthMbps ?: older.targetBandwidthMbps
     )

@@ -309,23 +309,20 @@ class H264Streamer(
         }
     }
 
-    fun updateBitrate(requested: Int): Boolean {
+    fun updateBitrate(config: StreamConfig): Boolean {
         val c = codec ?: return false
-        val bitrate = boundedBitrate(requested, selection ?: return false)
+        val bitrate = resolvedBitrate(config, selection ?: return false)
         return try {
             c.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, bitrate) })
             StreamState.actualBitrate.set(bitrate)
+            activeConfig = config
             true
         } catch (_: Exception) { false }
     }
 
     private fun configureCodec(chosen: H264EncoderSelection) {
-        // Raise the requested rate to a resolution/fps-appropriate target: the
-        // stored default is a flat 4 Mbps that starves 1080p (and especially
-        // 1080p60), which read as heavy blockiness. An explicitly higher user
-        // request is still honored; boundedBitrate keeps it under the cap.
-        val requested = activeConfig?.h264Bitrate ?: StreamState.h264Bitrate.get()
-        val bitrate = boundedBitrate(max(requested, recommendedBitrate(chosen.mode)), chosen)
+        // Auto and Manual use the same resolver at startup and during live updates.
+        val bitrate = resolvedBitrate(activeConfig ?: StreamState.currentConfig(), chosen)
         val highProfileLevel = highProfileLevelFor(chosen.codecName)
         val keyframeInterval = keyframeIntervalSeconds()
 
@@ -357,9 +354,8 @@ class H264Streamer(
                 setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
                 setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-                    // Independent of KEY_LOW_LATENCY: several encoders honor this
-                    // to cap how many frames they hold before emitting output.
+                    // KEY_LOW_LATENCY is decoder-only. KEY_LATENCY is the
+                    // optional encoder hint; actual support is logged below.
                     setInteger(MediaFormat.KEY_LATENCY, 1)
                 }
                 if (withCbr) {
@@ -445,16 +441,6 @@ class H264Streamer(
         (activeConfig?.h264KeyframeInterval ?: StreamState.h264KeyframeInterval.get())
             .coerceIn(1, 30)
 
-    /** Quality-appropriate bitrate floor scaled by resolution and frame rate. */
-    private fun recommendedBitrate(mode: H264ModeDto): Int {
-        val pixels = mode.width.toLong() * mode.height.toLong()
-        return when {
-            pixels >= 1920L * 1080L -> if (mode.fps >= 50) 16_000_000 else 10_000_000
-            pixels >= 1280L * 720L -> if (mode.fps >= 50) 9_000_000 else 6_000_000
-            else -> 3_000_000
-        }
-    }
-
     /** Highest AVC High-profile level the named encoder advertises, or null. */
     private fun highProfileLevelFor(codecName: String): Pair<Int, Int>? {
         return try {
@@ -524,6 +510,9 @@ class H264Streamer(
 
         override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
             if (codec !== this@H264Streamer.codec) return
+            val encoderLatency = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                format.containsKey(MediaFormat.KEY_LATENCY)) format.getInteger(MediaFormat.KEY_LATENCY).toString() else "unreported"
+            AppLogger.i("H264", "Encoder output latency hint: $encoderLatency frames (not sensor-to-screen latency)")
             val chosen = selection
             val nextColour = VideoColourInfo.fromMediaFormat(
                 format,
@@ -1123,15 +1112,10 @@ class H264Streamer(
         requestKeyFrame()
     }
 
-    private fun boundedBitrate(requested: Int, chosen: H264EncoderSelection): Int {
-        val practicalMax = when {
-            chosen.mode.width >= 1920 && chosen.mode.fps >= 60 -> 20_000_000
-            chosen.mode.width >= 1920 -> 14_000_000
-            chosen.mode.fps >= 60 -> 12_000_000
-            else -> 8_000_000
-        }
-        return min(practicalMax, chosen.bitrateRange.clamp(max(1_000_000, requested)))
-    }
+    private fun resolvedBitrate(config: StreamConfig, chosen: H264EncoderSelection): Int =
+        com.opencambridge.android.state.H264BitratePolicy.resolve(
+            config.h264BitrateMode, config.h264Bitrate, chosen.mode.width, chosen.mode.height,
+            chosen.mode.fps, chosen.bitrateRange.lower, chosen.bitrateRange.upper)
 
     private fun nextFrameSequence() = frameSequence.incrementAndGet()
     private fun currentSequence() = frameSequence.get()

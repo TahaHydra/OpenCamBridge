@@ -12,6 +12,7 @@ import { logEvent, logError, logTestMarker } from '../services/logging';
 import {
   EMPTY_PREVIEW_DIAGNOSTICS,
   PREVIEW_DIAGNOSTICS_EVENT,
+  PREVIEW_FALLBACK_EVENT,
   type PreviewStageDiagnostics,
 } from '../services/previewDiagnostics';
 import {
@@ -200,6 +201,12 @@ function normalizeAndroidMetrics(raw: any): any {
 }
 
 export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, previewOff, setPreviewOff }: ControlPanelProps) {
+  const [nativePreviewFallback, setNativePreviewFallback] = useState(false);
+  useEffect(() => {
+    const onFallback = (event: Event) => setNativePreviewFallback(Boolean((event as CustomEvent).detail));
+    window.addEventListener(PREVIEW_FALLBACK_EVENT, onFallback);
+    return () => window.removeEventListener(PREVIEW_FALLBACK_EVENT, onFallback);
+  }, []);
   const [cameras, setCameras] = useState<any[]>([]);
   const [settings, setSettings] = useState({
     cameraId: '0',
@@ -222,6 +229,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     streamMode: 'h264',
     targetBandwidthMbps: 0,
     h264Bitrate: 4000000,
+    h264BitrateMode: 'auto',
     h264KeyframeInterval: 5
   });
 
@@ -439,9 +447,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       linearZoom: status.linearZoom ?? current.linearZoom,
       targetBandwidthMbps: status.targetBandwidthMbps ?? current.targetBandwidthMbps,
       h264Bitrate: status.h264Bitrate ?? current.h264Bitrate,
-      // v2 fixes this at one second. Normalize legacy phone state here so an
-      // old persisted value cannot poison unrelated desktop controls.
-      h264KeyframeInterval: 5
+      h264BitrateMode: status.h264BitrateMode ?? current.h264BitrateMode,
+      h264KeyframeInterval: Math.min(10, Math.max(1, status.h264KeyframeInterval ?? current.h264KeyframeInterval))
     };
     settingsRef.current = next;
     setSettings(next);
@@ -700,10 +707,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     console.log('[Tauri UI] start_virtual_camera_feeder completed');
   };
 
-  // The H.264 preview reads decoded NV12 frames from the producer's shared
-  // ring. Keep that decoder/feed independent from the Media Foundation camera
-  // host: opening the desktop app starts preview decoding, but it does not
-  // activate the webcam for OBS until the user presses Start Webcam.
+  // WebCodecs owns its own compressed stream. Only the compatibility preview
+  // needs a native ring producer; preview never activates the webcam host.
   useEffect(() => {
     if (androidMetrics?.lifecycleState !== 'STREAMING') {
       // An explicit Stop suppresses the preview producer while the local
@@ -715,7 +720,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       androidMetrics?.selectedFps || androidMetrics?.encodedFps || settings.fps || 0
     );
     const shouldStart = shouldStartH264PreviewProducer({
-      previewEnabled: !previewOff,
+      previewEnabled: !previewOff && nativePreviewFallback,
       settingsHydrated: settingsHydratedRef.current,
       lifecycleState: androidMetrics?.lifecycleState,
       activeStreamMode: androidMetrics?.activeStreamMode || settings.streamMode,
@@ -748,7 +753,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
       .finally(() => {
         previewProducerStartInFlightRef.current = false;
       });
-  }, [androidMetrics, previewOff, settings.fps, settings.streamMode, vcamState?.process_running, addDiag]);
+  }, [androidMetrics, previewOff, nativePreviewFallback, settings.fps, settings.streamMode, vcamState?.process_running, addDiag]);
 
   const handleStartNativeCamera = async () => {
     const s = settingsRef.current;
@@ -849,7 +854,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
     const directKeys = [
       'profile', 'width', 'height', 'outputWidth', 'outputHeight', 'fps', 'jpegQuality',
       'cameraId', 'aspectRatio', 'displayRotation', 'mirror', 'streamMode',
-      'targetBandwidthMbps', 'h264Bitrate', 'h264KeyframeInterval'
+      'targetBandwidthMbps', 'h264Bitrate', 'h264BitrateMode', 'h264KeyframeInterval'
     ];
     for (const key of directKeys) {
       if (keysChanged.includes(key)) patch[key] = s[key];
@@ -1543,8 +1548,8 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                   <option value="mjpeg">MJPEG (compatibility)</option>
                 </select>
                 <p className="hint">
-                  H.264 encodes straight off the Camera2 surface, frames it as OCB2, and decodes on Windows in
-                  hardware. The app falls back to MJPEG only when that complete path is unavailable.
+                  H.264 encodes straight off the Camera2 surface and streams as OCB2. Windows prefers hardware
+                  decoding with software fallback. MJPEG remains the compatibility mode.
                 </p>
               </div>
 
@@ -1568,12 +1573,19 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
               ) : (
                 <>
                   <div className="field">
-                    <span className="field__label">Bitrate <b>{(settings.h264Bitrate / 1_000_000).toFixed(0)} Mb/s</b></span>
-                    <input type="range" min="1" max="20" step="1" value={Math.round(settings.h264Bitrate / 1_000_000)}
+                    <span className="field__label">Bitrate control</span>
+                    <select className="input-control" value={settings.h264BitrateMode}
+                      onChange={(e) => updateSetting('h264BitrateMode', e.target.value)}>
+                      <option value="auto">Automatic — resolution / FPS / device capability</option>
+                      <option value="manual">Manual</option>
+                    </select>
+                    <span className="field__label">{settings.h264BitrateMode === 'auto' ? 'Stored manual bitrate' : 'Requested bitrate'} <b>{(settings.h264Bitrate / 1_000_000).toFixed(0)} Mb/s</b></span>
+                    <input type="range" min="1" max="50" step="1" value={Math.round(settings.h264Bitrate / 1_000_000)}
+                      disabled={settings.h264BitrateMode !== 'manual'}
                       onChange={(e) => updateSetting('h264Bitrate', parseInt(e.target.value) * 1_000_000)} />
                     <p className="hint">
-                      Applies live with no stream interruption. The phone raises very low requests to a
-                      resolution-appropriate floor.
+                      {settings.h264BitrateMode === 'auto' ? 'Automatic chooses a quality target from the actual source mode and encoder capability.'
+                        : 'Manual applies the same requested rate live and after restart, clamped to encoder capability.'}
                     </p>
                   </div>
                   <div className="field">
@@ -1728,6 +1740,17 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
             <Section legend="Desktop preview stages" icon={<Monitor size={13} />}>
               <div className="tel-grid">
                 <Tel k="Preview state" v={previewDiagnostics.ready ? 'READY — frame displayed' : 'WAITING — no displayed frame'} tone={previewDiagnostics.ready ? 'ready' : 'warn'} />
+                <Tel k="Preview renderer" v={previewDiagnostics.renderer === 'webcodecs' ? 'WebCodecs · full source resolution' : 'Native NV12 compatibility · max 960px'} />
+                {previewDiagnostics.renderer === 'webcodecs' ? <>
+                  <Tel k="Decoded / presented fps" v={`${previewDiagnostics.previewReceivedFps.toFixed(1)} / ${previewDiagnostics.previewDisplayedFps.toFixed(1)}`} />
+                  <Tel k="Rendered source size" v={`${previewDiagnostics.parsedWidth}×${previewDiagnostics.parsedHeight}`} />
+                  <Tel k="Compressed bytes transferred" v={previewDiagnostics.ipcPayloadBytes} />
+                  <Tel k="Decode callback / draw submission" v={`${previewDiagnostics.decodeMs.toFixed(2)} / ${previewDiagnostics.previewUploadMs.toFixed(2)} ms`} />
+                  <Tel k="Decoded / decoder queue" v={`${previewDiagnostics.queuedFrames} / ${previewDiagnostics.decoderQueue}`} />
+                  <Tel k="Initial presentation cushion" v={`${previewDiagnostics.bufferMs.toFixed(1)} ms`} />
+                  <Tel k="Presentation skips" v={previewDiagnostics.previewSkippedSequences} />
+                  <Tel k="Last preview error" v={previewDiagnostics.lastError || 'none'} />
+                </> : <>
                 <Tel k="Producer / ring" v={`${producerRunning ? 'running' : 'stopped'} / ${previewDiagnostics.ringAlive ? 'alive' : 'unavailable'}`} tone={producerRunning && previewDiagnostics.ringAlive ? 'ready' : 'warn'} />
                 <Tel k="Ring write sequence / generation" v={`${previewDiagnostics.ringWriteSequence} / ${previewDiagnostics.streamGeneration}`} />
                 <Tel k="Preview command calls" v={previewDiagnostics.previewCommandCalls} />
@@ -1744,6 +1767,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                 <Tel k="Primaries / transfer" v={`${previewDiagnostics.colorPrimaries || '—'} / ${previewDiagnostics.colorTransfer || '—'}`} />
                 <Tel k="Torn slots rejected" v={previewDiagnostics.tornSlotsRejected} tone={previewDiagnostics.tornSlotsRejected > 0 ? 'warn' : undefined} />
                 <Tel k="Last preview error" v={previewDiagnostics.lastError || 'none'} tone={previewDiagnostics.lastError ? 'fail' : 'muted'} />
+                </>}
               </div>
               {previewDiagnostics.consumerStalled && (
                 <Notice kind="fail" icon={<AlertTriangle size={13} />}>
@@ -1819,7 +1843,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                     <Tel k="Transport bandwidth" v={`${metrics.transport_bandwidth_mbps ?? metrics.estimated_mbps} Mb/s`} />
                     <Tel k="Decode time" v={`${metrics.decode_ms_avg} ms`} />
                     <Tel k="Producer processing" v={`${metrics.producer_processing_ms ?? metrics.total_pipeline_ms} ms`} />
-                    {metrics.source === 'ocb2-h264' && <Tel k="Phone→ring lower bound" v={`${metrics.phone_to_ring_latency_ms ?? metrics.latency_ms ?? 0} ms`} />}
+                    {metrics.source === 'ocb2-h264' && <Tel k="Phone→ring estimate (lower bound)" v={`${metrics.phone_to_ring_latency_ms ?? metrics.latency_ms ?? 0} ms`} />}
                   </div>
                   <Tel
                     k="Decoder"
@@ -1837,7 +1861,7 @@ export default function ControlPanel({ baseUrl, token, fitMode, onEnterObsMode, 
                   {ring && (
                     <>
                       <Tel k="Playout buffer / target" v={`${ring.playout_buffer_depth_ms} / ${ring.playout_target_delay_ms} ms`} />
-                      <Tel k="Playout underruns / late drops" v={`${ring.playout_underruns} / ${ring.playout_late_dropped}`} tone={ring.playout_underruns || ring.playout_late_dropped ? 'warn' : 'ready'} />
+                      <Tel k="Output underruns" v={ring.playout_underruns} tone={ring.playout_underruns ? 'warn' : 'ready'} />
                     </>
                   )}
                   {vcamState?.last_metrics_time && (

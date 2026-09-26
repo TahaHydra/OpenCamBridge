@@ -1169,6 +1169,7 @@ private fun OutputTab(viewModel: StreamViewModel) {
     val activeMode by viewModel.activeStreamMode.collectAsState()
     val jpegQuality by viewModel.jpegQuality.collectAsState()
     val bitrate by viewModel.h264Bitrate.collectAsState()
+    val bitrateMode by viewModel.h264BitrateMode.collectAsState()
     val keyframeInterval by viewModel.h264KeyframeInterval.collectAsState()
     val fitMode by viewModel.previewFitMode.collectAsState()
     val aspectRatio by viewModel.aspectRatio.collectAsState()
@@ -1215,15 +1216,23 @@ private fun OutputTab(viewModel: StreamViewModel) {
 
         if (streamMode == "h264") {
             Section("Encoding") {
+                Segmented(
+                    options = listOf("auto" to "Automatic bitrate", "manual" to "Manual"),
+                    selected = bitrateMode,
+                    enabled = enabled,
+                    onSelect = viewModel::updateH264BitrateMode
+                )
+                Spacer(Modifier.height(10.dp))
                 Fader(
-                    label = "Bitrate",
+                    label = if (bitrateMode == "auto") "Stored manual bitrate" else "Requested bitrate",
                     readout = "${bitrate / 1_000_000} Mb/s",
                     value = (bitrate / 1_000_000).toFloat(),
-                    range = 1f..20f,
-                    steps = 18,
-                    enabled = enabled,
+                    range = 1f..50f,
+                    steps = 48,
+                    enabled = enabled && bitrateMode == "manual",
                     onChange = { viewModel.updateH264Bitrate(it.roundToInt() * 1_000_000) },
-                    note = "Applies live. Very low requests are raised to a floor appropriate for the resolution."
+                    note = if (bitrateMode == "auto") "Automatic uses the selected resolution, FPS and encoder capability."
+                        else "Applies live and after restart. Limited only by encoder capability."
                 )
                 Spacer(Modifier.height(14.dp))
                 Fader(

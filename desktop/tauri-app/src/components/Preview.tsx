@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { CameraOff, RefreshCw } from 'lucide-react';
 import { buildUrl } from '../services/api';
-import Nv12RingPreview from './Nv12RingPreview';
+import H264Preview from './H264Preview';
 
 interface PreviewProps {
   baseUrl: string;
@@ -157,7 +157,7 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
         {h264Active ? (
           // Every producer generation gets a fresh renderer. A stale READY flag,
           // sequence cursor or texture can never survive a rebind/codec switch.
-          <Nv12RingPreview key={previewSessionKey} fitMode={effectiveFit} />
+          <H264Preview key={previewSessionKey} baseUrl={baseUrl} token={token} fitMode={effectiveFit} />
         ) : showOverlay && (
           <div className="preview-overlay">
             {rebinding ? <RefreshCw size={48} opacity={0.6} className="animate-spin" /> : <CameraOff size={48} opacity={0.5} />}

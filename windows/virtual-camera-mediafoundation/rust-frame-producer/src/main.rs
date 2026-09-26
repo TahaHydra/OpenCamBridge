@@ -2959,14 +2959,14 @@ fn reverse_row(src: &[u8], dst: &mut [u8], count: usize, elem: usize) {
 const READER_QUEUE_DEPTH: usize = 4;
 
 enum ReaderEvent {
-    Record(ocb2::Record),
+    Record {
+        record: ocb2::Record,
+        received_ns: u64,
+    },
     /// The connection ended. `expected` distinguishes a clean close — the phone
     /// rebinding its camera, which it does routinely — from a genuine failure.
     /// Reconnect pacing depends on which it was.
-    Ended {
-        reason: String,
-        expected: bool,
-    },
+    Ended { reason: String, expected: bool },
 }
 
 /// Aligns the phone's capture clock to this machine's monotonic clock.
@@ -3087,7 +3087,14 @@ fn spawn_ocb2_reader(
                     Ok(Some(record)) => {
                         // A send error means the decode loop has moved on to a
                         // new connection; this thread is done.
-                        if events.send(ReaderEvent::Record(record)).is_err() {
+                        let received_ns = monotonic_ns();
+                        if events
+                            .send(ReaderEvent::Record {
+                                record,
+                                received_ns,
+                            })
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -3151,7 +3158,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
     // zero) but ARRIVE IN BURSTS of two or three, so every second or third access
     // unit shows a ~75ms gap while the ones between arrive back to back. Keep it
     // for the next time a smoothness complaint needs evidence rather than theory.
-    let mut last_au_instant: Option<Instant> = None;
+    let mut last_au_receive_ns: Option<u64> = None;
     let mut frame_trace = FrameTrace::from_env();
 
     loop {
@@ -3348,8 +3355,11 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                 last_print = Instant::now();
             }
 
-            let record = match event_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(ReaderEvent::Record(record)) => record,
+            let (record, receive_ns) = match event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(ReaderEvent::Record {
+                    record,
+                    received_ns,
+                }) => (record, received_ns),
                 Ok(ReaderEvent::Ended { reason, expected }) => {
                     last_error = Some(reason);
                     clean_disconnect = expected;
@@ -3361,7 +3371,8 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                     break 'connection;
                 }
             };
-            let receive_ns = monotonic_ns();
+            // Timestamp complete records before queueing so this estimate also
+            // includes local reader/decoder queue wait.
             // The discontinuity flag is a property of the STREAM, not of one
             // record type: the protocol says a client flushes its decoder on a
             // discontinuity and waits for a keyframe. Handling it here rather
@@ -3445,10 +3456,10 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                 }
                 ocb2::TYPE_VIDEO_ACCESS_UNIT => {
                     received_frames += 1;
-                    let arrival_delta_us = last_au_instant
-                        .map(|previous: Instant| previous.elapsed().as_micros() as u64)
+                    let arrival_delta_us = last_au_receive_ns
+                        .map(|previous| receive_ns.saturating_sub(previous) / 1_000)
                         .unwrap_or(0);
-                    last_au_instant = Some(Instant::now());
+                    last_au_receive_ns = Some(receive_ns);
                     frame_trace.begin(&record, arrival_delta_us);
                     // A discontinuity on this record was already handled above.
                     if waiting_for_keyframe && !record.is_keyframe() {

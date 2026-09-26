@@ -21,6 +21,7 @@ data class StreamConfig(
     val accessToken: String = "",
     val streamMode: String = "h264",
     val h264Bitrate: Int = 4_000_000,
+    val h264BitrateMode: String = "auto",
     val h264KeyframeInterval: Int = H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS,
     val cameraId: String = "0",
     val width: Int = 1920,
@@ -155,6 +156,7 @@ object StreamState {
 
     val streamMode = AtomicReference("h264") // h264 preferred; mjpeg compatibility
     val h264Bitrate = AtomicInteger(4000000)
+    val h264BitrateMode = AtomicReference("auto")
     val h264KeyframeInterval = AtomicInteger(H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS)
     val activeStreamMode = AtomicReference("mjpeg")
     val fallbackReason = AtomicReference("")
@@ -394,6 +396,7 @@ object StreamState {
         accessToken.set(config.accessToken)
         streamMode.set(config.streamMode)
         h264Bitrate.set(config.h264Bitrate)
+        h264BitrateMode.set(config.h264BitrateMode)
         h264KeyframeInterval.set(config.h264KeyframeInterval)
         cameraId.set(config.cameraId)
         width.set(config.width)
@@ -419,6 +422,7 @@ object StreamState {
             accessToken = accessToken.get(),
             streamMode = streamMode.get(),
             h264Bitrate = h264Bitrate.get(),
+            h264BitrateMode = h264BitrateMode.get(),
             h264KeyframeInterval = h264KeyframeInterval.get(),
             cameraId = cameraId.get(),
             width = width.get(),
@@ -478,6 +482,7 @@ object StreamState {
                 height = config.height,
                 fps = config.fps,
                 h264Bitrate = config.h264Bitrate,
+                h264BitrateMode = config.h264BitrateMode,
                 phonePreviewEnabled = config.localPreviewEnabled
             ),
             selected = selected,
@@ -508,6 +513,7 @@ object StreamState {
         activeStreamMode = selectedState?.streamMode ?: config.streamMode,
         fallbackReason = fallbackState?.reason.orEmpty(),
         h264Bitrate = config.h264Bitrate,
+        h264BitrateMode = config.h264BitrateMode,
         h264KeyframeInterval = config.h264KeyframeInterval,
         cameraId = config.cameraId,
         width = config.width,
@@ -592,6 +598,7 @@ data class StreamStatusDto(
     val activeStreamMode: String = "mjpeg",
     val fallbackReason: String = "",
     val h264Bitrate: Int,
+    val h264BitrateMode: String = "auto",
     val h264KeyframeInterval: Int,
     val cameraId: String,
     val width: Int,
@@ -678,6 +685,7 @@ data class DesiredPipelineDto(
     val height: Int,
     val fps: Int,
     val h264Bitrate: Int,
+    val h264BitrateMode: String = "auto",
     val phonePreviewEnabled: Boolean
 )
 

@@ -343,25 +343,15 @@ function DesktopApp() {
     || '—';
   const codecLabel = (serverStatus?.activeStreamMode || serverStatus?.streamMode || '—').toString().toUpperCase();
 
-  if (obsMode) {
-    return (
-      <div style={{ width: '100vw', height: '100vh', margin: 0, padding: 0, overflow: 'hidden', background: '#000', position: 'relative' }}>
+  return (
+    <div className="app-container animate-fade" style={obsMode ? { width: '100vw', height: '100vh', padding: 0, background: '#000' } : undefined}>
+      {obsMode && <>
         <style>{`.preview-stage { border-radius: 0 !important; background: transparent !important; }`}</style>
-        <Preview baseUrl={baseUrl} token={token} fitMode={fitMode} serverStatus={serverStatus} />
-        <button
-          className="btn btn--sm"
-          onClick={() => setObsMode(false)}
-          style={{ position: 'absolute', top: 16, right: 16, zIndex: 9999 }}
-        >
+        <button className="btn btn--sm" onClick={() => setObsMode(false)} style={{ position: 'absolute', top: 16, right: 16, zIndex: 9999 }}>
           <Unplug size={13} /> Exit clean feed (Esc)
         </button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="app-container animate-fade">
-      <header className="header">
+      </>}
+      <header className="header" style={obsMode ? { display: 'none' } : undefined}>
         <div className="header__brand">
           <div className="header__mark"><Camera size={16} /></div>
           <div className="header__word"><b>Open</b><span>Cam</span><b>Bridge</b></div>
@@ -395,15 +385,15 @@ function DesktopApp() {
         </div>
       </header>
 
-      <main className="main-content">
+      <main className="main-content" style={obsMode ? { gridTemplateColumns: '1fr', padding: 0, gap: 0 } : undefined}>
         <div className="stack stack--14" style={{ height: '100%', minHeight: 0 }}>
-          {isError && serverStatus?.lastError && (
+          {!obsMode && isError && serverStatus?.lastError && (
             <div className="error-banner animate-fade">
               <AlertTriangle size={15} />
               <span><strong>Camera error:</strong> {serverStatus.lastError}</span>
             </div>
           )}
-          {!previewOff ? (
+          {(!previewOff || obsMode) ? (
             <Preview baseUrl={baseUrl} token={token} fitMode={fitMode} serverStatus={serverStatus} />
           ) : (
             <div className="preview-wrapper">
@@ -421,7 +411,11 @@ function DesktopApp() {
           )}
         </div>
 
-        <ControlPanel baseUrl={baseUrl} token={token} fitMode={fitMode} setFitMode={setFitMode} onEnterObsMode={() => setObsMode(true)} previewOff={previewOff} setPreviewOff={setPreviewOff} />
+        {/* Keep the lifecycle controller mounted in clean feed, including native
+            fallback startup. Hiding controls must not abandon preview ownership. */}
+        <div style={{ display: obsMode ? 'none' : 'contents' }}>
+          <ControlPanel baseUrl={baseUrl} token={token} fitMode={fitMode} setFitMode={setFitMode} onEnterObsMode={() => setObsMode(true)} previewOff={previewOff && !obsMode} setPreviewOff={setPreviewOff} />
+        </div>
       </main>
 
       {showLogs && <LogsView onClose={() => setShowLogs(false)} />}
