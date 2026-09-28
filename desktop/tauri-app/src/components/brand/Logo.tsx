@@ -1,12 +1,9 @@
-/** The OpenCamBridge mark: a lens in the accent tile. */
+import originalLogo from '../../assets/opencambridge-original.png';
+
+/** Original packaged OpenCamBridge artwork, shared with the executable icon. */
 export function LogoMark({ size = 24 }: { size?: number }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" className="logo-mark">
-      <rect x="1" y="1" width="22" height="22" rx="6.5" fill="var(--accent)" />
-      <circle cx="12" cy="12" r="5.4" fill="none" stroke="#fff" strokeWidth="2" />
-      <circle cx="12" cy="12" r="1.9" fill="#fff" />
-      <circle cx="17.6" cy="6.4" r="1.1" fill="#fff" opacity="0.85" />
-    </svg>
+    <img src={originalLogo} width={size} height={size} alt="" aria-hidden="true" className="logo-mark" />
   );
 }
 

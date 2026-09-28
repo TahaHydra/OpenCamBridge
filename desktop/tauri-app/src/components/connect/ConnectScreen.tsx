@@ -26,7 +26,7 @@ export class UnauthorizedError extends Error {
 /** Reachability (no token needed for /health by design), then authorisation. */
 export async function verifyPhone(url: string, token: string): Promise<string> {
   const formattedUrl = url.endsWith('/') ? url.slice(0, -1) : url;
-  const healthRes = await fetch(`${formattedUrl}/health`);
+  const healthRes = await apiFetch(formattedUrl, '/health');
   if (!healthRes.ok) throw new Error('Health check failed');
   const text = await healthRes.text();
   if (!(text === 'OK' || text.toLowerCase().includes('ok'))) throw new Error('Invalid health response');

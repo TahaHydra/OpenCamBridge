@@ -15,6 +15,8 @@ import { VIRTUAL_CAMERA_NAME } from '../../services/obs';
 import { VIRTUAL_CAMERA_LABEL, VIRTUAL_CAMERA_TONE, type Tone } from '../../state/status';
 import type { CameraController } from '../../state/useCameraController';
 import type { ObsIntegration } from '../../state/useObs';
+import OutputFramingControl from './OutputFramingControl';
+import { ManualBitrateWarning } from '../camera/BitrateControl';
 
 /**
  * Outputs: where the picture goes. The virtual camera (seen by apps as
@@ -39,7 +41,8 @@ export default function OutputsRail({
   return (
     <aside className="rail rail--right" aria-label="Outputs">
       <div className="rail__heading">Outputs</div>
-      <VirtualCameraCard controller={controller} onOpenDiagnostics={onOpenDiagnostics} />
+      <VirtualCameraCard controller={controller} onOpenDiagnostics={onOpenDiagnostics} showBitrateWarning={!advanced} />
+      <OutputFramingControl controller={controller} />
       <ObsCard controller={controller} obs={obs} onOpenIntegrations={onOpenIntegrations} />
       <OutputCard
         icon={<Maximize2 size={17} />}
@@ -89,7 +92,7 @@ function OutputCard({
   );
 }
 
-function VirtualCameraCard({ controller, onOpenDiagnostics }: { controller: CameraController; onOpenDiagnostics: () => void }) {
+function VirtualCameraCard({ controller, onOpenDiagnostics, showBitrateWarning }: { controller: CameraController; onOpenDiagnostics: () => void; showBitrateWarning: boolean }) {
   const { vcamState, virtualCamera } = controller;
   const [busy, setBusy] = useState(false);
   const ring = vcamState?.metrics?.ring;
@@ -117,6 +120,7 @@ function VirtualCameraCard({ controller, onOpenDiagnostics }: { controller: Came
           {ring.negotiated_width}×{ring.negotiated_height} · {Math.round(ring.negotiated_fps_num / Math.max(1, ring.negotiated_fps_den))} FPS
         </div>
       )}
+      {showBitrateWarning && <ManualBitrateWarning controller={controller} />}
 
       {virtualCamera === 'not-installed' ? (
         <Button

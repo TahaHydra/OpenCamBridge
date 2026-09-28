@@ -1,0 +1,19 @@
+.framing-presets { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; margin-top: 12px; }
+.framing-preset { min-height: 30px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); color: var(--text-2); font: inherit; font-size: 11px; cursor: pointer; }
+.framing-preset:hover { color: var(--text); border-color: var(--accent); }
+.framing-preset.is-selected { color: var(--accent-text); border-color: var(--accent); background: var(--accent-soft); }
+.framing-preset:focus-visible, .crop-selection:focus-visible, .crop-handle:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.framing-note { margin-top: 10px; line-height: 1.5; }
+.framing-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 10px; }
+.crop-overlay { position: absolute; z-index: 4; overflow: hidden; pointer-events: none; }
+.crop-selection { position: absolute; border: 2px solid #fff; box-shadow: 0 0 0 2000px rgb(0 0 0 / 42%); cursor: move; pointer-events: auto; touch-action: none; box-sizing: border-box; }
+.crop-selection__label { position: absolute; top: 9px; left: 9px; padding: 3px 7px; border-radius: 4px; background: rgb(0 0 0 / 65%); color: white; font-size: 11px; pointer-events: none; }
+.crop-selection__grid { position: absolute; inset: 0; background: linear-gradient(to right, transparent 33%, #ffffff35 33%, #ffffff35 33.3%, transparent 33.3%, transparent 66.6%, #ffffff35 66.6%, #ffffff35 66.9%, transparent 66.9%), linear-gradient(to bottom, transparent 33%, #ffffff35 33%, #ffffff35 33.3%, transparent 33.3%, transparent 66.6%, #ffffff35 66.6%, #ffffff35 66.9%, transparent 66.9%); pointer-events: none; }
+.crop-selection__effective { position: absolute; border: 1px dashed #ffdc85; box-sizing: border-box; pointer-events: none; }
+.crop-handle { position: absolute; width: 18px; height: 18px; background: white; border: 2px solid #222; border-radius: 4px; touch-action: none; }
+.crop-handle--nw { top: 0; left: 0; cursor: nwse-resize; }
+.crop-handle--ne { top: 0; right: 0; cursor: nesw-resize; }
+.crop-handle--sw { bottom: 0; left: 0; cursor: nesw-resize; }
+.crop-handle--se { bottom: 0; right: 0; cursor: nwse-resize; }
+.framing-error { position: absolute; bottom: 12px; left: 12px; right: 12px; z-index: 8; padding: 10px; border-radius: var(--r-sm); background: var(--danger-soft); color: var(--danger-text); font-size: 12px; }
+.bitrate-warning { color: var(--warn-text); font-size: 11px; line-height: 1.5; margin: 8px 0 0; }

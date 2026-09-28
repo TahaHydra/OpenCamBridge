@@ -146,10 +146,7 @@ namespace winrt::WindowsSample::implementation
         uint32_t sourceColor = 0;
         const bool sourceKnown = SUCCEEDED(m_shmClient.GetProducerFormat(
             &sourceWidth, &sourceHeight, &sourceFpsNum, &sourceFpsDen, &sourceColor));
-        const uint32_t sourceFps = sourceKnown && sourceFpsDen > 0
-            ? static_cast<uint32_t>((sourceFpsNum + sourceFpsDen / 2) / sourceFpsDen)
-            : 30;
-        const bool sourceSupports60 = sourceFps >= 50;
+        const bool sourceSupports60 = sourceKnown && OcbSourceSupports60(sourceFpsNum, sourceFpsDen);
 
         struct Mode { GUID subtype; uint32_t width; uint32_t height; uint32_t fps; };
         std::vector<Mode> modes;
@@ -163,18 +160,24 @@ namespace winrt::WindowsSample::implementation
         const bool sourceGeometryCommon =
             (sourceWidth == 1920 && sourceHeight == 1080) ||
             (sourceWidth == 1280 && sourceHeight == 720) ||
+            (sourceWidth == 1080 && sourceHeight == 1920) ||
+            (sourceWidth == 720 && sourceHeight == 1280) ||
             (sourceWidth == 640 && sourceHeight == 480);
         if (sourceKnown && sourceGeometryCommon) {
             addMode(MFVideoFormat_NV12, sourceWidth, sourceHeight, sourceSupports60 ? 60 : 30);
         }
         // Compatibility-first list. 60 fps is not exposed for a 30 fps
-        // producer, and the first type is always a real 30 fps default.
+        // producer; when known, its geometry and cadence are preferred first.
         addMode(MFVideoFormat_NV12, 1920, 1080, 30);
         addMode(MFVideoFormat_NV12, 1280, 720, 30);
         addMode(MFVideoFormat_NV12, 640, 480, 30);
+        addMode(MFVideoFormat_NV12, 1080, 1920, 30);
+        addMode(MFVideoFormat_NV12, 720, 1280, 30);
         if (sourceSupports60) {
             addMode(MFVideoFormat_NV12, 1920, 1080, 60);
             addMode(MFVideoFormat_NV12, 1280, 720, 60);
+            addMode(MFVideoFormat_NV12, 1080, 1920, 60);
+            addMode(MFVideoFormat_NV12, 720, 1280, 60);
         }
         // DirectShow/WebRTC bridges commonly choose packed YUY2 even when they
         // can enumerate NV12. Advertising and producing it ourselves avoids a
@@ -183,8 +186,12 @@ namespace winrt::WindowsSample::implementation
         addMode(MFVideoFormat_YUY2, 1920, 1080, 30);
         addMode(MFVideoFormat_YUY2, 1280, 720, 30);
         addMode(MFVideoFormat_YUY2, 640, 480, 30);
+        addMode(MFVideoFormat_YUY2, 1080, 1920, 30);
+        addMode(MFVideoFormat_YUY2, 720, 1280, 30);
         addMode(MFVideoFormat_RGB32, 1280, 720, 30);
         addMode(MFVideoFormat_RGB32, 640, 480, 30);
+        addMode(MFVideoFormat_RGB32, 1080, 1920, 30);
+        addMode(MFVideoFormat_RGB32, 720, 1280, 30);
 
         const uint32_t NUM_MEDIATYPES = static_cast<uint32_t>(modes.size());
         wil::unique_cotaskmem_array_ptr<wil::com_ptr_nothrow<IMFMediaType>> mediaTypeList = wilEx::make_unique_cotaskmem_array<wil::com_ptr_nothrow<IMFMediaType>>(NUM_MEDIATYPES);

@@ -1,5 +1,6 @@
 import { useCallback, useSyncExternalStore } from 'react';
 import type { ConnectMode } from './types';
+import { DEFAULT_FRAMING, normalizeFraming, type OutputFraming } from '../services/outputFraming.js';
 
 /**
  * Desktop-only preferences, persisted in the WebView's localStorage.
@@ -42,6 +43,10 @@ export interface AppPreferences {
   theme: 'dark' | 'black';
   /** Local preview framing only; never changes what apps receive. */
   fitMode: 'fit' | 'fill';
+  /** Native output framing in upright source coordinates; independent of capture. */
+  outputFraming: OutputFraming;
+  /** Show output crop handles over the full source preview. */
+  editOutputFraming: boolean;
   /** Flips only this window's preview, like looking in a mirror. */
   mirrorPreview: boolean;
   /** Desktop preview decoding. Off keeps the window out of the frame budget. */
@@ -69,6 +74,8 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   advancedMode: false,
   theme: 'dark',
   fitMode: 'fit',
+  outputFraming: DEFAULT_FRAMING,
+  editOutputFraming: false,
   mirrorPreview: false,
   previewEnabled: true,
   autoReconnect: false,
@@ -103,6 +110,7 @@ function readStorage(): AppPreferences {
   }
   if (!Array.isArray(merged.knownDevices)) merged.knownDevices = [];
   if (!Array.isArray(merged.customProfiles)) merged.customProfiles = [];
+  merged.outputFraming = normalizeFraming(merged.outputFraming);
   return merged;
 }
 

@@ -5,6 +5,7 @@
 #include <d3d11.h>
 #include <stdint.h>
 #include <vector>
+#include "OutputFraming.h"
 
 #define OCBR_MAGIC 0x5242434F
 #define OCBR_FORMAT_NV12 2
@@ -151,7 +152,7 @@ private:
         DWORD sourceYStride, DWORD sourceUvStride, DWORD outputWidth, DWORD outputHeight,
         DWORD inputFpsNumerator, DWORD inputFpsDenominator,
         DWORD outputFpsNumerator, DWORD outputFpsDenominator,
-        std::vector<BYTE>& output);
+        std::vector<BYTE>& output, const OcbFramingSettings& settings, uint32_t colorDescriptor);
     HRESULT EnsureGpuResizeResources(DWORD sourceWidth, DWORD sourceHeight, DWORD outputWidth, DWORD outputHeight,
         DWORD inputFpsNumerator, DWORD inputFpsDenominator,
         DWORD outputFpsNumerator, DWORD outputFpsDenominator);
@@ -180,6 +181,7 @@ private:
     // Selection-cadence trace; see TraceSelection. Off unless OCB_VCAM_TRACE is set.
     LONG64 m_lastSelectQpc = 0;
     std::vector<BYTE> m_nv12Scratch;
+    OcbFramingReader m_framingReader;
     ID3D11Device* m_d3dDevice = nullptr;
     ID3D11DeviceContext* m_d3dContext = nullptr;
     ID3D11VideoDevice* m_videoDevice = nullptr;

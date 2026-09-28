@@ -1,6 +1,7 @@
 mod adb;
 mod logger;
 mod nv12_preview;
+mod output_framing;
 mod sync_state;
 mod virtualcam;
 mod winproc;
@@ -14,6 +15,7 @@ pub fn run() {
         .manage(virtualcam::VirtualCamManager::new())
         .manage(logger::SessionLog::new())
         .manage(nv12_preview::Nv12PreviewReader::new())
+        .manage(output_framing::OutputFramingState::default())
         .invoke_handler(tauri::generate_handler![
             adb::get_adb_status,
             adb::list_devices,
@@ -30,6 +32,7 @@ pub fn run() {
             virtualcam::get_virtual_camera_status,
             nv12_preview::get_nv12_preview_frame,
             nv12_preview::get_nv12_preview_diagnostics,
+            output_framing::set_output_framing,
             logger::start_log_session,
             logger::append_log,
             logger::get_log_path,

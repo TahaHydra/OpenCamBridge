@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { apiFetch, buildUrl } from '../services/api';
+import { apiFetch, cancelPhoneRequests } from '../services/api';
+import { startNativeOutput } from '../services/nativeOutputSession';
+import { uprightSourceDimensions } from '../services/outputFraming.js';
 import { desktopInvoke as invoke } from '../services/desktopBridge';
 import { logEvent, logError, logTestMarker } from '../services/logging';
 import {
@@ -103,6 +105,15 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
   const previewProducerStartInFlightRef = useRef(false);
   const previewProducerRetryAfterRef = useRef(0);
   const previewAutoStartSuppressedRef = useRef(false);
+  const nativeOperationRef = useRef(0);
+  const nativeStartBusyRef = useRef(false);
+  const phoneOnlineRef = useRef(false);
+  const mountedRef = useRef(true);
+  const statusInFlightRef = useRef(false);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; nativeOperationRef.current++; cancelPhoneRequests(baseUrl); };
+  }, [baseUrl]);
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -252,35 +263,42 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
   }, []);
 
   const fetchStatus = useCallback(() => {
-    apiFetch(baseUrl, '/api/camera/status', token)
+    if (statusInFlightRef.current) return;
+    statusInFlightRef.current = true;
+    apiFetch(baseUrl, '/api/camera/status', token, { timeoutMs: 3500 })
       .then(res => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
       })
       .then(data => {
+        if (!mountedRef.current) return;
         const status = data.status || data;
         if (status) {
+          if (!phoneOnlineRef.current) authoritativeRevisionRef.current = null;
+          phoneOnlineRef.current = true;
           setServerStatus(status);
           importAuthoritativeState(status);
         }
       })
       .catch(() => {
-        setServerStatus((prev: any) => ({ ...prev, lifecycleState: 'OFFLINE', lastError: 'Server disconnected' }));
-      });
+        if (!mountedRef.current) return;
+        setServerStatus((prev: any) => ({ ...prev, lifecycleState: 'OFFLINE', lastError: 'Phone stopped or disconnected / Start again from the phone' }));
+        setAndroidMetrics(null);
+        if (phoneOnlineRef.current) {
+          phoneOnlineRef.current = false;
+          nativeOperationRef.current++;
+          previewAutoStartSuppressedRef.current = true;
+          producerPurposeRef.current = null;
+          cancelPhoneRequests(baseUrl);
+          // Independent asynchronous native teardown. Never hold the UI hostage
+          // to a dead phone request, and never remotely restart its service.
+          void Promise.allSettled([invoke('stop_virtual_camera_feeder'), invoke('stop_virtual_camera_host')]);
+        }
+      }).finally(() => { statusInFlightRef.current = false; });
   }, [baseUrl, token, importAuthoritativeState]);
 
-  useEffect(() => {
-    const events = new EventSource(buildUrl(baseUrl, '/api/state/events', token));
-    const onState = () => fetchStatus();
-    events.addEventListener('state', onState);
-    events.onerror = () => {
-      // The existing one-second poll remains a reconnect/version-skew fallback.
-    };
-    return () => {
-      events.removeEventListener('state', onState);
-      events.close();
-    };
-  }, [baseUrl, token, fetchStatus]);
+  // Native one-second polling is the state channel on USB and LAN alike. Browser
+  // EventSource cannot carry our header and is subject to packaged CSP/CORS.
 
   const refreshCapabilities = useCallback(() => {
     apiFetch(baseUrl, '/api/device/info', token)
@@ -315,6 +333,7 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
     refreshCapabilities();
     fetchStatus();
 
+    let sampling = false;
     const interval = setInterval(() => {
       setNow(Date.now() / 1000);
       // Pull phone-side setting changes into the desktop every tick. Without
@@ -323,10 +342,11 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
       // never propagated to the desktop UI. fetchStatus() is guarded by
       // isSyncingRef so it won't clobber an in-flight desktop change.
       fetchStatus();
-
-      invoke<VirtualCamState>('get_virtual_camera_status')
+      if (sampling) return;
+      sampling = true;
+      void Promise.allSettled([invoke<VirtualCamState>('get_virtual_camera_status')
         .then(setVcamState)
-        .catch(console.error);
+        .catch(console.error),
 
       apiFetch(baseUrl, '/health', token)
         .then(res => {
@@ -336,12 +356,12 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
             setAndroidStreamStatus('error');
           }
         })
-        .catch(() => setAndroidStreamStatus('error'));
+        .catch(() => setAndroidStreamStatus('error')),
 
       apiFetch(baseUrl, '/api/stream/metrics', token)
         .then(res => res.json())
         .then(data => setAndroidMetrics(normalizeAndroidMetrics(data)))
-        .catch(() => setAndroidMetrics(null));
+        .catch(() => setAndroidMetrics(null))]).finally(() => { sampling = false; });
     }, 1000);
 
     return () => clearInterval(interval);
@@ -583,7 +603,6 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
         vcamStateRef.current = state;
         setVcamState(state);
         addDiag('h264Preview', 'Desktop H.264 producer is running; waiting for the renderer to display a preview frame');
-        window.dispatchEvent(new CustomEvent('reload-preview'));
       })
       .catch((error: any) => {
         previewProducerRetryAfterRef.current = Date.now() + 5000;
@@ -608,30 +627,40 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
     }
   };
 
-  /** Starts the complete Windows camera: phone stream, decoded feed and MF host. */
+  /** Attach Windows output to the existing phone stream; preview owns itself. */
   const handleStartNativeCamera = async () => {
+    if (nativeStartBusyRef.current) return;
+    nativeStartBusyRef.current = true;
+    const operation = ++nativeOperationRef.current;
     const s = settingsRef.current;
 
     setVcamMessage('Starting pipeline...');
     try {
       previewAutoStartSuppressedRef.current = false;
       await waitForPreviewProducerIdle();
-      if (!vcamState?.host_running || !vcamState?.host_activated) {
-        await invoke('start_virtual_camera_host');
-      }
-
-      await restartFullPipelineWithSettings(s, []);
+      await startNativeOutput({
+        readPhone: async () => normalizeAndroidMetrics(await (await apiFetch(baseUrl, '/api/stream/metrics', token)).json()),
+        readNative: () => invoke<VirtualCamState>('get_virtual_camera_status'),
+        startProducer: actual => handleStartProducer(s, actual, 'webcam'),
+        startHost: () => invoke<void>('start_virtual_camera_host'),
+        isCancelled: () => !mountedRef.current || operation !== nativeOperationRef.current,
+      });
+      producerPurposeRef.current = 'webcam';
 
       setVcamMessage('');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
     } catch (e: any) {
+      // Stop/disconnect owns teardown once this attempt has been superseded.
+      // An old rejected Start must not send fresh Stop commands into a newer session.
+      if (!mountedRef.current || operation !== nativeOperationRef.current) return;
       console.error('[Tauri UI] handleStartNativeCamera failed:', e);
       setVcamMessage(`Error: ${e.toString()}`);
       // A producer that is alive but failed readiness must not leave the Start
       // button disabled. Keep the visible error and return to a retryable state.
       try { await invoke('stop_virtual_camera_feeder'); producerPurposeRef.current = null; } catch {}
+      try { await invoke('stop_virtual_camera_host'); } catch {}
       try { setVcamState(await invoke<VirtualCamState>('get_virtual_camera_status')); } catch {}
-    }
+    } finally { nativeStartBusyRef.current = false; }
   };
 
   /**
@@ -640,6 +669,7 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
    * camera can be started again from here.
    */
   const handleStopNativeCamera = async () => {
+    nativeOperationRef.current++;
     try {
       previewAutoStartSuppressedRef.current = true;
       await waitForPreviewProducerIdle();
@@ -657,15 +687,14 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
 
   /**
    * Unpublishes OpenCamBridge Camera but keeps the phone streaming, so the
-   * desktop preview carries on. The preview decoder restarts on its own (for
-   * H.264) because the auto-start policy sees the producer gone.
+   * independently owned WebCodecs preview carries on without restarting.
    */
   const stopVirtualCamera = async () => {
+    nativeOperationRef.current++;
     try {
-      await waitForPreviewProducerIdle();
-      await invoke('stop_virtual_camera_feeder');
+      previewAutoStartSuppressedRef.current = true;
+      await Promise.all([invoke('stop_virtual_camera_feeder'), invoke('stop_virtual_camera_host')]);
       producerPurposeRef.current = null;
-      await invoke('stop_virtual_camera_host');
       addDiag('host', 'Virtual camera stopped; phone stream left running');
       setVcamMessage('');
       await refreshVcamState();
@@ -681,15 +710,13 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
     try {
       previewAutoStartSuppressedRef.current = false;
       await waitForPreviewProducerIdle();
-      const actual = await restartAndroidStreamWithSettings(s, []);
+      const actual = normalizeAndroidMetrics(await (await apiFetch(baseUrl, '/api/stream/metrics', token)).json());
+      if (actual.lifecycleState !== 'STREAMING') throw new Error('Start again from the phone');
       await handleStartProducer(s, actual, 'feed');
 
       setVcamMessage('');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
 
-      if (!previewOff) {
-        setTimeout(() => window.dispatchEvent(new CustomEvent('reload-preview')), 1000);
-      }
     } catch (e: any) {
       console.error('[Tauri UI] handleStartFeedOnly failed:', e);
       setVcamMessage(`Error: ${e.toString()}`);
@@ -702,7 +729,6 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
       await waitForPreviewProducerIdle();
       await invoke('stop_virtual_camera_feeder');
       producerPurposeRef.current = null;
-      await stopStream();
       setVcamMessage('Stopped feed.');
       invoke<VirtualCamState>('get_virtual_camera_status').then(setVcamState);
     } catch (e: any) {
@@ -1079,7 +1105,6 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
     if (committed < 3) throw new Error(`Decoded frame producer committed only ${committed}/3 readiness frames`);
 
     fetchStatus();
-    if (!previewOff) window.dispatchEvent(new CustomEvent('reload-preview'));
   };
 
   const restartFullPipelineWithSettings = async (s: CameraSettings, keysChanged: string[]) => {
@@ -1127,9 +1152,6 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
 
     fetchStatus();
 
-    if (!previewOff) {
-      setTimeout(() => window.dispatchEvent(new CustomEvent('reload-preview')), 1000);
-    }
   };
 
   /**
@@ -1244,6 +1266,7 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
   const diagAlert: '' | 'warn' | 'fail' = binariesBlocked ? 'fail' : activeError || androidMetrics?.fallbackUsed ? 'warn' : '';
   const phoneState = phoneStateFrom(serverStatus);
   const virtualCamera = virtualCameraPhase(vcamState);
+  const sourceDimensions = uprightSourceDimensions(serverStatus, settings);
 
   return {
     // identity
@@ -1254,6 +1277,7 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
     phoneInfo,
     phoneState,
     serverStatus,
+    sourceDimensions,
     androidMetrics,
     androidRunning,
     cameras,

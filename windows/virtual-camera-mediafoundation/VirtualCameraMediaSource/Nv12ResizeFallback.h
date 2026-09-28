@@ -6,23 +6,28 @@
 #include <cmath>
 #include <cstdint>
 #include <vector>
+#include "OutputFraming.h"
 
 enum class OcbResizeBackend : LONG { NativeMatch = 0, Gpu = 1, CpuFallback = 2 };
 
-struct OcbFitRect { DWORD left; DWORD top; DWORD width; DWORD height; };
-
-inline OcbFitRect OcbComputeLetterbox(DWORD sourceWidth, DWORD sourceHeight, DWORD outputWidth, DWORD outputHeight)
+inline void OcbBlackenNv12Padding(std::vector<BYTE>& output, DWORD width, DWORD height,
+    const OcbFitRect& image, bool fullRange)
 {
-    DWORD fittedWidth = outputWidth;
-    DWORD fittedHeight = outputHeight;
-    if (static_cast<uint64_t>(sourceWidth) * outputHeight > static_cast<uint64_t>(outputWidth) * sourceHeight) {
-        fittedHeight = static_cast<DWORD>((static_cast<uint64_t>(outputWidth) * sourceHeight) / sourceWidth);
-    } else {
-        fittedWidth = static_cast<DWORD>((static_cast<uint64_t>(outputHeight) * sourceWidth) / sourceHeight);
+    if (image.left == 0 && image.top == 0 && image.width == width && image.height == height) return;
+    for (DWORD plane = 0; plane < 2; ++plane) {
+        const DWORD divisor = plane ? 2 : 1;
+        BYTE* pixels = output.data() + (plane ? static_cast<size_t>(width) * height : 0);
+        const BYTE black = plane ? 128 : (fullRange ? 0 : 16);
+        for (DWORD y = 0; y < height / divisor; ++y) {
+            BYTE* row = pixels + static_cast<size_t>(y) * width;
+            if (y < image.top / divisor || y >= (image.top + image.height) / divisor)
+                memset(row, black, width);
+            else {
+                memset(row, black, image.left);
+                memset(row + image.left + image.width, black, width - image.left - image.width);
+            }
+        }
     }
-    fittedWidth = (std::max<DWORD>)(2, fittedWidth & ~1u);
-    fittedHeight = (std::max<DWORD>)(2, fittedHeight & ~1u);
-    return { (outputWidth - fittedWidth) / 2, (outputHeight - fittedHeight) / 2, fittedWidth, fittedHeight };
 }
 
 inline BYTE OcbBilinearSample(
@@ -43,31 +48,36 @@ inline BYTE OcbBilinearSample(
 
 inline HRESULT OcbResizeNv12Cpu(
     const BYTE* source, DWORD sourceWidth, DWORD sourceHeight, DWORD sourceYStride, DWORD sourceUvStride,
-    DWORD outputWidth, DWORD outputHeight, std::vector<BYTE>& output)
+    DWORD outputWidth, DWORD outputHeight, std::vector<BYTE>& output,
+    OcbFramingSettings settings = {}, bool fullRange = false)
 {
     if (!source || sourceWidth == 0 || sourceHeight == 0 || outputWidth == 0 || outputHeight == 0 ||
         (((sourceWidth | sourceHeight | outputWidth | outputHeight) & 1u) != 0) ||
         sourceYStride < sourceWidth || sourceUvStride < sourceWidth) return E_INVALIDARG;
     output.assign(static_cast<size_t>(outputWidth) * outputHeight * 3 / 2, 128);
-    std::fill(output.begin(), output.begin() + static_cast<size_t>(outputWidth) * outputHeight, static_cast<BYTE>(16));
-    const OcbFitRect fit = OcbComputeLetterbox(sourceWidth, sourceHeight, outputWidth, outputHeight);
+    std::fill(output.begin(), output.begin() + static_cast<size_t>(outputWidth) * outputHeight, static_cast<BYTE>(fullRange ? 0 : 16));
+    const OcbFraming framing = OcbComputeFraming(sourceWidth, sourceHeight, outputWidth, outputHeight, settings);
+    const auto& fit = framing.destination;
+    const auto& crop = framing.source;
+    const BYTE* sourceY = source + static_cast<size_t>(crop.top) * sourceYStride + crop.left;
     for (DWORD y = 0; y < fit.height; ++y) {
-        const float sy = (y + 0.5f) * sourceHeight / fit.height - 0.5f;
+        const float sy = (y + 0.5f) * crop.height / fit.height - 0.5f;
         BYTE* destination = output.data() + static_cast<size_t>(fit.top + y) * outputWidth + fit.left;
         for (DWORD x = 0; x < fit.width; ++x) {
-            const float sx = (x + 0.5f) * sourceWidth / fit.width - 0.5f;
-            destination[x] = OcbBilinearSample(source, sourceYStride, sourceWidth, sourceHeight, sx, sy);
+            const float sx = (x + 0.5f) * crop.width / fit.width - 0.5f;
+            destination[x] = OcbBilinearSample(sourceY, sourceYStride, crop.width, crop.height, sx, sy);
         }
     }
-    const BYTE* sourceUv = source + static_cast<size_t>(sourceYStride) * sourceHeight;
+    const BYTE* sourceUv = source + static_cast<size_t>(sourceYStride) * sourceHeight +
+        static_cast<size_t>(crop.top / 2) * sourceUvStride + crop.left;
     BYTE* outputUv = output.data() + static_cast<size_t>(outputWidth) * outputHeight;
     for (DWORD y = 0; y < fit.height / 2; ++y) {
-        const float sy = (y + 0.5f) * (sourceHeight / 2) / (fit.height / 2) - 0.5f;
+        const float sy = (y + 0.5f) * (crop.height / 2) / (fit.height / 2) - 0.5f;
         BYTE* destination = outputUv + static_cast<size_t>(fit.top / 2 + y) * outputWidth + fit.left;
         for (DWORD x = 0; x < fit.width / 2; ++x) {
-            const float sx = (x + 0.5f) * (sourceWidth / 2) / (fit.width / 2) - 0.5f;
-            destination[x * 2] = OcbBilinearSample(sourceUv, sourceUvStride, sourceWidth / 2, sourceHeight / 2, sx, sy, 2, 0);
-            destination[x * 2 + 1] = OcbBilinearSample(sourceUv, sourceUvStride, sourceWidth / 2, sourceHeight / 2, sx, sy, 2, 1);
+            const float sx = (x + 0.5f) * (crop.width / 2) / (fit.width / 2) - 0.5f;
+            destination[x * 2] = OcbBilinearSample(sourceUv, sourceUvStride, crop.width / 2, crop.height / 2, sx, sy, 2, 0);
+            destination[x * 2 + 1] = OcbBilinearSample(sourceUv, sourceUvStride, crop.width / 2, crop.height / 2, sx, sy, 2, 1);
         }
     }
     return S_OK;

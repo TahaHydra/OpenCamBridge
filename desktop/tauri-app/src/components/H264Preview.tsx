@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { fetch as nativeFetch } from '@tauri-apps/plugin-http';
-import { isTauriRuntime } from '../services/desktopBridge';
+import { phoneStreamFetch } from '../services/api';
 import { EMPTY_PREVIEW_DIAGNOSTICS, publishPreviewDiagnostics, PREVIEW_FALLBACK_EVENT } from '../services/previewDiagnostics';
 import Nv12RingPreview from './Nv12RingPreview';
 
@@ -50,10 +49,11 @@ export default function H264Preview({ baseUrl, token, fitMode }: { baseUrl: stri
       dispose();
       const reason = error instanceof Error ? error.message : String(error);
       publishPreviewDiagnostics({ ...EMPTY_PREVIEW_DIAGNOSTICS, renderer: 'webcodecs', lastError: reason });
-      if (unsupported || ++failures.current >= 3) setFallback(`Native compatibility preview: ${reason}`);
+      if (unsupported) setFallback(`Native compatibility preview: ${reason}`);
       else {
+        failures.current++;
         setMessage('Reconnecting H.264 preview…');
-        retry = window.setTimeout(() => setSession(value => value + 1), 750);
+        retry = window.setTimeout(() => setSession(value => value + 1), Math.min(2000, 250 * failures.current));
       }
     };
     const waitForWorker = () => new Promise<void>((resolve, reject) => {
@@ -87,11 +87,7 @@ export default function H264Preview({ baseUrl, token, fitMode }: { baseUrl: stri
       await ready;
       if (disposed) return;
       const url = new URL('/stream.ocb2', baseUrl);
-      const request = {
-        signal: abort.signal, headers: new Headers(token ? { 'X-OpenCamBridge-Token': token } : {}),
-        maxRedirections: 0, connectTimeout: 5000,
-      };
-      const response = await (isTauriRuntime() ? nativeFetch : fetch)(url.toString(), request);
+      const response = await phoneStreamFetch(url.toString(), token, { signal: abort.signal });
       if (disposed) { await response.body?.cancel(); return; }
       if (!response.ok || !response.body) { await response.body?.cancel(); throw new Error(`Preview HTTP ${response.status}`); }
       reader = response.body.getReader();

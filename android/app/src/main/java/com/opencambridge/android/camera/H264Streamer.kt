@@ -104,6 +104,7 @@ class H264Streamer(
     private var partialKeyframe = false
     private var partialPresentationUs = 0L
     private var zoomJob: Job? = null
+    private val zoomSettlement = ZoomSettlement()
     private var heartbeatJob: Job? = null
 
     private var captureWindowStartNs = 0L
@@ -209,6 +210,8 @@ class H264Streamer(
 
     private suspend fun stopInternal(sendEnd: Boolean) {
         val wasRunning = running.getAndSet(false)
+        zoomSettlement.cancel()
+        zoomJob?.cancel(); zoomJob = null
         if (sendEnd && wasRunning) broadcast(
             Ocb2.record(Ocb2.TYPE_END_OF_STREAM, Ocb2.FLAG_END_OF_STREAM, currentSequence(), SystemClock.elapsedRealtimeNanos(), 0)
         )
@@ -223,7 +226,6 @@ class H264Streamer(
         partialKeyframe = false
         partialPresentationUs = 0L
         heartbeatJob?.cancel(); heartbeatJob = null
-        zoomJob?.cancel(); zoomJob = null
         val oldCameraThread = cameraThread
         val oldCodecThread = codecThread
         oldCameraThread?.quitSafely(); cameraThread = null; cameraHandler = null
@@ -903,6 +905,12 @@ class H264Streamer(
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
             if (session !== this@H264Streamer.session) return
+            synchronized(zoomSettlement) {
+                if (zoomSettlement.onCaptured(request.tag as? Long)) {
+                    requestKeyFrame()
+                    AppLogger.i("H264", "Zoom settled; requested one fresh IDR")
+                }
+            }
             val timestamp = result.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP) ?: SystemClock.elapsedRealtimeNanos()
             if (captureWindowStartNs == 0L) captureWindowStartNs = timestamp
             captureWindowFrames++
@@ -934,7 +942,7 @@ class H264Streamer(
         builder.set(CaptureRequest.FLASH_MODE, if (StreamState.torchRequested.get()) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
     }
 
-    private fun refreshRequest() {
+    private fun refreshRequest(): Unit = synchronized(zoomSettlement) {
         val builder = requestBuilder ?: return
         val currentSession = session ?: return
         val chosen = selection ?: return
@@ -945,7 +953,17 @@ class H264Streamer(
     }
 
     fun setZoomRatio(ratio: Float) {
+        zoomJob?.cancel()
+        val movement = zoomSettlement.begin()
+        applyZoomRatio(ratio, movement, settled = true)
+    }
+
+    private fun applyZoomRatio(ratio: Float, movement: Long, settled: Boolean): Unit = synchronized(zoomSettlement) {
+        if (!zoomSettlement.isCurrent(movement)) return
         StreamState.zoomRatio.set(ratio)
+        // Only the final request is tagged. Camera2 completion confirms the
+        // final crop reached capture before the encoder is asked for an IDR.
+        requestBuilder?.setTag(if (settled) movement else null)
         refreshRequest()
     }
 
@@ -957,14 +975,15 @@ class H264Streamer(
         val target = minZoom + linear.coerceIn(0f, 1f) * (maxZoom - minZoom)
         StreamState.linearZoom.set(linear.coerceIn(0f, 1f))
         zoomJob?.cancel()
+        val movement = zoomSettlement.begin()
         zoomJob = scope.launch {
             var current = StreamState.zoomRatio.get()
             while (kotlin.math.abs(current - target) > 0.03f) {
                 current += if (current < target) 0.03f else -0.03f
-                setZoomRatio(current)
+                applyZoomRatio(current, movement, settled = false)
                 delay(30)
             }
-            setZoomRatio(target)
+            applyZoomRatio(target, movement, settled = true)
         }
     }
 

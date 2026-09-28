@@ -1,6 +1,7 @@
 package com.opencambridge.android.ui
 
 import android.os.SystemClock
+import android.view.Window
 import android.view.WindowManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -26,6 +27,7 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.view.WindowCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.delay
@@ -61,10 +63,10 @@ fun ScreenCurtainHost(
     }
     val idleDelay = if (mode == ScreenCurtainMode.Always) ALWAYS_DELAY_MS else AUTO_DELAY_MS
     var lastTouch by remember { mutableLongStateOf(SystemClock.uptimeMillis()) }
-    var curtained by remember { mutableStateOf(false) }
+    var curtained by remember(streaming, mode) { mutableStateOf(false) }
 
     // Inactivity: every touch restarts the countdown.
-    LaunchedEffect(eligible, lastTouch, curtained) {
+    LaunchedEffect(eligible, idleDelay, lastTouch, curtained) {
         if (eligible && !curtained) {
             delay(idleDelay)
             curtained = true
@@ -81,31 +83,17 @@ fun ScreenCurtainHost(
     val keepOn = streaming && (eligible || curtained)
     DisposableEffect(activity, keepOn) {
         val window = activity?.window
+        val alreadyKeptOn = window?.attributes?.flags?.and(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) != 0
         if (keepOn) window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        else window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+        onDispose {
+            if (keepOn && !alreadyKeptOn) window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
     }
 
     DisposableEffect(activity, curtained) {
         val window = activity?.window
-        if (curtained && window != null) {
-            window.attributes = window.attributes.apply {
-                screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_OFF
-            }
-            WindowCompat.getInsetsController(window, window.decorView).apply {
-                systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                hide(WindowInsetsCompat.Type.systemBars())
-            }
-        }
-        onDispose {
-            if (curtained && window != null) {
-                window.attributes = window.attributes.apply {
-                    screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
-                }
-                WindowCompat.getInsetsController(window, window.decorView)
-                    .show(WindowInsetsCompat.Type.systemBars())
-            }
-        }
+        val lease = if (curtained && window != null) CurtainWindowLease(AndroidCurtainWindow(window)) else null
+        onDispose { lease?.restore() }
     }
 
     Box(
@@ -129,6 +117,39 @@ fun ScreenCurtainHost(
                 lastTouch = SystemClock.uptimeMillis()
             })
         }
+    }
+}
+
+private class AndroidCurtainWindow(private val window: Window) : CurtainWindow {
+    private val bars = WindowInsetsCompat.Type.statusBars() or WindowInsetsCompat.Type.navigationBars()
+    private val controller = WindowCompat.getInsetsController(window, window.decorView)
+    override var state: CurtainWindowState
+        get() {
+            val insets = ViewCompat.getRootWindowInsets(window.decorView)
+            val visible = insets?.let {
+                (if (it.isVisible(WindowInsetsCompat.Type.statusBars())) WindowInsetsCompat.Type.statusBars() else 0) or
+                    (if (it.isVisible(WindowInsetsCompat.Type.navigationBars())) WindowInsetsCompat.Type.navigationBars() else 0)
+            }
+            return CurtainWindowState(window.attributes.screenBrightness, visible, controller.systemBarsBehavior)
+        }
+        set(value) {
+            window.attributes = window.attributes.apply { screenBrightness = value.brightness }
+            value.visibleBars?.let { visible ->
+                controller.systemBarsBehavior = value.barsBehavior
+                val hidden = bars and visible.inv()
+                if (hidden != 0) controller.hide(hidden)
+                if (visible != 0) controller.show(visible)
+            }
+        }
+
+    override fun dim() {
+        val previous = state
+        state = previous.copy(
+            brightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_OFF,
+            // If insets are unavailable, don't mutate visibility we cannot restore.
+            visibleBars = previous.visibleBars?.let { 0 },
+            barsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE,
+        )
     }
 }
 
@@ -165,4 +186,3 @@ fun ScreenCurtainMode.describe(): String = when (this) {
     ScreenCurtainMode.Always -> "Dims to black 5 seconds after your last touch whenever the camera is on."
     ScreenCurtainMode.Never -> "The screen follows your normal timeout. Use Dim on the camera screen to black it out."
 }
-

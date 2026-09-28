@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager};
 
 use crate::sync_state::RecoverMutex;
 use crate::winproc::CREATE_NO_WINDOW;
@@ -231,6 +231,7 @@ pub struct VirtualCamManager {
     // RecoverMutex changes poison behavior only and preserves this order.
     child: Mutex<Option<Child>>,
     host_child: Mutex<Option<Child>>,
+    host_operation: AtomicU64,
     metrics: Mutex<Option<VirtualCamMetrics>>,
     producer_path: Mutex<Option<String>>,
     last_error: Mutex<Option<String>>,
@@ -480,6 +481,7 @@ impl VirtualCamManager {
         Self {
             child: Mutex::new(None),
             host_child: Mutex::new(None),
+            host_operation: AtomicU64::new(0),
             metrics: Mutex::new(None),
             producer_path: Mutex::new(None),
             last_error: Mutex::new(None),
@@ -518,23 +520,30 @@ pub fn check_virtual_camera_backend() -> bool {
 }
 
 #[tauri::command]
-pub fn register_virtual_camera_backend() -> Result<String, String> {
-    run_installer_command("--register")
+pub async fn register_virtual_camera_backend() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| run_installer_command("--register")).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn unregister_virtual_camera_backend() -> Result<String, String> {
-    run_installer_command("--unregister")
+pub async fn unregister_virtual_camera_backend() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| run_installer_command("--unregister")).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn get_virtual_camera_backend_details() -> Result<String, String> {
-    run_installer_command("--status")
+pub async fn get_virtual_camera_backend_details() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| run_installer_command("--status")).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<(), String> {
+pub async fn start_virtual_camera_host(app: AppHandle) -> Result<(), String> {
+    let operation = app.state::<VirtualCamManager>().host_operation.fetch_add(1, Ordering::AcqRel) + 1;
+    tauri::async_runtime::spawn_blocking(move || start_host_inner(&app.state::<VirtualCamManager>(), operation))
+        .await.map_err(|e| e.to_string())?
+}
+
+fn start_host_inner(state: &VirtualCamManager, operation: u64) -> Result<(), String> {
     let mut host_guard = state.host_child.lock_recover();
+    if state.host_operation.load(Ordering::Acquire) != operation { return Err("Host start cancelled".into()); }
 
     // A stale handle to a dead host must not block a restart (this made the
     // Start button a silent no-op after the host crashed or failed to start).
@@ -607,6 +616,10 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     let mut activation_error = None;
     let activated = loop {
+        if state.host_operation.load(Ordering::Acquire) != operation {
+            activation_error = Some("Host start cancelled".into());
+            break false;
+        }
         if let Ok(Some(status)) = child.try_wait() {
             activation_error = Some(format!(
                 "Virtual-camera host exited before activation: {status}"
@@ -637,10 +650,12 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
     if !activated {
         let _ = child.kill();
         let _ = child.wait();
-        state.host_activated.store(false, Ordering::Release);
         let message =
             activation_error.unwrap_or_else(|| "Virtual-camera host activation failed".into());
-        *state.last_error.lock_recover() = Some(message.clone());
+        if state.host_operation.load(Ordering::Acquire) == operation {
+            state.host_activated.store(false, Ordering::Release);
+            *state.last_error.lock_recover() = Some(message.clone());
+        }
         return Err(message);
     }
 
@@ -654,9 +669,17 @@ pub fn start_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<
 }
 
 #[tauri::command]
-pub fn stop_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<(), String> {
-    state.host_activated.store(false, Ordering::Release);
+pub async fn stop_virtual_camera_host(app: AppHandle) -> Result<(), String> {
+    let operation = app.state::<VirtualCamManager>().host_operation.fetch_add(1, Ordering::AcqRel) + 1;
+    tauri::async_runtime::spawn_blocking(move || stop_host_inner(&app.state::<VirtualCamManager>(), operation))
+        .await.map_err(|e| e.to_string())?
+}
+
+fn stop_host_inner(state: &VirtualCamManager, operation: u64) -> Result<(), String> {
     let mut host_guard = state.host_child.lock_recover();
+    // A delayed Stop must never remove a child belonging to a newer Start.
+    if state.host_operation.load(Ordering::Acquire) != operation { return Ok(()); }
+    state.host_activated.store(false, Ordering::Release);
     if let Some(mut child) = host_guard.take() {
         let _ = child.kill();
         let _ = child.wait();
@@ -665,9 +688,8 @@ pub fn stop_virtual_camera_host(state: State<'_, VirtualCamManager>) -> Result<(
 }
 
 #[tauri::command]
-pub fn start_virtual_camera_feeder(
+pub async fn start_virtual_camera_feeder(
     app: AppHandle,
-    state: State<'_, VirtualCamManager>,
     url: String,
     width: u32,
     height: u32,
@@ -678,6 +700,20 @@ pub fn start_virtual_camera_feeder(
     profile: Option<String>,
     token: Option<String>,
     source: Option<String>,
+) -> Result<(), String> {
+    let operation = app.state::<VirtualCamManager>().producer_instance.fetch_add(1, Ordering::AcqRel) + 1;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<VirtualCamManager>();
+        start_feeder_inner(app.clone(), &state, operation, url, width, height, fps,
+            source_width, source_height, source_fps, profile, token, source)
+    }).await.map_err(|e| e.to_string())?
+}
+
+fn start_feeder_inner(
+    app: AppHandle, state: &VirtualCamManager, operation: u64,
+    url: String, width: u32, height: u32, fps: f64,
+    source_width: u32, source_height: u32, source_fps: f64,
+    profile: Option<String>, token: Option<String>, source: Option<String>,
 ) -> Result<(), String> {
     let source = match source.as_deref() {
         None | Some("mjpeg") => "mjpeg",
@@ -694,6 +730,7 @@ pub fn start_virtual_camera_feeder(
         source, source_width, source_height, source_fps, width, height
     );
     let mut child_guard = state.child.lock_recover();
+    if state.producer_instance.load(Ordering::Acquire) != operation { return Err("Producer start cancelled".into()); }
     if let Some(mut child) = child_guard.take() {
         println!(
             ">>> [Tauri] Found existing producer (PID {}). Stopping it.",
@@ -701,10 +738,10 @@ pub fn start_virtual_camera_feeder(
         );
         let _ = child.kill();
         let _ = child.wait();
-        *state.last_error.lock_recover() = None;
-        *state.metrics.lock_recover() = None;
-        *state.last_metrics_time.lock_recover() = None;
     }
+    *state.last_error.lock_recover() = None;
+    *state.metrics.lock_recover() = None;
+    *state.last_metrics_time.lock_recover() = None;
     *state.producer_state.lock_recover() = "STARTING".to_string();
 
     let repo_root = repository_root();
@@ -785,7 +822,6 @@ pub fn start_virtual_camera_feeder(
         ">>> [Tauri] Spawned rust-frame-producer with PID: {}",
         child.id()
     );
-    state.producer_instance.fetch_add(1, Ordering::AcqRel);
 
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -796,6 +832,11 @@ pub fn start_virtual_camera_feeder(
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             if let Ok(line) = line {
+                let state_manager = app_clone.state::<VirtualCamManager>();
+                // Hold the ownership lock through publication. Checking the
+                // atomic alone allows an old callback to overwrite new metrics.
+                let child_guard = state_manager.child.lock_recover();
+                if state_manager.producer_instance.load(Ordering::Acquire) != operation || child_guard.is_none() { break; }
                 let value = serde_json::from_str::<serde_json::Value>(&line).ok();
                 match value
                     .as_ref()
@@ -872,6 +913,8 @@ pub fn start_virtual_camera_feeder(
     // and committed at least three frames to the ring.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
+        let mut guard = state.child.lock_recover();
+        if state.producer_instance.load(Ordering::Acquire) != operation { return Err("Producer start cancelled".into()); }
         if let Some(metrics) = state.metrics.lock_recover().as_ref() {
             if metrics.producer_state == "WRITING_RING" && metrics.ring_frames_committed >= 3 {
                 return Ok(());
@@ -879,21 +922,20 @@ pub fn start_virtual_camera_feeder(
         }
         let current_error = { state.last_error.lock_recover().clone() };
         if let Some(error) = current_error {
-            let _ = stop_virtual_camera_feeder(state);
+            drop(guard);
+            let _ = stop_feeder_inner(state, operation);
             return Err(error);
         }
-        {
-            let mut guard = state.child.lock_recover();
-            if let Some(child) = guard.as_mut() {
-                if let Ok(Some(status)) = child.try_wait() {
-                    *guard = None;
-                    return Err(format!("Producer exited before ring readiness: {status}"));
-                }
+        if let Some(child) = guard.as_mut() {
+            if let Ok(Some(status)) = child.try_wait() {
+                *guard = None;
+                return Err(format!("Producer exited before ring readiness: {status}"));
             }
         }
+        drop(guard);
         if std::time::Instant::now() >= deadline {
             let producer_state = state.producer_state.lock_recover().clone();
-            let _ = stop_virtual_camera_feeder(state);
+            let _ = stop_feeder_inner(state, operation);
             return Err(format!(
                 "Producer readiness timed out in state {producer_state}"
             ));
@@ -903,9 +945,15 @@ pub fn start_virtual_camera_feeder(
 }
 
 #[tauri::command]
-pub fn stop_virtual_camera_feeder(state: State<'_, VirtualCamManager>) -> Result<(), String> {
-    state.producer_instance.fetch_add(1, Ordering::AcqRel);
+pub async fn stop_virtual_camera_feeder(app: AppHandle) -> Result<(), String> {
+    let operation = app.state::<VirtualCamManager>().producer_instance.fetch_add(1, Ordering::AcqRel) + 1;
+    tauri::async_runtime::spawn_blocking(move || stop_feeder_inner(&app.state::<VirtualCamManager>(), operation))
+        .await.map_err(|e| e.to_string())?
+}
+
+fn stop_feeder_inner(state: &VirtualCamManager, operation: u64) -> Result<(), String> {
     let mut child_guard = state.child.lock_recover();
+    if state.producer_instance.load(Ordering::Acquire) != operation { return Ok(()); }
     if let Some(mut child) = child_guard.take() {
         let _ = child.kill();
         let _ = child.wait();
@@ -922,7 +970,12 @@ pub fn stop_virtual_camera_feeder(state: State<'_, VirtualCamManager>) -> Result
 }
 
 #[tauri::command]
-pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> VirtualCamState {
+pub async fn get_virtual_camera_status(app: AppHandle) -> Result<VirtualCamState, String> {
+    tauri::async_runtime::spawn_blocking(move || get_status_inner(&app.state::<VirtualCamManager>()))
+        .await.map_err(|e| e.to_string())
+}
+
+fn get_status_inner(state: &VirtualCamManager) -> VirtualCamState {
     let mut child_guard = state.child.lock_recover();
 
     let mut process_running = false;
@@ -1062,10 +1115,57 @@ pub fn get_virtual_camera_status(state: State<'_, VirtualCamManager>) -> Virtual
 
 #[cfg(test)]
 mod tests {
+    use super::{start_host_inner, stop_feeder_inner, stop_host_inner, VirtualCamManager};
+    use crate::sync_state::RecoverMutex;
+    use std::sync::atomic::Ordering;
     use super::{
         binary_identity_mismatches, classify_producer_exit, complete_pipeline_ready,
         ProducerExitKind,
     };
+
+    #[test]
+    fn producer_stop_execution_does_not_create_another_intent() {
+        let state = VirtualCamManager::new();
+        // Generation was already allocated before scheduling the blocking work.
+        state.producer_instance.store(7, Ordering::Release);
+        stop_feeder_inner(&state, 7).unwrap();
+        assert_eq!(state.producer_instance.load(Ordering::Acquire), 7);
+    }
+
+    #[test]
+    fn stale_producer_stop_or_failure_cleanup_preserves_newer_state() {
+        let state = VirtualCamManager::new();
+        state.producer_instance.store(8, Ordering::Release);
+        *state.producer_state.lock_recover() = "WRITING_RING".into();
+        *state.last_metrics_time.lock_recover() = Some(123);
+        stop_feeder_inner(&state, 7).unwrap();
+        assert_eq!(state.producer_state.lock_recover().as_str(), "WRITING_RING");
+        assert_eq!(*state.last_metrics_time.lock_recover(), Some(123));
+        assert_eq!(state.producer_instance.load(Ordering::Acquire), 8);
+        stop_feeder_inner(&state, 8).unwrap();
+        assert_eq!(state.producer_state.lock_recover().as_str(), "STOPPED");
+        assert_eq!(*state.last_metrics_time.lock_recover(), None);
+    }
+
+    #[test]
+    fn stale_host_stop_preserves_newer_activation() {
+        let state = VirtualCamManager::new();
+        state.host_operation.store(8, Ordering::Release);
+        state.host_activated.store(true, Ordering::Release);
+        stop_host_inner(&state, 7).unwrap();
+        assert!(state.host_activated.load(Ordering::Acquire));
+        stop_host_inner(&state, 8).unwrap();
+        assert!(!state.host_activated.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn superseded_host_start_does_not_attempt_activation() {
+        let state = VirtualCamManager::new();
+        state.host_operation.store(8, Ordering::Release);
+        assert_eq!(start_host_inner(&state, 7).unwrap_err(), "Host start cancelled");
+        assert!(state.host_child.lock_recover().is_none());
+        assert!(state.last_error.lock_recover().is_none());
+    }
 
     #[test]
     fn console_control_exit_is_benign_not_a_crash() {

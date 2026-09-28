@@ -3,6 +3,8 @@ import { Segmented } from '../primitives';
 import { automaticBitrateMbps, heightLabel } from '../../services/profilePolicy.js';
 import type { CameraController } from '../../state/useCameraController';
 import type { CameraSettings } from '../../state/types';
+import { manualBitrateWarning } from '../../services/bitrateWarning.js';
+import '../../styles/framing.css';
 
 /**
  * H.264 bitrate, as the phone models it: Automatic (the phone's recommended
@@ -39,6 +41,7 @@ export function BitrateModeSwitch({ controller, disabled }: { controller: Camera
 
 export function ManualBitrateSlider({ controller, disabled }: { controller: CameraController; disabled?: boolean }) {
   return (
+    <>
     <CommitSlider
       label="Manual H.264 bitrate"
       value={Math.round(controller.settings.h264Bitrate / 1_000_000)}
@@ -48,5 +51,14 @@ export function ManualBitrateSlider({ controller, disabled }: { controller: Came
       format={value => `${value} Mb/s`}
       onCommit={value => void controller.updateManualBitrate(value * 1_000_000)}
     />
+    <ManualBitrateWarning controller={controller} />
+    </>
   );
+}
+
+export function ManualBitrateWarning({ controller }: { controller: CameraController }) {
+  const warning = manualBitrateWarning(controller.settings, controller.androidMetrics);
+  return warning ? <p className="bitrate-warning" role="status">
+    Low bitrate may soften detail and add compression artifacts. Auto recommends {warning.recommendation} Mb/s for {warning.width}×{warning.height} at {warning.fps} FPS.
+  </p> : null;
 }

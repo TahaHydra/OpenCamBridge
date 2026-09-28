@@ -183,29 +183,8 @@ HRESULT SharedMemoryClient::EnsureGpuResizeResources(
     RETURN_IF_FAILED(m_videoDevice->CreateVideoProcessorOutputView(
         m_outputTexture, m_videoEnumerator, &outputDesc, &m_outputView));
 
-    RECT sourceRect = { 0, 0, static_cast<LONG>(sourceWidth), static_cast<LONG>(sourceHeight) };
-    // Preserve source aspect ratio in the exact consumer canvas. Portrait or
-    // rotated frames are GPU-letterboxed once instead of being stretched or
-    // passed through the removed CPU nearest-neighbour path.
-    DWORD fittedWidth = outputWidth;
-    DWORD fittedHeight = outputHeight;
-    if (static_cast<uint64_t>(sourceWidth) * outputHeight > static_cast<uint64_t>(outputWidth) * sourceHeight) {
-        fittedHeight = static_cast<DWORD>((static_cast<uint64_t>(outputWidth) * sourceHeight) / sourceWidth);
-    } else {
-        fittedWidth = static_cast<DWORD>((static_cast<uint64_t>(outputHeight) * sourceWidth) / sourceHeight);
-    }
-    fittedWidth = std::max<DWORD>(2, fittedWidth & ~1u);
-    fittedHeight = std::max<DWORD>(2, fittedHeight & ~1u);
-    const LONG left = static_cast<LONG>((outputWidth - fittedWidth) / 2);
-    const LONG top = static_cast<LONG>((outputHeight - fittedHeight) / 2);
-    RECT outputRect = { left, top, left + static_cast<LONG>(fittedWidth), top + static_cast<LONG>(fittedHeight) };
     RECT outputCanvas = { 0, 0, static_cast<LONG>(outputWidth), static_cast<LONG>(outputHeight) };
-    D3D11_VIDEO_COLOR background = {};
-    background.YCbCr = { 16.0f / 255.0f, 0.5f, 0.5f, 1.0f };
-    m_videoContext->VideoProcessorSetOutputBackgroundColor(m_videoProcessor, TRUE, &background);
     m_videoContext->VideoProcessorSetStreamFrameFormat(m_videoProcessor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-    m_videoContext->VideoProcessorSetStreamSourceRect(m_videoProcessor, 0, TRUE, &sourceRect);
-    m_videoContext->VideoProcessorSetStreamDestRect(m_videoProcessor, 0, TRUE, &outputRect);
     m_videoContext->VideoProcessorSetOutputTargetRect(m_videoProcessor, TRUE, &outputCanvas);
 
     m_resizeSourceWidth = sourceWidth;
@@ -223,10 +202,29 @@ HRESULT SharedMemoryClient::ResizeNv12Gpu(const BYTE* source, DWORD sourceWidth,
     DWORD sourceYStride, DWORD sourceUvStride, DWORD outputWidth, DWORD outputHeight,
     DWORD inputFpsNumerator, DWORD inputFpsDenominator,
     DWORD outputFpsNumerator, DWORD outputFpsDenominator,
-    std::vector<BYTE>& output)
+    std::vector<BYTE>& output, const OcbFramingSettings& settings, uint32_t colorDescriptor)
 {
     RETURN_IF_FAILED(EnsureGpuResizeResources(sourceWidth, sourceHeight, outputWidth, outputHeight,
         inputFpsNumerator, inputFpsDenominator, outputFpsNumerator, outputFpsDenominator));
+    const OcbFraming framing = OcbComputeFraming(sourceWidth, sourceHeight, outputWidth, outputHeight, settings);
+    const auto& crop = framing.source;
+    const auto& fit = framing.destination;
+    RECT sourceRect = { static_cast<LONG>(crop.left), static_cast<LONG>(crop.top),
+        static_cast<LONG>(crop.left + crop.width), static_cast<LONG>(crop.top + crop.height) };
+    RECT outputRect = { static_cast<LONG>(fit.left), static_cast<LONG>(fit.top),
+        static_cast<LONG>(fit.left + fit.width), static_cast<LONG>(fit.top + fit.height) };
+    // Rectangles change live without rebuilding the device or restarting capture.
+    m_videoContext->VideoProcessorSetStreamSourceRect(m_videoProcessor, 0, TRUE, &sourceRect);
+    m_videoContext->VideoProcessorSetStreamDestRect(m_videoProcessor, 0, TRUE, &outputRect);
+    const bool fullRange = ((colorDescriptor >> 8) & 0xff) == 2;
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE colorSpace = {};
+    colorSpace.YCbCr_Matrix = (colorDescriptor & 0xff) == 1 ? 0 : 1;
+    colorSpace.Nominal_Range = fullRange ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255 : D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+    m_videoContext->VideoProcessorSetStreamColorSpace(m_videoProcessor, 0, &colorSpace);
+    m_videoContext->VideoProcessorSetOutputColorSpace(m_videoProcessor, &colorSpace);
+    D3D11_VIDEO_COLOR background = {};
+    background.YCbCr = { fullRange ? 0.0f : 16.0f / 255.0f, 128.0f / 255.0f, 128.0f / 255.0f, 1.0f };
+    m_videoContext->VideoProcessorSetOutputBackgroundColor(m_videoProcessor, TRUE, &background);
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     RETURN_IF_FAILED(m_d3dContext->Map(m_inputUpload, 0, D3D11_MAP_WRITE, 0, &mapped));
     for (DWORD row = 0; row < sourceHeight; ++row) {
@@ -261,6 +259,10 @@ HRESULT SharedMemoryClient::ResizeNv12Gpu(const BYTE* source, DWORD sourceWidth,
             mappedOutputUv + static_cast<size_t>(row) * mapped.RowPitch, outputWidth);
     }
     m_d3dContext->Unmap(m_outputReadback, 0);
+    // NV12 padding is exact even on drivers that convert the background using
+    // a different nominal range. Only padding is touched; image pixels retain
+    // GPU scaling. The existing GPU readback already owns this compact buffer.
+    OcbBlackenNv12Padding(output, outputWidth, outputHeight, fit, fullRange);
     return S_OK;
 }
 
@@ -829,7 +831,9 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
         DWORD sourceUvStride = local.uvStride;
         uint64_t sourceYBytes = expectedY;
         bool sourceCompact = false;
-        if (local.width != width || local.height != height) {
+        const OcbFramingSettings framingSettings = m_framingReader.Read();
+        const uint32_t colorDescriptor = local.reservedTail != 0 ? local.reservedTail : 0x01020102;
+        if (local.width != width || local.height != height || framingSettings.mode == OcbFramingMode::Custom) {
             const DWORD inputFpsNumerator = static_cast<DWORD>((std::max<LONG>)(1,
                 InterlockedCompareExchange(&ring->producerFpsNum, 0, 0)));
             const DWORD inputFpsDenominator = static_cast<DWORD>((std::max<LONG>)(1,
@@ -842,7 +846,7 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
             auto tryGpu = [&] {
                 HRESULT hr = ResizeNv12Gpu(source, local.width, local.height, local.yStride, local.uvStride,
                     width, height, inputFpsNumerator, inputFpsDenominator,
-                    outputFpsNumerator, outputFpsDenominator, m_nv12Scratch);
+                    outputFpsNumerator, outputFpsDenominator, m_nv12Scratch, framingSettings, colorDescriptor);
                 if (FAILED(hr)) InterlockedIncrement(&ring->resizeFailures);
                 return hr;
             };
@@ -850,7 +854,8 @@ HRESULT SharedMemoryClient::CopyStableSlot(BYTE* pBuf, BYTE* bufferStart, DWORD 
                 tryGpu,
                 [&] { ResetGpuResizeResources(); },
                 [&] { return OcbResizeNv12Cpu(source, local.width, local.height, local.yStride,
-                    local.uvStride, width, height, m_nv12Scratch); },
+                    local.uvStride, width, height, m_nv12Scratch, framingSettings,
+                    ((colorDescriptor >> 8) & 0xff) == 2); },
                 IsD3dDeviceLoss,
                 backend);
             RETURN_IF_FAILED(resizeResult);

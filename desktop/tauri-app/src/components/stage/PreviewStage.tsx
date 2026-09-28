@@ -1,18 +1,22 @@
-import type { ReactNode } from 'react';
+import { useRef, type ReactNode } from 'react';
 import { AlertTriangle, CameraOff, MonitorOff, RefreshCw, Smartphone, X } from 'lucide-react';
 import Preview from '../Preview';
 import { Button, IconButton, Spinner } from '../primitives';
 import type { CameraController } from '../../state/useCameraController';
+import CropOverlay from './CropOverlay';
+import { useOutputFraming } from '../../state/useOutputFraming';
+import { setPreferences } from '../../state/preferences';
+import { centeredCrop } from '../../services/outputFraming.js';
 
 /**
  * The container the camera preview lives in.
  *
  * This component owns the product-level states around the picture — phone
  * unreachable, camera stopped, preview paused, a change being applied — and
- * the local-only presentation options (Fit/Fill, mirror preview). It does NOT
- * render video itself: `<Preview>` (and the H.264 renderer behind it) is the
- * isolated preview implementation, mounted unchanged in the viewport slot with
- * its original props. A replacement renderer only has to honour the same
+ * the local presentation options (Fit/Fill, mirror preview). The output editor
+ * overlays the full source and sends independent native framing settings. It
+ * does not render video itself: `<Preview>` owns the picture. A replacement
+ * renderer only has to honour the same
  * contract: fill `.viewer__viewport`, render the picture as `.preview-img`
  * (canvas/img/video) and respect `fitMode`.
  */
@@ -33,6 +37,14 @@ export default function PreviewStage({
   compact?: boolean;
 }) {
   const { phoneState, serverStatus, baseUrl, token, transport } = controller;
+  const viewport = useRef<HTMLDivElement>(null);
+  const source = controller.sourceDimensions;
+  const { framing, editing, error: framingError } = useOutputFraming(source, controller.producerRunning);
+  const showEditor = editing && !compact && previewEnabled && phoneState === 'streaming';
+  const ring = controller.vcamState?.metrics?.ring;
+  const outputAspect = ring && ring.negotiated_width > 0 && ring.negotiated_height > 0
+    ? ring.negotiated_width / ring.negotiated_height : 16 / 9;
+  const crop = framing.mode === 'fill' ? centeredCrop(source.width, source.height, outputAspect) : framing.crop;
 
   let content: ReactNode;
   if (!previewEnabled) {
@@ -50,10 +62,10 @@ export default function PreviewStage({
     content = (
       <StageMessage
         icon={<Smartphone size={28} />}
-        title="Phone not reachable"
+        title="Phone stopped or disconnected"
         text={transport === 'USB'
-          ? 'Open OpenCamBridge on the phone and tap Start. Check that the USB cable is connected — the desktop reconnects on its own.'
-          : 'Open OpenCamBridge on the phone and tap Start. Keep both devices on the same network — the desktop reconnects on its own.'}
+          ? 'Start again from the phone. The desktop reconnects automatically. Check that the USB cable is connected.'
+          : 'Start again from the phone. The desktop reconnects automatically. Keep both devices on the same network.'}
       />
     );
   } else if (phoneState === 'stopped') {
@@ -76,12 +88,17 @@ export default function PreviewStage({
       />
     );
   } else {
-    content = <Preview baseUrl={baseUrl} token={token} fitMode={fitMode} serverStatus={serverStatus} />;
+    content = <Preview baseUrl={baseUrl} token={token} fitMode={showEditor ? 'fit' : fitMode} serverStatus={serverStatus} />;
   }
 
   return (
     <div className={`viewer${compact ? ' viewer--compact' : ''}`}>
-      <div className={`viewer__viewport${mirrorPreview ? ' is-mirrored' : ''}`}>{content}</div>
+      <div ref={viewport} className={`viewer__viewport${mirrorPreview ? ' is-mirrored' : ''}`}>
+        {content}
+        {showEditor && <CropOverlay viewport={viewport} source={source} crop={crop} outputAspect={outputAspect} showAppTrim={framing.mode !== 'fit'} mirrored={mirrorPreview}
+          onChange={next => setPreferences({ outputFraming: { preset: 'custom', mode: 'custom', crop: next } })} />}
+      </div>
+      {!compact && framingError && <div className="framing-error" role="alert">{framingError}</div>}
 
       {!compact && controller.isLive && !controller.isSyncing && phoneState === 'streaming' && previewEnabled && (
         <div className="viewer__live" title="An app is using the virtual camera">
