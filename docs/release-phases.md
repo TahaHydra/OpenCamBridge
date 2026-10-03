@@ -27,10 +27,19 @@ deprecated Wi-Fi APIs and Gradle's JDK native-access notice.
 
 ## Phase 2 — dependency and release configuration review
 
-Not yet complete. Check current advisories and applicable fixes in small batches;
-verify each changed dependency before committing. npm production audit returned
-zero advisories during this pass; cargo-audit is not installed. A web search alone
-is not a complete Rust/Android dependency audit. Review signing/distribution state.
+### 2a — desktop JavaScript dependencies: verified
+
+The full npm audit found four affected build dependencies: baseline-browser-mapping,
+browserslist, nanoid and postcss. Updated their compatible lockfile versions and
+required transitives (no package.json major-version change). Full `npm audit` now
+reports zero advisories. All 84 frontend tests, ten OCB2 conformance cases, and
+the frontend production build pass with the updated lockfile.
+
+### 2b — native/Android dependencies and release configuration: pending
+
+Check current advisories and applicable fixes in small batches; verify each changed
+dependency before committing. cargo-audit is not installed. A web search alone is
+not a complete Rust/Android dependency audit. Review signing/distribution state.
 
 ## Phase 3 — remaining network/lifecycle/performance risks
 
