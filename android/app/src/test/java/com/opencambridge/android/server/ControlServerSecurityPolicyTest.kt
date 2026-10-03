@@ -1,10 +1,26 @@
 package com.opencambridge.android.server
 
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ControlServerSecurityPolicyTest {
+    @Test fun obsUsbNeverReflectsUntrustedQueryTokens() {
+        val snapshot = BoundAuthenticationSnapshot("usbOnly", "permanent-secret")
+        assertEquals("\"\"", snapshot.obsScriptToken("\";alert(1);//</script><script>"))
+    }
+
+    @Test fun obsLanEncodesRequestTokenWithoutLeakingLegacyCredential() {
+        val snapshot = BoundAuthenticationSnapshot("lanToken", "permanent-secret")
+        assertEquals("\"paired-token\"", snapshot.obsScriptToken("paired-token"))
+        assertEquals("\"\"", snapshot.obsScriptToken(null))
+        val hostile = "\";alert(1);//</script><script>\u2028"
+        val encoded = snapshot.obsScriptToken(hostile)
+        assertFalse(encoded.contains('<'))
+        assertFalse(encoded.contains('\u2028'))
+        assertEquals(hostile, kotlinx.serialization.json.Json.decodeFromString<String>(encoded))
+    }
     @Test fun lanRequiresBoundTokenExceptHealth() {
         val snapshot = BoundAuthenticationSnapshot("lanToken", "correct-token")
         assertTrue(snapshot.authorizes("/health", null))

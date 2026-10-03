@@ -2,6 +2,7 @@ package com.opencambridge.android.server
 
 import java.net.URI
 import java.security.MessageDigest
+import kotlinx.serialization.json.JsonPrimitive
 
 data class CorsEndpoint(val host: String, val schemes: List<String>)
 
@@ -39,6 +40,14 @@ object ControlServerSecurityPolicy {
 class BoundAuthenticationSnapshot(accessMode: String, accessToken: String?) {
     val requiresToken: Boolean = accessMode != "usbOnly"
     private val token = accessToken.orEmpty().toByteArray(Charsets.UTF_8)
+
+    /** Only reflect this request's credential, never the listener's legacy secret.
+     * JSON quoting alone does not prevent an HTML </script> termination. */
+    fun obsScriptToken(provided: String?): String =
+        JsonPrimitive(if (requiresToken) provided.orEmpty() else "").toString()
+            .replace("<", "\\u003c")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029")
 
     fun authorizes(path: String, provided: String?): Boolean =
         path == "/health" || !requiresToken ||

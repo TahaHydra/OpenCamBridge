@@ -2,6 +2,7 @@ mod adb;
 mod logger;
 mod nv12_preview;
 mod output_framing;
+mod pairing;
 mod sync_state;
 mod virtualcam;
 mod winproc;
@@ -16,7 +17,14 @@ pub fn run() {
         .manage(logger::SessionLog::new())
         .manage(nv12_preview::Nv12PreviewReader::new())
         .manage(output_framing::OutputFramingState::default())
+        .manage(pairing::PairingManager::default())
         .invoke_handler(tauri::generate_handler![
+            pairing::pairing_start,
+            pairing::pairing_status,
+            pairing::pairing_cancel,
+            pairing::pairing_list,
+            pairing::pairing_forget,
+            pairing::pairing_connect,
             adb::get_adb_status,
             adb::list_devices,
             adb::forward_port,

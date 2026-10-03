@@ -16,6 +16,7 @@ import { apiFetch } from '../../services/api';
 import { desktopInvoke as invoke } from '../../services/desktopBridge';
 import { getPreferences, setPreferences, usePreferences } from '../../state/preferences';
 import type { AdbDevice, ConnectionInfo, ConnectMode } from '../../state/types';
+import PairingPanel from './PairingPanel';
 
 export class UnauthorizedError extends Error {
   constructor() {
@@ -79,6 +80,7 @@ export default function ConnectScreen({
   const [error, setError] = useState('');
   const [helpOpen, setHelpOpen] = useState(false);
   const [portOpen, setPortOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const autoTried = useRef(false);
 
   const refreshDevices = useCallback(async (): Promise<AdbDevice[]> => {
@@ -192,12 +194,15 @@ export default function ConnectScreen({
           <span className="connect__device"><Laptop size={32} /></span>
         </div>
         <h1 className="connect__title">Connect your phone</h1>
-        <p className="connect__subtitle">Open OpenCamBridge on your Android phone and tap <b>Start</b>.</p>
+        <p className="connect__subtitle">{mode === 'usb'
+          ? <>Open OpenCamBridge on your Android phone and tap <b>Start</b>.</>
+          : <>Pair your Android phone, then tap <b>Start</b> on the phone to connect.</>}</p>
 
         <div className="connect__card">
           <Segmented
             label="Connection method"
             value={mode}
+            disabled={busy}
             options={[
               { value: 'usb', label: 'USB', icon: <Usb size={14} /> },
               { value: 'lan', label: 'Wi-Fi', icon: <Wifi size={14} /> },
@@ -270,19 +275,25 @@ export default function ConnectScreen({
             </>
           ) : (
             <>
+              <PairingPanel onConnect={onConnect} busy={busy} onBusyChange={setBusy} />
+              <button type="button" className="connect__disclosure" onClick={() => setAdvancedOpen(value => !value)} aria-expanded={advancedOpen} aria-controls="advanced-wifi">
+                {advancedOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />} Advanced: manual address and token
+              </button>
+              {advancedOpen && <div className="pairing" id="advanced-wifi">
               <p className="connect__lede">
                 On the phone open <b>Settings › Connection</b>, choose <b>Wi-Fi</b>, then copy the address and access token it shows.
               </p>
               <Field label="Phone address">
-                <TextInput label="Phone address" value={lanUrl} onChange={setLanUrl} placeholder="http://192.168.1.10:8080" mono />
+                <TextInput label="Phone address" value={lanUrl} onChange={setLanUrl} placeholder="http://192.168.1.10:8080" disabled={busy} mono />
               </Field>
               <Field label={<span className="connect__token-label"><ShieldCheck size={13} /> Access token</span>}>
-                <TextInput label="Access token" type="password" value={lanToken} onChange={setLanToken} placeholder="From the phone" onEnter={() => void lanConnect()} />
+                <TextInput label="Access token" type="password" value={lanToken} onChange={setLanToken} placeholder="From the phone" disabled={busy} onEnter={() => { if (!busy) void lanConnect(); }} />
               </Field>
               <Button variant="primary" size="lg" block loading={busy} disabled={!lanUrl.trim() || !lanToken.trim()} onClick={() => void lanConnect()}>
                 Connect over Wi-Fi
               </Button>
               <p className="connect__note">USB is faster and keeps video off your network. Use Wi-Fi when a cable isn't practical.</p>
+              </div>}
             </>
           )}
         </div>

@@ -62,6 +62,7 @@ fun ConnectionSettingsPage(viewModel: StreamViewModel, ui: PhoneUiViewModel, onB
     val pendingRestart = running && bound != null && (bound!!.accessMode != accessMode || bound!!.port != port)
 
     SettingsScaffold(title = "Connection", onBack = onBack) {
+        PairingGroup(running = running, port = if (running) bound?.port ?: port else port, wifi = wifi)
         if (pendingRestart) {
             Notice(
                 "Stop and start OpenCamBridge on this phone to switch to ${if (wifi) "Wi-Fi" else "USB only"} on port $port.",
@@ -74,7 +75,7 @@ fun ConnectionSettingsPage(viewModel: StreamViewModel, ui: PhoneUiViewModel, onB
         SettingsGroup(
             title = "How your computer connects",
             footer = if (wifi) {
-                "Reachable on your network. Every request needs the access token below, and security settings can only be changed on this phone."
+                "Reachable on your network. Pair a PC above or use the manual access token below. Security settings can only be changed on this phone."
             } else {
                 "Recommended. Only reachable through the USB cable (adb port forward), so nothing on your network can connect."
             }

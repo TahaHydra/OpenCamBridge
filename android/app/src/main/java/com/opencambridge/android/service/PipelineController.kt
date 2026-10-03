@@ -11,6 +11,9 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import com.opencambridge.android.pairing.PairedRequest
 
 enum class PipelineResultCode {
     OK,
@@ -97,6 +100,7 @@ data class PipelineResult(
 
 sealed class PipelineCommand(val label: String) {
     internal val completion = CompletableDeferred<PipelineResult>()
+    internal var authorizationJob: Job? = null
 
     class Start : PipelineCommand("START")
     class Stop : PipelineCommand("STOP")
@@ -136,7 +140,16 @@ class PipelineController(
                         pending.removeFirstOrNull()?.also { active = it }
                     } ?: break
                     try {
-                        command.completion.complete(handle(command))
+                        val authorization = command.authorizationJob
+                        val result = if (authorization == null) handle(command) else {
+                            authorization.ensureActive()
+                            coroutineScope {
+                                val execution = async { handle(command) }
+                                val revoked = authorization.invokeOnCompletion { execution.cancel() }
+                                try { execution.await() } finally { revoked.dispose() }
+                            }
+                        }
+                        command.completion.complete(result)
                     } catch (e: CancellationException) {
                         cancel(command, "Pipeline command cancelled")
                         currentCoroutineContext().ensureActive()
@@ -159,6 +172,7 @@ class PipelineController(
     }
 
     suspend fun submit(command: PipelineCommand): PipelineResult {
+        command.authorizationJob = currentCoroutineContext()[PairedRequest]?.job
         enqueue(command)
         return command.completion.await()
     }
@@ -173,7 +187,8 @@ class PipelineController(
             when (command) {
                 is PipelineCommand.ApplySettings -> {
                     val older = pending.filterIsInstance<PipelineCommand.ApplySettings>().filter {
-                        ApplyPatchCoalescingPolicy.canMerge(it.request, it.source, command.request, command.source)
+                        it.authorizationJob === command.authorizationJob &&
+                            ApplyPatchCoalescingPolicy.canMerge(it.request, it.source, command.request, command.source)
                     }
                     older.forEach {
                         pending.remove(it)

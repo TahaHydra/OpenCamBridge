@@ -43,6 +43,13 @@ import io.ktor.utils.io.writeFully
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
+import com.opencambridge.android.pairing.PairingStore
+import com.opencambridge.android.pairing.PairedRequest
+import com.opencambridge.android.pairing.PhoneDiscovery
+import com.opencambridge.android.pairing.PairingInput
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -67,6 +74,9 @@ class ControlServer(
 ) {
     private var engine: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
     private val cameraRepo = CameraRepository(context)
+    private val pairedStore by lazy { runCatching { PairingStore.get(context) }.getOrNull() }
+    private var phoneDiscovery: PhoneDiscovery? = null
+    private var boundPort: Int = 8080
     private val ocb2BrowserParserSource: String by lazy {
         context.assets.open("ocb2-parser.js").bufferedReader().use { it.readText() }
     }
@@ -95,6 +105,7 @@ class ControlServer(
         }
 
         val port = StreamState.port.get()
+        boundPort = port
         val accessMode = StreamState.accessMode.get()
         boundAuthentication = BoundAuthenticationSnapshot(accessMode, StreamState.accessToken.get())
         val host = if (boundAuthentication.requiresToken) "0.0.0.0" else "127.0.0.1"
@@ -128,7 +139,11 @@ class ControlServer(
                 intercept(io.ktor.server.application.ApplicationCallPipeline.Plugins) {
                     val path = call.request.path()
                     val token = call.request.queryParameters["token"] ?: call.request.headers["X-OpenCamBridge-Token"]
-                    if (!boundAuthentication.authorizes(path, token)) {
+                    val identify = path == "/api/pairing/identify" && boundAuthentication.requiresToken
+                    val legacy = boundAuthentication.authorizes(path, token)
+                    val requestJob = currentCoroutineContext()[Job]!!
+                    val paired = !legacy && !identify && pairedStore?.authorization?.authorize(token, requestJob) == true
+                    if (!legacy && !identify && !paired) {
                             AppLogger.w("Security", "Rejected unauthorized request to $path")
                             if (call.request.accept()?.contains("text/html") == true || path == "/") {
                                 call.respondText("Unauthorized. Missing or invalid token.", ContentType.Text.Html, HttpStatusCode.Unauthorized)
@@ -138,10 +153,19 @@ class ControlServer(
                             finish()
                             return@intercept
                         }
+                    if (paired) withContext(PairedRequest(requestJob)) { proceed() }
                 }
 
                 get("/")                           { serveIndex(call) }
                 get("/health")                     { call.respondText("OK") }
+                get("/api/pairing/identify") {
+                    val remote = call.request.origin.remoteAddress
+                    val proof = if (boundAuthentication.requiresToken && PairingInput.privateIpv4(remote)) {
+                        pairedStore?.let { store -> store.authorization.identify(store.phoneId, boundPort,
+                            call.request.queryParameters["credentialId"].orEmpty(), call.request.queryParameters["nonce"].orEmpty()) }
+                    } else null
+                    if (proof == null) call.respond(HttpStatusCode.NotFound) else call.respond(proof)
+                }
                 get("/api/device/info")            { serveDeviceInfo(call) }
                 get("/api/camera/list")            { serveCameraList(call) }
                 get("/api/camera/status")          { serveCameraStatus(call) }
@@ -182,11 +206,16 @@ class ControlServer(
                 get("/obs")                        { serveObs(call) }
             }
         }.start(wait = false)
+        if (boundAuthentication.requiresToken) {
+            phoneDiscovery = runCatching { pairedStore?.let { PhoneDiscovery(it, port) } }.getOrNull()
+        }
         return true
     }
 
     @Synchronized
     fun stop() {
+        phoneDiscovery?.close()
+        phoneDiscovery = null
         engine?.stop(gracePeriodMillis = 500, timeoutMillis = 1000)
         engine = null
     }
@@ -201,8 +230,10 @@ class ControlServer(
 
     private suspend fun serveObs(call: RoutingCall) {
         val fit = call.request.queryParameters["fit"].takeIf { it == "contain" || it == "cover" } ?: "cover"
-        val accessMode = StreamState.accessMode.get()
-        val token = StreamState.accessToken.get()
+        val tokenRequired = boundAuthentication.requiresToken
+        val tokenLiteral = boundAuthentication.obsScriptToken(
+            call.request.queryParameters["token"] ?: call.request.headers["X-OpenCamBridge-Token"]
+        )
 
         if (StreamState.activeStreamMode.get() == "h264") {
             call.respondText(ContentType.Text.Html) {
@@ -213,7 +244,7 @@ class ControlServer(
                 #error{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;background:#000;font:18px system-ui;text-align:center;padding:24px}
                 </style></head><body><canvas id="stream"></canvas><div id="error">Connecting H.264 preview…</div><script>
                 $ocb2BrowserParserSource
-                const token = "$token", tokenRequired = "$accessMode" === "lanToken";
+                const token = $tokenLiteral, tokenRequired = $tokenRequired;
                 const canvas = document.getElementById('stream'), errorBox = document.getElementById('error');
                 let info={effectiveRotation:0,mirror:false}, configBytes=new Uint8Array(0), decoder=null, lastTs=-1;
                 const fail = message => { errorBox.textContent=message; errorBox.style.display='flex'; };
@@ -257,12 +288,12 @@ class ControlServer(
             <body>
               <img id="stream" src="/stream.mjpeg?obs=1">
               <script>
-                const isTokenRequired = "$accessMode" === "lanToken";
-                const token = "$token";
+                const isTokenRequired = $tokenRequired;
+                const token = $tokenLiteral;
                 const img = document.getElementById('stream');
                 let url = '/stream.mjpeg?obs=1';
                 if (isTokenRequired && token) {
-                    url += '&token=' + token;
+                    url += '&token=' + encodeURIComponent(token);
                 }
                 img.src = url;
 
@@ -1197,6 +1228,7 @@ class ControlServer(
 
     private suspend fun serveStateEvents(call: RoutingCall) {
         call.respondTextWriter(contentType = ContentType.Text.EventStream) {
+            authorizeStream(call)
             var lastRevision = Long.MIN_VALUE
             var lastGeneration = Long.MIN_VALUE
             var lastLifecycle = ""
@@ -1454,6 +1486,7 @@ class ControlServer(
         call.respondBytesWriter(
             contentType = ContentType.parse("multipart/x-mixed-replace; boundary=$MJPEG_BOUNDARY")
         ) {
+            authorizeStream(call)
             streamMjpegFrames()
         }
     }
@@ -1521,6 +1554,7 @@ class ControlServer(
         call.respondBytesWriter(
             contentType = ContentType.parse("application/vnd.opencambridge.ocb2")
         ) {
+            authorizeStream(call)
             val channel = h264Streamer.subscribe()
             try {
                 for (frame in channel) {
@@ -1537,6 +1571,14 @@ class ControlServer(
             } finally {
                 h264Streamer.unsubscribe(channel)
             }
+        }
+    }
+
+    private suspend fun authorizeStream(call: RoutingCall) {
+        val token = call.request.queryParameters["token"] ?: call.request.headers["X-OpenCamBridge-Token"]
+        if (boundAuthentication.authorizes(call.request.path(), token)) return
+        if (pairedStore?.authorization?.authorize(token, currentCoroutineContext()[Job]!!) != true) {
+            throw CancellationException("Pairing revoked")
         }
     }
 
