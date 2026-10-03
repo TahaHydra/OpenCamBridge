@@ -51,7 +51,7 @@ android {
 }
 
 dependencies {
-    implementation("org.bouncycastle:bcprov-jdk18on:1.83")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.86")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     // AndroidX core
     implementation(libs.androidx.core.ktx)

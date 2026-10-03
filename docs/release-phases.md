@@ -35,7 +35,15 @@ required transitives (no package.json major-version change). Full `npm audit` no
 reports zero advisories. All 84 frontend tests, ten OCB2 conformance cases, and
 the frontend production build pass with the updated lockfile.
 
-### 2b — native/Android dependencies and release configuration: pending
+### 2b — Android pairing crypto update: verified
+
+Updated Bouncy Castle from 1.83 to the current stable 1.86 hardening release:
+https://www.bouncycastle.org/download/bouncy-castle-java/ . The complete Android
+unit suite (including the fixed SRP interoperability vector), debug APK and unsigned
+release APK builds pass. This is not a claim that every upstream advisory affects
+the limited SRP API used here, nor a full transitive Android audit.
+
+### 2c — remaining dependency and release configuration review: pending
 
 Check current advisories and applicable fixes in small batches; verify each changed
 dependency before committing. cargo-audit is not installed. A web search alone is
