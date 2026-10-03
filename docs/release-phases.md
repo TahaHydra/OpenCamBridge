@@ -43,11 +43,34 @@ unit suite (including the fixed SRP interoperability vector), debug APK and unsi
 release APK builds pass. This is not a claim that every upstream advisory affects
 the limited SRP API used here, nor a full transitive Android audit.
 
-### 2c — remaining dependency and release configuration review: pending
+### 2c — native dependency advisory fixes
 
-Check current advisories and applicable fixes in small batches; verify each changed
-dependency before committing. cargo-audit is not installed. A web search alone is
-not a complete Rust/Android dependency audit. Review signing/distribution state.
+Queried OSV for registry names/versions in Cargo.lock (no application secrets sent).
+Updated compatible dependencies: event-listener 5.4.2, h2 0.4.19, rustls 0.23.45,
+plist 1.10.1 / quick-xml 0.42.0, and required transitives. This removes
+RUSTSEC-2026-0221, -0258, -0285, -0194 and -0195 from the lockfile matches.
+All 33 native tests and the Windows release executable rebuild pass.
+
+The repeat query checked 539 registry packages. Remaining findings:
+
+- glib 0.18.5: RUSTSEC-2024-0429 / GHSA-wrw7-89jp-8q8g. Not in the current
+  Windows target dependency tree; a Linux release needs separate remediation.
+- proc-macro-error: RUSTSEC-2024-0370 (unmaintained); also absent from this Windows
+  target tree.
+- Five unic-* crates: RUSTSEC-2025-0081, -0075, -0080, -0100 and -0098
+  (unmaintained), inherited via Tauri/urlpattern. These warnings remain open;
+  they were not suppressed or misreported as fixed.
+
+Advisory detail source: `https://api.osv.dev/v1/vulns/<advisory-id>` (RustSec data).
+This is a dependency-version check, not exploitability analysis or a penetration test.
+
+### 2d — release blockers / remaining scope
+
+Release APK is unsigned; Windows installer packaging and signing were not done.
+The full Android transitive dependency audit is still outstanding. Existing
+HTTP transport remains trusted-LAN-only. Physical acceptance checks below have
+not been performed by the agent, per the user's direction. Do not call this a
+fully audited or publish-ready release until these gates are resolved.
 
 ## Phase 3 — remaining network/lifecycle/performance risks
 
