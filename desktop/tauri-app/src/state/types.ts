@@ -164,6 +164,8 @@ export interface H264ModePaths {
     supported: boolean;
     reason?: string;
     cameraFps?: number;
+    verification?: 'advertised' | 'unverified' | 'verified' | 'rejected' | 'inconclusive';
+    requiresVerification?: boolean;
   }[];
 }
 

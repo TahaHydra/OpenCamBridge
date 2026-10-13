@@ -54,8 +54,9 @@ inline OcbFraming OcbComputeFraming(DWORD sw, DWORD sh, DWORD ow, DWORD oh, OcbF
         const DWORD bottom = (std::min)(sh, static_cast<DWORD>(std::ceil((s.y + s.height) * sh / 2)) * 2);
         source.width = (std::max<DWORD>)(2, right - source.left);
         source.height = (std::max<DWORD>)(2, bottom - source.top);
+        return { source, OcbComputeLetterbox(source.width, source.height, ow, oh) };
     }
-    // Fill center-trims the full source; Custom center-trims the selected region.
+    // Only Fill center-trims. Custom preserves the complete selected region.
     // This is applied once, after the producer has made the source upright.
     if (static_cast<uint64_t>(source.width) * oh > static_cast<uint64_t>(ow) * source.height) {
         const DWORD w = (std::max<DWORD>)(2, static_cast<DWORD>(static_cast<uint64_t>(source.height) * ow / oh) & ~1u);

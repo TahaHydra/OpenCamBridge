@@ -224,15 +224,19 @@ class StreamService : LifecycleService() {
             while (isActive) {
                 kotlinx.coroutines.delay(2000)
 
-                if (StreamState.h264Failed.getAndSet(false) && StreamState.activeStreamMode.get() == "h264") {
+                // Startup owns candidate errors; consuming them here can queue a
+                // second fallback after the candidate loop has already recovered.
+                if (H264RuntimeRecoveryPolicy.active(StreamState.lifecycleState.get(), StreamState.rebindInProgress.get(), StreamState.activeStreamMode.get()) &&
+                    StreamState.h264Failed.compareAndSet(true, false)) {
                     pipelineController.submit(
                         PipelineCommand.RuntimeH264Failure(
-                            StreamState.capturePathError.get().ifBlank { "hardware encoder/capture path failed at runtime" }
+                            StreamState.capturePathError.get().ifBlank { "hardware encoder/capture path failed at runtime" },
+                            StreamState.pipelineGeneration.get()
                         )
                     )
                 }
 
-                if (StreamState.activeStreamMode.get() == "h264") {
+                if (H264RuntimeRecoveryPolicy.active(StreamState.lifecycleState.get(), StreamState.rebindInProgress.get(), StreamState.activeStreamMode.get())) {
                     val target = StreamState.selectedFps.get()
                     val actual = minOf(StreamState.captureFps.get(), StreamState.encodedFps.get())
                     lowH264Windows = if (target > 0 && actual > 0 && actual * 100 < target * 80) lowH264Windows + 1 else 0
@@ -321,7 +325,9 @@ class StreamService : LifecycleService() {
         is PipelineCommand.Stop -> stopCameraNow()
         is PipelineCommand.Recover -> recoverCameraNow()
         is PipelineCommand.ApplySettings -> applySettingsPatch(command.request, command.source)
-        is PipelineCommand.RuntimeH264Failure -> switchToMjpegNow(command.reason)
+        is PipelineCommand.RuntimeH264Failure -> if (H264RuntimeRecoveryPolicy.current(command.generation, StreamState.pipelineGeneration.get(),
+            StreamState.lifecycleState.get(), StreamState.rebindInProgress.get(), StreamState.activeStreamMode.get())) switchToMjpegNow(command.reason)
+            else pipelineResult("Ignored stale H.264 runtime failure")
         is PipelineCommand.AdaptiveDowngrade -> adaptiveDowngradeNow(command.reason)
         is PipelineCommand.PreviewSurfaceChanged -> previewSurfaceChangedNow(command.attached)
         is PipelineCommand.SetTorch -> applyRuntimeControl(command.baseRevision, command.requestId, command.source) {

@@ -1,15 +1,13 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent, type RefObject } from 'react';
-import { centeredCrop, containRect, moveCrop, resizeCrop, type CropRect } from '../../services/outputFraming.js';
+import { containRect, moveCrop, resizeCrop, type CropRect } from '../../services/outputFraming.js';
 import '../../styles/framing.css';
 
 type Drag = { pointerId: number; x: number; y: number; crop: CropRect; corner: string };
 
-export default function CropOverlay({ viewport, source, crop, outputAspect, showAppTrim, mirrored, onChange }: {
+export default function CropOverlay({ viewport, source, crop, mirrored, onChange }: {
   viewport: RefObject<HTMLDivElement | null>;
   source: { width: number; height: number };
   crop: CropRect;
-  outputAspect: number;
-  showAppTrim: boolean;
   mirrored: boolean;
   onChange: (crop: CropRect) => void;
 }) {
@@ -26,8 +24,6 @@ export default function CropOverlay({ viewport, source, crop, outputAspect, show
     return () => observer.disconnect();
   }, [viewport]);
   const image = containRect(box.width, box.height, source.width, source.height);
-  const effective = centeredCrop(source.width * crop.width, source.height * crop.height, outputAspect);
-  const trimmed = showAppTrim && (effective.width < 0.999 || effective.height < 0.999);
   const pointerDown = (event: PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0 || !image.width) return;
     const target = event.target as HTMLElement;
@@ -64,8 +60,6 @@ export default function CropOverlay({ viewport, source, crop, outputAspect, show
         onPointerCancel={() => { drag.current = null; }} onLostPointerCapture={() => { drag.current = null; }} onKeyDown={keyboard}>
         <span className="crop-selection__label">Output crop</span>
         <span className="crop-selection__grid" />
-        {trimmed && <span className="crop-selection__effective" title="Area delivered at the connected app’s aspect ratio"
-          style={{ left: `${effective.x * 100}%`, top: `${effective.y * 100}%`, width: `${effective.width * 100}%`, height: `${effective.height * 100}%` }} />}
         {(['nw', 'ne', 'sw', 'se'] as const).map(corner => {
           const visualCorner = mirrored ? corner.replace(/[we]/g, direction => direction === 'w' ? 'e' : 'w') : corner;
           const name = `${visualCorner.startsWith('n') ? 'top' : 'bottom'} ${visualCorner.endsWith('w') ? 'left' : 'right'}`;

@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Debug-only, explicitly invoked real-device capture verification. -->
+    <instrumentation android:name="com.opencambridge.android.camera.CaptureProbeInstrumentation"
+        android:targetPackage="com.opencambridge.android" android:label="Capture request probe" />
+</manifest>

@@ -146,11 +146,18 @@ function modesFor(camera, streamMode) {
 const sameMode = (a, b) =>
   Number(a.width) === Number(b.width) && Number(a.height) === Number(b.height) && Number(a.fps) === Number(b.fps);
 
+export function captureRateLabel(camera, streamMode, width, height, fps) {
+  const entry = streamMode === 'h264' && camera?.h264PathCapabilities?.find(candidate => sameMode(candidate.mode, { width, height, fps }));
+  const state = entry?.paths?.find(path => path.engine === 'REGULAR_SURFACE' && path.supported)?.verification;
+  const suffix = { unverified: 'verify', verified: 'verified', rejected: 'retry', inconclusive: 'retry later' }[state];
+  return `${fps} FPS${suffix ? ` · ${suffix}` : ''}`;
+}
+
 const maxFps = modes => Math.max(0, ...modes.map(mode => Number(mode.fps) || 0));
 
 /**
  * H.264 modes the camera delivers through a regular Camera2 capture session —
- * the genuine ones.
+ * including explicitly labelled regular-session trial candidates.
  *
  * `h264Modes` is the phone's selectable list; `h264PathCapabilities` says, per
  * mode, which capture engine can provide it. A rate that only a constrained

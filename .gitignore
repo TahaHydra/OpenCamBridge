@@ -87,6 +87,8 @@ desktop/tauri-app/src-tauri/release-runtime/
 *.keystore
 *.pfx
 android/.kotlin/
+!android/app/src/debug/
+!android/app/src/debug/**
 !docs/release/
 !docs/release/**
 docs/release/third-party/

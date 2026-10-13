@@ -180,6 +180,8 @@ object StreamState {
     val encoderName = AtomicReference("")
     val hardwareEncoder = AtomicBoolean(false)
     val captureEngine = AtomicReference("")
+    val captureVerification = AtomicReference("")
+    val captureVerificationReason = AtomicReference("")
     val cameraSessionFps = AtomicInteger(0)
     val gpuBridgeFps = AtomicInteger(0)
     val capturePathError = AtomicReference("")
@@ -573,7 +575,9 @@ object StreamState {
         captureEngine = selectedState?.captureEngine.orEmpty(),
         cameraSessionFps = cameraSessionFps.get(),
         gpuBridgeFps = gpuBridgeFps.get(),
-        capturePathError = capturePathError.get()
+        capturePathError = capturePathError.get(),
+        captureVerification = captureVerification.get(),
+        captureVerificationReason = captureVerificationReason.get()
         )
     }
 }
@@ -658,7 +662,9 @@ data class StreamStatusDto(
     val captureEngine: String = "",
     val cameraSessionFps: Int = 0,
     val gpuBridgeFps: Int = 0,
-    val capturePathError: String = ""
+    val capturePathError: String = "",
+    val captureVerification: String = "",
+    val captureVerificationReason: String = ""
 )
 
 @Serializable

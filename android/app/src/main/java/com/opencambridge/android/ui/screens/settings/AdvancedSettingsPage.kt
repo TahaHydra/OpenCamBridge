@@ -29,6 +29,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
@@ -67,6 +68,8 @@ fun AdvancedSettingsPage(
     val running by ui.serviceRunning.collectAsState()
     val logs by viewModel.logs.collectAsState()
     val problems = logs.count { it.level == "ERROR" || it.level == "WARN" }
+    val context = LocalContext.current
+    var cleared by remember { mutableStateOf(false) }
 
     SettingsScaffold(title = "Advanced", onBack = onBack) {
         if (running) {
@@ -76,6 +79,11 @@ fun AdvancedSettingsPage(
             Notice("Encoding and preview-shape settings appear here while OpenCamBridge is running.", Tone.Accent, modifier = Modifier.fillMaxWidth())
         }
         SettingsGroup(title = "Troubleshooting") {
+            NavRow("Reset learned camera modes", subtitle = if (cleared) "Cleared. The next selected 60 FPS start will verify again." else "Retry previously limited 60 FPS modes on the next start", onClick = {
+                com.opencambridge.android.camera.LearnedCaptureModes(context).clear()
+                cleared = true
+            })
+            RowDivider()
             NavRow("Diagnostics", onClick = { onNavigate(SettingsPage.Diagnostics) }, subtitle = "Pipeline, encoder and orientation details", icon = Icons.Filled.Insights)
             RowDivider()
             NavRow(
@@ -218,6 +226,8 @@ private fun PreviewShapeGroup(viewModel: StreamViewModel) {
 
 @Composable
 fun DiagnosticsPage(viewModel: StreamViewModel, onBack: () -> Unit) {
+    val verification by viewModel.captureVerification.collectAsState()
+    val verificationReason by viewModel.captureVerificationReason.collectAsState()
     val cameras by viewModel.cameras.collectAsState()
     val selectedCameraId by viewModel.selectedCameraId.collectAsState()
     val width by viewModel.width.collectAsState()
@@ -258,6 +268,11 @@ fun DiagnosticsPage(viewModel: StreamViewModel, onBack: () -> Unit) {
             ValueRow("Capture / encode", "$actualFps / $encodedFps fps", tone = if (encodedFps >= fps - 5) Tone.Ok else Tone.Warn, mono = true)
             RowDivider()
             ValueRow("Capture path", engineLabel(captureEngine))
+            if (activeMode == "h264" && verification.isNotBlank()) {
+                RowDivider()
+                ValueRow("Mode verification", verification)
+                if (verificationReason.isNotBlank()) Text(verificationReason, color = Ocb.Text3, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(12.dp))
+            }
             RowDivider()
             ValueRow("Encoder", if (encoderName.isBlank()) "—" else "${shortCodec(encoderName)} · ${if (hardwareEncoder) "hardware" else "software"}")
             RowDivider()

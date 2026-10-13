@@ -7,6 +7,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Build
 import android.util.Range
 import android.util.Size
 import kotlinx.serialization.Serializable
@@ -28,7 +29,9 @@ data class H264PathCapability(
     val reason: String,
     val cameraFps: Int? = null,
     val aeRangeLower: Int? = null,
-    val aeRangeUpper: Int? = null
+    val aeRangeUpper: Int? = null,
+    val verification: String = "advertised",
+    val requiresVerification: Boolean = false
 )
 
 data class H264EncoderSelection(
@@ -38,7 +41,9 @@ data class H264EncoderSelection(
     val bitrateRange: Range<Int>,
     val captureEngine: H264CaptureEngine,
     val cameraFpsRange: Range<Int>,
-    val cameraCaptureFps: Int
+    val cameraCaptureFps: Int,
+    val requiresVerification: Boolean = false,
+    val sessionParameters: Boolean = false
 )
 
 /**
@@ -48,13 +53,8 @@ data class H264EncoderSelection(
  * a constrained high-speed SurfaceTexture rendered into the encoder surface.
  */
 object H264Capabilities {
-    // The constrained high-speed session (direct 60 fps surface, or the 120->60
-    // GPU bridge) is the only way to reach 60 fps on OEM-locked devices like the
-    // OnePlus 9, but it crops the sensor FOV (reads as a "lens switch"), AE-limits
-    // in low light, and forces a SESSION_HIGH_SPEED teardown. Disable it: use only
-    // the regular Camera2 session and honor whatever fps it natively provides (30
-    // or, on capable phones, 60). Requests the regular session cannot meet fall
-    // back to its available rate instead of engaging high-speed.
+    // Regular sessions only. Some OEM metadata understates regular 60 FPS;
+    // explicitly selected candidates are measured in the actual stream.
     private const val HIGH_SPEED_ENABLED = false
 
     val preferredModes = listOf(
@@ -138,9 +138,27 @@ object H264Capabilities {
         } else {
             0L
         }
+        val regularDeclared = regularRange != null && RegularModePolicy.durationSupports(minDuration, mode.fps) &&
+            (mode.fps != 60 || regularRange.lower == 60)
+        val regularTrial = encoderFailure == null && regularSizes.contains(size) && mode.fps == 60 && !regularDeclared
+        val selectedRegularRange = if (regularTrial) Range(60, 60) else regularRange
+        val measured = if (regularTrial && encoder != null) {
+            val preview = com.opencambridge.android.state.StreamState.currentConfig().localPreviewEnabled
+            val cache = LearnedCaptureModes(context)
+            listOf(false, true).mapNotNull { parameters -> cache.read(CaptureTrialKey(
+                Build.FINGERPRINT, cameraId, mode.width, mode.height, mode.fps, encoder.first.name, preview, parameters)) }
+        } else emptyList()
+        val verification = when {
+            !regularTrial -> "advertised"
+            measured.any { it.best == CaptureVerdict.VERIFIED } -> "verified"
+            measured.any { it.last == CaptureVerdict.INCONCLUSIVE } -> "inconclusive"
+            measured.size == 2 && measured.all { it.last == CaptureVerdict.REJECTED } -> "rejected"
+            else -> "unverified"
+        }
         val regularReason = when {
             encoderFailure != null -> encoderFailure
             !regularSizes.contains(size) -> "MediaCodec surface size is absent from regular outputs"
+            regularTrial -> "unverified regular fixed 60 FPS; measured only when selected"
             regularRange == null -> "no regular AE range contains ${mode.fps} fps"
             !RegularModePolicy.durationSupports(minDuration, mode.fps) ->
                 "regular min frame duration ${minDuration}ns does not prove ${mode.fps} fps"
@@ -186,11 +204,13 @@ object H264Capabilities {
         return listOf(
             H264PathCapability(
                 H264CaptureEngine.REGULAR_SURFACE,
-                regularReason.startsWith("declared"),
+                regularReason.startsWith("declared") || regularTrial,
                 regularReason,
                 mode.fps,
-                regularRange?.lower,
-                regularRange?.upper
+                selectedRegularRange?.lower,
+                selectedRegularRange?.upper,
+                verification,
+                regularTrial
             ),
             H264PathCapability(
                 H264CaptureEngine.HIGH_SPEED_SURFACE,
@@ -228,16 +248,21 @@ object H264Capabilities {
                     it.cameraFps == mode.fps &&
                     capabilities.any { direct -> direct.engine == H264CaptureEngine.HIGH_SPEED_SURFACE && direct.supported }
             }
-            .map {
-                H264EncoderSelection(
+            .flatMap {
+                val chosen = H264EncoderSelection(
                     encoder.first.name,
                     true,
                     mode,
                     encoder.second,
                     it.engine,
                     Range(it.aeRangeLower ?: it.cameraFps ?: mode.fps, it.aeRangeUpper ?: it.cameraFps ?: mode.fps),
-                    it.cameraFps ?: mode.fps
+                    it.cameraFps ?: mode.fps,
+                    requiresVerification = it.requiresVerification
                 )
+                // Try ordinary repeating requests first. A deterministic 30 FPS
+                // result can try session parameters once, never a high-speed path.
+                if (chosen.requiresVerification) sequenceOf(chosen, chosen.copy(sessionParameters = true))
+                else sequenceOf(chosen)
             }
             .toList()
     }

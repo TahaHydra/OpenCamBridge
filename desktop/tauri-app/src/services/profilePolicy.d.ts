@@ -38,6 +38,7 @@ export function describeProfile(profile: CaptureProfile, options?: { withQuality
 export function profileBitrateMode(profile: CaptureProfile): 'auto' | 'manual';
 export function automaticBitrateMbps(width: number, height: number, fps: number): number;
 export function regularH264Modes(camera: CameraInfo | undefined | null): CameraMode[];
+export function captureRateLabel(camera: CameraInfo | null | undefined, streamMode: string, width: number, height: number, fps: number): string;
 export function resolveProfile<T extends CaptureProfile>(profile: T, camera: CameraInfo | undefined | null): T;
 export function resolveProfiles<T extends CaptureProfile>(profiles: readonly T[], camera: CameraInfo | undefined | null): T[];
 export function profileAvailability(profile: CaptureProfile, camera: CameraInfo | undefined | null): ProfileAvailability;

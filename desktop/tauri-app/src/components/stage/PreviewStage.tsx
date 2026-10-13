@@ -95,7 +95,7 @@ export default function PreviewStage({
     <div className={`viewer${compact ? ' viewer--compact' : ''}`}>
       <div ref={viewport} className={`viewer__viewport${mirrorPreview ? ' is-mirrored' : ''}`}>
         {content}
-        {showEditor && <CropOverlay viewport={viewport} source={source} crop={crop} outputAspect={outputAspect} showAppTrim={framing.mode !== 'fit'} mirrored={mirrorPreview}
+        {showEditor && <CropOverlay viewport={viewport} source={source} crop={crop} mirrored={mirrorPreview}
           onChange={next => setPreferences({ outputFraming: { preset: 'custom', mode: 'custom', crop: next } })} />}
       </div>
       {!compact && framingError && <div className="framing-error" role="alert">{framingError}</div>}

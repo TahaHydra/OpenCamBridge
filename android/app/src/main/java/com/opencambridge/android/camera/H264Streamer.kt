@@ -21,6 +21,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
@@ -80,6 +81,9 @@ class H264Streamer(
     private val frameSequence = AtomicLong(0)
     private val captureGeneration = AtomicLong(0)
     private val running = AtomicBoolean(false)
+    private val learnedModes = LearnedCaptureModes(context)
+    @Volatile private var trialWindow: CaptureSampleWindow? = null
+    @Volatile private var activePreviewAttached = false
 
     private var cameraThread: HandlerThread? = null
     private var codecThread: HandlerThread? = null
@@ -122,6 +126,8 @@ class H264Streamer(
         StreamState.rebindInProgress.set(true)
         try {
             val config = StreamState.currentConfig()
+            StreamState.captureVerification.set(if (config.fps == 60) "unverified" else "advertised")
+            StreamState.captureVerificationReason.set("")
             activeConfig = config
             activePipelineGeneration = StreamState.pipelineGeneration.get()
             val cameraId = config.cameraId
@@ -157,21 +163,125 @@ class H264Streamer(
             codecHandler = Handler(codecThread!!.looper)
 
             val failures = mutableListOf<String>()
+            val expectedPreview = config.localPreviewEnabled && StreamState.camera2PreviewSurface.get()?.isValid == true
+            val orderedCandidates = candidates.groupBy { it.mode }.values.flatMap { group ->
+                group.sortedBy { if (learnedModes.read(learnedModes.key(cameraId, it, expectedPreview))?.best == CaptureVerdict.VERIFIED) 0 else 1 }
+            }
             var chosen: H264EncoderSelection? = null
-            for (candidate in candidates) {
+            val temporarilyLimited = mutableSetOf<H264ModeDto>()
+            for (candidate in orderedCandidates) {
+                if (candidate.mode in temporarilyLimited) continue
+                if (candidate.requiresVerification && !learnedModes.allowed(learnedModes.key(cameraId, candidate, expectedPreview))) {
+                    failures += "${candidate.mode.width}x${candidate.mode.height}@60 retry cooldown; clear learned modes to retry now"
+                    StreamState.captureVerification.set("inconclusive")
+                    StreamState.captureVerificationReason.set("A previous trial is in retry cooldown. Reset learned camera modes in phone Advanced settings to retry now.")
+                    continue
+                }
                 try {
+                    activePreviewAttached = expectedPreview
+                    StreamState.h264Failed.set(false)
                     captureWindowStartNs = 0L
                     captureWindowFrames = 0
                     bridgeWindowStartNs = 0L
                     bridgeWindowFrames = 0
                     configureCodec(candidate)
+                    selection = candidate
                     val candidateGeneration = captureGeneration.incrementAndGet()
-                    val device = openCamera(cameraId, candidateGeneration)
+                    val device = if (candidate.requiresVerification) kotlinx.coroutines.withTimeout(5_000) { openCamera(cameraId, candidateGeneration) }
+                        else openCamera(cameraId, candidateGeneration)
                     camera = device
-                    createSession(device, candidate, candidateGeneration)
+                    if (candidate.requiresVerification) {
+                        kotlinx.coroutines.withTimeout(5_000) { createSession(device, candidate, candidateGeneration) }
+                        val key = learnedModes.key(cameraId, candidate, activePreviewAttached)
+                        val cached = learnedModes.read(key)
+                        if (!learnedModes.allowed(key)) {
+                            failures += "Actual preview configuration is in retry cooldown"
+                            releaseCaptureAttempt()
+                            continue
+                        }
+                        if (cached?.last != CaptureVerdict.VERIFIED) {
+                            StreamState.captureVerification.set("verifying")
+                            StreamState.captureVerificationReason.set("Measuring regular fixed 60 FPS capture and encoder cadence")
+                            val samples = CaptureSampleWindow(SystemClock.elapsedRealtimeNanos())
+                            trialWindow = samples
+                            try {
+                                while (!samples.ready(SystemClock.elapsedRealtimeNanos()) && !samples.expired(SystemClock.elapsedRealtimeNanos())) {
+                                    check(candidateGeneration == captureGeneration.get()) { "Capture trial generation changed" }
+                                    if (StreamState.h264Failed.get()) break
+                                    delay(50)
+                                }
+                            } finally { trialWindow = null }
+                            check(candidateGeneration == captureGeneration.get()) { "Capture trial generation changed" }
+                            val thermal = (context.getSystemService(Context.POWER_SERVICE) as PowerManager).currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE
+                            val measured = samples.result(thermal).let {
+                                if (StreamState.h264Failed.get()) it.copy(verdict = CaptureVerdict.INCONCLUSIVE, reason = "Encoder failed during verification; rebuilding fallback")
+                                else if (cached?.best == CaptureVerdict.VERIFIED && it.verdict != CaptureVerdict.VERIFIED)
+                                    it.copy(verdict = CaptureVerdict.INCONCLUSIVE, reason = "Previously verified mode is temporarily limited; retry is available")
+                                else it
+                            }
+                            learnedModes.remember(key, measured.verdict)
+                            StreamState.captureVerification.set(measured.verdict.name.lowercase())
+                            StreamState.captureVerificationReason.set(measured.reason)
+                            AppLogger.i("CaptureTrial", "${candidate.mode.width}x${candidate.mode.height} camera=$cameraId preview=$activePreviewAttached params=${candidate.sessionParameters}: $measured")
+                            if (measured.verdict != CaptureVerdict.VERIFIED) {
+                                if (measured.verdict == CaptureVerdict.INCONCLUSIVE) temporarilyLimited.add(candidate.mode)
+                                failures += measured.reason
+                                val alternate = orderedCandidates.any { it.mode == candidate.mode && it.sessionParameters != candidate.sessionParameters && learnedModes.allowed(learnedModes.key(cameraId, it, activePreviewAttached)) }
+                                if (measured.verdict == CaptureVerdict.REJECTED && alternate) {
+                                    releaseCaptureAttempt()
+                                    continue
+                                }
+                                val fallback = candidates.firstOrNull { it.mode.width == candidate.mode.width && it.mode.height == candidate.mode.height && it.mode.fps == 30 }
+                                    ?.copy(codecName = candidate.codecName, bitrateRange = candidate.bitrateRange)
+                                if (fallback != null && samples.alive() && !StreamState.h264Failed.get() && session != null && requestBuilder != null) {
+                                    synchronized(zoomSettlement) {
+                                        configureRequest(requestBuilder!!, fallback)
+                                        submitRepeating(session!!, requestBuilder!!.build(), fallback)
+                                        selection = fallback
+                                    }
+                                    updateBitrate(config)
+                                    requestKeyFrame()
+                                    val settling = CaptureSampleWindow(SystemClock.elapsedRealtimeNanos(), 30, 300_000_000L, 1_200_000_000L)
+                                    trialWindow = settling
+                                    try {
+                                        while (!settling.ready(SystemClock.elapsedRealtimeNanos()) && !settling.expired(SystemClock.elapsedRealtimeNanos())) {
+                                            check(candidateGeneration == captureGeneration.get()) { "Fallback generation changed" }
+                                            if (StreamState.h264Failed.get()) break
+                                            delay(50)
+                                        }
+                                    } finally { trialWindow = null }
+                                    check(!StreamState.h264Failed.get() && settling.result(thermal).verdict == CaptureVerdict.VERIFIED) {
+                                        "30 FPS did not settle in the existing session; rebuilding fallback"
+                                    }
+                                    chosen = fallback
+                                    AppLogger.i("CaptureTrial", "Fell back to 30 FPS in the existing camera session and encoder")
+                                    break
+                                }
+                                throw IllegalStateException("${measured.reason}; rebuilding same-size 30 FPS fallback")
+                            }
+                        } else {
+                            StreamState.captureVerification.set("verified")
+                            StreamState.captureVerificationReason.set("Previously measured on this firmware and actual preview configuration")
+                        }
+                    } else {
+                        createSession(device, candidate, candidateGeneration)
+                        if (failures.isEmpty() || candidate.mode.fps == config.fps) {
+                            StreamState.captureVerification.set("advertised")
+                            StreamState.captureVerificationReason.set("Advertised regular Camera2 mode")
+                        }
+                    }
                     chosen = candidate
                     break
                 } catch (e: Exception) {
+                    trialWindow = null
+                    if (e is kotlinx.coroutines.CancellationException && e !is kotlinx.coroutines.TimeoutCancellationException) throw e
+                    if (candidate.requiresVerification) {
+                        val verdict = if (e is IllegalArgumentException || e.cause is IllegalArgumentException) CaptureVerdict.REJECTED else CaptureVerdict.INCONCLUSIVE
+                        if (verdict == CaptureVerdict.INCONCLUSIVE) temporarilyLimited.add(candidate.mode)
+                        learnedModes.remember(learnedModes.key(cameraId, candidate, activePreviewAttached), verdict)
+                        StreamState.captureVerification.set(verdict.name.lowercase())
+                        StreamState.captureVerificationReason.set("Capture request failed: ${e.message}; bounded retry is available")
+                    }
                     val failure = "${candidate.mode.width}x${candidate.mode.height}@${candidate.mode.fps} ${candidate.captureEngine}: ${e.javaClass.simpleName}: ${e.message}"
                     failures += failure
                     AppLogger.w("H264Path", failure)
@@ -239,6 +349,7 @@ class H264Streamer(
     }
 
     private suspend fun releaseCaptureAttempt() {
+        trialWindow = null
         captureGeneration.incrementAndGet()
         val oldSession = session
         val oldSessionClosed = sessionClosedSignal
@@ -552,6 +663,7 @@ class H264Streamer(
     }
 
     private fun publishAccessUnit(data: ByteArray, presentationTimeUs: Long, keyframe: Boolean) {
+        trialWindow?.encoded(presentationTimeUs * 1000L, SystemClock.elapsedRealtimeNanos())
         // Several Qualcomm encoders honor PREPEND_HEADER_TO_SYNC_FRAMES but do
         // not emit BUFFER_FLAG_CODEC_CONFIG or expose csd-* in a format-change
         // callback. Derive SPS/PPS from that first IDR so every current and
@@ -781,6 +893,7 @@ class H264Streamer(
                         }
                         try {
                             session = configured
+                            activePreviewAttached = activeTargets.size > 1
                             val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
                             activeTargets.forEach(builder::addTarget)
                             configureRequest(builder, chosen)
@@ -842,6 +955,11 @@ class H264Streamer(
                     executor,
                     callback
                 )
+                if (chosen.sessionParameters) {
+                    configuration.sessionParameters = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                        configureRequest(this, chosen)
+                    }.build()
+                }
                 device.createCaptureSession(configuration)
             } catch (e: Exception) {
                 if (!continuation.isActive) return
@@ -872,6 +990,10 @@ class H264Streamer(
         builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, chosen.cameraFpsRange)
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
         builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            chars.get(CameraCharacteristics.SCALER_AVAILABLE_ROTATE_AND_CROP_MODES)?.contains(CaptureRequest.SCALER_ROTATE_AND_CROP_NONE) == true) {
+            builder.set(CaptureRequest.SCALER_ROTATE_AND_CROP, CaptureRequest.SCALER_ROTATE_AND_CROP_NONE)
+        }
         applyControls(builder, chars)
     }
 
@@ -912,6 +1034,10 @@ class H264Streamer(
                 }
             }
             val timestamp = result.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP) ?: SystemClock.elapsedRealtimeNanos()
+            trialWindow?.capture(timestamp,
+                result.get(android.hardware.camera2.CaptureResult.SENSOR_FRAME_DURATION) ?: 0,
+                result.get(android.hardware.camera2.CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0,
+                SystemClock.elapsedRealtimeNanos())
             if (captureWindowStartNs == 0L) captureWindowStartNs = timestamp
             captureWindowFrames++
             if (timestamp - captureWindowStartNs >= 1_000_000_000L) {

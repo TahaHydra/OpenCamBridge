@@ -39,6 +39,8 @@ private fun LiveCameraSettings(viewModel: StreamViewModel) {
     val displayRotation by viewModel.displayRotation.collectAsState()
     val rebinding by viewModel.rebindInProgress.collectAsState()
     val actualFps by viewModel.actualFps.collectAsState()
+    val verification by viewModel.captureVerification.collectAsState()
+    val verificationReason by viewModel.captureVerificationReason.collectAsState()
 
     val enabled = !rebinding
     val camera = cameras.find { it.id == cameraId }
@@ -55,7 +57,7 @@ private fun LiveCameraSettings(viewModel: StreamViewModel) {
     SettingsGroup(
         title = "Camera",
         footer = if (streamMode == "h264") {
-            "Only modes this camera can capture and encode in hardware are offered."
+            "Unadvertised 60 fps is verified only when selected. Low light may reduce cadence."
         } else {
             "MJPEG is the compatibility format. Actual rate depends on the camera and the light."
         } + if (actualFps > 0) " Delivering $actualFps of $fps fps now." else ""
@@ -109,6 +111,10 @@ private fun LiveCameraSettings(viewModel: StreamViewModel) {
             enabled = enabled,
             onSelect = { CaptureActions.switchFormat(viewModel, camera, cameraId, it, width, height, fps) }
         )
+    }
+
+    if (streamMode == "h264" && verificationReason.isNotBlank()) {
+        Notice(verificationReason, if (verification == "verified") Tone.Ok else Tone.Accent, modifier = Modifier.fillMaxWidth())
     }
 
     SettingsGroup(title = "Picture your computer receives") {

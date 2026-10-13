@@ -21,6 +21,14 @@ int main()
     framing = OcbComputeFraming(1920, 1080, 1280, 720, settings);
     assert(framing.source.left == 480 && framing.source.top == 270);
     assert(framing.source.width == 960 && framing.source.height == 540);
+    // Custom owns the selected rectangle. A landscape consumer must not
+    // discard its top/bottom again just to fill its negotiated shape.
+    settings = { OcbFramingMode::Custom, 0.5f, 0, 0.5f, 1 };
+    framing = OcbComputeFraming(8, 4, 8, 4, settings);
+    assert(framing.source.left == 4 && framing.source.top == 0);
+    assert(framing.source.width == 4 && framing.source.height == 4);
+    assert(framing.destination.left == 2 && framing.destination.top == 0);
+    assert(framing.destination.width == 4 && framing.destination.height == 4);
     settings.x = std::numeric_limits<float>::quiet_NaN();
     assert(!OcbValidFraming(settings));
     settings = { OcbFramingMode::Custom, 0.9f, 0, 0.2f, 1 };
@@ -34,7 +42,16 @@ int main()
         for (DWORD x = 4; x < 8; ++x) pattern[y * 8 + x] = 200;
     settings = { OcbFramingMode::Custom, 0.5f, 0, 0.5f, 1 };
     assert(SUCCEEDED(OcbResizeNv12Cpu(pattern.data(), 8, 4, 8, 8, 8, 4, output, settings)));
-    for (size_t i = 0; i < 32; ++i) assert(output[i] == 200);
+    for (DWORD y = 0; y < 4; ++y)
+        for (DWORD x = 0; x < 8; ++x)
+            assert(output[y * 8 + x] == (x >= 2 && x < 6 ? 200 : 16));
+    // Full preserves every source pixel when no scaling is needed.
+    assert(SUCCEEDED(OcbResizeNv12Cpu(pattern.data(), 8, 4, 8, 8, 8, 4, output)));
+    assert(output == pattern);
+    const auto fullPortrait = OcbComputeFraming(1080, 1920, 1920, 1080, {});
+    assert(fullPortrait.source.left == 0 && fullPortrait.source.top == 0);
+    assert(fullPortrait.source.width == 1080 && fullPortrait.source.height == 1920);
+    assert(fullPortrait.destination.left > 0 && fullPortrait.destination.height == 1080);
     assert(SUCCEEDED(OcbResizeNv12Cpu(pattern.data(), 8, 4, 8, 8, 4, 8, output, {}, true)));
     assert(output[0] == 0 && output[32] == 128 && output[33] == 128);
     // Tiny and edge selections remain nonempty, even and inside the source.

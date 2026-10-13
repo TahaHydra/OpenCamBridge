@@ -12,7 +12,7 @@ import DevicePicker from './DevicePicker';
 import CommitSlider from './CommitSlider';
 import { BITRATE_HINT, BitrateModeSwitch, ManualBitrateSlider, automaticBitrateLabel } from './BitrateControl';
 import { Field, Group, IconButton, MetricRow, Segmented, Select, Slider, SwitchRow } from '../primitives';
-import { codecLabel, heightLabel, matchProfile } from '../../services/profilePolicy.js';
+import { codecLabel, heightLabel, matchProfile, captureRateLabel } from '../../services/profilePolicy.js';
 import { useProfiles } from '../../state/profiles';
 import type { CameraController } from '../../state/useCameraController';
 import type { AdbDevice, ConnectionInfo } from '../../state/types';
@@ -125,7 +125,7 @@ export default function CameraRail({
               label="Frame rate"
               value={settings.fps}
               disabled={captureLocked}
-              options={controller.fpsChoices.map(fps => ({ value: fps, label: `${fps} FPS` }))}
+              options={controller.fpsChoices.map(fps => ({ value: fps, label: captureRateLabel(activeCam, settings.streamMode, settings.width, settings.height, fps) }))}
               onChange={fps => void controller.updateFps(fps)}
             />
           ) : (
@@ -134,7 +134,7 @@ export default function CameraRail({
               value={settings.fps}
               disabled={captureLocked}
               placeholder="No rate at this resolution"
-              options={controller.fpsChoices.map(fps => ({ value: fps, label: `${fps} FPS` }))}
+              options={controller.fpsChoices.map(fps => ({ value: fps, label: captureRateLabel(activeCam, settings.streamMode, settings.width, settings.height, fps) }))}
               onChange={fps => void controller.updateFps(fps)}
             />
           )}
@@ -152,6 +152,9 @@ export default function CameraRail({
             onChange={mode => void controller.updateSetting('streamMode', mode)}
           />
         </Field>
+        {settings.streamMode === 'h264' && controller.serverStatus?.captureVerificationReason && <p className="settings-note" role="status">
+          {controller.serverStatus.captureVerificationReason}
+        </p>}
       </Group>
 
       <Group title="Adjust">

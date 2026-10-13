@@ -105,7 +105,7 @@ sealed class PipelineCommand(val label: String) {
     class Start : PipelineCommand("START")
     class Stop : PipelineCommand("STOP")
     class Recover : PipelineCommand("RECOVER")
-    class RuntimeH264Failure(val reason: String) : PipelineCommand("H264_FAILURE")
+    class RuntimeH264Failure(val reason: String, val generation: Long) : PipelineCommand("H264_FAILURE")
     class AdaptiveDowngrade(val reason: String) : PipelineCommand("ADAPTIVE_DOWNGRADE")
     class PreviewSurfaceChanged(val attached: Boolean) : PipelineCommand("PREVIEW_SURFACE_CHANGED")
     class SetTorch(val enabled: Boolean, val baseRevision: Long, val requestId: String, val source: String) : PipelineCommand("SET_TORCH")

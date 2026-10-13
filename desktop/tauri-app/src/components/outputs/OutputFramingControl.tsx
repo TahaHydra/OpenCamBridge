@@ -29,7 +29,7 @@ export default function OutputFramingControl({ controller }: { controller: Camer
       <p className="output-card__note framing-note">
         {framing.mode === 'fit' ? 'Full picture, with black bars when the app uses a different shape.'
           : framing.mode === 'fill' ? 'Fills the connected app’s frame by cropping the center.'
-            : 'Drag the box or its corners in the preview. Apps with a different shape trim the selection further; the dashed line shows that area.'}
+            : 'Drag the box or its corners in the preview. The complete selection is sent to apps, with bars when their shape differs.'}
       </p>
       {ring && ring.negotiated_width > 0 && <div className="output-card__format tabular">App output: {ring.negotiated_width}×{ring.negotiated_height}</div>}
       <div className="framing-actions">

@@ -13,9 +13,22 @@ import {
   regularH264Modes,
   resolveProfile,
   resolveProfiles,
+  captureRateLabel,
 } from './profilePolicy.js';
 
 const byId = id => BUILT_IN_PROFILES.find(profile => profile.id === id);
+
+test('rate choices distinguish a selectable trial from verified or advertised support', () => {
+  const camera = { h264PathCapabilities: [{ mode: { width: 1920, height: 1080, fps: 60 }, paths: [{ engine: 'REGULAR_SURFACE', supported: true, verification: 'unverified' }] }] };
+  assert.equal(captureRateLabel(camera, 'h264', 1920, 1080, 60), '60 FPS · verify');
+  camera.h264PathCapabilities[0].paths[0].verification = 'verified';
+  assert.equal(captureRateLabel(camera, 'h264', 1920, 1080, 60), '60 FPS · verified');
+  camera.h264PathCapabilities[0].paths[0].verification = 'rejected';
+  assert.equal(captureRateLabel(camera, 'h264', 1920, 1080, 60), '60 FPS · retry');
+  assert.equal(captureRateLabel(camera, 'mjpeg', 1920, 1080, 60), '60 FPS');
+  assert.equal(captureRateLabel(camera, 'h264', 1280, 720, 60), '60 FPS');
+  assert.equal(captureRateLabel(null, 'h264', 1920, 1080, 30), '30 FPS');
+});
 
 // A phone like the OnePlus 9 main lens: 30 fps only through the regular session.
 const onePlusMain = {

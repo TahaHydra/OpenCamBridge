@@ -112,6 +112,10 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _captureEngine = MutableStateFlow("")
     val captureEngine: StateFlow<String> = _captureEngine.asStateFlow()
+    private val _captureVerification = MutableStateFlow("")
+    val captureVerification: StateFlow<String> = _captureVerification.asStateFlow()
+    private val _captureVerificationReason = MutableStateFlow("")
+    val captureVerificationReason: StateFlow<String> = _captureVerificationReason.asStateFlow()
 
     /** What the pipeline actually settled on, which can differ from the request. */
     private val _activeStreamMode = MutableStateFlow("h264")
@@ -265,6 +269,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 _encoderName.value = StreamState.encoderName.get() ?: ""
                 _hardwareEncoder.value = StreamState.hardwareEncoder.get()
                 _captureEngine.value = StreamState.captureEngine.get() ?: ""
+                _captureVerification.value = StreamState.captureVerification.get()
+                _captureVerificationReason.value = StreamState.captureVerificationReason.get()
                 _fallbackReason.value = StreamState.fallbackReason.get() ?: ""
                 _encodedWidth.value = StreamState.encodedWidth.get()
                 _encodedHeight.value = StreamState.encodedHeight.get()
