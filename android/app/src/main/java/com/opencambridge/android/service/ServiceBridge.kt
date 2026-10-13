@@ -28,6 +28,7 @@ object ServiceBridge {
     @Volatile var stopCamera: (suspend () -> PipelineResult)? = null
     @Volatile var recoverCamera: (suspend () -> PipelineResult)? = null
     @Volatile var previewSurfaceChanged: (suspend (Boolean) -> PipelineResult)? = null
+    @Volatile var foregroundChanged: (() -> Unit)? = null
 
     val isServiceRunning: Boolean get() = applyPatch != null
 
@@ -40,5 +41,6 @@ object ServiceBridge {
         stopCamera = null
         recoverCamera = null
         previewSurfaceChanged = null
+        foregroundChanged = null
     }
 }

@@ -27,6 +27,18 @@ class MainActivity : ComponentActivity() {
     private val viewModel: StreamViewModel by viewModels()
     private val uiViewModel: PhoneUiViewModel by viewModels()
 
+    override fun onStart() {
+        super.onStart()
+        StreamState.appForeground.set(true)
+        ServiceBridge.foregroundChanged?.invoke()
+    }
+
+    override fun onStop() {
+        StreamState.appForeground.set(false)
+        ServiceBridge.foregroundChanged?.invoke()
+        super.onStop()
+    }
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->

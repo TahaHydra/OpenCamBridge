@@ -34,6 +34,9 @@ object StoppedSettingsStore {
         val streamMode: String,
         val mirror: Boolean,
         val displayRotation: String,
+        val latencyProfile: String,
+        val lowLightPriority: String,
+        val allowHighSpeed: Boolean,
     )
 
     fun read(context: Context): Snapshot {
@@ -55,6 +58,9 @@ object StoppedSettingsStore {
             streamMode = prefs.getString("streamMode", "h264") ?: "h264",
             mirror = prefs.getBoolean("mirror", false),
             displayRotation = if (rotation == "auto") "0" else rotation,
+            latencyProfile = prefs.getString("latencyProfile", "balanced") ?: "balanced",
+            lowLightPriority = prefs.getString("lowLightPriority", "stable") ?: "stable",
+            allowHighSpeed = prefs.getBoolean("allowHighSpeed", false),
         )
     }
 

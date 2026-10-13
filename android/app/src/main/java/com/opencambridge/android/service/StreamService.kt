@@ -25,6 +25,8 @@ import com.opencambridge.android.state.H264SettingsPolicy
 import com.opencambridge.android.state.LifecycleState
 import com.opencambridge.android.state.SettingsManager
 import com.opencambridge.android.state.StreamState
+import com.opencambridge.android.state.ThermalAdaptationPolicy
+import com.opencambridge.android.state.WifiLatencyLockPolicy
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Job
@@ -46,6 +48,14 @@ class StreamService : LifecycleService() {
     private var lowH264Windows = 0
     private lateinit var pipelineController: PipelineController
     private var streamWakeLock: android.os.PowerManager.WakeLock? = null
+    private var wifiLatencyLock: android.net.wifi.WifiManager.WifiLock? = null
+    private var thermalListener: android.os.PowerManager.OnThermalStatusChangedListener? = null
+    private val thermalPolicy = ThermalAdaptationPolicy()
+    private var thermalCameraSteps = 0
+    private val thermalRecoveryModes = ArrayDeque<H264ModeDto>()
+    private var appliedThermalLevel = -1
+    private var boundLan = false
+    private var foregroundStarted = false
     private val cameraRepository by lazy { CameraRepository(applicationContext) }
     private val appliedRequestResults = object : LinkedHashMap<String, PipelineResult>(128, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, PipelineResult>?): Boolean = size > 128
@@ -111,6 +121,20 @@ class StreamService : LifecycleService() {
         ServiceBridge.previewSurfaceChanged = { attached ->
             pipelineController.submit(PipelineCommand.PreviewSurfaceChanged(attached))
         }
+        ServiceBridge.foregroundChanged = ::updateWifiLatencyLock
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            val thermalPower = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            try {
+                StreamState.thermalStatus.set(thermalPower.currentThermalStatus)
+                val listener = android.os.PowerManager.OnThermalStatusChangedListener { status ->
+                    StreamState.thermalStatus.set(status)
+                }
+                thermalPower.addThermalStatusListener(mainExecutor, listener)
+                thermalListener = listener
+            } catch (e: RuntimeException) {
+                AppLogger.w("Thermal", "Thermal monitoring unavailable: ${e.message}")
+            }
+        }
 
         // Track the PHYSICAL device orientation (accelerometer, works with the
         // app in background and with display auto-rotate locked) and feed it to
@@ -160,6 +184,7 @@ class StreamService : LifecycleService() {
         unlockReceiver = object : android.content.BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 val action = intent?.action ?: return
+                if (action == Intent.ACTION_SCREEN_OFF) releaseWifiLatencyLock("screen off") else updateWifiLatencyLock()
                 if (action != Intent.ACTION_USER_PRESENT && action != Intent.ACTION_SCREEN_ON) return
                 if (StreamState.lifecycleState.get() == LifecycleState.FAILED) {
                     AppLogger.i("Power", "Screen on/unlock after camera loss -> recovering pipeline")
@@ -167,10 +192,12 @@ class StreamService : LifecycleService() {
                 }
             }
         }
-        registerReceiver(unlockReceiver, android.content.IntentFilter().apply {
+        androidx.core.content.ContextCompat.registerReceiver(this, unlockReceiver, android.content.IntentFilter().apply {
             addAction(Intent.ACTION_USER_PRESENT)
             addAction(Intent.ACTION_SCREEN_ON)
-        })
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(android.net.wifi.WifiManager.NETWORK_STATE_CHANGED_ACTION)
+        }, androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED)
 
         val power = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
         if (!power.isIgnoringBatteryOptimizations(packageName)) {
@@ -208,6 +235,8 @@ class StreamService : LifecycleService() {
         }
 
         val serverStarted = controlServer.start()
+        foregroundStarted = true
+        if (serverStarted) boundLan = StreamState.currentConfig().accessMode != "usbOnly"
         val port = StreamState.port.get()
         if (serverStarted) {
             Log.d(TAG, "StreamService started. Server on port $port.")
@@ -223,6 +252,8 @@ class StreamService : LifecycleService() {
         if (monitorJob?.isActive != true) monitorJob = lifecycleScope.launch {
             while (isActive) {
                 kotlinx.coroutines.delay(2000)
+                updateWifiLatencyLock()
+                pipelineController.submit(PipelineCommand.ThermalTick())
 
                 if (StreamState.h264Failed.getAndSet(false) && StreamState.activeStreamMode.get() == "h264") {
                     pipelineController.submit(
@@ -232,7 +263,12 @@ class StreamService : LifecycleService() {
                     )
                 }
 
-                if (StreamState.activeStreamMode.get() == "h264") {
+                if (StreamState.activeStreamMode.get() == "h264" &&
+                    StreamState.currentConfig().profile == "adaptive" &&
+                    StreamState.thermalStatus.get() < 3 &&
+                    StreamState.thermalAdaptationLevel.get() < 3 &&
+                    StreamState.lowLightPriority.get() == "stable"
+                ) {
                     val target = StreamState.selectedFps.get()
                     val actual = minOf(StreamState.captureFps.get(), StreamState.encodedFps.get())
                     lowH264Windows = if (target > 0 && actual > 0 && actual * 100 < target * 80) lowH264Windows + 1 else 0
@@ -287,6 +323,17 @@ class StreamService : LifecycleService() {
         AppLogger.i("System", "StreamService stopping completely")
         monitorJob?.cancel()
         monitorJob = null
+        foregroundStarted = false
+        releaseWifiLatencyLock("service stopped")
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            thermalListener?.let { listener ->
+                try {
+                    (getSystemService(Context.POWER_SERVICE) as android.os.PowerManager).removeThermalStatusListener(listener)
+                } catch (_: RuntimeException) {}
+            }
+        }
+        thermalListener = null
+        resetThermalAdaptation()
         ServiceBridge.clear()
         orientationListener?.disable()
         unlockReceiver?.let { try { unregisterReceiver(it) } catch (_: Exception) {} }
@@ -323,6 +370,7 @@ class StreamService : LifecycleService() {
         is PipelineCommand.ApplySettings -> applySettingsPatch(command.request, command.source)
         is PipelineCommand.RuntimeH264Failure -> switchToMjpegNow(command.reason)
         is PipelineCommand.AdaptiveDowngrade -> adaptiveDowngradeNow(command.reason)
+        is PipelineCommand.ThermalTick -> applyThermalAdaptationNow()
         is PipelineCommand.PreviewSurfaceChanged -> previewSurfaceChangedNow(command.attached)
         is PipelineCommand.SetTorch -> applyRuntimeControl(command.baseRevision, command.requestId, command.source) {
             if (StreamState.activeStreamMode.get() == "h264") h264Streamer.setTorch(command.enabled) else mjpegStreamer.setTorch(command.enabled)
@@ -381,6 +429,8 @@ class StreamService : LifecycleService() {
         return try {
             mjpegStreamer.stop()
             h264Streamer.stop()
+            h264Streamer.resetAdaptiveProfile()
+            resetThermalAdaptation()
             resetPipelineMetrics()
             transitionLifecycle(LifecycleState.STOPPED)
             releaseStreamWakeLock()
@@ -460,11 +510,134 @@ class StreamService : LifecycleService() {
     }
 
     private suspend fun adaptiveDowngradeNow(reason: String): PipelineResult {
+        if (StreamState.currentConfig().profile != "adaptive") {
+            return pipelineResult("Manual capture profile retained: $reason")
+        }
         val next = h264Streamer.prepareAdaptiveDowngrade()
             ?: return switchToMjpegNow("$reason; no lower sustainable H.264 profile")
         StreamState.publishRuntimeRevision("adaptive-watchdog", java.util.UUID.randomUUID().toString())
         StreamState.publishFallback(true, "$reason; adapting to ${next.width}x${next.height}@${next.fps}")
         return rebindCameraNow(StreamState.fallbackReason.get())
+    }
+
+    /** Runs on the same actor as settings/start/stop; listener callbacks only
+     * publish temperature. Thermal changes never modify the desired config. */
+    private suspend fun applyThermalAdaptationNow(): PipelineResult {
+        val config = StreamState.currentConfig()
+        if (StreamState.lifecycleState.get() != LifecycleState.STREAMING ||
+            StreamState.activeStreamMode.get() != "h264"
+        ) return pipelineResult("Thermal status observed; H.264 inactive")
+        val eligible = config.profile == "adaptive" && config.h264BitrateMode == "auto"
+        val decision = thermalPolicy.evaluate(
+            StreamState.thermalStatus.get(), android.os.SystemClock.elapsedRealtime(), eligible
+        )
+        StreamState.thermalAdaptationLevel.set(decision.level)
+        StreamState.thermalBitrateScale.set(decision.bitrateScale)
+        StreamState.thermalFpsCap.set(decision.fpsCap ?: 0)
+        StreamState.thermalAdaptationReason.set(when {
+            !eligible -> "Manual quality retained; automatic thermal adaptation disabled"
+            decision.level == 0 -> "Requested quality; thermal status ${StreamState.thermalStatus.get()}"
+            else -> "Thermal level ${StreamState.thermalStatus.get()}; adaptation ${decision.level}, " +
+                "bitrate ${(decision.bitrateScale * 100).toInt()}%" + (decision.fpsCap?.let { ", FPS cap $it" } ?: "")
+        })
+        if (!eligible && thermalCameraSteps > 0) {
+            thermalCameraSteps = 0
+            thermalRecoveryModes.clear()
+            h264Streamer.resetAdaptiveProfile()
+            appliedThermalLevel = -1
+            return rebindCameraNow("Restoring requested manual quality")
+        }
+        if (decision.level == appliedThermalLevel) return pipelineResult("Thermal policy unchanged")
+        val previousLevel = appliedThermalLevel
+        appliedThermalLevel = decision.level
+        StreamState.publishRuntimeRevision("thermal-policy", java.util.UUID.randomUUID().toString())
+        if (eligible && decision.cameraStep > thermalCameraSteps) {
+            val previousMode = StreamState.toStatusDto().snapshot.selected?.let { H264ModeDto(it.width, it.height, it.fps) }
+            val next = if (previousMode != null) h264Streamer.prepareAdaptiveDowngrade(decision.fpsCap) else null
+            if (next != null) {
+                thermalRecoveryModes.addLast(previousMode!!)
+                thermalCameraSteps++
+                AppLogger.w("Thermal", "Sustained heat: adapting to ${next.width}x${next.height}@${next.fps}")
+                return rebindCameraNow("Sustained thermal pressure; camera step $thermalCameraSteps")
+            }
+        } else if (eligible && decision.cameraStep < thermalCameraSteps) {
+            val next = h264Streamer.prepareAdaptiveRecovery(thermalRecoveryModes.lastOrNull())
+            if (next != null) {
+                thermalRecoveryModes.removeLastOrNull()
+                thermalCameraSteps--
+                AppLogger.i("Thermal", "Device cooled: recovering to ${next.width}x${next.height}@${next.fps}")
+                return rebindCameraNow("Thermal recovery; camera step $thermalCameraSteps")
+            }
+        }
+        if (!h264Streamer.applyRuntimeAdaptation(decision.bitrateScale, decision.fpsCap)) {
+            // Some encoders reject dynamic bitrate or camera AE updates. A
+            // bounded rebind on a policy transition is the compatibility path.
+            if (eligible && previousLevel >= 0 && previousLevel != decision.level) {
+                return rebindCameraNow("Thermal adaptation requires encoder reconfiguration")
+            }
+        }
+        if (previousLevel != decision.level) AppLogger.i("Thermal", StreamState.thermalAdaptationReason.get())
+        return pipelineResult("Thermal adaptation applied")
+    }
+
+    private fun resetThermalAdaptation() {
+        thermalPolicy.reset()
+        thermalCameraSteps = 0
+        thermalRecoveryModes.clear()
+        appliedThermalLevel = -1
+        StreamState.thermalAdaptationLevel.set(0)
+        StreamState.thermalBitrateScale.set(1.0)
+        StreamState.thermalFpsCap.set(0)
+        StreamState.thermalAdaptationReason.set("")
+    }
+
+    private fun updateWifiLatencyLock() {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q) {
+            releaseWifiLatencyLock("API below 29")
+            return
+        }
+        val power = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        val connectivity = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val wifiConnected = connectivity.allNetworks.any { network ->
+            connectivity.getNetworkCapabilities(network)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+        }
+        val streaming = StreamState.lifecycleState.get() == LifecycleState.STREAMING
+        val clients = StreamState.h264ClientCount.get() + StreamState.mjpegClientCount.get()
+        if (!WifiLatencyLockPolicy.eligible(
+                android.os.Build.VERSION.SDK_INT, streaming, foregroundStarted && StreamState.appForeground.get(),
+                power.isInteractive, wifiConnected, boundLan, clients, StreamState.latencyProfile.get()
+            )) {
+            releaseWifiLatencyLock(when {
+                !streaming -> "camera inactive"
+                !boundLan -> "USB transport"
+                !foregroundStarted || !StreamState.appForeground.get() -> "app background"
+                !power.isInteractive -> "screen off"
+                !wifiConnected -> "Wi-Fi disconnected"
+                clients == 0 -> "no stream clients"
+                else -> "smooth profile"
+            })
+            return
+        }
+        if (wifiLatencyLock?.isHeld == true) return
+        try {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+            val lock = wifi.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "OpenCamBridge:LanLatency")
+            lock.setReferenceCounted(false)
+            lock.acquire()
+            wifiLatencyLock = lock
+            StreamState.wifiLowLatencyLockHeld.set(lock.isHeld)
+            StreamState.wifiLowLatencyLockReason.set("LAN streaming, foreground and screen on; hardware support determines effect")
+        } catch (e: RuntimeException) {
+            releaseWifiLatencyLock("unavailable: ${e.javaClass.simpleName}")
+            AppLogger.w("WiFi", "Low-latency Wi-Fi lock unavailable: ${e.message}")
+        }
+    }
+
+    private fun releaseWifiLatencyLock(reason: String) {
+        try { if (wifiLatencyLock?.isHeld == true) wifiLatencyLock?.release() } catch (_: RuntimeException) {}
+        wifiLatencyLock = null
+        StreamState.wifiLowLatencyLockHeld.set(false)
+        StreamState.wifiLowLatencyLockReason.set(reason)
     }
 
     private suspend fun previewSurfaceChangedNow(attached: Boolean): PipelineResult {
@@ -493,6 +666,7 @@ class StreamService : LifecycleService() {
             "Invalid pipeline lifecycle transition $current -> $target"
         }
         StreamState.lifecycleState.set(target)
+        updateWifiLatencyLock()
     }
 
     /**
@@ -575,6 +749,7 @@ class StreamService : LifecycleService() {
         try {
             h264Streamer.start()
             StreamState.activeStreamMode.set("h264")
+            appliedThermalLevel = -1 // Reapply live scale/cap to the new codec/session.
         } catch (h264Error: Exception) {
             val selected = selectCanonicalMjpegFallback(config) ?: throw IllegalStateException(
                 "H.264 failed exactly at ${config.width}x${config.height}@${config.fps}: ${h264Error.message}; " +
@@ -627,6 +802,9 @@ class StreamService : LifecycleService() {
             streamMode = req.streamMode ?: previous.streamMode,
             h264Bitrate = req.h264Bitrate ?: previous.h264Bitrate,
             h264BitrateMode = req.h264BitrateMode ?: (if (req.h264Bitrate != null) "manual" else previous.h264BitrateMode),
+            latencyProfile = req.latencyProfile ?: previous.latencyProfile,
+            lowLightPriority = req.lowLightPriority ?: previous.lowLightPriority,
+            allowHighSpeed = req.allowHighSpeed ?: previous.allowHighSpeed,
             h264KeyframeInterval = H264SettingsPolicy.normalizeKeyframeInterval(
                 req.h264KeyframeInterval ?: previous.h264KeyframeInterval
             ),
@@ -635,7 +813,7 @@ class StreamService : LifecycleService() {
             height = req.height ?: previous.height,
             outputWidth = req.outputWidth ?: previous.outputWidth,
             outputHeight = req.outputHeight ?: previous.outputHeight,
-            profile = req.profile ?: previous.profile,
+            profile = req.profile ?: if (req.width != null || req.height != null || req.fps != null) "manual" else previous.profile,
             jpegQuality = req.jpegQuality?.coerceIn(1, 100) ?: previous.jpegQuality,
             fps = req.fps ?: previous.fps,
             previewFitMode = req.previewFitMode ?: previous.previewFitMode,
@@ -649,8 +827,11 @@ class StreamService : LifecycleService() {
         if (next.h264BitrateMode !in listOf("auto", "manual") || next.h264Bitrate !in 1_000_000..50_000_000) {
             return rememberRequest(req.requestId, pipelineResult("Invalid H.264 bitrate mode or manual value (1–50 Mbps)", PipelineResultCode.UNPROCESSABLE))
         }
+        if (next.latencyProfile !in setOf("low", "balanced", "smooth") ||
+            next.lowLightPriority !in setOf("stable", "low-light")
+        ) return rememberRequest(req.requestId, pipelineResult("Invalid latency or low-light priority", PipelineResultCode.UNPROCESSABLE))
         val touchesPath = req.cameraId != null || req.streamMode != null || req.width != null ||
-            req.height != null || req.fps != null || req.profile != null
+            req.height != null || req.fps != null || req.profile != null || req.allowHighSpeed != null
         validateRequestedPath(next, touchesPath)?.let { rejection ->
             val requested = "${next.streamMode.uppercase()} ${next.width}x${next.height}@${next.fps}"
             return rememberRequest(req.requestId, pipelineResult(
@@ -668,25 +849,31 @@ class StreamService : LifecycleService() {
             previous.profile != next.profile || previous.h264KeyframeInterval != next.h264KeyframeInterval ||
             previous.localPreviewEnabled != next.localPreviewEnabled ||
             previous.displayRotation != next.displayRotation || previous.mirror != next.mirror
+            || previous.lowLightPriority != next.lowLightPriority || previous.allowHighSpeed != next.allowHighSpeed
+            || previous.latencyProfile != next.latencyProfile
         var requiresRebind = captureChanged
 
         AppLogger.i("System", "Settings patch received from ${source ?: "unknown"}")
 
         if (captureChanged) {
             h264Streamer.resetAdaptiveProfile()
+            resetThermalAdaptation()
             lowH264Windows = 0
         }
         val appliedRevision = StreamState.publishConfigRevision(next, source ?: "api", req.requestId)
+        updateWifiLatencyLock()
         if (previous.accessMode != next.accessMode || previous.port != next.port) {
             AppLogger.w("Security", "Bind settings changed; restart the service to bind ${next.accessMode}:${next.port}")
         }
-        if (!requiresRebind && (previous.h264Bitrate != next.h264Bitrate || previous.h264BitrateMode != next.h264BitrateMode) &&
+        if (!requiresRebind && (previous.h264Bitrate != next.h264Bitrate || previous.h264BitrateMode != next.h264BitrateMode ||
+                previous.accessMode != next.accessMode) &&
             StreamState.activeStreamMode.get() == "h264" &&
             StreamState.lifecycleState.get() == LifecycleState.STREAMING &&
             !h264Streamer.updateBitrate(next)
         ) {
             requiresRebind = true
         }
+        if (previous.h264BitrateMode != next.h264BitrateMode) appliedThermalLevel = -1
 
         // Dynamic preview surface detach. CameraX requires setSurfaceProvider to
         // run on the MAIN thread; this patch is applied from the Ktor HTTP worker
@@ -729,9 +916,11 @@ class StreamService : LifecycleService() {
         val mode = config.streamMode
         val profile = config.profile
         if (mode == "h264") {
-            if (fps !in setOf(30, 60)) return "Unsupported H.264 webcam FPS $fps; selectable values are 30 or 60"
-            if ((width != 1280 || height != 720) && (width != 1920 || height != 1080)) {
-                return "Unsupported H.264 webcam resolution ${width}x$height"
+            if (width !in 1..1920 || height !in 1..1920 || width.toLong() * height > 1920L * 1080 || fps !in 1..60) {
+                return "H.264 mode exceeds the shared webcam frame capacity (1920x1080, 60 FPS)"
+            }
+            if (H264Capabilities.supportedModes(applicationContext, cameraId, config.allowHighSpeed).isEmpty()) {
+                return "Camera $cameraId has no supported H.264 modes"
             }
             if (profile == "adaptive") return null
             val selections = H264Capabilities.selectCandidates(
@@ -740,18 +929,24 @@ class StreamService : LifecycleService() {
                 width,
                 height,
                 fps,
-                includeAdaptiveFallbacks = false
+                includeAdaptiveFallbacks = false,
+                allowHighSpeed = config.allowHighSpeed,
+                lowLightPriority = config.lowLightPriority
             )
             if (selections.isNotEmpty()) return null
             val reasons = H264Capabilities.inspectPathCapabilities(
                 applicationContext,
                 cameraId,
-                H264ModeDto(width, height, fps)
+                H264ModeDto(width, height, fps), config.allowHighSpeed, config.lowLightPriority
             ).joinToString("; ") { "${it.engine}: ${it.reason}" }
             return "H.264 ${width}x$height@$fps is unavailable on camera $cameraId: $reasons"
         }
-        if (mode != "mjpeg") return "Unknown stream mode '$mode'"
-        if (fps !in setOf(15, 30, 60)) return "Unsupported MJPEG FPS $fps; selectable values are 15, 30, or 60"
+        if (mode != "mjpeg") {
+            return "Unknown stream mode '$mode'"
+        }
+        if (fps !in setOf(15, 30, 60)) {
+            return "Unsupported MJPEG FPS $fps; selectable values are 15, 30, or 60"
+        }
         val camera = cameraRepository.listCameras().firstOrNull { it.id == cameraId }
             ?: return "Unknown camera '$cameraId'"
         if (camera.mjpegModes.none { it.width == width && it.height == height && it.fps == fps }) {
@@ -763,7 +958,7 @@ class StreamService : LifecycleService() {
     }
 
     private fun supportedAlternatives(config: com.opencambridge.android.state.StreamConfig): List<String> {
-        val camera = cameraRepository.listCameras().firstOrNull { it.id == config.cameraId }
+        val camera = cameraRepository.listCameras(config.allowHighSpeed).firstOrNull { it.id == config.cameraId }
             ?: return emptyList()
         return if (config.streamMode == "h264") {
             val preference = H264Capabilities.preferredModes.withIndex().associate { it.value to it.index }

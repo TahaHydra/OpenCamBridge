@@ -12,6 +12,7 @@ function Canonical-Fields($fields) {
 
 $canonical = "name=$($schema.name);version=$($schema.version);packing=$($schema.packing);headerSize=$($schema.headerSize);slotHeaderSize=$($schema.slotHeaderSize);slotCount=$($schema.slotCount);header=$(Canonical-Fields $schema.header);slot=$(Canonical-Fields $schema.slotHeader)"
 $sha = [Security.Cryptography.SHA256]::Create()
+$canonical += ";limits=$($schema.limits.maxDimension):$($schema.limits.maxPixels):$($schema.limits.maxNv12Bytes)"
 try { $digest = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical)) } finally { $sha.Dispose() }
 $fingerprint = [BitConverter]::ToUInt64($digest, 0)
 $fingerprintHex = "0x{0:x16}" -f $fingerprint
@@ -23,7 +24,7 @@ $rustTypes = @{
     atomic_i32 = "std::sync::atomic::AtomicI32";
     atomic_u64 = "std::sync::atomic::AtomicU64";
     bytes16 = "[u8; 16]"; bytes32 = "[u8; 32]";
-    u64x1 = "[u64; 1]"; u64x2 = "[u64; 2]"; u64x6 = "[u64; 6]"; u64x7 = "[u64; 7]"
+    u64x1 = "[u64; 1]"; u64x2 = "[u64; 2]"; u64x3 = "[u64; 3]"; u64x6 = "[u64; 6]"; u64x7 = "[u64; 7]"
 }
 
 # The cursor arithmetic is emitted rather than hand-written in each language.
@@ -161,6 +162,9 @@ function Rust-Assertions([string]$headerType, [string]$slotType) {
     $lines.Add("pub const RING_HEADER_SIZE: usize = $($schema.headerSize);")
     $lines.Add("pub const SLOT_HEADER_SIZE: usize = $($schema.slotHeaderSize);")
     $lines.Add("pub const SLOT_COUNT: usize = $($schema.slotCount);")
+    $lines.Add("pub const RING_MAX_DIMENSION: usize = $($schema.limits.maxDimension);")
+    $lines.Add("pub const RING_MAX_PIXELS: usize = $($schema.limits.maxPixels);")
+    $lines.Add("pub const RING_MAX_NV12_BYTES: usize = $($schema.limits.maxNv12Bytes);")
     $lines.Add("const _: () = assert!(std::mem::size_of::<$headerType>() == RING_HEADER_SIZE);")
     $lines.Add("const _: () = assert!(std::mem::size_of::<$slotType>() == SLOT_HEADER_SIZE);")
     foreach ($field in $schema.header) {
@@ -187,6 +191,9 @@ $cpp.Add("#define OCBR_VERSION $($schema.version)")
 $cpp.Add("#define OCBR_HEADER_SIZE $($schema.headerSize)")
 $cpp.Add("#define OCBR_SLOT_HEADER_SIZE $($schema.slotHeaderSize)")
 $cpp.Add("#define OCBR_SLOT_COUNT $($schema.slotCount)")
+$cpp.Add("#define OCBR_MAX_DIMENSION $($schema.limits.maxDimension)")
+$cpp.Add("#define OCBR_MAX_PIXELS $($schema.limits.maxPixels)")
+$cpp.Add("#define OCBR_MAX_NV12_BYTES $($schema.limits.maxNv12Bytes)")
 $cpp.Add("#define OCBR_ABI_HASH $($fingerprintHex)ULL")
 $cpp.Add("#define OCBR_ABI_LAYOUT_SHA256 `"$shaHex`"")
 $cpp.Add("static_assert(sizeof(OpenCamBridgeRingHeader) == $($schema.headerSize), `"ring header size changed`" );")

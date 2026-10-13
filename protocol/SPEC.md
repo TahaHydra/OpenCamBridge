@@ -133,16 +133,21 @@ Neither H.264 path converts frames to BGRA.
 If the software decoder cannot sustain at least 80 percent of the selected rate
 for three measurement windows, the producer asks Android to rebind to MJPEG.
 
-Producer and virtual-camera DLL share a version-4 `OCBR` ring. The header is 320
+Producer and virtual-camera DLL share a version-5 `OCBR` ring. The header is 384
 bytes followed by sixteen equal slots. Each slot has a 128-byte metadata header
-and space for at most a 1920x1080 NV12 frame, so the mapping is roughly 50 MB.
+and space for at most 3,110,400 NV12 bytes, so the mapping is roughly 50 MB.
+Dimensions must be positive/even, each at most 1920, with at most 2,073,600 pixels;
+1080x1920 portrait is valid. Limits participate in the schema fingerprint.
 
 Ring metadata includes the published slot and sequence, producer heartbeat,
 consumer-selected width/height/rate, and total virtual-camera unique/repeated
 sample counters. Slot metadata contains write and commit epochs, sequence,
 capture/receive/decode timestamps, dimensions, Y/UV strides, pixel format,
 payload size, flags, data offset, packed colour descriptor, and NV12 bytes. The
-descriptor uses a previously reserved field, so the ring ABI is unchanged.
+descriptor uses a slot field retained from v4. Ring v5 additionally reports local
+commit-to-delivery age, delivery timestamp/count/repeats, processing/resize times
+and skipped-frame counters. A different version, header size or fingerprint is
+rejected rather than interpreted as compatible memory.
 
 The producer fills a non-published slot, commits it with release ordering, then
 atomically publishes it. The virtual camera copies only a stable selected slot
@@ -154,7 +159,7 @@ counter.
 
 ### Frame history and consumer cursors
 
-Version 4 makes the ring a bounded history rather than a single latest frame. The
+Version 4 introduced bounded history; version 5 preserves it. The
 distinction matters because the two consumers — the virtual camera and the desktop
 preview — read on unrelated clocks, and `published_slot` can only ever name the
 newest frame, never what came before it.
@@ -176,8 +181,11 @@ different frame than the one it reports. The Rust copy carries the tests.
 The virtual camera and desktop preview have separate bounded cursors. The desktop
 preview's first call returns the newest committed frame immediately, then drains newer
 live frames in order and skips forward when more than three are pending. The virtual
-camera starts immediately from a stable frame about 90-100 ms behind the live edge,
-then consumes equal-rate sequences in order. Neither cursor changes the other's state.
+camera starts immediately from stable available history, builds the selected cushion
+on a cold ring, and consumes equal-rate sequences in order with bounded drift correction.
+Neither cursor changes the other's state. The primary WebCodecs preview reads the
+producer's authenticated compressed loopback fanout; only its compatibility fallback
+uses this ring cursor.
 Both consumers can count *skipped* frames separately from frames already overwritten
 in the ring.
 
@@ -186,21 +194,25 @@ in the ring.
 Media Foundation requests are paced at the negotiated output interval. A missed
 deadline is rebased to the current time; it is never repaid with a sub-frame catch-up
 interval. The virtual camera uses a fixed time-sized sequence queue rather than the
-adaptive capture-timestamp servo. The queue target is 90 ms rounded up to whole source
-intervals: three intervals (about 100 ms) at 30 fps and six at 60 fps.
+adaptive capture-timestamp servo. Low/Balanced/Smooth targets are 55/90/140 ms.
+Actual depth is quantized by capture cadence and arrival bursts; it is measured,
+not guaranteed to equal the target. Sustained high/low depth pressure causes bounded
+skips/repeats after hysteresis rather than letting clock mismatch drain/fill the ring.
 
 For equal source and output rates, the consumer releases the next committed sequence
-in order. If output is faster than the source, it repeats the previous stable sequence
-until the next exists. If the source is faster than output, it recentres at the fixed
-live-edge delay, which performs deterministic rate conversion. A generation change
+in order. Unequal rates follow a timestamp cadence and deliberately repeat or skip
+for rate conversion. Consumer pauses/overwritten cursors recenter at bounded history
+and restore live sample time. A generation change
 immediately selects a stable frame from the new generation; retained slots from the
 old stream are never replayed.
 
-This deliberately replaces the adaptive scheduler in the native shipping path. Live
+The earlier fixed queue replaced the adaptive scheduler in the native shipping path. Live
 probing showed that scheduler pinning its target at 140 ms while a healthy 30 fps ring
 advanced, reducing virtual-camera unique output to 22-25 fps. The fixed queue delivered
 3,044 unique frames from 3,046 ring writes over 101.6 seconds, with three isolated
-repeats and no catch-up burst.
+repeats and no catch-up burst. Those are historical baseline measurements, not
+measurements of the October drift-correction changes; see the implementation record
+for deterministic tests and outstanding physical validation.
 
 The desktop preview uses its own bounded cursor queue and never modifies
 virtual-camera consumer state.

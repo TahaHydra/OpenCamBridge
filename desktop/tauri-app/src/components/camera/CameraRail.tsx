@@ -251,6 +251,21 @@ export default function CameraRail({
       </Group>
 
       {advanced && <EncodingGroup controller={controller} disabled={captureLocked} />}
+      <Group title="Latency and light">
+        <Field label="Latency" hint="Less buffering responds sooner; Smooth absorbs larger arrival bursts. Applies to preview and camera output.">
+          <Select label="Latency profile" value={settings.latencyProfile} disabled={captureLocked}
+            options={[{ value: 'low', label: 'Low latency' }, { value: 'balanced', label: 'Balanced' }, { value: 'smooth', label: 'Smooth' }]}
+            onChange={value => void controller.updateSetting('latencyProfile', value as 'low' | 'balanced' | 'smooth')} />
+        </Field>
+        <Field label="Exposure priority" hint="Low-light priority allows longer exposure, which can lower actual FPS and increase motion blur.">
+          <Select label="Exposure priority" value={settings.lowLightPriority} disabled={captureLocked}
+            options={[{ value: 'stable', label: 'Stable FPS' }, { value: 'low-light', label: 'Low-light priority' }]}
+            onChange={value => void controller.updateSetting('lowLightPriority', value as 'stable' | 'low-light')} />
+        </Field>
+        {advanced && <SwitchRow label="Experimental high-speed capture" checked={settings.allowHighSpeed} disabled={captureLocked}
+          description="May unlock 60 FPS, crop the field of view and restrict camera controls. Requires device testing."
+          onChange={value => void controller.updateSetting('allowHighSpeed', value)} />}
+      </Group>
     </aside>
   );
 }

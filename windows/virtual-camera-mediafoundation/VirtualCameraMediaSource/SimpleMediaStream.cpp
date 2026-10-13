@@ -157,14 +157,21 @@ namespace winrt::WindowsSample::implementation
             }
             modes.push_back({ subtype, width, height, fps });
         };
-        const bool sourceGeometryCommon =
-            (sourceWidth == 1920 && sourceHeight == 1080) ||
-            (sourceWidth == 1280 && sourceHeight == 720) ||
-            (sourceWidth == 1080 && sourceHeight == 1920) ||
-            (sourceWidth == 720 && sourceHeight == 1280) ||
-            (sourceWidth == 640 && sourceHeight == 480);
-        if (sourceKnown && sourceGeometryCommon) {
-            addMode(MFVideoFormat_NV12, sourceWidth, sourceHeight, sourceSupports60 ? 60 : 30);
+        const bool sourceGeometryValid = sourceWidth > 0 && sourceHeight > 0 &&
+            sourceWidth <= OCBR_MAX_DIMENSION && sourceHeight <= OCBR_MAX_DIMENSION &&
+            ((sourceWidth | sourceHeight) & 1u) == 0 &&
+            static_cast<uint64_t>(sourceWidth) * sourceHeight <= OCBR_MAX_PIXELS;
+        if (sourceKnown && sourceGeometryValid) {
+            const uint32_t actualRate = sourceFpsNum / (std::max<DWORD>)(1, sourceFpsDen);
+            addMode(MFVideoFormat_NV12, sourceWidth, sourceHeight,
+                sourceSupports60 ? 60 : actualRate >= 1 && actualRate <= 60 ? actualRate : 30);
+            if (actualRate == 24 || actualRate == 25 || actualRate == 50) {
+                for (const auto& format : { MFVideoFormat_NV12, MFVideoFormat_YUY2, MFVideoFormat_RGB32 }) {
+                    addMode(format, sourceWidth, sourceHeight, actualRate);
+                    addMode(format, 1280, 720, actualRate);
+                    addMode(format, 640, 480, actualRate);
+                }
+            }
         }
         // Compatibility-first list. 60 fps is not exposed for a 30 fps
         // producer; when known, its geometry and cadence are preferred first.
@@ -192,6 +199,16 @@ namespace winrt::WindowsSample::implementation
         addMode(MFVideoFormat_RGB32, 640, 480, 30);
         addMode(MFVideoFormat_RGB32, 1080, 1920, 30);
         addMode(MFVideoFormat_RGB32, 720, 1280, 30);
+        addMode(MFVideoFormat_RGB32, 1920, 1080, 30);
+        if (sourceSupports60) {
+            for (const auto& format : { MFVideoFormat_YUY2, MFVideoFormat_RGB32 }) {
+                addMode(format, 1920, 1080, 60);
+                addMode(format, 1280, 720, 60);
+                addMode(format, 640, 480, 60);
+                addMode(format, 1080, 1920, 60);
+                addMode(format, 720, 1280, 60);
+            }
+        }
 
         const uint32_t NUM_MEDIATYPES = static_cast<uint32_t>(modes.size());
         wil::unique_cotaskmem_array_ptr<wil::com_ptr_nothrow<IMFMediaType>> mediaTypeList = wilEx::make_unique_cotaskmem_array<wil::com_ptr_nothrow<IMFMediaType>>(NUM_MEDIATYPES);
@@ -383,6 +400,7 @@ namespace winrt::WindowsSample::implementation
         // server spun RequestSample continuously (~340k requests served ~150
         // real frames), pegging CPU and inflating repeated-frame counters.
         PaceToFrameRate();
+        const uint64_t processingStartNs = SharedMemoryClient::HostNowNs();
 
         winrt::slim_lock_guard lock(m_Lock);
         wil::com_ptr_nothrow<IMFSample> sample;
@@ -428,8 +446,13 @@ namespace winrt::WindowsSample::implementation
             // into the middle of a live stream is a visible flash - worse than the
             // momentary freeze it replaces, and indistinguishable from a real fault.
             bool repeated = false;
-            if (m_lastGoodFrameLength > 0 && m_lastGoodFrameLength <= bufferLock.bufferLength) {
+            if (m_lastGoodFrameLength > 0 && m_lastGoodFrameLength == bufferLock.bufferLength &&
+                m_lastGoodFramePitch == bufferLock.pitch) {
                 memcpy(bufferLock.bufferStart, m_lastGoodFrame.data(), m_lastGoodFrameLength);
+                metadata = m_lastGoodMetadata;
+                metadata.isNew = false;
+                metadata.sampleTimeNs = 0;
+                metadata.flags = 0;
                 repeated = true;
             }
             if (!repeated) {
@@ -444,13 +467,16 @@ namespace winrt::WindowsSample::implementation
                     return fallbackResult;
                 }
             }
-        } else if (bufferLock.bufferLength > 0 && bufferLock.bufferLength <= OCB_LAST_GOOD_FRAME_LIMIT) {
+        } else if ((metadata.isNew || m_lastGoodFrameLength != bufferLock.bufferLength || m_lastGoodFramePitch != bufferLock.pitch) &&
+            bufferLock.bufferLength > 0 && bufferLock.bufferLength <= OCB_LAST_GOOD_FRAME_LIMIT) {
             // Keep a copy so the branch above has something to repeat.
             if (m_lastGoodFrame.size() < bufferLock.bufferLength) {
                 m_lastGoodFrame.resize(bufferLock.bufferLength);
             }
             memcpy(m_lastGoodFrame.data(), bufferLock.bufferStart, bufferLock.bufferLength);
             m_lastGoodFrameLength = bufferLock.bufferLength;
+            m_lastGoodFramePitch = bufferLock.pitch;
+            m_lastGoodMetadata = metadata;
         }
         HRESULT lengthResult = bufferLock.CommitLength(width, height, subtype);
         if (FAILED(lengthResult)) {
@@ -512,6 +538,8 @@ namespace winrt::WindowsSample::implementation
             GUID_NULL,
             S_OK,
             sample.get()));
+
+        (void)m_shmClient.ReportSampleDelivery(metadata, processingStartNs);
 
         return S_OK;
     }
@@ -792,6 +820,8 @@ namespace winrt::WindowsSample::implementation
 
         // Set stream state
         m_streamState = MF_STREAM_STATE_RUNNING;
+        m_lastGoodFrameLength = 0;
+        m_lastGoodMetadata = {};
         m_streamEpoch100ns = 0;
         m_lastSampleTime100ns = 0;
 

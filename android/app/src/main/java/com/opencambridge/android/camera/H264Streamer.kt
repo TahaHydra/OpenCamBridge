@@ -42,7 +42,6 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
@@ -59,8 +58,8 @@ import kotlin.math.min
  * client subscribes. Sustained slow clients are still disconnected rather
  * than allowed to build unbounded latency.
  */
-internal fun h264ClientQueueCapacity(fps: Int): Int =
-    ((fps.coerceAtLeast(1) + 1) / 2 + 2).coerceIn(10, 32)
+internal fun h264ClientQueueCapacity(fps: Int, profile: String = "balanced"): Int =
+    H264DeliveryPolicy.capacity(fps, profile)
 
 /**
  * Zero-copy H.264 capture path: Camera2 writes directly into a hardware
@@ -74,6 +73,14 @@ class H264Streamer(
     private val scope = CoroutineScope(Dispatchers.Default)
     private val lifecycleMutex = Mutex()
     private val clients = CopyOnWriteArrayList<Channel<ByteArray>>()
+    private val deliveryLock = Any()
+    private val clientDelivery = HashMap<Channel<ByteArray>, H264ClientDeliveryState>()
+    private val idrPolicy = H264IdrPolicy()
+    private val encoderHistory = H264EncoderHistory()
+    private var historyRecordedGeneration = -1L
+    private var keyframeJob: Job? = null
+    @Volatile private var runtimeBitrateScale = 1.0
+    @Volatile private var runtimeFpsCap: Int? = null
     // The sequence carried by video records is frame-only. Heartbeats and
     // configuration records reuse the latest value, so transport bookkeeping
     // cannot look like dropped camera frames on Windows.
@@ -97,8 +104,8 @@ class H264Streamer(
     private var activeConfig: StreamConfig? = null
     @Volatile private var activePipelineGeneration: Long = -1
     private var adaptiveMode: H264ModeDto? = null
-    private var codecConfig: ByteArray? = null
-    private var streamInfo: ByteArray? = null
+    @Volatile private var codecConfig: ByteArray? = null
+    @Volatile private var streamInfo: ByteArray? = null
     @Volatile private var colourInfo = VideoColourInfo.regularSdr(1920)
     private var partialAccessUnit: ByteArrayOutputStream? = null
     private var partialKeyframe = false
@@ -126,25 +133,27 @@ class H264Streamer(
             activePipelineGeneration = StreamState.pipelineGeneration.get()
             val cameraId = config.cameraId
             val desiredMode = H264ModeDto(config.width, config.height, config.fps)
+            val availableModes = H264Capabilities.supportedModes(context, cameraId, config.allowHighSpeed)
             val requested = adaptiveMode
             val candidateModes = when {
                 config.profile != "adaptive" -> listOf(desiredMode)
                 requested != null -> CapturePathPolicy.adaptiveSuffix(
-                    desiredMode, requested, H264Capabilities.preferredModes
+                    desiredMode, requested, availableModes
                 )
-                else -> CapturePathPolicy.adaptiveModes(desiredMode, H264Capabilities.preferredModes)
-            }.let { modes ->
-                // High-speed capture is disabled, so a requested 60 fps the regular
-                // session cannot provide must fall back to the regular rate for the
-                // same resolution rather than failing. Always offer a 30 fps
-                // same-size fallback (60-capable regular sessions still win first).
-                val fallback = H264ModeDto(desiredMode.width, desiredMode.height, 30)
-                if (modes.contains(fallback)) modes else modes + fallback
+                else -> CapturePathPolicy.adaptiveModes(desiredMode, availableModes)
             }
-            val candidates = H264Capabilities.selectCandidates(context, cameraId, candidateModes)
+            val candidates = H264Capabilities.selectCandidates(context, cameraId, candidateModes, config.allowHighSpeed, config.lowLightPriority)
+                .filter { candidate ->
+                    val cap = runtimeFpsCap?.takeIf { config.profile == "adaptive" && config.h264BitrateMode == "auto" }
+                    cap == null || candidate.captureEngine == H264CaptureEngine.REGULAR_SURFACE || candidate.mode.fps <= cap
+                }
+                .groupBy { encoderHistoryKey(config, it) }
+                .flatMap { (key, group) ->
+                    encoderHistory.order(key, group.map { it.codecName }).map { name -> group.first { it.codecName == name } }
+                }
             if (candidates.isEmpty()) {
                 val declared = candidateModes.joinToString(" | ") { mode ->
-                    val paths = H264Capabilities.inspectPathCapabilities(context, cameraId, mode)
+                    val paths = H264Capabilities.inspectPathCapabilities(context, cameraId, mode, config.allowHighSpeed, config.lowLightPriority)
                         .joinToString("; ") { "${it.engine}=${it.reason}" }
                     "${mode.width}x${mode.height}@${mode.fps}: $paths"
                 }
@@ -172,7 +181,8 @@ class H264Streamer(
                     chosen = candidate
                     break
                 } catch (e: Exception) {
-                    val failure = "${candidate.mode.width}x${candidate.mode.height}@${candidate.mode.fps} ${candidate.captureEngine}: ${e.javaClass.simpleName}: ${e.message}"
+                    encoderHistory.failed(encoderHistoryKey(config, candidate), candidate.codecName)
+                    val failure = "${candidate.mode.width}x${candidate.mode.height}@${candidate.mode.fps} ${candidate.captureEngine} ${candidate.codecName}: ${e.javaClass.simpleName}: ${e.message}"
                     failures += failure
                     AppLogger.w("H264Path", failure)
                     releaseCaptureAttempt()
@@ -234,12 +244,23 @@ class H264Streamer(
         if (oldCodecThread != null && oldCodecThread !== Thread.currentThread()) oldCodecThread.join(1_500)
         clients.forEach { it.close() }
         clients.clear()
-        clientOverflowBudget.clear()
+        synchronized(deliveryLock) { clientDelivery.clear() }
+        keyframeJob?.cancel(); keyframeJob = null
+        idrPolicy.reset()
         StreamState.h264ClientCount.set(0)
     }
 
     private suspend fun releaseCaptureAttempt() {
         captureGeneration.incrementAndGet()
+        // Invalidate callbacks immediately, before camera/session close waits.
+        val oldCodec = codec
+        codec = null
+        keyframeJob?.cancel(); keyframeJob = null
+        idrPolicy.reset()
+        codecConfig = null
+        partialAccessUnit = null
+        partialKeyframe = false
+        partialPresentationUs = 0L
         val oldSession = session
         val oldSessionClosed = sessionClosedSignal
         session = null
@@ -268,8 +289,6 @@ class H264Streamer(
         // Invalidate this generation before stopping it. Qualcomm can deliver
         // callbacks queued by stop/release after the replacement codec starts;
         // callback identity checks below keep those events isolated.
-        val oldCodec = codec
-        codec = null
         try { oldCodec?.signalEndOfInputStream() } catch (_: Exception) {}
         try { oldCodec?.stop() } catch (_: Exception) {}
         try { oldCodec?.release() } catch (_: Exception) {}
@@ -277,38 +296,89 @@ class H264Streamer(
         encoderSurface = null
     }
 
-    fun subscribe(): Channel<ByteArray> {
-        // Access units are indivisible. If a client cannot keep up, disconnect
-        // it and reconnect at a fresh config+IDR instead of dropping references.
-        // A half-second bounded cushion prevents normal USB jitter from being
-        // mistaken for a slow client while keeping glass-to-glass latency low.
+    fun subscribe(): Channel<ByteArray> = synchronized(deliveryLock) {
         val fps = selection?.mode?.fps ?: activeConfig?.fps ?: 30
-        val channel = Channel<ByteArray>(capacity = h264ClientQueueCapacity(fps))
+        val profile = activeConfig?.latencyProfile ?: "balanced"
+        val channel = Channel<ByteArray>(capacity = h264ClientQueueCapacity(fps, profile))
+        clientDelivery[channel] = H264ClientDeliveryState(H264DeliveryPolicy.maxAgeMs(profile))
         clients.add(channel)
         StreamState.h264ClientCount.set(clients.size)
-        streamInfo?.let(channel::trySend)
-        codecConfig?.let { config ->
-            channel.trySend(Ocb2.record(Ocb2.TYPE_CODEC_CONFIG, Ocb2.FLAG_CODEC_CONFIG or Ocb2.FLAG_DISCONTINUITY,
-                currentSequence(), SystemClock.elapsedRealtimeNanos(), 0, config))
-        }
+        enqueueBootstrap(channel)
         requestKeyFrame()
-        return channel
+        channel
     }
 
-    fun unsubscribe(channel: Channel<ByteArray>) {
+    fun unsubscribe(channel: Channel<ByteArray>) = synchronized(deliveryLock) {
         clients.remove(channel)
-        clientOverflowBudget.remove(channel)
+        clientDelivery.remove(channel)
         StreamState.h264ClientCount.set(clients.size)
         channel.close()
     }
 
     fun requestKeyFrame() {
-        val c = codec ?: return
-        try {
-            c.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
-        } catch (e: Exception) {
-            Log.w(TAG, "Keyframe request failed", e)
+        val requestedCodec = codec ?: return
+        val waitMs = idrPolicy.request(SystemClock.elapsedRealtime()) ?: return
+        keyframeJob = scope.launch {
+            if (waitMs > 0) delay(waitMs)
+            if (codec !== requestedCodec || !idrPolicy.fire(SystemClock.elapsedRealtime())) return@launch
+            try {
+                requestedCodec.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
+            } catch (e: Exception) { Log.w(TAG, "Keyframe request failed", e) }
         }
+    }
+
+    /** Server calls immediately before each socket write, including after a
+     * suspended write. Never send a record invalidated by queue recovery. */
+    fun shouldSendClientRecord(channel: Channel<ByteArray>, record: ByteArray): Boolean = synchronized(deliveryLock) {
+        val state = clientDelivery[channel] ?: return@synchronized false
+        val now = SystemClock.elapsedRealtime()
+        if (!state.contains(record)) return@synchronized false
+        if (state.consume(record, now)) return@synchronized true
+        // A record missing from this generation was already invalidated; a
+        // stale current generation needs the same config + genuine IDR recovery.
+        recoverClient(channel, state, now)
+        false
+    }
+
+    private fun enqueueClient(channel: Channel<ByteArray>, record: ByteArray): Boolean {
+        val state = clientDelivery[channel] ?: return false
+        if (!channel.trySend(record).isSuccess) return false
+        state.enqueue(record, SystemClock.elapsedRealtime())
+        return true
+    }
+
+    private fun enqueueBootstrap(channel: Channel<ByteArray>) {
+        streamInfo?.let { enqueueClient(channel, it) }
+        codecConfig?.let { config -> enqueueClient(channel,
+            Ocb2.record(Ocb2.TYPE_CODEC_CONFIG, Ocb2.FLAG_CODEC_CONFIG or Ocb2.FLAG_DISCONTINUITY,
+                currentSequence(), SystemClock.elapsedRealtimeNanos(), 0, config)) }
+    }
+
+    private fun broadcastStreamChange(record: ByteArray) = synchronized(deliveryLock) {
+        StreamState.bytesSentThisSecond.addAndGet(record.size.toLong())
+        for (channel in clients) {
+            val state = clientDelivery[channel] ?: continue
+            while (channel.tryReceive().isSuccess) { }
+            state.restartChain()
+            enqueueBootstrap(channel)
+        }
+        requestKeyFrame()
+    }
+
+    private fun recoverClient(channel: Channel<ByteArray>, state: H264ClientDeliveryState, nowMs: Long) {
+        while (channel.tryReceive().isSuccess) { /* Drop complete pending records. */ }
+        if (!state.recover(nowMs)) {
+            AppLogger.w("H264", "Disconnecting client after repeated queue age/overflow recovery")
+            clients.remove(channel)
+            clientDelivery.remove(channel)
+            channel.close()
+            StreamState.h264ClientCount.set(clients.size)
+            return
+        }
+        enqueueClient(channel, Ocb2.record(Ocb2.TYPE_HEARTBEAT, Ocb2.FLAG_DISCONTINUITY,
+            currentSequence(), SystemClock.elapsedRealtimeNanos(), 0))
+        enqueueBootstrap(channel)
+        requestKeyFrame()
     }
 
     fun updateBitrate(config: StreamConfig): Boolean {
@@ -320,6 +390,41 @@ class H264Streamer(
             activeConfig = config
             true
         } catch (_: Exception) { false }
+    }
+
+    /** Effective thermal controls never replace the user's requested config.
+     * Retain policy over an internal rebind; manual settings always win. */
+    fun applyRuntimeAdaptation(bitrateScale: Double, fpsCap: Int?): Boolean {
+        val config = activeConfig ?: return false
+        val previousCap = runtimeFpsCap
+        val effective = H264RuntimeAdaptationPolicy.resolve(config.profile, config.h264BitrateMode, bitrateScale, fpsCap, config.fps)
+        runtimeBitrateScale = effective.bitrateScale
+        runtimeFpsCap = effective.fpsCap
+        val changed = updateBitrate(config)
+        val chosen = selection ?: return false
+        // A constrained session may have required a lower encoder mode during
+        // the cap. Removing that cap restores the original ladder on rebind.
+        if (previousCap != null && runtimeFpsCap == null && adaptiveMode == null && chosen.mode.fps < config.fps) return false
+        if (chosen.captureEngine != H264CaptureEngine.REGULAR_SURFACE) {
+            return changed && (runtimeFpsCap == null || chosen.mode.fps <= runtimeFpsCap!!)
+        }
+        return try {
+            val builder = requestBuilder ?: return false
+            configureRequest(builder, chosen)
+            submitRepeating(session ?: return false, builder.build(), chosen)
+            if (previousCap != runtimeFpsCap) {
+                StreamState.cameraSessionFps.set(effectiveStreamFps(chosen, config))
+                val updated = buildStreamInfo(chosen, config, lastRejectedPaths)
+                streamInfo = updated
+                // New cadence must reach the native scheduler and preview.
+                // A discontinuity + coalesced IDR preserves decoder references.
+                broadcastStreamChange(updated)
+            }
+            changed
+        } catch (e: Exception) {
+            AppLogger.w("H264", "Effective camera rate update rejected: ${e.javaClass.simpleName}: ${e.message}")
+            false
+        }
     }
 
     private fun configureCodec(chosen: H264EncoderSelection) {
@@ -334,18 +439,20 @@ class H264Streamer(
         // the implementation default (usually VBR), which for a live virtual
         // camera shows up as a bitrate that wanders.
         colourInfo = VideoColourInfo.regularSdr(chosen.mode.width)
-        fun buildFormat(withHighProfile: Boolean, withCbr: Boolean): MediaFormat =
+        fun buildFormat(withHighProfile: Boolean, withCbr: Boolean, withHints: Boolean = true): MediaFormat =
             MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, chosen.mode.width, chosen.mode.height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, chosen.mode.fps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, keyframeInterval)
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
-                setInteger(MediaFormat.KEY_PRIORITY, 0)
+                if (withHints) {
+                    setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
+                    setInteger(MediaFormat.KEY_PRIORITY, 0)
+                }
                 // Tell the encoder it is running in realtime so it does not clock
                 // itself down to a power-saving rate under thermal pressure.
-                setInteger(MediaFormat.KEY_OPERATING_RATE, chosen.mode.fps)
+                if (withHints) setInteger(MediaFormat.KEY_OPERATING_RATE, chosen.mode.fps)
                 // Keep the encoder, decoded NV12 ring, Tauri shader and Media
                 // Foundation media type on one explicit SDR interpretation.
                 setInteger(
@@ -355,7 +462,7 @@ class H264Streamer(
                 )
                 setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
                 setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                if (withHints && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     // KEY_LOW_LATENCY is decoder-only. KEY_LATENCY is the
                     // optional encoder hint; actual support is logged below.
                     setInteger(MediaFormat.KEY_LATENCY, 1)
@@ -378,15 +485,18 @@ class H264Streamer(
         val ladder = listOf(
             "High profile + CBR" to buildFormat(withHighProfile = true, withCbr = true),
             "CBR" to buildFormat(withHighProfile = false, withCbr = true),
-            "baseline format" to buildFormat(withHighProfile = false, withCbr = false)
+            "High profile" to buildFormat(withHighProfile = true, withCbr = false),
+            "baseline format" to buildFormat(withHighProfile = false, withCbr = false),
+            "format without optional latency hints" to buildFormat(withHighProfile = false, withCbr = false, withHints = false)
         )
         var selected: MediaCodec? = null
         var selectedDescription: String? = null
         var lastFailure: Exception? = null
         for ((description, format) in ladder) {
-            val candidate = MediaCodec.createByCodecName(chosen.codecName)
-            candidate.setCallback(codecCallback, codecHandler)
+            var candidate: MediaCodec? = null
             try {
+                candidate = MediaCodec.createByCodecName(chosen.codecName)
+                candidate.setCallback(codecCallback, codecHandler)
                 candidate.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 selected = candidate
                 selectedDescription = description
@@ -394,7 +504,7 @@ class H264Streamer(
             } catch (e: Exception) {
                 lastFailure = e
                 AppLogger.w("H264", "Encoder rejected $description: ${e.javaClass.simpleName}: ${e.message}")
-                try { candidate.release() } catch (_: Exception) {}
+                try { candidate?.release() } catch (_: Exception) {}
             }
         }
         val encoder = selected
@@ -405,11 +515,11 @@ class H264Streamer(
         if (selectedDescription != ladder.first().first) {
             AppLogger.w("H264", "Encoder configured with reduced settings: $selectedDescription")
         }
-        encoderSurface = encoder.createInputSurface()
         // Publish the generation before start(), because asynchronous format
         // and error callbacks are allowed as soon as the codec starts.
         codec = encoder
         try {
+            encoderSurface = encoder.createInputSurface()
             encoder.start()
         } catch (e: Exception) {
             if (codec === encoder) codec = null
@@ -526,7 +636,7 @@ class H264Streamer(
                 val config = activeConfig ?: StreamState.currentConfig()
                 val updated = buildStreamInfo(chosen, config, lastRejectedPaths)
                 streamInfo = updated
-                broadcast(updated)
+                broadcastStreamChange(updated)
             }
             val pieces = listOf("csd-0", "csd-1").mapNotNull { key ->
                 if (!format.containsKey(key)) null else format.getByteBuffer(key)?.toByteArray()
@@ -551,19 +661,30 @@ class H264Streamer(
         }
     }
 
-    private fun publishAccessUnit(data: ByteArray, presentationTimeUs: Long, keyframe: Boolean) {
+    private fun publishAccessUnit(data: ByteArray, presentationTimeUs: Long, @Suppress("UNUSED_PARAMETER") keyframe: Boolean) {
+        val idr = H264DeliveryPolicy.containsIdr(data)
+        if (idr) idrPolicy.onIdr()
+        val generation = captureGeneration.get()
+        if (idr && running.get() && historyRecordedGeneration != generation) {
+            val selected = selection
+            val config = activeConfig
+            if (selected != null && config != null) {
+                encoderHistory.succeeded(encoderHistoryKey(config, selected), selected.codecName)
+                historyRecordedGeneration = generation
+            }
+        }
         // Several Qualcomm encoders honor PREPEND_HEADER_TO_SYNC_FRAMES but do
         // not emit BUFFER_FLAG_CODEC_CONFIG or expose csd-* in a format-change
         // callback. Derive SPS/PPS from that first IDR so every current and
         // future OCB2 client still receives an explicit type-2 config record.
-        if (keyframe && (codecConfig == null || codecConfig?.isEmpty() == true)) {
+        if (idr && (codecConfig == null || codecConfig?.isEmpty() == true)) {
             extractAnnexBCodecConfig(data)?.let { config ->
                 codecConfig = config
                 broadcast(Ocb2.record(Ocb2.TYPE_CODEC_CONFIG, Ocb2.FLAG_CODEC_CONFIG,
                     currentSequence(), presentationTimeUs * 1000L, presentationTimeUs, config))
             }
         }
-        val flags = if (keyframe) Ocb2.FLAG_KEYFRAME else 0
+        val flags = if (idr) Ocb2.FLAG_KEYFRAME else 0
         val captureNs = max(0L, presentationTimeUs * 1000L)
         // Sender-side cadence, measured on this phone's monotonic clock right before
         // the record is queued. The desktop compares these deltas against its own
@@ -579,7 +700,7 @@ class H264Streamer(
             Ocb2.record(
                 Ocb2.TYPE_VIDEO_ACCESS_UNIT, flags, nextFrameSequence(), captureNs,
                 presentationTimeUs, data, sendDeltaUs
-            )
+            ), video = true, idr = idr
         )
         val now = SystemClock.elapsedRealtimeNanos()
         encodedWindowFrames++
@@ -605,61 +726,20 @@ class H264Streamer(
             message.toByteArray(Charsets.UTF_8)))
     }
 
-    /**
-     * Overflow budget before a client is treated as genuinely too slow.
-     *
-     * A full queue means the desktop did not drain the socket in time. One
-     * occurrence is ordinary jitter — a GPU hiccup, a scheduling gap — and used
-     * to cost a disconnect, which is far more disruptive than the stall it was
-     * reacting to: the producer has to re-open the HTTP stream, re-subscribe and
-     * wait for a fresh config plus IDR. Recover in place instead, and only give
-     * up on a client that keeps overflowing.
-     */
-    private val clientOverflowBudget = ConcurrentHashMap<Channel<ByteArray>, Int>()
-
-    private fun broadcast(record: ByteArray) {
+    private fun broadcast(record: ByteArray, video: Boolean = false, idr: Boolean = false) = synchronized(deliveryLock) {
         StreamState.bytesSentThisSecond.addAndGet(record.size.toLong())
-        var recoveredClient = false
+        val now = SystemClock.elapsedRealtime()
         for (client in clients) {
-            if (client.trySend(record).isSuccess) {
-                clientOverflowBudget.remove(client)
-                continue
-            }
-            val strikes = (clientOverflowBudget[client] ?: 0) + 1
-            if (strikes > MAX_CLIENT_OVERFLOWS) {
-                AppLogger.w("H264", "Disconnecting a client that overflowed $strikes times in a row")
-                clientOverflowBudget.remove(client)
-                clients.remove(client)
-                client.close()
-                continue
-            }
-            clientOverflowBudget[client] = strikes
-            // Access units are indivisible and inter-frame references matter, so
-            // there is no useful way to deliver a partial backlog. Discard what
-            // the client has not consumed and restart it at the next IDR: one
-            // visible blip instead of a multi-hundred-millisecond outage.
-            var discarded = 0
-            while (client.tryReceive().isSuccess) discarded++
-            // A heartbeat is the record type whose payload is legitimately empty,
-            // so it is what carries the discontinuity: a type-3 record must hold
-            // a complete access unit and cannot be used as a bare marker. The
-            // client flushes its decoder and waits for the next keyframe.
-            val restarted = client.trySend(
-                Ocb2.record(
-                    Ocb2.TYPE_HEARTBEAT, Ocb2.FLAG_DISCONTINUITY,
-                    currentSequence(), SystemClock.elapsedRealtimeNanos(), 0
-                )
-            ).isSuccess
-            AppLogger.w(
-                "H264",
-                "Client queue overflowed (strike $strikes); dropped $discarded queued records" +
-                    if (restarted) " and requested a fresh keyframe" else ""
-            )
-            recoveredClient = true
+            val state = clientDelivery[client] ?: continue
+            if (state.expired(now)) { recoverClient(client, state, now) }
+            if (client !in clientDelivery) { continue }
+            if (video && !state.acceptsVideo(idr)) { continue }
+            if (enqueueClient(client, record)) { continue }
+            recoverClient(client, state, now)
+            // Recovery just invalidated all references; only an actual IDR
+            // from this same callback may be queued after the bootstrap.
+            if (client in clientDelivery && (!video || state.acceptsVideo(idr))) enqueueClient(client, record)
         }
-        // Only one IDR is needed no matter how many clients recovered, and it must
-        // be requested after the queues have been drained so it is not discarded.
-        if (recoveredClient) requestKeyFrame()
         StreamState.h264ClientCount.set(clients.size)
     }
 
@@ -869,7 +949,17 @@ class H264Streamer(
 
     private fun configureRequest(builder: CaptureRequest.Builder, chosen: H264EncoderSelection) {
         val chars = manager.getCameraCharacteristics(activeConfig?.cameraId ?: StreamState.cameraId.get())
-        builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, chosen.cameraFpsRange)
+        val config = activeConfig ?: StreamState.currentConfig()
+        val cap = runtimeFpsCap?.takeIf { config.profile == "adaptive" && config.h264BitrateMode == "auto" }
+        val effectiveRange = if (cap != null && chosen.captureEngine == H264CaptureEngine.REGULAR_SURFACE) {
+            val available = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
+            val lowerRate = available.map { it.upper }.filter { it <= cap && it <= chosen.mode.fps }.maxOrNull()
+            lowerRate?.let { fps -> RegularModePolicy.selectRange(available.map {
+                RegularModePolicy.AeRange(it.lower, it.upper) }, fps, config.lowLightPriority)
+            }?.let { android.util.Range(it.min, it.max) }
+                ?: throw IllegalStateException("No declared regular AE rate under thermal cap $cap")
+        } else chosen.cameraFpsRange
+        builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, effectiveRange)
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
         builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
         applyControls(builder, chars)
@@ -904,7 +994,7 @@ class H264Streamer(
 
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-            if (session !== this@H264Streamer.session) return
+            if (session !== this@H264Streamer.session) { return }
             synchronized(zoomSettlement) {
                 if (zoomSettlement.onCaptured(request.tag as? Long)) {
                     requestKeyFrame()
@@ -959,7 +1049,7 @@ class H264Streamer(
     }
 
     private fun applyZoomRatio(ratio: Float, movement: Long, settled: Boolean): Unit = synchronized(zoomSettlement) {
-        if (!zoomSettlement.isCurrent(movement)) return
+        if (!zoomSettlement.isCurrent(movement)) { return }
         StreamState.zoomRatio.set(ratio)
         // Only the final request is tagged. Camera2 completion confirms the
         // final crop reached capture before the encoder is asked for an IDR.
@@ -996,20 +1086,49 @@ class H264Streamer(
     /** Select the next lower complete camera+encoder profile without changing
      * the user's requested settings. The service restarts this streamer after
      * this returns a mode. */
-    fun prepareAdaptiveDowngrade(): H264ModeDto? {
+    fun prepareAdaptiveDowngrade(fpsCap: Int? = null): H264ModeDto? {
         val config = activeConfig ?: return null
         if (config.profile != "adaptive") return null
         val current = selection?.mode ?: return null
-        val supported = H264Capabilities.supportedModes(context, config.cameraId)
+        val supported = H264Capabilities.supportedModes(context, config.cameraId, config.allowHighSpeed)
         val requested = H264ModeDto(config.width, config.height, config.fps)
-        val modes = CapturePathPolicy.adaptiveModes(requested, H264Capabilities.preferredModes)
+        val modes = CapturePathPolicy.adaptiveModes(requested, supported)
             .filter(supported::contains)
+        if (fpsCap != null) {
+            return H264RuntimeAdaptationPolicy.thermalMode(current, modes, fpsCap)?.also { adaptiveMode = it }
+        }
         val index = modes.indexOfFirst { it == current }
         if (index < 0 || index + 1 >= modes.size) return null
         return modes[index + 1].also { adaptiveMode = it }
     }
 
-    fun resetAdaptiveProfile() { adaptiveMode = null }
+    fun prepareAdaptiveRecovery(target: H264ModeDto? = null): H264ModeDto? {
+        val config = activeConfig ?: return null
+        if (config.profile != "adaptive" || adaptiveMode == null) return null
+        val current = selection?.mode ?: return null
+        val supported = H264Capabilities.supportedModes(context, config.cameraId, config.allowHighSpeed)
+        val modes = CapturePathPolicy.adaptiveModes(H264ModeDto(config.width, config.height, config.fps), supported)
+            .filter(supported::contains)
+        if (target != null) return target.takeIf(modes::contains)?.also { adaptiveMode = it }
+        val index = modes.indexOf(current)
+        if (index <= 0) return null
+        return modes[index - 1].also { adaptiveMode = it }
+    }
+
+    fun resetAdaptiveProfile() {
+        adaptiveMode = null
+        runtimeBitrateScale = 1.0
+        runtimeFpsCap = null
+    }
+
+    private fun encoderHistoryKey(config: StreamConfig, candidate: H264EncoderSelection): String =
+        "${Build.FINGERPRINT}|${config.cameraId}|${candidate.mode.width}x${candidate.mode.height}@${candidate.mode.fps}|" +
+            "${candidate.captureEngine}|${config.lowLightPriority}|${config.h264KeyframeInterval}|" +
+            "${config.h264BitrateMode}|${if (config.h264BitrateMode == "manual") config.h264Bitrate else 0}"
+
+    private fun effectiveStreamFps(chosen: H264EncoderSelection, config: StreamConfig): Int =
+        H264RuntimeAdaptationPolicy.streamFps(chosen.mode.fps,
+            runtimeFpsCap?.takeIf { config.profile == "adaptive" && config.h264BitrateMode == "auto" })
 
     private fun publishSelection(chosen: H264EncoderSelection, rejectedPaths: List<String>) {
         val m = chosen.mode
@@ -1032,8 +1151,10 @@ class H264Streamer(
         }
         StreamState.encoderName.set(chosen.codecName)
         StreamState.hardwareEncoder.set(chosen.hardware)
+        AppLogger.i("H264", "Hardware=${chosen.hardware}; declared performance coverage=${chosen.performanceCovered ?: "unreported"}")
         StreamState.captureEngine.set(chosen.captureEngine.name)
-        StreamState.cameraSessionFps.set(chosen.cameraCaptureFps)
+        StreamState.cameraSessionFps.set(if (chosen.captureEngine == H264CaptureEngine.REGULAR_SURFACE)
+            effectiveStreamFps(chosen, config) else chosen.cameraCaptureFps)
         StreamState.capturePathError.set(rejectedPaths.joinToString(" | "))
         StreamState.gpuBridgeFps.set(0)
         StreamState.frameWidth.set(m.width); StreamState.frameHeight.set(m.height)
@@ -1088,13 +1209,15 @@ class H264Streamer(
             put("codec", "H264")
             put("framing", "annex-b-access-units")
             put("width", m.width); put("height", m.height)
-            put("fpsNumerator", m.fps); put("fpsDenominator", 1)
+            put("fpsNumerator", effectiveStreamFps(chosen, config)); put("fpsDenominator", 1)
             put("bitrate", StreamState.actualBitrate.get())
+            put("latencyProfile", config.latencyProfile)
             put("cameraId", config.cameraId)
             put("encoderName", chosen.codecName)
             put("hardwareEncoder", chosen.hardware)
             put("captureEngine", chosen.captureEngine.name)
-            put("cameraCaptureFps", chosen.cameraCaptureFps)
+            put("cameraCaptureFps", if (chosen.captureEngine == H264CaptureEngine.REGULAR_SURFACE)
+                effectiveStreamFps(chosen, config) else chosen.cameraCaptureFps)
             put("effectiveRotation", transform.effectiveRotation)
             put("mirror", transform.mirror)
             put("sensorOrientation", transform.sensorOrientation)
@@ -1127,14 +1250,16 @@ class H264Streamer(
             Log.w(TAG, "Rotation update failed", e); return
         }
         streamInfo = record
-        broadcast(record)
-        requestKeyFrame()
+        broadcastStreamChange(record)
     }
 
-    private fun resolvedBitrate(config: StreamConfig, chosen: H264EncoderSelection): Int =
-        com.opencambridge.android.state.H264BitratePolicy.resolve(
+    private fun resolvedBitrate(config: StreamConfig, chosen: H264EncoderSelection): Int {
+        val base = com.opencambridge.android.state.H264BitratePolicy.resolve(
             config.h264BitrateMode, config.h264Bitrate, chosen.mode.width, chosen.mode.height,
-            chosen.mode.fps, chosen.bitrateRange.lower, chosen.bitrateRange.upper)
+            chosen.mode.fps, chosen.bitrateRange.lower, chosen.bitrateRange.upper, config.accessMode)
+        val scale = if (config.profile == "adaptive" && config.h264BitrateMode == "auto") runtimeBitrateScale else 1.0
+        return (base * scale).toInt().coerceIn(chosen.bitrateRange.lower, chosen.bitrateRange.upper)
+    }
 
     private fun nextFrameSequence() = frameSequence.incrementAndGet()
     private fun currentSequence() = frameSequence.get()

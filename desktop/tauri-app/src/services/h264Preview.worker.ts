@@ -5,7 +5,7 @@ import { avcCodec, PreviewTimeline } from './h264PreviewPolicy.js';
 
 const worker = self as unknown as DedicatedWorkerGlobalScope;
 type Record = { type: number; flags: number; sequence: number; encoderTimestampUs: bigint; payload: Uint8Array };
-type Info = { width: number; height: number; fpsNumerator: number; fpsDenominator: number; effectiveRotation: number; mirror: boolean; colorMatrix?: string; colorRange?: string; colorPrimaries?: string; colorTransfer?: string };
+type Info = { width: number; height: number; fpsNumerator: number; fpsDenominator: number; effectiveRotation: number; mirror: boolean; colorMatrix?: string; colorRange?: string; colorPrimaries?: string; colorTransfer?: string; latencyProfile?: 'low' | 'balanced' | 'smooth' };
 const Parser = (globalThis as unknown as { Ocb2Browser: { Parser: new () => { push(b: Uint8Array): void; next(): Record | null } } }).Ocb2Browser.Parser;
 let parser = new Parser();
 let canvas: OffscreenCanvas;
@@ -16,6 +16,7 @@ let config = new Uint8Array(0);
 let waitingForKey = true;
 let failed = false;
 let timeline = new PreviewTimeline();
+let latencyProfile: 'low' | 'balanced' | 'smooth' = 'balanced';
 let animation = 0;
 let decoded = 0;
 let displayed = 0;
@@ -27,6 +28,35 @@ let firstInputAt = 0;
 let decodeMs = 0;
 let decodeSamples = 0;
 const submitted = new Map<number, number>();
+let decoderWake: (() => void) | undefined;
+
+function wakeDecoder() {
+  const wake = decoderWake;
+  decoderWake = undefined;
+  wake?.();
+}
+
+async function waitForDecoderRoom() {
+  const deadline = performance.now() + 2000;
+  while (!failed && decoder?.state === 'configured' &&
+      (decoder.decodeQueueSize >= 8 || submitted.size >= 16)) {
+    if (performance.now() >= deadline) throw new Error('Preview decoder stopped draining');
+    // Cached GOPs can contain many AUs in one compressed chunk. Yield to the
+    // decoder's task queue, rather than filling it from a chain of microtasks.
+    // The caller retains just one compressed chunk while local fanout remains
+    // independently bounded; a slow WebView never stalls native decoding.
+    await new Promise<void>(resolve => {
+      const wake = () => {
+        worker.clearTimeout(timer);
+        if (decoderWake === wake) decoderWake = undefined;
+        resolve();
+      };
+      const timer = worker.setTimeout(wake, 25);
+      decoderWake = wake;
+    });
+  }
+  return !failed && decoder?.state === 'configured';
+}
 
 function resetDecoder() {
   if (decoder && decoder.state !== 'closed') decoder.close();
@@ -35,6 +65,7 @@ function resetDecoder() {
   lastTimestamp = -1;
   submitted.clear();
   timeline.reset();
+  wakeDecoder();
 }
 
 function fail(message: string, unsupported = false) {
@@ -111,6 +142,7 @@ async function configure(keyData: Uint8Array) {
       const now = performance.now();
       const inputAt = submitted.get(frame.timestamp);
       if (inputAt !== undefined) { decodeMs += now - inputAt; decodeSamples++; submitted.delete(frame.timestamp); }
+      wakeDecoder();
       lastOutputAt = now;
       decoded++;
       timeline.push(frame, now * 1000);
@@ -118,6 +150,7 @@ async function configure(keyData: Uint8Array) {
     error(error) { fail(`H.264 preview: ${error.message}`); },
   });
   decoder.configure(supported.config!);
+  decoder.addEventListener('dequeue', wakeDecoder);
 }
 
 async function record(record: Record) {
@@ -131,8 +164,9 @@ async function record(record: Record) {
       ![0, 90, 180, 270].includes(next.effectiveRotation || 0)) throw new Error('Invalid OCB2 video geometry');
     if (info && (next.width !== info.width || next.height !== info.height)) { resetDecoder(); config = new Uint8Array(0); }
     info = next;
+    if (next.latencyProfile === 'low' || next.latencyProfile === 'balanced' || next.latencyProfile === 'smooth') latencyProfile = next.latencyProfile;
     timeline.reset();
-    timeline = new PreviewTimeline(next.fpsNumerator / next.fpsDenominator);
+    timeline = new PreviewTimeline(next.fpsNumerator / next.fpsDenominator, latencyProfile);
   } else if (record.type === 2) {
     resetDecoder();
     config = new Uint8Array(record.payload);
@@ -141,9 +175,9 @@ async function record(record: Record) {
     if (waitingForKey && !key) return;
     if (!decoder) await configure(record.payload);
     if (!decoder || failed) return;
-    // Never discard a compressed delta and continue a broken reference chain.
-    // Reconnect requests a fresh config/IDR without touching native consumers.
-    if (decoder.decodeQueueSize > 8 || submitted.size > 16) throw new Error('Preview decoder is falling behind');
+    // Preserve the compressed reference chain while draining a cached GOP.
+    // A stalled decoder times out and retries the producer's local endpoint.
+    if (!await waitForDecoderRoom() || !decoder) return;
     const timestamp = Number(record.encoderTimestampUs);
     if (!Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp <= lastTimestamp) {
       throw new Error('H.264 timestamp discontinuity');
@@ -167,6 +201,7 @@ async function record(record: Record) {
 worker.onmessage = async ({ data }) => {
   try {
     if (data.type === 'init') {
+      latencyProfile = data.latencyProfile === 'low' || data.latencyProfile === 'smooth' ? data.latencyProfile : 'balanced';
       if (typeof VideoDecoder === 'undefined' || typeof worker.requestAnimationFrame !== 'function') {
         fail('WebCodecs video rendering is unavailable in this WebView', true); return;
       }
@@ -179,7 +214,10 @@ worker.onmessage = async ({ data }) => {
       worker.postMessage({ type: 'ready' });
     } else if (data.type === 'chunk' && !failed) {
       parser.push(new Uint8Array(data.bytes));
-      for (let item; (item = parser.next()) !== null;) await record(item);
+      for (let item; (item = parser.next()) !== null;) {
+        await record(item);
+        if (failed) return;
+      }
       worker.postMessage({ type: 'consumed' });
     }
   } catch (error) { fail(error instanceof Error ? error.message : String(error)); }

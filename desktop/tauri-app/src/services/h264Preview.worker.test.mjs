@@ -12,16 +12,28 @@ const code = ts.transpileModule(fs.readFileSync(new URL('./h264Preview.worker.ts
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
 }).outputText;
 
-function runtime(supported = true) {
+function runtime(supported = true, drainAsynchronously = false) {
   const messages = [], configurations = [], decoders = [];
   class Decoder {
     static async isConfigSupported(config) { return { supported: true, config }; }
-    constructor(callbacks) { this.callbacks = callbacks; this.state = 'unconfigured'; this.decodeQueueSize = 0; decoders.push(this); }
+    constructor(callbacks) { this.callbacks = callbacks; this.state = 'unconfigured'; this.decodeQueueSize = 0; this.maxQueue = 0; this.chunks = []; this.listeners = new Set(); decoders.push(this); }
     configure(config) { configurations.push(config); this.state = 'configured'; }
-    decode() {}
+    decode(chunk) {
+      this.chunks.push(chunk);
+      if (!drainAsynchronously) return;
+      this.decodeQueueSize++;
+      this.maxQueue = Math.max(this.maxQueue, this.decodeQueueSize);
+      setTimeout(() => {
+        if (this.state !== 'configured') return;
+        this.decodeQueueSize--;
+        this.callbacks.output({ timestamp: chunk.timestamp, displayWidth: 16, displayHeight: 16, close() {} });
+        for (const listener of this.listeners) listener();
+      }, 1);
+    }
+    addEventListener(type, listener) { if (type === 'dequeue') this.listeners.add(listener); }
     close() { assert.notEqual(this.state, 'closed'); this.state = 'closed'; }
   }
-  const scope = { exports: {}, performance, Uint8Array, DataView, TextDecoder,
+  const scope = { exports: {}, performance, Uint8Array, DataView, TextDecoder, setTimeout, clearTimeout,
     Ocb2Browser: parser, postMessage: message => messages.push(message),
     require: name => name.endsWith('h264PreviewPolicy.js') ? policy : parser,
     EncodedVideoChunk: class { constructor(options) { Object.assign(this, options); } },
@@ -46,6 +58,26 @@ test('worker without video/animation APIs reports immediate compatibility fallba
   assert.equal(r.messages.length, 1);
   assert.equal(r.messages[0].type, 'error');
   assert.equal(r.messages[0].unsupported, true);
+});
+
+test('late-join cached GOP drains through bounded decoder backpressure without reconnecting', async () => {
+  const r = runtime(true, true);
+  await r.send({ type: 'init', canvas: { getContext: () => ({}) } });
+  const info = { width: 16, height: 16, fpsNumerator: 30, fpsDenominator: 1, effectiveRotation: 0 };
+  const packets = [record(1, 4, new TextEncoder().encode(JSON.stringify(info))),
+    record(2, 1, Uint8Array.of(0, 0, 0, 1, 0x67, 100, 0, 42))];
+  for (let i = 0; i < 40; i++) packets.push(record(3, i === 0 ? 2 : 0,
+    Uint8Array.of(0, 0, 1, i === 0 ? 0x65 : 0x61), BigInt((i + 1) * 33333)));
+  const bytes = new Uint8Array(packets.reduce((size, packet) => size + packet.bytes.byteLength, 0));
+  let offset = 0;
+  for (const packet of packets) { bytes.set(new Uint8Array(packet.bytes), offset); offset += packet.bytes.byteLength; }
+  await r.send({ type: 'chunk', bytes: bytes.buffer });
+  assert.deepEqual(r.messages.filter(message => message.type === 'error'), []);
+  assert.equal(r.messages.filter(message => message.type === 'consumed').length, 1);
+  assert.equal(r.decoders[0].chunks.length, 40);
+  assert.ok(r.decoders[0].maxQueue <= 8, `peak decoder queue ${r.decoders[0].maxQueue}`);
+  assert.equal(r.decoders[0].chunks[0].type, 'key');
+  assert.ok(r.decoders[0].chunks.slice(1).every(chunk => chunk.type === 'delta'));
 });
 test('actual worker configures OCB2 colors, waits for IDR after heartbeat discontinuity and handles closed decoder errors', async () => {
   const r = runtime();

@@ -72,9 +72,11 @@ class PipelineControllerTest {
         entered.await()
         val apply = controller.enqueue(PipelineCommand.ApplySettings(patch("phone", fps = 30), "phone"))
         val preview = controller.enqueue(PipelineCommand.PreviewSurfaceChanged(true))
+        val thermal = controller.enqueue(PipelineCommand.ThermalTick())
         val stop = controller.enqueue(PipelineCommand.Stop())
         assertEquals(PipelineResultCode.CANCELLED, apply.await().code)
         assertEquals(PipelineResultCode.CANCELLED, preview.await().code)
+        assertEquals(PipelineResultCode.CANCELLED, thermal.await().code)
         release.complete(Unit)
         start.await(); stop.await()
         assertEquals(listOf("START", "STOP"), synchronized(order) { order.toList() })
@@ -100,7 +102,33 @@ class PipelineControllerTest {
         start.await(); newest.await()
         assertEquals(1280, applied?.width)
         assertEquals(60, applied?.fps)
+        assertEquals("manual", applied?.profile)
         assertTrue(applied?.requestId?.contains("60") == true)
+        controller.close(); scope.cancel()
+    }
+
+    @Test fun queuedBehaviorSettingsRetainBothFieldsWhenCoalesced() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var applied: UpdateSettingsRequest? = null
+        val controller = PipelineController(scope) { command ->
+            if (command is PipelineCommand.Start) { entered.complete(Unit); release.await() }
+            if (command is PipelineCommand.ApplySettings) applied = command.request
+            ok(command)
+        }
+        val start = controller.enqueue(PipelineCommand.Start())
+        entered.await()
+        val first = UpdateSettingsRequest(baseRevision = 7, requestId = "first", clientType = "phone", lowLightPriority = "low-light")
+        val second = UpdateSettingsRequest(baseRevision = 7, requestId = "second", clientType = "phone", allowHighSpeed = true)
+        val old = controller.enqueue(PipelineCommand.ApplySettings(first, "phone"))
+        val newest = controller.enqueue(PipelineCommand.ApplySettings(second, "phone"))
+        assertEquals(PipelineResultCode.CANCELLED, old.await().code)
+        release.complete(Unit)
+        start.await(); newest.await()
+        assertEquals("low-light", applied?.lowLightPriority)
+        assertEquals(true, applied?.allowHighSpeed)
+        assertEquals("second", applied?.requestId)
         controller.close(); scope.cancel()
     }
 

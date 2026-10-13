@@ -6,6 +6,7 @@ import androidx.camera.camera2.interop.Camera2CameraInfo
 import com.opencambridge.android.camera.CameraRepository
 import com.opencambridge.android.camera.H264Streamer
 import com.opencambridge.android.camera.H264ModeDto
+import com.opencambridge.android.camera.H264Capabilities
 import com.opencambridge.android.camera.CameraInfoDto
 import com.opencambridge.android.service.PipelineResult
 import com.opencambridge.android.service.PipelineResultCode
@@ -1291,12 +1292,7 @@ class ControlServer(
                 PipelineCapabilitiesDto(
                     revision = StreamState.revision.get(),
                     cameras = cameras,
-                    adaptivePreference = listOf(
-                        H264ModeDto(1920, 1080, 60),
-                        H264ModeDto(1280, 720, 60),
-                        H264ModeDto(1920, 1080, 30),
-                        H264ModeDto(1280, 720, 30)
-                    ),
+                    adaptivePreference = H264Capabilities.preferredModes,
                     compatibilityFallback = "mjpeg",
                     windowsDecoderRequirement = "Media Foundation hardware AVC decoder availability is reported by the desktop producer"
                 )
@@ -1564,6 +1560,7 @@ class ControlServer(
                         lifecycle == com.opencambridge.android.state.LifecycleState.STOPPED ||
                         lifecycle == com.opencambridge.android.state.LifecycleState.FAILED
                     ) break
+                    if (!h264Streamer.shouldSendClientRecord(channel, frame)) continue
                     writeFully(frame)
                     flush()
                 }
@@ -1600,6 +1597,9 @@ class ControlServer(
                 fps = activeFps,
                 h264Bitrate = snapshot.desired.h264Bitrate,
                 h264BitrateMode = snapshot.desired.h264BitrateMode,
+                latencyProfile = snapshot.desired.latencyProfile,
+                lowLightPriority = snapshot.desired.lowLightPriority,
+                allowHighSpeed = snapshot.desired.allowHighSpeed,
                 desired = StreamModeInfoDto(
                     mode = snapshot.desired.streamMode,
                     width = snapshot.desired.width,
@@ -1810,6 +1810,9 @@ data class UpdateSettingsRequest(
     val streamMode: String? = null,
     val h264Bitrate: Int? = null,
     val h264BitrateMode: String? = null,
+    val latencyProfile: String? = null,
+    val lowLightPriority: String? = null,
+    val allowHighSpeed: Boolean? = null,
     val h264KeyframeInterval: Int? = null,
     val targetBandwidthMbps: Int? = null
 )
@@ -1821,6 +1824,9 @@ private data class StreamInfoDto(
     val fps: Int,
     val h264Bitrate: Int,
     val h264BitrateMode: String = "auto",
+    val latencyProfile: String = "balanced",
+    val lowLightPriority: String = "stable",
+    val allowHighSpeed: Boolean = false,
     val desired: StreamModeInfoDto,
     val selected: StreamModeInfoDto?,
     val actual: StreamActualInfoDto?,

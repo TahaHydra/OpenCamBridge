@@ -81,7 +81,7 @@ impl StreamInfo {
             self.device_rotation,
         ]
         .iter()
-            .all(|value| matches!(value, 0 | 90 | 180 | 270))
+        .all(|value| matches!(value, 0 | 90 | 180 | 270))
     }
 
     /** Packed into the existing ring slot `reserved_tail` field, so colour
@@ -108,10 +108,18 @@ impl StreamInfo {
     }
 }
 
-fn default_color_matrix() -> String { "bt709".into() }
-fn default_color_range() -> String { "limited".into() }
-fn default_color_primaries() -> String { "bt709".into() }
-fn default_color_transfer() -> String { "bt709".into() }
+fn default_color_matrix() -> String {
+    "bt709".into()
+}
+fn default_color_range() -> String {
+    "limited".into()
+}
+fn default_color_primaries() -> String {
+    "bt709".into()
+}
+fn default_color_transfer() -> String {
+    "bt709".into()
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {

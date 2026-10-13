@@ -130,7 +130,7 @@ export default function SignalChain({
       placeholder: 'idle',
       detail: producerRunning
         ? [
-            metrics?.decode_backend === 'media-foundation-d3d11'
+            metrics?.decode_backend?.startsWith('media-foundation-')
               ? metrics?.d3d11_output
                 ? 'MF · D3D11'
                 : 'MF · system memory'
@@ -182,7 +182,8 @@ export default function SignalChain({
     androidRunning,
     producerRunning,
     consumerAttached,
-    softwareDecode: metrics?.decode_backend != null && metrics.decode_backend !== 'media-foundation-d3d11',
+    softwareDecode: metrics?.hardware_decoder === false ||
+      (metrics?.decode_backend != null && !metrics.decode_backend.startsWith('media-foundation-')),
     softwareEncode: androidMetrics?.hardwareEncoder === false,
     fallbackReason: androidMetrics?.fallbackReason || metrics?.fallback_reason || '',
   });

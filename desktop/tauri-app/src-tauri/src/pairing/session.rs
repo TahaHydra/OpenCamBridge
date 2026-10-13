@@ -72,7 +72,12 @@ pub struct Invitation {
     pub phone: Option<SavedPhone>,
 }
 impl Invitation {
-    pub fn new(pc_id: String, name: String, mut hosts: Vec<String>, port: u16) -> Result<Self, String> {
+    pub fn new(
+        pc_id: String,
+        name: String,
+        mut hosts: Vec<String>,
+        port: u16,
+    ) -> Result<Self, String> {
         // Android bounds QR connection attempts to eight private interfaces.
         hosts.truncate(8);
         let id = crypto::random_hex(16);
@@ -307,7 +312,8 @@ mod tests {
     #[test]
     fn qr_invitation_fits_the_android_eight_address_limit() {
         let hosts = (1..=12).map(|n| format!("192.168.{n}.1")).collect();
-        let invitation = Invitation::new(crypto::random_hex(16), "Test PC".into(), hosts, 9000).unwrap();
+        let invitation =
+            Invitation::new(crypto::random_hex(16), "Test PC".into(), hosts, 9000).unwrap();
         assert_eq!(invitation.view.hosts.len(), 8);
     }
     #[test]

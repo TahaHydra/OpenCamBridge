@@ -71,13 +71,13 @@ internal object ApplyPatchCoalescingPolicy {
         var mask = 0
         if (request.cameraId != null || request.width != null || request.height != null ||
             request.outputWidth != null || request.outputHeight != null || request.profile != null ||
-            request.fps != null || request.streamMode != null
+            request.fps != null || request.streamMode != null || request.lowLightPriority != null || request.allowHighSpeed != null
         ) mask = mask or CAPTURE
         if (request.displayRotation != null || request.mirror != null) mask = mask or TRANSFORM
         if (request.localPreviewEnabled != null || request.phonePreviewEnabled != null) mask = mask or PREVIEW
         if (request.accessMode != null || request.port != null || request.accessToken != null) mask = mask or NETWORK
         if (request.jpegQuality != null || request.h264Bitrate != null || request.h264BitrateMode != null ||
-            request.h264KeyframeInterval != null || request.targetBandwidthMbps != null
+            request.h264KeyframeInterval != null || request.targetBandwidthMbps != null || request.latencyProfile != null
         ) mask = mask or ENCODING
         if (request.previewFitMode != null || request.aspectRatio != null || request.zoomSpeed != null) {
             mask = mask or DISPLAY
@@ -107,6 +107,7 @@ sealed class PipelineCommand(val label: String) {
     class Recover : PipelineCommand("RECOVER")
     class RuntimeH264Failure(val reason: String) : PipelineCommand("H264_FAILURE")
     class AdaptiveDowngrade(val reason: String) : PipelineCommand("ADAPTIVE_DOWNGRADE")
+    class ThermalTick : PipelineCommand("THERMAL_TICK")
     class PreviewSurfaceChanged(val attached: Boolean) : PipelineCommand("PREVIEW_SURFACE_CHANGED")
     class SetTorch(val enabled: Boolean, val baseRevision: Long, val requestId: String, val source: String) : PipelineCommand("SET_TORCH")
     class SetLinearZoom(val linear: Float, val baseRevision: Long, val requestId: String, val source: String) : PipelineCommand("SET_LINEAR_ZOOM")
@@ -223,7 +224,7 @@ class PipelineController(
                     pending.filter {
                         it is PipelineCommand.ApplySettings || it is PipelineCommand.PreviewSurfaceChanged ||
                             it is PipelineCommand.SetTorch || it is PipelineCommand.SetLinearZoom ||
-                            it is PipelineCommand.SetZoomRatio
+                            it is PipelineCommand.SetZoomRatio || it is PipelineCommand.ThermalTick
                     }
                         .forEach { pending.remove(it); cancelled += it }
                     pending.addFirst(command)
@@ -239,6 +240,12 @@ class PipelineController(
                         pending.remove(it); cancelled += it
                     }
                     pending.addFirst(command)
+                }
+                is PipelineCommand.ThermalTick -> {
+                    pending.filterIsInstance<PipelineCommand.ThermalTick>().forEach {
+                        pending.remove(it); cancelled += it
+                    }
+                    pending.addLast(command)
                 }
                 else -> pending.addLast(command)
             }
@@ -294,7 +301,7 @@ class PipelineController(
         height = newer.height ?: older.height,
         outputWidth = newer.outputWidth ?: older.outputWidth,
         outputHeight = newer.outputHeight ?: older.outputHeight,
-        profile = newer.profile ?: older.profile,
+        profile = newer.profile ?: if (newer.width != null || newer.height != null || newer.fps != null) "manual" else older.profile,
         fps = newer.fps ?: older.fps,
         jpegQuality = newer.jpegQuality ?: older.jpegQuality,
         previewFitMode = newer.previewFitMode ?: older.previewFitMode,
@@ -310,6 +317,9 @@ class PipelineController(
         streamMode = newer.streamMode ?: older.streamMode,
         h264Bitrate = newer.h264Bitrate ?: older.h264Bitrate,
         h264BitrateMode = newer.h264BitrateMode ?: (if (newer.h264Bitrate != null) "manual" else older.h264BitrateMode),
+        latencyProfile = newer.latencyProfile ?: older.latencyProfile,
+        lowLightPriority = newer.lowLightPriority ?: older.lowLightPriority,
+        allowHighSpeed = newer.allowHighSpeed ?: older.allowHighSpeed,
         h264KeyframeInterval = newer.h264KeyframeInterval ?: older.h264KeyframeInterval,
         targetBandwidthMbps = newer.targetBandwidthMbps ?: older.targetBandwidthMbps
     )

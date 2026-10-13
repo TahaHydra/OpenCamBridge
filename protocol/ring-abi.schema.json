@@ -1,10 +1,11 @@
 {
   "name": "OpenCamBridge NV12 ring ABI",
-  "version": 4,
+  "version": 5,
   "packing": 8,
-  "headerSize": 320,
+  "headerSize": 384,
   "slotHeaderSize": 128,
   "slotCount": 16,
+  "limits": { "maxDimension": 1920, "maxPixels": 2073600, "maxNv12Bytes": 3110400 },
   "header": [
     { "name": "magic", "cpp": "magic", "type": "u32", "offset": 0, "size": 4 },
     { "name": "version", "cpp": "version", "type": "u16", "offset": 4, "size": 2 },
@@ -51,7 +52,14 @@
     { "name": "playout_scheduler_resets", "cpp": "playoutSchedulerResets", "type": "atomic_u64", "offset": 296, "size": 8 },
     { "name": "playout_clock_ppm", "cpp": "playoutClockPpm", "type": "atomic_i32", "offset": 304, "size": 4 },
     { "name": "playout_max_output_gap_ms", "cpp": "playoutMaxOutputGapMs", "type": "atomic_u32", "offset": 308, "size": 4 },
-    { "name": "reserved", "cpp": "reserved", "type": "u64x1", "offset": 312, "size": 8 }
+    { "name": "consumer_ring_age_ns", "cpp": "consumerRingAgeNs", "type": "atomic_u64", "offset": 312, "size": 8 },
+    { "name": "consumer_delivery_qpc_ns", "cpp": "consumerDeliveryQpcNs", "type": "atomic_u64", "offset": 320, "size": 8 },
+    { "name": "consumer_delivery_count", "cpp": "consumerDeliveryCount", "type": "atomic_u64", "offset": 328, "size": 8 },
+    { "name": "consumer_delivery_repeats", "cpp": "consumerDeliveryRepeats", "type": "atomic_u64", "offset": 336, "size": 8 },
+    { "name": "consumer_delivery_processing_us", "cpp": "consumerDeliveryProcessingUs", "type": "atomic_u64", "offset": 344, "size": 8 },
+    { "name": "resize_processing_us", "cpp": "resizeProcessingUs", "type": "atomic_u64", "offset": 352, "size": 8 },
+    { "name": "playout_skipped_frames", "cpp": "playoutSkippedFrames", "type": "atomic_u64", "offset": 360, "size": 8 },
+    { "name": "reserved", "cpp": "reserved", "type": "u64x2", "offset": 368, "size": 16 }
   ],
   "slotHeader": [
     { "name": "write_epoch", "cpp": "writeEpoch", "type": "u64", "offset": 0, "size": 8 },

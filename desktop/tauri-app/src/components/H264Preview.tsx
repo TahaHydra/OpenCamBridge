@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { phoneStreamFetch } from '../services/api';
+import { desktopInvoke } from '../services/desktopBridge';
+import { localPreviewRequest, previewNeedsFallback } from '../services/previewTransportPolicy.js';
 import { EMPTY_PREVIEW_DIAGNOSTICS, publishPreviewDiagnostics, PREVIEW_FALLBACK_EVENT } from '../services/previewDiagnostics';
 import Nv12RingPreview from './Nv12RingPreview';
 
-export default function H264Preview({ baseUrl, token, fitMode }: { baseUrl: string; token?: string; fitMode: string }) {
+export default function H264Preview({ baseUrl, token, fitMode, latencyProfile = 'balanced' }: { baseUrl: string; token?: string; fitMode: string; latencyProfile?: 'low' | 'balanced' | 'smooth' }) {
   const surfaceRef = useRef<HTMLDivElement>(null);
   const [fallback, setFallback] = useState('');
   const [message, setMessage] = useState('Starting full-resolution H.264 preview…');
@@ -30,6 +32,7 @@ export default function H264Preview({ baseUrl, token, fitMode }: { baseUrl: stri
     let retry = 0;
     let watchdog = 0;
     let lastBytesAt = performance.now();
+    let lastDisplayAt = performance.now();
     let settle: (() => void) | undefined;
     let rejectPending: ((error: Error) => void) | undefined;
     let totalDisplayed = 0;
@@ -49,9 +52,9 @@ export default function H264Preview({ baseUrl, token, fitMode }: { baseUrl: stri
       dispose();
       const reason = error instanceof Error ? error.message : String(error);
       publishPreviewDiagnostics({ ...EMPTY_PREVIEW_DIAGNOSTICS, renderer: 'webcodecs', lastError: reason });
-      if (unsupported) setFallback(`Native compatibility preview: ${reason}`);
+      failures.current++;
+      if (previewNeedsFallback(unsupported, failures.current, chunks > 0)) setFallback(`Native compatibility preview: ${reason}`);
       else {
-        failures.current++;
         setMessage('Reconnecting H.264 preview…');
         retry = window.setTimeout(() => setSession(value => value + 1), Math.min(2000, 250 * failures.current));
       }
@@ -68,7 +71,7 @@ export default function H264Preview({ baseUrl, token, fitMode }: { baseUrl: stri
         else if (data.type === 'error') onFailure(new Error(data.message), data.unsupported);
         else if (data.type === 'stats') {
           totalDisplayed += data.displayed;
-          if (data.displayed > 0) { failures.current = 0; setMessage(''); }
+          if (data.displayed > 0) { failures.current = 0; lastDisplayAt = performance.now(); setMessage(''); }
           publishPreviewDiagnostics({ ...EMPTY_PREVIEW_DIAGNOSTICS, renderer: 'webcodecs', ready: totalDisplayed > 0,
             nonEmptyResponses: chunks, ipcPayloadBytes: totalBytes, parsedWidth: data.width, parsedHeight: data.height,
             rendererDisplayCount: totalDisplayed, lastDisplayedSequence: totalDisplayed,
@@ -80,14 +83,22 @@ export default function H264Preview({ baseUrl, token, fitMode }: { baseUrl: stri
       };
       watchdog = window.setInterval(() => {
         if (performance.now() - lastBytesAt > 8000) onFailure(new Error('Preview stream timed out'));
+        // Heartbeats alone cannot keep a non-decoding preview alive forever.
+        // Hidden/minimized windows are allowed to suspend presentation.
+        if (document.visibilityState === 'hidden') lastDisplayAt = performance.now();
+        else if (chunks > 0 && performance.now() - lastDisplayAt > 12000)
+          onFailure(new Error('Preview received data but displayed no frames'), true);
       }, 1000);
       const ready = waitForWorker();
       const offscreen = canvas.transferControlToOffscreen();
-      worker.postMessage({ type: 'init', canvas: offscreen }, [offscreen]);
+      worker.postMessage({ type: 'init', canvas: offscreen, latencyProfile }, [offscreen]);
       await ready;
       if (disposed) return;
-      const url = new URL('/stream.ocb2', baseUrl);
-      const response = await phoneStreamFetch(url.toString(), token, { signal: abort.signal });
+      const endpoint = await desktopInvoke<{ url: string; token: string } | null>('get_h264_preview_endpoint');
+      if (disposed) return;
+      if (!endpoint) throw new Error('Waiting for the native H.264 producer');
+      const request = localPreviewRequest(endpoint);
+      const response = await phoneStreamFetch(request.url, undefined, { signal: abort.signal, headers: request.headers });
       if (disposed) { await response.body?.cancel(); return; }
       if (!response.ok || !response.body) { await response.body?.cancel(); throw new Error(`Preview HTTP ${response.status}`); }
       reader = response.body.getReader();
@@ -105,7 +116,7 @@ export default function H264Preview({ baseUrl, token, fitMode }: { baseUrl: stri
     }
     void start().catch(onFailure);
     return () => { disposed = true; dispose(); canvas.remove(); window.clearTimeout(retry); publishPreviewDiagnostics({ ...EMPTY_PREVIEW_DIAGNOSTICS }); };
-  }, [baseUrl, token, session, fallback]);
+  }, [baseUrl, token, session, fallback, latencyProfile]);
 
   useEffect(() => {
     const canvas = surfaceRef.current?.querySelector('canvas');

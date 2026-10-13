@@ -39,6 +39,10 @@ private fun LiveCameraSettings(viewModel: StreamViewModel) {
     val displayRotation by viewModel.displayRotation.collectAsState()
     val rebinding by viewModel.rebindInProgress.collectAsState()
     val actualFps by viewModel.actualFps.collectAsState()
+    val latencyProfile by viewModel.latencyProfile.collectAsState()
+    val lowLightPriority by viewModel.lowLightPriority.collectAsState()
+    val allowHighSpeed by viewModel.allowHighSpeed.collectAsState()
+    val profile by viewModel.profile.collectAsState()
 
     val enabled = !rebinding
     val camera = cameras.find { it.id == cameraId }
@@ -55,7 +59,7 @@ private fun LiveCameraSettings(viewModel: StreamViewModel) {
     SettingsGroup(
         title = "Camera",
         footer = if (streamMode == "h264") {
-            "Only modes this camera can capture and encode in hardware are offered."
+            "Only modes this camera can capture and encode are offered. Hardware encoding is preferred."
         } else {
             "MJPEG is the compatibility format. Actual rate depends on the camera and the light."
         } + if (actualFps > 0) " Delivering $actualFps of $fps fps now." else ""
@@ -129,6 +133,38 @@ private fun LiveCameraSettings(viewModel: StreamViewModel) {
             onSelect = viewModel::updateDisplayRotation
         )
     }
+
+    SettingsGroup(title = "Streaming behavior", footer = "Manual capture and bitrate choices are retained during heat. Automatic quality recovers gradually after the phone cools.") {
+        SegmentedRow(
+            title = "Latency profile",
+            subtitle = "Low latency favors freshness. Smooth allows more buffering for jitter. Balanced is the default.",
+            options = listOf("low" to "Low latency", "balanced" to "Balanced", "smooth" to "Smooth"),
+            selected = latencyProfile, enabled = enabled, onSelect = viewModel::updateLatencyProfile
+        )
+        if (streamMode == "h264") {
+            RowDivider()
+            SegmentedRow(
+                title = "Capture quality",
+                subtitle = "Automatic adapts to sustained load and heat. Selecting a resolution or frame rate chooses Manual.",
+                options = listOf("adaptive" to "Automatic", "manual" to "Manual"),
+                selected = if (profile == "adaptive") "adaptive" else "manual", enabled = enabled,
+                onSelect = viewModel::updateProfile
+            )
+            RowDivider()
+            SegmentedRow(
+                title = "Exposure priority",
+                subtitle = "Low light permits longer exposure and variable cadence; stable rate prefers fixed FPS when available.",
+                options = listOf("stable" to "Stable rate", "low-light" to "Low light"),
+                selected = lowLightPriority, enabled = enabled, onSelect = viewModel::updateLowLightPriority
+            )
+            RowDivider()
+            SwitchRow(
+                title = "Experimental high-speed capture",
+                subtitle = "Regular capture is preferred. High-speed sessions may crop the field of view, darken exposure and restrict phone preview.",
+                checked = allowHighSpeed, enabled = enabled, onChange = viewModel::updateAllowHighSpeed
+            )
+        }
+    }
 }
 
 @Composable
@@ -152,5 +188,11 @@ private fun StoppedCameraSettings(viewModel: StreamViewModel, ui: PhoneUiViewMod
         ValueRow("Mirror camera output", if (stopped.mirror) "On" else "Off")
         RowDivider()
         ValueRow("Rotation", "${stopped.displayRotation.toIntOrNull() ?: 0}°")
+        RowDivider()
+        ValueRow("Latency profile", stopped.latencyProfile)
+        RowDivider()
+        ValueRow("Exposure priority", if (stopped.lowLightPriority == "low-light") "Low light" else "Stable rate")
+        RowDivider()
+        ValueRow("Experimental high speed", if (stopped.allowHighSpeed) "Allowed" else "Off")
     }
 }

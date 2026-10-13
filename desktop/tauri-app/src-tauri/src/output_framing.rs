@@ -89,6 +89,24 @@ struct FramingWire {
     reserved: AtomicU32,
 }
 const WIRE_SIZE: usize = 40;
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LatencyProfile {
+    #[default]
+    Balanced = 0,
+    Low = 1,
+    Smooth = 2,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResizePreference {
+    #[default]
+    Auto = 0,
+    Cpu = 1,
+    Gpu = 2,
+}
 const _: () = assert!(std::mem::size_of::<FramingWire>() == WIRE_SIZE);
 const _: () = assert!(std::mem::offset_of!(FramingWire, sequence) == 12);
 
@@ -176,6 +194,16 @@ impl FramingMapping {
     }
 
     fn publish(&self, mode: FramingMode, crop: NormalizedCrop) {
+        self.publish_profile(mode, crop, LatencyProfile::Balanced, ResizePreference::Auto);
+    }
+
+    fn publish_profile(
+        &self,
+        mode: FramingMode,
+        crop: NormalizedCrop,
+        profile: LatencyProfile,
+        resize: ResizePreference,
+    ) {
         let wire = unsafe { &*(self.view.Value as *const FramingWire) };
         // Recover an odd generation left by an interrupted previous process.
         let start = wire.sequence.load(Ordering::SeqCst).wrapping_add(1) | 1;
@@ -190,7 +218,8 @@ impl FramingMapping {
             .store((crop.width as f32).to_bits(), Ordering::Relaxed);
         wire.height
             .store((crop.height as f32).to_bits(), Ordering::Relaxed);
-        wire.reserved.store(0, Ordering::Relaxed);
+        wire.reserved
+            .store(profile as u32 | ((resize as u32) << 8), Ordering::Relaxed);
         wire.sequence.store(start.wrapping_add(1), Ordering::SeqCst);
     }
 }
@@ -213,6 +242,8 @@ pub fn set_output_framing(
     state: tauri::State<'_, OutputFramingState>,
     mode: FramingMode,
     crop: NormalizedCrop,
+    latency_profile: Option<LatencyProfile>,
+    resize_backend: Option<ResizePreference>,
 ) -> Result<(), String> {
     crop.validate()?;
     let mut mapping = state
@@ -226,7 +257,12 @@ pub fn set_output_framing(
             Some(w!("Local\\OpenCamBridgeOutputFramingV1")),
         )?);
     }
-    mapping.as_ref().unwrap().publish(mode, crop);
+    mapping.as_ref().unwrap().publish_profile(
+        mode,
+        crop,
+        latency_profile.unwrap_or_default(),
+        resize_backend.unwrap_or_default(),
+    );
     Ok(())
 }
 
@@ -301,6 +337,27 @@ mod tests {
             mapping.publish(FramingMode::Fit, NormalizedCrop::default());
             assert_eq!(wire.mode.load(Ordering::Relaxed), 0);
             assert_eq!(wire.width.load(Ordering::Relaxed), 1.0f32.to_bits());
+            for (profile, expected) in [
+                (LatencyProfile::Low, 1),
+                (LatencyProfile::Smooth, 2),
+                (LatencyProfile::Balanced, 0),
+            ] {
+                mapping.publish_profile(
+                    FramingMode::Fit,
+                    NormalizedCrop::default(),
+                    profile,
+                    ResizePreference::Auto,
+                );
+                assert_eq!(wire.reserved.load(Ordering::Relaxed), expected);
+                assert_eq!(wire.sequence.load(Ordering::SeqCst) % 2, 0);
+            }
+            mapping.publish_profile(
+                FramingMode::Fit,
+                NormalizedCrop::default(),
+                LatencyProfile::Low,
+                ResizePreference::Cpu,
+            );
+            assert_eq!(wire.reserved.load(Ordering::Relaxed), 257);
             UnmapViewOfFile(view).unwrap();
             CloseHandle(handle).unwrap();
         }

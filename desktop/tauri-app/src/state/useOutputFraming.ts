@@ -7,18 +7,18 @@ let pending = Promise.resolve();
 let revision = 0;
 
 /** Serialize writes so a slow older crop cannot replace the latest selection. */
-export function applyOutputFraming(framing: OutputFraming): Promise<void> {
+export function applyOutputFraming(framing: OutputFraming, latencyProfile: 'low' | 'balanced' | 'smooth' = 'balanced', resizeBackend: 'auto' | 'cpu' | 'gpu' = 'auto'): Promise<void> {
   const requestedRevision = ++revision;
   const task = pending.catch(() => undefined).then(async () => {
     if (requestedRevision !== revision || !isTauriRuntime()) return;
-    await desktopInvoke('set_output_framing', { mode: framing.mode, crop: framing.crop });
+    await desktopInvoke('set_output_framing', { mode: framing.mode, crop: framing.crop, latencyProfile, resizeBackend });
   });
   pending = task;
   return task;
 }
 
 /** Mount once with the preview stage; it also stays mounted in clean-feed mode. */
-export function useOutputFraming(source: { width: number; height: number }, producerRunning: boolean) {
+export function useOutputFraming(source: { width: number; height: number }, producerRunning: boolean, latencyProfile: 'low' | 'balanced' | 'smooth' = 'balanced') {
   const preferences = usePreferences();
   const [error, setError] = useState('');
   const framing = useMemo(() => resolveFraming(preferences.outputFraming, source.width, source.height),
@@ -26,11 +26,11 @@ export function useOutputFraming(source: { width: number; height: number }, prod
   useEffect(() => {
     let current = true;
     const timer = window.setTimeout(() => {
-      void applyOutputFraming(framing).then(() => { if (current) setError(''); }, failure => {
+      void applyOutputFraming(framing, latencyProfile, preferences.resizeBackend).then(() => { if (current) setError(''); }, failure => {
         if (current) setError(`Output framing could not be applied: ${String(failure)}`);
       });
     }, 80);
     return () => { current = false; window.clearTimeout(timer); };
-  }, [framing, producerRunning]);
+  }, [framing, producerRunning, latencyProfile, preferences.resizeBackend]);
   return { framing, editing: preferences.editOutputFraming, error };
 }

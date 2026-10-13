@@ -20,7 +20,7 @@ import android.util.Log
  */
 class CameraRepository(private val context: Context) {
 
-    fun listCameras(): List<CameraInfoDto> {
+    fun listCameras(allowHighSpeed: Boolean = com.opencambridge.android.state.StreamState.allowHighSpeed.get()): List<CameraInfoDto> {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val ids = try {
             manager.cameraIdList
@@ -31,7 +31,7 @@ class CameraRepository(private val context: Context) {
 
         val cameras = ids.mapNotNull { id ->
             try {
-                readCamera(manager, id)
+                readCamera(manager, id, allowHighSpeed)
             } catch (e: Exception) {
                 Log.w("CameraRepository", "Skipping camera $id: ${e.message}")
                 null
@@ -100,7 +100,7 @@ class CameraRepository(private val context: Context) {
         }
     }
 
-    private fun readCamera(manager: CameraManager, id: String): CameraInfoDto {
+    private fun readCamera(manager: CameraManager, id: String, allowHighSpeed: Boolean): CameraInfoDto {
         val chars = manager.getCameraCharacteristics(id)
 
         val facingInt = chars.get(CameraCharacteristics.LENS_FACING)
@@ -157,18 +157,15 @@ class CameraRepository(private val context: Context) {
         // Build complete regular-session tuples. A camera-wide AE range cannot
         // prove that a particular resolution or output path can sustain its
         // upper bound; the exact output's minimum frame duration must agree.
-        val standardSizes = listOf(640 to 480, 960 to 540, 1280 to 720, 1920 to 1080)
         val aeEvidence = fpsRanges.map { RegularModePolicy.AeRange(it.min, it.max) }
         fun regularOutputs(
             formatName: String,
             candidates: List<android.util.Size>,
             duration: (android.util.Size) -> Long,
         ): List<RegularCameraModeDto> {
-            val outputs = standardSizes.mapNotNull { (w, h) ->
-                val match = candidates.firstOrNull { it.width == w && it.height == h }
-                    ?: return@mapNotNull null
+            val outputs = candidates.filter { RegularModePolicy.fitsRing(it.width, it.height) }.map { match ->
                 val minDuration = try { duration(match) } catch (_: Exception) { 0L }
-                RegularModePolicy.Output(w, h, minDuration)
+                RegularModePolicy.Output(match.width, match.height, minDuration)
             }
             return RegularModePolicy.build(id, formatName, outputs, aeEvidence)
         }
@@ -190,7 +187,10 @@ class CameraRepository(private val context: Context) {
             .groupBy { it.width to it.height }
             .map { (size, modes) -> ResolutionFpsDto(size.first, size.second, modes.maxOf { it.fps }) }
             .sortedByDescending { it.width.toLong() * it.height }
-        val mjpegModes = yuvRegularModes.map { H264ModeDto(it.width, it.height, it.fps) }
+        // CameraX MJPEG pacing currently exposes the compatibility rates only.
+        // H.264 separately offers every declared regional regular rate.
+        val mjpegModes = yuvRegularModes.filter { it.fps in setOf(15, 30, 60) }
+            .map { H264ModeDto(it.width, it.height, it.fps) }
 
         // Zoom ratio range (API 30+); older devices only report max digital zoom.
         var zoomMin = 1.0f
@@ -225,8 +225,9 @@ class CameraRepository(private val context: Context) {
             }
         }
 
-        val h264PathCapabilities = H264Capabilities.preferredModes.map { mode ->
-            H264ModePathDto(mode, H264Capabilities.inspectPathCapabilities(context, id, mode))
+        val h264SupportedModes = H264Capabilities.supportedModes(context, id, allowHighSpeed)
+        val h264PathCapabilities = (h264SupportedModes + H264Capabilities.preferredModes).distinct().map { mode ->
+            H264ModePathDto(mode, H264Capabilities.inspectPathCapabilities(context, id, mode, allowHighSpeed))
         }
         return CameraInfoDto(
             id = id,
@@ -250,7 +251,7 @@ class CameraRepository(private val context: Context) {
             supportsHighSpeed = supportsHighSpeed,
             highSpeedSizes = highSpeedSizes,
             highSpeedFpsRanges = highSpeedFpsRanges,
-            h264Modes = h264PathCapabilities.filter { candidate -> candidate.paths.any { it.supported } }.map { it.mode },
+            h264Modes = h264SupportedModes,
             h264PathCapabilities = h264PathCapabilities
         )
     }

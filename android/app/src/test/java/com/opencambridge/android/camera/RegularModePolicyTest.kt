@@ -14,7 +14,7 @@ class RegularModePolicyTest {
             listOf(RegularModePolicy.Output(1920, 1080, 33_333_333)),
             listOf(RegularModePolicy.AeRange(15, 30), RegularModePolicy.AeRange(30, 30)),
         )
-        assertEquals(listOf(15, 30), modes.map { it.fps }.sorted())
+        assertEquals(listOf(30), modes.map { it.fps }.sorted())
         assertFalse(modes.any { it.fps == 60 })
     }
 
@@ -57,5 +57,23 @@ class RegularModePolicyTest {
             listOf(RegularModePolicy.AeRange(15, 60)),
         )
         assertTrue(modes.isEmpty())
+    }
+
+    @Test fun supportsRegionalRatesAndLowerResolutionsWithinRing() {
+        val modes = RegularModePolicy.build("0", "MEDIA_CODEC_SURFACE", listOf(
+            RegularModePolicy.Output(640, 480, 20_000_000),
+            RegularModePolicy.Output(3840, 2160, 20_000_000),
+            RegularModePolicy.Output(1080, 1920, 20_000_000),
+            RegularModePolicy.Output(1920, 1200, 20_000_000)), listOf(24, 25, 30, 50, 60).map { RegularModePolicy.AeRange(it, it) })
+        assertEquals(listOf(24, 25, 30, 50), modes.filter { it.width == 640 }.map { it.fps }.sorted())
+        assertTrue(modes.any { it.width == 1080 && it.height == 1920 })
+        assertFalse(modes.any { it.width == 3840 || it.height == 1200 })
+    }
+
+    @Test fun stableCadencePrefersFixedWhileLowLightPrefersExposureHeadroom() {
+        val ranges = listOf(RegularModePolicy.AeRange(30, 30), RegularModePolicy.AeRange(15, 30))
+        assertEquals(RegularModePolicy.AeRange(30, 30), RegularModePolicy.selectRange(ranges, 30))
+        assertEquals(RegularModePolicy.AeRange(15, 30), RegularModePolicy.selectRange(ranges, 30, "low-light"))
+        assertEquals(null, RegularModePolicy.selectRange(ranges, 24))
     }
 }

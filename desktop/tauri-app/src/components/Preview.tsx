@@ -23,7 +23,7 @@ export default function Preview({ baseUrl, token, fitMode, serverStatus }: Previ
   return <div className="preview-wrapper">
     <div className="preview-stage" style={{ width: '100%', height: '100%' }}>
       {live ? h264
-        ? <H264Preview key={session} baseUrl={baseUrl} token={token} fitMode={fitMode} />
+        ? <H264Preview key={session} baseUrl={baseUrl} token={token} fitMode={fitMode} latencyProfile={serverStatus?.latencyProfile || 'balanced'} />
         : <MjpegPreview key={session} baseUrl={baseUrl} token={token} fitMode={fitMode} />
         : <div className="preview-overlay"><CameraOff size={48} opacity={0.5} />
           <div>{['STARTING', 'RECONFIGURING', 'RECOVERING'].includes(lifecycle)

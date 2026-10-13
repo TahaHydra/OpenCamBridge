@@ -9,13 +9,16 @@ enum class OcbFramingMode : uint32_t { Fit = 0, Fill = 1, Custom = 2 };
 struct OcbFramingSettings {
     OcbFramingMode mode = OcbFramingMode::Fit;
     float x = 0, y = 0, width = 1, height = 1;
+    // Reserved wire word: 0 Balanced, 1 Low latency, 2 Smooth.
+    uint32_t latencyProfile = 0;
+    uint32_t resizeBackend = 0; // 0 Auto/GPU with fallback, 1 CPU, 2 GPU with fallback.
 };
 struct OcbFitRect { DWORD left; DWORD top; DWORD width; DWORD height; };
 struct OcbFraming { OcbFitRect source; OcbFitRect destination; };
 
 inline bool OcbValidFraming(const OcbFramingSettings& s)
 {
-    return static_cast<uint32_t>(s.mode) <= 2 &&
+    return static_cast<uint32_t>(s.mode) <= 2 && s.latencyProfile <= 2 && s.resizeBackend <= 2 &&
         std::isfinite(s.x) && std::isfinite(s.y) && std::isfinite(s.width) && std::isfinite(s.height) &&
         s.x >= 0 && s.y >= 0 && s.width > 0 && s.height > 0 &&
         s.x <= 1 && s.y <= 1 && s.width <= 1 && s.height <= 1 &&
@@ -86,12 +89,16 @@ inline bool OcbReadFramingSnapshot(const volatile OcbFramingWire* wire, OcbFrami
         MemoryBarrier();
         const uint32_t magic = wire->magic, version = wire->version, size = wire->size;
         const uint32_t mode = wire->mode, bits[] = { wire->x, wire->y, wire->width, wire->height };
+        const uint32_t latencyProfile = wire->reserved;
         MemoryBarrier();
         if (before != wire->sequence) continue;
         if (magic != 0x4642434f || version != 1 || size != sizeof(OcbFramingWire)) return false;
         OcbFramingSettings next;
         next.mode = static_cast<OcbFramingMode>(mode);
         memcpy(&next.x, bits, sizeof(bits));
+        next.latencyProfile = latencyProfile & 0xff;
+        next.resizeBackend = (latencyProfile >> 8) & 0xff;
+        if (latencyProfile & 0xffff0000) return false;
         if (!OcbValidFraming(next)) return false;
         settings = next;
         return true;

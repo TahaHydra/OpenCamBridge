@@ -37,6 +37,13 @@ export interface RingDiagnostics {
   playout_scheduler_resets: number;
   playout_clock_ppm: number;
   playout_max_output_gap_ms: number;
+  consumer_ring_age_ms?: number;
+  consumer_delivery_qpc_ns?: number;
+  consumer_delivery_count?: number;
+  consumer_delivery_repeats?: number;
+  consumer_delivery_processing_us?: number;
+  resize_processing_us?: number;
+  playout_skipped_frames?: number;
 }
 
 export interface VirtualCamMetrics {
@@ -83,6 +90,24 @@ export interface VirtualCamMetrics {
   decoder_name?: string;
   d3d11_output?: boolean;
   hardware_decoder?: boolean | null;
+  decoder_observations?: {
+    d3d11_aware?: boolean;
+    d3d_manager_accepted?: boolean;
+    d3d_multithread_protected?: boolean;
+    output_samples?: number;
+    dxgi_output_samples?: number;
+    cpu_output_samples?: number;
+    cpu_readback_ms_avg?: number;
+    dxgi_readback_ms_avg?: number;
+    cpu_bytes_copied?: number;
+    acceleration_verified?: boolean;
+  };
+  preview_fanout?: {
+    subscribers: number;
+    overflow_disconnects: number;
+    max_queue_bytes: number;
+    max_queue_age_ms: number;
+  };
   encoder_name?: string;
   hardware_encoder?: boolean;
   camera_id?: string;
@@ -190,6 +215,9 @@ export interface CameraSettings {
   /** 'auto': the phone picks a bitrate for the mode; 'manual': h264Bitrate is used. */
   h264BitrateMode: 'auto' | 'manual';
   h264KeyframeInterval: number;
+  latencyProfile: 'low' | 'balanced' | 'smooth';
+  lowLightPriority: 'stable' | 'low-light';
+  allowHighSpeed: boolean;
 }
 
 export type SettingKey = keyof CameraSettings;

@@ -99,6 +99,14 @@ HRESULT OcbResizeWithFallback(
 
 inline bool OcbRunResizeFallbackSelfTests()
 {
+    OcbFramingWire wire = { 0x4642434f, 1, sizeof(OcbFramingWire), 2, 0, 0, 0, 0x3f800000, 0x3f800000, 0x102 };
+    OcbFramingSettings settings;
+    if (!OcbReadFramingSnapshot(&wire, settings) || settings.latencyProfile != 2 || settings.resizeBackend != 1) return false;
+    wire.reserved = 0x300;
+    if (OcbReadFramingSnapshot(&wire, settings)) return false;
+    wire.reserved = 0;
+    wire.sequence = 3;
+    if (OcbReadFramingSnapshot(&wire, settings)) return false;
     const OcbFitRect up = OcbComputeLetterbox(1280, 720, 1920, 1080);
     const OcbFitRect down = OcbComputeLetterbox(1920, 1080, 1280, 720);
     const OcbFitRect portrait = OcbComputeLetterbox(1280, 720, 720, 1280);

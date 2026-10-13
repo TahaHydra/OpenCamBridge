@@ -7,7 +7,6 @@ import { logEvent, logError, logTestMarker } from '../services/logging';
 import {
   EMPTY_PREVIEW_DIAGNOSTICS,
   PREVIEW_DIAGNOSTICS_EVENT,
-  PREVIEW_FALLBACK_EVENT,
   type PreviewStageDiagnostics,
 } from '../services/previewDiagnostics';
 import {
@@ -79,21 +78,17 @@ const INITIAL_SETTINGS: CameraSettings = {
   h264Bitrate: 4000000,
   h264BitrateMode: 'auto',
   h264KeyframeInterval: 5,
+  latencyProfile: 'balanced',
+  lowLightPriority: 'stable',
+  allowHighSpeed: false,
 };
 
 const newRequestId = () => globalThis.crypto?.randomUUID?.() || `tauri-${Date.now()}`;
 
 export function useCameraController({ baseUrl, token, previewEnabled }: CameraControllerOptions) {
   const previewOff = !previewEnabled;
-  // The WebCodecs preview reads the compressed stream itself. Only when it has
-  // fallen back to the native compatibility renderer does preview need the
-  // desktop producer (H264Preview announces that with PREVIEW_FALLBACK_EVENT).
-  const [nativePreviewFallback, setNativePreviewFallback] = useState(false);
-  useEffect(() => {
-    const onFallback = (event: Event) => setNativePreviewFallback(Boolean((event as CustomEvent).detail));
-    window.addEventListener(PREVIEW_FALLBACK_EVENT, onFallback);
-    return () => window.removeEventListener(PREVIEW_FALLBACK_EVENT, onFallback);
-  }, []);
+  // The producer owns the only phone H.264 connection. WebCodecs subscribes
+  // to its local compressed fanout; the compatibility renderer reads its ring.
 
   const [cameras, setCameras] = useState<CameraInfo[]>([]);
   const [settings, setSettings] = useState<CameraSettings>(INITIAL_SETTINGS);
@@ -257,6 +252,9 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
       // the interval, any other value chosen on the phone was silently reset
       // by the next unrelated desktop change.
       h264KeyframeInterval: Math.min(10, Math.max(1, status.h264KeyframeInterval ?? current.h264KeyframeInterval)),
+      latencyProfile: status.latencyProfile === 'low' || status.latencyProfile === 'smooth' ? status.latencyProfile : 'balanced',
+      lowLightPriority: status.lowLightPriority === 'low-light' ? 'low-light' : 'stable',
+      allowHighSpeed: Boolean(status.allowHighSpeed),
     };
     settingsRef.current = next;
     setSettings(next);
@@ -300,15 +298,19 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
   // Native one-second polling is the state channel on USB and LAN alike. Browser
   // EventSource cannot carry our header and is subject to packaged CSP/CORS.
 
+  const capabilitiesRequestRef = useRef(0);
   const refreshCapabilities = useCallback(() => {
+    const request = ++capabilitiesRequestRef.current;
+    const current = () => mountedRef.current && request === capabilitiesRequestRef.current;
     apiFetch(baseUrl, '/api/device/info', token)
       .then(res => res.json())
-      .then(setPhoneInfo)
-      .catch(() => setPhoneInfo(null));
+      .then(info => { if (current()) setPhoneInfo(info); })
+      .catch(() => { if (current()) setPhoneInfo(null); });
 
     apiFetch(baseUrl, '/api/pipeline/capabilities', token)
       .then(res => res.json())
       .then(data => {
+        if (!current()) return;
         const list: CameraInfo[] = Array.isArray(data) ? data : data.cameras || [];
         setCameras(list);
         // Prefer main/back-wide as the default lens (not telephoto/ultrawide),
@@ -326,8 +328,17 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
           }
         }
       })
-      .catch(e => addDiag('cameraList', `Camera list fetch failed: ${e}`));
+      .catch(e => { if (current()) addDiag('cameraList', `Camera list fetch failed: ${e}`); });
   }, [baseUrl, token, addDiag]);
+
+  // Use acknowledged phone state: an optimistic toggle can precede its API
+  // mutation. The next status also covers changes made on the phone itself.
+  const capabilitiesHighSpeed = Boolean(serverStatus?.allowHighSpeed);
+  const lastCapabilitiesHighSpeed = useRef(capabilitiesHighSpeed);
+  useEffect(() => {
+    if (capabilitiesHighSpeed !== lastCapabilitiesHighSpeed.current) refreshCapabilities();
+    lastCapabilitiesHighSpeed.current = capabilitiesHighSpeed;
+  }, [capabilitiesHighSpeed, refreshCapabilities]);
 
   useEffect(() => {
     refreshCapabilities();
@@ -568,8 +579,8 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
     console.log('[Tauri UI] start_virtual_camera_feeder completed');
   };
 
-  // WebCodecs owns its own compressed stream. Only the compatibility preview
-  // needs a native ring producer; preview never activates the webcam host.
+  // Every H.264 preview needs the shared producer; preview never activates
+  // the webcam host. Native output later reuses the already running producer.
   useEffect(() => {
     if (androidMetrics?.lifecycleState !== 'STREAMING') {
       // An explicit Stop suppresses the preview producer while the local
@@ -581,7 +592,7 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
       androidMetrics?.selectedFps || androidMetrics?.encodedFps || settings.fps || 0
     );
     const shouldStart = shouldStartH264PreviewProducer({
-      previewEnabled: !previewOff && nativePreviewFallback,
+      previewEnabled: !previewOff,
       settingsHydrated: settingsHydratedRef.current,
       lifecycleState: androidMetrics?.lifecycleState,
       activeStreamMode: androidMetrics?.activeStreamMode || settings.streamMode,
@@ -613,7 +624,7 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
       .finally(() => {
         previewProducerStartInFlightRef.current = false;
       });
-  }, [androidMetrics, previewOff, nativePreviewFallback, settings.fps, settings.streamMode, vcamState?.process_running, addDiag]);
+  }, [androidMetrics, previewOff, settings.fps, settings.streamMode, vcamState?.process_running, addDiag]);
 
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -783,7 +794,8 @@ export function useCameraController({ baseUrl, token, previewEnabled }: CameraCo
     const directKeys: (keyof CameraSettings)[] = [
       'profile', 'width', 'height', 'outputWidth', 'outputHeight', 'fps', 'jpegQuality',
       'cameraId', 'aspectRatio', 'displayRotation', 'mirror', 'streamMode',
-      'targetBandwidthMbps', 'h264Bitrate', 'h264BitrateMode', 'h264KeyframeInterval'
+      'targetBandwidthMbps', 'h264Bitrate', 'h264BitrateMode', 'h264KeyframeInterval',
+      'latencyProfile', 'lowLightPriority', 'allowHighSpeed'
     ];
     for (const key of directKeys) {
       if (keysChanged.includes(key)) patch[key] = s[key];

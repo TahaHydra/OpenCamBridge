@@ -38,6 +38,7 @@ pub fn run() {
             virtualcam::start_virtual_camera_feeder,
             virtualcam::stop_virtual_camera_feeder,
             virtualcam::get_virtual_camera_status,
+            virtualcam::get_h264_preview_endpoint,
             nv12_preview::get_nv12_preview_frame,
             nv12_preview::get_nv12_preview_diagnostics,
             output_framing::set_output_framing,

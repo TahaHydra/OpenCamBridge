@@ -1,5 +1,5 @@
 import { Crop, RotateCcw } from 'lucide-react';
-import { Button } from '../primitives';
+import { Button, Field, Select } from '../primitives';
 import { DEFAULT_FRAMING, FRAMING_PRESETS, resolveFraming, type FramingPreset } from '../../services/outputFraming.js';
 import { setPreferences, usePreferences } from '../../state/preferences';
 import type { CameraController } from '../../state/useCameraController';
@@ -26,6 +26,11 @@ export default function OutputFramingControl({ controller }: { controller: Camer
           className={`framing-preset${framing.preset === preset.value ? ' is-selected' : ''}`}
           onClick={() => select(preset.value)}>{preset.label}</button>)}
       </div>
+      {prefs.advancedMode && <Field label="Resize processing" hint="Compare CPU and GPU sample/resize times in Diagnostics. Automatic uses GPU with a safe CPU fallback.">
+        <Select label="Resize processing" value={prefs.resizeBackend}
+          options={[{ value: 'auto', label: 'Automatic' }, { value: 'cpu', label: 'CPU comparison' }, { value: 'gpu', label: 'GPU preferred' }]}
+          onChange={value => setPreferences({ resizeBackend: value as 'auto' | 'cpu' | 'gpu' })} />
+      </Field>}
       <p className="output-card__note framing-note">
         {framing.mode === 'fit' ? 'Full picture, with black bars when the app uses a different shape.'
           : framing.mode === 'fill' ? 'Fills the connected app’s frame by cropping the center.'

@@ -39,7 +39,7 @@ export default function PreviewStage({
   const { phoneState, serverStatus, baseUrl, token, transport } = controller;
   const viewport = useRef<HTMLDivElement>(null);
   const source = controller.sourceDimensions;
-  const { framing, editing, error: framingError } = useOutputFraming(source, controller.producerRunning);
+  const { framing, editing, error: framingError } = useOutputFraming(source, controller.producerRunning, controller.settings.latencyProfile);
   const showEditor = editing && !compact && previewEnabled && phoneState === 'streaming';
   const ring = controller.vcamState?.metrics?.ring;
   const outputAspect = ring && ring.negotiated_width > 0 && ring.negotiated_height > 0

@@ -45,6 +45,7 @@ export interface AppPreferences {
   fitMode: 'fit' | 'fill';
   /** Native output framing in upright source coordinates; independent of capture. */
   outputFraming: OutputFraming;
+  resizeBackend: 'auto' | 'cpu' | 'gpu';
   /** Show output crop handles over the full source preview. */
   editOutputFraming: boolean;
   /** Flips only this window's preview, like looking in a mirror. */
@@ -75,6 +76,7 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   theme: 'dark',
   fitMode: 'fit',
   outputFraming: DEFAULT_FRAMING,
+  resizeBackend: 'auto',
   editOutputFraming: false,
   mirrorPreview: false,
   previewEnabled: true,
@@ -111,6 +113,7 @@ function readStorage(): AppPreferences {
   if (!Array.isArray(merged.knownDevices)) merged.knownDevices = [];
   if (!Array.isArray(merged.customProfiles)) merged.customProfiles = [];
   merged.outputFraming = normalizeFraming(merged.outputFraming);
+  if (!['auto', 'cpu', 'gpu'].includes(merged.resizeBackend)) merged.resizeBackend = 'auto';
   return merged;
 }
 

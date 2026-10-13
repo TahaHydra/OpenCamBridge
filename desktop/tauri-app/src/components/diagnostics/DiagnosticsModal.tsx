@@ -208,8 +208,13 @@ function ThroughputTab({ controller }: { controller: CameraController }) {
           <>
             <Tel k="Playout buffer / target" v={`${ring.playout_buffer_depth_ms} / ${ring.playout_target_delay_ms} ms`} />
             <Tel k="Output underruns" v={ring.playout_underruns} tone={ring.playout_underruns ? 'warn' : 'ready'} />
-            <Tel k="Scheduler resets / clock drift" v={`${ring.playout_scheduler_resets} / ${ring.playout_clock_ppm} ppm`} />
+            <Tel k="Scheduler resets / clock slope estimate" v={`${ring.playout_scheduler_resets} / ${ring.playout_clock_ppm} ppm`} />
             <Tel k="Max output gap" v={`${ring.playout_max_output_gap_ms} ms`} />
+            <Tel k="Ring commit → camera delivery" v={`${ring.consumer_ring_age_ms ?? 0} ms`} />
+            <Tel k="Sample processing / resize" v={`${ring.consumer_delivery_processing_us ?? 0} / ${ring.resize_processing_us ?? 0} µs`} />
+            <Tel k="Delivered / repeated samples" v={`${ring.consumer_delivery_count ?? 0} / ${ring.consumer_delivery_repeats ?? 0}`} />
+            <Tel k="Frames skipped by rate/drift correction" v={ring.playout_skipped_frames ?? 0} />
+            <p className="hint">Delivery is measured when Media Foundation queues the sample. Phone-clock latency is estimated; this does not measure the receiving app’s display or glass-to-glass latency.</p>
           </>
         )}
         {controller.vcamState?.last_metrics_time && (

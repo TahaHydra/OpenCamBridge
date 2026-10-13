@@ -22,6 +22,9 @@ data class StreamConfig(
     val streamMode: String = "h264",
     val h264Bitrate: Int = 4_000_000,
     val h264BitrateMode: String = "auto",
+    val latencyProfile: String = "balanced",
+    val lowLightPriority: String = "stable",
+    val allowHighSpeed: Boolean = false,
     val h264KeyframeInterval: Int = H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS,
     val cameraId: String = "0",
     val width: Int = 1920,
@@ -147,6 +150,14 @@ object StreamState {
     // When true, noisy diagnostics (all log levels) are shown; when false,
     // only WARN/ERROR are surfaced in the phone Logs tab.
     val developerMode = AtomicBoolean(false)
+    val appForeground = AtomicBoolean(false)
+    val thermalStatus = AtomicInteger(0)
+    val thermalAdaptationLevel = AtomicInteger(0)
+    val thermalBitrateScale = AtomicReference(1.0)
+    val thermalFpsCap = AtomicInteger(0)
+    val thermalAdaptationReason = AtomicReference("")
+    val wifiLowLatencyLockHeld = AtomicBoolean(false)
+    val wifiLowLatencyLockReason = AtomicReference("inactive")
 
 
     // Security & Network
@@ -157,6 +168,9 @@ object StreamState {
     val streamMode = AtomicReference("h264") // h264 preferred; mjpeg compatibility
     val h264Bitrate = AtomicInteger(4000000)
     val h264BitrateMode = AtomicReference("auto")
+    val latencyProfile = AtomicReference("balanced")
+    val lowLightPriority = AtomicReference("stable")
+    val allowHighSpeed = AtomicBoolean(false)
     val h264KeyframeInterval = AtomicInteger(H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS)
     val activeStreamMode = AtomicReference("mjpeg")
     val fallbackReason = AtomicReference("")
@@ -292,6 +306,9 @@ object StreamState {
                 it.desired.displayRotation != config.displayRotation ||
                 it.desired.mirror != config.mirror ||
                 it.desired.h264KeyframeInterval != config.h264KeyframeInterval
+                || it.desired.lowLightPriority != config.lowLightPriority
+                || it.desired.allowHighSpeed != config.allowHighSpeed
+                || it.desired.latencyProfile != config.latencyProfile
             it.copy(
                 desired = config,
                 revision = it.revision + 1,
@@ -397,6 +414,9 @@ object StreamState {
         streamMode.set(config.streamMode)
         h264Bitrate.set(config.h264Bitrate)
         h264BitrateMode.set(config.h264BitrateMode)
+        latencyProfile.set(config.latencyProfile)
+        lowLightPriority.set(config.lowLightPriority)
+        allowHighSpeed.set(config.allowHighSpeed)
         h264KeyframeInterval.set(config.h264KeyframeInterval)
         cameraId.set(config.cameraId)
         width.set(config.width)
@@ -423,6 +443,9 @@ object StreamState {
             streamMode = streamMode.get(),
             h264Bitrate = h264Bitrate.get(),
             h264BitrateMode = h264BitrateMode.get(),
+            latencyProfile = latencyProfile.get(),
+            lowLightPriority = lowLightPriority.get(),
+            allowHighSpeed = allowHighSpeed.get(),
             h264KeyframeInterval = h264KeyframeInterval.get(),
             cameraId = cameraId.get(),
             width = width.get(),
@@ -483,6 +506,9 @@ object StreamState {
                 fps = config.fps,
                 h264Bitrate = config.h264Bitrate,
                 h264BitrateMode = config.h264BitrateMode,
+                latencyProfile = config.latencyProfile,
+                lowLightPriority = config.lowLightPriority,
+                allowHighSpeed = config.allowHighSpeed,
                 phonePreviewEnabled = config.localPreviewEnabled
             ),
             selected = selected,
@@ -514,6 +540,16 @@ object StreamState {
         fallbackReason = fallbackState?.reason.orEmpty(),
         h264Bitrate = config.h264Bitrate,
         h264BitrateMode = config.h264BitrateMode,
+        latencyProfile = config.latencyProfile,
+        lowLightPriority = config.lowLightPriority,
+        allowHighSpeed = config.allowHighSpeed,
+        thermalStatus = thermalStatus.get(),
+        thermalAdaptationLevel = thermalAdaptationLevel.get(),
+        thermalBitrateScale = thermalBitrateScale.get(),
+        thermalFpsCap = thermalFpsCap.get(),
+        thermalAdaptationReason = thermalAdaptationReason.get(),
+        wifiLowLatencyLockHeld = wifiLowLatencyLockHeld.get(),
+        wifiLowLatencyLockReason = wifiLowLatencyLockReason.get(),
         h264KeyframeInterval = config.h264KeyframeInterval,
         cameraId = config.cameraId,
         width = config.width,
@@ -599,6 +635,16 @@ data class StreamStatusDto(
     val fallbackReason: String = "",
     val h264Bitrate: Int,
     val h264BitrateMode: String = "auto",
+    val latencyProfile: String = "balanced",
+    val lowLightPriority: String = "stable",
+    val allowHighSpeed: Boolean = false,
+    val thermalStatus: Int = 0,
+    val thermalAdaptationLevel: Int = 0,
+    val thermalBitrateScale: Double = 1.0,
+    val thermalFpsCap: Int = 0,
+    val thermalAdaptationReason: String = "",
+    val wifiLowLatencyLockHeld: Boolean = false,
+    val wifiLowLatencyLockReason: String = "inactive",
     val h264KeyframeInterval: Int,
     val cameraId: String,
     val width: Int,
@@ -686,6 +732,9 @@ data class DesiredPipelineDto(
     val fps: Int,
     val h264Bitrate: Int,
     val h264BitrateMode: String = "auto",
+    val latencyProfile: String = "balanced",
+    val lowLightPriority: String = "stable",
+    val allowHighSpeed: Boolean = false,
     val phonePreviewEnabled: Boolean
 )
 

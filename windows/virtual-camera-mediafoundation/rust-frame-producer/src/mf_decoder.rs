@@ -1,8 +1,10 @@
 use std::mem::ManuallyDrop;
 use std::ptr::null_mut;
+use std::time::Instant;
 use windows::core::{ComInterface, Interface};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
@@ -54,9 +56,15 @@ pub struct MfH264Decoder {
     _context: ID3D11DeviceContext,
     _device_manager: IMFDXGIDeviceManager,
     pub name: String,
-    /** The MFT accepted the DXGI device manager and is producing through the
-     * D3D11-aware path. This does not prove that DXVA acceleration is active. */
+    /// True only after an actual output buffer exposes IMFDXGIBuffer.
+    /// Neither manager acceptance nor DXGI output proves DXVA acceleration.
     pub d3d11_output_active: bool,
+    d3d11_aware: bool,
+    d3d_manager_accepted: bool,
+    output_samples: u64,
+    dxgi_output_samples: u64,
+    readback_ns: u64,
+    dxgi_readback_ns: u64,
     // Keep this last: Rust drops fields in declaration order, so Media
     // Foundation and COM remain alive until every object above is released.
     _runtime: MfRuntimeGuard,
@@ -107,6 +115,16 @@ impl MfH264Decoder {
             .map_err(err("D3D11CreateDevice"))?;
             let device = device.ok_or("D3D11 device was not returned")?;
             let context = context.ok_or("D3D11 context was not returned")?;
+            // MF may use the shared immediate context on its work queues.
+            // Microsoft's MF D3D11 guidance recommends this to avoid deadlocks
+            // around video decoder buffers. The return is the PREVIOUS state.
+            let multithread = context
+                .cast::<ID3D10Multithread>()
+                .map_err(err("D3D11 context multithread interface"))?;
+            multithread.SetMultithreadProtected(true);
+            if !multithread.GetMultithreadProtected().as_bool() {
+                return Err("D3D11 context multithread protection was not enabled".into());
+            }
 
             let mut reset_token = 0u32;
             let mut device_manager = None;
@@ -219,7 +237,13 @@ impl MfH264Decoder {
                 _context: context,
                 _device_manager: device_manager,
                 name: "Microsoft H.264 Video Decoder MFT".to_string(),
-                d3d11_output_active: d3d_set,
+                d3d11_output_active: false,
+                d3d11_aware: d3d_aware,
+                d3d_manager_accepted: d3d_set,
+                output_samples: 0,
+                dxgi_output_samples: 0,
+                readback_ns: 0,
+                dxgi_readback_ns: 0,
                 _runtime: runtime,
             })
         }
@@ -235,6 +259,21 @@ impl MfH264Decoder {
                 .map_err(err("decoder restart"))?;
         }
         Ok(())
+    }
+
+    pub fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "d3d11_aware": self.d3d11_aware,
+            "d3d_manager_accepted": self.d3d_manager_accepted,
+            "d3d_multithread_protected": true,
+            "output_samples": self.output_samples,
+            "dxgi_output_samples": self.dxgi_output_samples,
+            "cpu_output_samples": self.output_samples.saturating_sub(self.dxgi_output_samples),
+            "cpu_readback_ms_avg": self.readback_ns as f64 / self.output_samples.max(1) as f64 / 1_000_000.0,
+            "dxgi_readback_ms_avg": self.dxgi_readback_ns as f64 / self.dxgi_output_samples.max(1) as f64 / 1_000_000.0,
+            "cpu_bytes_copied": self.output_samples.saturating_mul(self.scratch.len() as u64),
+            "acceleration_verified": false,
+        })
     }
 
     pub fn decode<F>(
@@ -315,7 +354,20 @@ impl MfH264Decoder {
                     let timestamp = out_sample
                         .GetSampleTime()
                         .unwrap_or(pts_us.saturating_mul(10));
+                    let dxgi_backed = out_sample
+                        .GetBufferByIndex(0)
+                        .map(|buffer| buffer.cast::<IMFDXGIBuffer>().is_ok())
+                        .unwrap_or(false);
+                    let readback_start = Instant::now();
                     self.copy_nv12_sample(&out_sample)?;
+                    let readback_ns = readback_start.elapsed().as_nanos() as u64;
+                    self.output_samples += 1;
+                    self.readback_ns += readback_ns;
+                    self.d3d11_output_active = dxgi_backed;
+                    if dxgi_backed {
+                        self.dxgi_output_samples += 1;
+                        self.dxgi_readback_ns += readback_ns;
+                    }
                     on_frame(DecodedNv12 {
                         bytes: &self.scratch,
                         width: self.width,

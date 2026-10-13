@@ -21,16 +21,21 @@ object ResolutionPolicy {
         requestedWidth: Int,
         requestedHeight: Int
     ): ResolutionSelector {
+        // User settings and automatic compatibility fallback have already been
+        // validated as a complete camera tuple by the service. CameraX must
+        // bind that tuple, rather than silently substituting its 720p default.
+        val exactTuple = profile == "exact" || profile == "manual" || profile == "adaptive"
         val filter = ResolutionFilter { supportedSizes, _ ->
             val validSizes = mutableListOf<Size>()
             var fallbackUsed = false
             var resolutionPolicyName = ""
             
-            when (profile) {
+            when (if (exactTuple) "exact" else profile) {
                 "exact" -> {
                     resolutionPolicyName = "exact_canonical_tuple"
                     validSizes.addAll(supportedSizes.filter {
-                        landscapeW(it) == requestedWidth && landscapeH(it) == requestedHeight
+                        landscapeW(it) == maxOf(requestedWidth, requestedHeight) &&
+                            landscapeH(it) == minOf(requestedWidth, requestedHeight)
                     })
                 }
                 "low-latency" -> {
@@ -92,7 +97,7 @@ object ResolutionPolicy {
                 }
             }
             
-            if (validSizes.isEmpty() && profile != "exact") {
+            if (validSizes.isEmpty() && !exactTuple) {
                 fallbackUsed = true
                 resolutionPolicyName = "fallback_auto_no_valid_size"
                 validSizes.addAll(supportedSizes)
@@ -107,7 +112,7 @@ object ResolutionPolicy {
 
         val boundSize = android.util.Size(requestedWidth, requestedHeight)
         
-        val fallbackRule = if (profile == "exact") {
+        val fallbackRule = if (exactTuple) {
             androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_NONE
         } else {
             androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER

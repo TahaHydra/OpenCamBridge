@@ -48,12 +48,18 @@ export default function PerformancePage({ controller }: SettingsContext) {
 
       <SettingsSection
         title="Virtual camera decoding"
-        description={m ? undefined : 'Shown while the virtual camera or the compatibility preview is running.'}
+        description={m ? undefined : 'Shown while the virtual camera or H.264 preview is running.'}
       >
         <div className="settings-metrics">
           <MetricRow label="Decoder" value={m?.decoder_name || m?.decode_backend || '—'} />
           <MetricRow label="Acceleration" value={hardware} tone={m?.hardware_decoder === false ? 'warn' : m?.hardware_decoder ? 'ok' : undefined} />
           <MetricRow label="GPU output" value={m ? (m.d3d11_output ? 'D3D11' : 'System memory') : '—'} />
+          {m?.decoder_observations && <>
+            <MetricRow label="D3D device manager" value={m.decoder_observations.d3d_manager_accepted ? 'Accepted' : 'Not accepted'} />
+            <MetricRow label="Observed DXGI / CPU frames" value={`${m.decoder_observations.dxgi_output_samples ?? 0} / ${m.decoder_observations.cpu_output_samples ?? 0}`} />
+            <MetricRow label="CPU readback / copy" value={`${(m.decoder_observations.cpu_readback_ms_avg ?? 0).toFixed(2)} ms`} />
+          </>}
+          {m?.preview_fanout && <MetricRow label="Local preview subscribers" value={`${m.preview_fanout.subscribers} · ${m.preview_fanout.overflow_disconnects} overflow reconnects`} />}
           <MetricRow label="Pixel format" value={m?.pixel_format || '—'} />
           <MetricRow label="Resize" value={m ? (m.source_width !== m.output_width ? `${m.resize_backend || 'GPU'} · ${m.source_width}×${m.source_height} → ${m.output_width}×${m.output_height}` : 'Not needed') : '—'} />
           <MetricRow label="Decode time" value={m ? `${m.decode_ms_avg} ms` : '—'} />

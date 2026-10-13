@@ -1,6 +1,6 @@
 # OpenCamBridge V2 architecture
 
-Last updated for `v2/streaming-engine`.
+Last updated on main for the October 2026 streaming audit fixes.
 
 ## End-to-end data path
 
@@ -10,9 +10,9 @@ Camera2 regular / constrained high-speed / high-speed GPU bridge
   -> asynchronous complete H.264 access units
   -> OCB2 /stream.ocb2
   -> Media Foundation H.264 MFT + D3D11 manager
-  -> decoded NV12, optional one-time D3D11 video-processor resize
-     (bounded CPU NV12 letterbox fallback after GPU failure)
+  -> owned decoded NV12, CPU orientation transform
   -> validated 16-slot NV12 ring, bounded sequence playback
+  -> consumer D3D11 resize/framing or compatible CPU fallback/comparison
   -> SimpleMediaStream NV12 sample
   -> Windows camera consumer
 ```
@@ -41,7 +41,7 @@ The shared corpus in `protocol/conformance` runs against Kotlin, Rust, and the a
 
 The producer has observable states from `STARTING` through connection, stream-info/config/keyframe/decode, `WRITING_RING`, stalled/fallback/failed. Media Foundation D3D11 output is reported separately from hardware decode, which remains `unknown` unless acceleration can be proven.
 
-The ring ABI is generated from `protocol/ring-abi.schema.json`. Version 4 has a 320-byte header, sixteen reusable NV12 slots and aligned 128-byte slot headers, atomic publication, ACL-restricted file/mapping access, producer/consumer heartbeats, build hashes and geometry/bounds validation. The production camera uses the fixed sequence queue (nominal 90 ms rounded to source frames). The older adaptive scheduler remains in the tree for historical simulations; it is not the production selection policy.
+The ring ABI is generated from `protocol/ring-abi.schema.json`. Version 5 has a 384-byte header, explicit full-HD pixel/payload limits, sixteen reusable NV12 slots and aligned 128-byte slot headers, atomic publication, ACL-restricted file/mapping access, producer/consumer heartbeats, build hashes and geometry/bounds validation. The production camera uses a fixed-delay queue with startup fill, bounded drift correction and consumer-local rate conversion. Low/Balanced/Smooth use 55/90/140 ms presentation targets. The older adaptive scheduler remains available for historical simulations; it is not the production selection policy.
 
 ## Virtual camera
 
@@ -53,18 +53,19 @@ The ring ABI is generated from `protocol/ring-abi.schema.json`. Version 4 has a 
 
 Tauri chooses an explicit ADB device, applies revisioned complete tuples, starts the producer with Android selected/actual source properties and independent Windows output dimensions, verifies three ring commits plus host activation, and maintains current virtual-camera-consumer readiness separately.
 
-The primary desktop preview opens an independent authenticated OCB2 stream through
-the existing native HTTP plugin. Only compressed chunks cross IPC, with one chunk
+The producer owns the only phone video connection. The primary desktop preview
+opens its separately authenticated loopback OCB2 fanout through the native HTTP plugin.
+Only compressed chunks cross IPC, with one chunk
 in flight to the worker. The shared OCB2 parser feeds an Annex-B WebCodecs decoder,
 preferring hardware with software allowed. Stream discontinuities reset decoding
 and wait for a keyframe. OCB2 SDR color metadata and rotation/mirror are preserved.
 Full-resolution VideoFrames are presented to an OffscreenCanvas on display rAF;
 the compositor scales the source to the UI rectangle. The bounded decoded-frame
-queue starts with two source intervals (at most 70 ms). Discarded/displayed frames
+queue uses the shared latency profile and slowly corrects phone/host clock phase. Discarded/displayed frames
 are closed, and transport/worker resources are canceled on Stop/unmount.
 
 Unsupported or repeatedly failing WebCodecs uses the existing 960-edge NV12 ring
-preview. Only this fallback auto-starts a native preview producer. The lifecycle
+preview. H.264 preview auto-starts the native producer for either renderer. The lifecycle
 controller stays mounted when clean feed hides the controls. Neither preview
 path activates or stops the virtual-camera host on failure.
 

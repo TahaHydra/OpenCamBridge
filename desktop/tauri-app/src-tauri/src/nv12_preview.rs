@@ -26,9 +26,10 @@ const PREVIEW_MAX_DIMENSION: usize = 960;
 const PREVIEW_QUEUE_DEPTH: u64 = 3;
 
 const OCBR_MAGIC: u32 = 0x5242_434f;
-const RING_VERSION: u16 = 4;
+const RING_VERSION: u16 = 5;
 const FORMAT_NV12: u32 = 2;
-const MAX_NV12_SIZE: usize = 1920 * 1080 * 3 / 2;
+const MAX_NV12_SIZE: usize = RING_MAX_NV12_BYTES;
+const _: () = assert!(RING_MAX_PIXELS * 3 / 2 == MAX_NV12_SIZE);
 const SLOT_SIZE: usize = SLOT_HEADER_SIZE + MAX_NV12_SIZE;
 const MAPPING_SIZE: usize = RING_HEADER_SIZE + SLOT_COUNT * SLOT_SIZE;
 const PREVIEW_HEADER_SIZE: usize = 80;
@@ -91,7 +92,14 @@ struct RingHeader {
     playout_scheduler_resets: AtomicU64,
     playout_clock_ppm: AtomicI32,
     playout_max_output_gap_ms: AtomicU32,
-    reserved: [u64; 1],
+    consumer_ring_age_ns: AtomicU64,
+    consumer_delivery_qpc_ns: AtomicU64,
+    consumer_delivery_count: AtomicU64,
+    consumer_delivery_repeats: AtomicU64,
+    consumer_delivery_processing_us: AtomicU64,
+    resize_processing_us: AtomicU64,
+    playout_skipped_frames: AtomicU64,
+    reserved: [u64; 2],
 }
 
 #[repr(C)]
@@ -179,9 +187,7 @@ unsafe fn downscale_nv12_bilinear(
         fn coordinates(input: usize, output: usize) -> Vec<(usize, usize, u64)> {
             (0..output)
                 .map(|position| {
-                    let source = ((position as f64 + 0.5) * input as f64
-                        / output as f64
-                        - 0.5)
+                    let source = ((position as f64 + 0.5) * input as f64 / output as f64 - 0.5)
                         .clamp(0.0, (input - 1) as f64);
                     let first = source.floor() as usize;
                     let second = (first + 1).min(input - 1);
@@ -201,9 +207,12 @@ unsafe fn downscale_nv12_bilinear(
                 let (x0, x1, wx) = xs[ox];
                 for channel in 0..channels {
                     let top_left = *source.add(y0 * source_stride + x0 * channels + channel) as u64;
-                    let top_right = *source.add(y0 * source_stride + x1 * channels + channel) as u64;
-                    let bottom_left = *source.add(y1 * source_stride + x0 * channels + channel) as u64;
-                    let bottom_right = *source.add(y1 * source_stride + x1 * channels + channel) as u64;
+                    let top_right =
+                        *source.add(y0 * source_stride + x1 * channels + channel) as u64;
+                    let bottom_left =
+                        *source.add(y1 * source_stride + x0 * channels + channel) as u64;
+                    let bottom_right =
+                        *source.add(y1 * source_stride + x1 * channels + channel) as u64;
                     let top = (top_left * (ONE - wx) + top_right * wx + ONE / 2) >> 16;
                     let bottom = (bottom_left * (ONE - wx) + bottom_right * wx + ONE / 2) >> 16;
                     output[(oy * output_width + ox) * channels + channel] =
@@ -216,12 +225,24 @@ unsafe fn downscale_nv12_bilinear(
     let y_out_len = out_width * out_height;
     let (y_out, uv_out) = out.split_at_mut(y_out_len);
     resize_plane(
-        y_src, y_src_stride, src_width, src_height, 1,
-        out_width, out_height, y_out,
+        y_src,
+        y_src_stride,
+        src_width,
+        src_height,
+        1,
+        out_width,
+        out_height,
+        y_out,
     );
     resize_plane(
-        uv_src, uv_src_stride, src_width / 2, src_height / 2, 2,
-        out_width / 2, out_height / 2, uv_out,
+        uv_src,
+        uv_src_stride,
+        src_width / 2,
+        src_height / 2,
+        2,
+        out_width / 2,
+        out_height / 2,
+        uv_out,
     );
 }
 
@@ -512,8 +533,8 @@ unsafe fn read_newest_from_base(
     let uv_stride = metadata.uv_stride as usize;
     if width == 0
         || height == 0
-        || width > 1920
-        || height > 1920
+        || width > RING_MAX_DIMENSION
+        || height > RING_MAX_DIMENSION
         || width & 1 != 0
         || height & 1 != 0
         || y_stride < width
@@ -560,7 +581,11 @@ unsafe fn read_newest_from_base(
             expected as u32,
             stream_generation,
             metadata.ring_sequence,
-            if metadata.reserved_tail == 0 { COLOR_BT709_LIMITED_SDR } else { metadata.reserved_tail },
+            if metadata.reserved_tail == 0 {
+                COLOR_BT709_LIMITED_SDR
+            } else {
+                metadata.reserved_tail
+            },
             ring.producer_fps_num.load(Ordering::Acquire),
             ring.producer_fps_den.load(Ordering::Acquire),
         );
@@ -589,7 +614,11 @@ unsafe fn read_newest_from_base(
             out_payload as u32,
             stream_generation,
             metadata.ring_sequence,
-            if metadata.reserved_tail == 0 { COLOR_BT709_LIMITED_SDR } else { metadata.reserved_tail },
+            if metadata.reserved_tail == 0 {
+                COLOR_BT709_LIMITED_SDR
+            } else {
+                metadata.reserved_tail
+            },
             ring.producer_fps_num.load(Ordering::Acquire),
             ring.producer_fps_den.load(Ordering::Acquire),
         );
@@ -825,15 +854,11 @@ pub fn get_nv12_preview_frame(
     }
     let last_returned_generation = reader.last_returned_generation;
     let last_returned_ring_sequence = reader.last_returned_ring_sequence;
-    let result = reader
-        .mapping
-        .as_ref()
-        .unwrap()
-        .read_newest(
-            after_sequence,
-            last_returned_generation,
-            last_returned_ring_sequence,
-        );
+    let result = reader.mapping.as_ref().unwrap().read_newest(
+        after_sequence,
+        last_returned_generation,
+        last_returned_ring_sequence,
+    );
     match result {
         Ok(frame) => {
             reader.ring_write_sequence = frame.ring_write_sequence;
@@ -1148,8 +1173,15 @@ mod tests {
         let mut out = vec![0u8; 2 * 2 * 3 / 2];
         unsafe {
             downscale_nv12_bilinear(
-                y_src.as_ptr(), src_w, uv_src.as_ptr(), src_w,
-                src_w, src_h, 2, 2, &mut out,
+                y_src.as_ptr(),
+                src_w,
+                uv_src.as_ptr(),
+                src_w,
+                src_w,
+                src_h,
+                2,
+                2,
+                &mut out,
             );
         }
         assert!(out[..4].iter().all(|value| (127..=128).contains(value)));

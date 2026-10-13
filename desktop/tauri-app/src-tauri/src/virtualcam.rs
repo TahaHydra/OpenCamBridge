@@ -92,6 +92,10 @@ pub struct VirtualCamMetrics {
     #[serde(default)]
     pub hardware_decoder: Option<bool>,
     #[serde(default)]
+    pub decoder_observations: Option<serde_json::Value>,
+    #[serde(default)]
+    pub preview_fanout: Option<serde_json::Value>,
+    #[serde(default)]
     pub encoder_name: String,
     #[serde(default)]
     pub hardware_encoder: bool,
@@ -110,26 +114,51 @@ pub struct VirtualCamMetrics {
 
 impl VirtualCamMetrics {
     fn normalize_truthful_names(&mut self) {
-        let ring_source_fps = self.ring.as_ref().map(|ring| {
-            ring.source_fps_num / ring.source_fps_den.max(1)
-        }).unwrap_or(0);
-        self.source_fps = if ring_source_fps > 0 { ring_source_fps } else { self.fps_target };
+        let ring_source_fps = self
+            .ring
+            .as_ref()
+            .map(|ring| ring.source_fps_num / ring.source_fps_den.max(1))
+            .unwrap_or(0);
+        self.source_fps = if ring_source_fps > 0 {
+            ring_source_fps
+        } else {
+            self.fps_target
+        };
         self.transport_received_fps = self.transport_fps;
         self.producer_decoded_fps = self.decoded_unique_fps;
         self.ring_written_fps = self.written_fps;
-        self.virtual_camera_requested_fps = self.ring.as_ref().map(|ring| {
-            ring.negotiated_fps_num / ring.negotiated_fps_den.max(1)
-        }).unwrap_or(0);
+        self.virtual_camera_requested_fps = self
+            .ring
+            .as_ref()
+            .map(|ring| ring.negotiated_fps_num / ring.negotiated_fps_den.max(1))
+            .unwrap_or(0);
         self.virtual_camera_repeated_fps = self.repeated_samples.min(u32::MAX as u64) as u32;
         self.producer_processing_ms = self.total_pipeline_ms;
-        self.phone_to_ring_latency_ms =
-            if self.source == "ocb2-h264" { self.latency_ms } else { 0 };
+        self.phone_to_ring_latency_ms = if self.source == "ocb2-h264" {
+            self.latency_ms
+        } else {
+            0
+        };
         self.transport_bandwidth_mbps = self.estimated_mbps.clone();
     }
 }
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub struct RingDiagnostics {
+    #[serde(default)]
+    pub consumer_ring_age_ms: u64,
+    #[serde(default)]
+    pub resize_processing_us: u64,
+    #[serde(default)]
+    pub playout_skipped_frames: u64,
+    #[serde(default)]
+    pub consumer_delivery_qpc_ns: u64,
+    #[serde(default)]
+    pub consumer_delivery_count: u64,
+    #[serde(default)]
+    pub consumer_delivery_repeats: u64,
+    #[serde(default)]
+    pub consumer_delivery_processing_us: u64,
     pub consumer_attached: bool,
     pub consumer_pid: u32,
     pub consumer_heartbeat_qpc: u64,
@@ -225,6 +254,7 @@ pub struct BinaryIdentityStatus {
 }
 
 pub struct VirtualCamManager {
+    preview_endpoint: Mutex<Option<LocalPreviewEndpoint>>,
     // Lock-order audit (2026-07-17): process handles are outer locks
     // (`child` before `host_child` when both are needed); metrics/error/path
     // locks are leaves and no path acquires a process lock while holding one.
@@ -290,9 +320,8 @@ fn virtual_camera_installer_path() -> PathBuf {
     // installer-folder executable can be locked by an elevated/orphaned host,
     // which previously made a successful rebuild impossible to exercise until
     // reboot. Packaged/source-only layouts still use the retained fallback.
-    let built = root.join(
-        "windows/virtual-camera-mediafoundation/x64/Release/VirtualCamera_Installer.exe",
-    );
+    let built =
+        root.join("windows/virtual-camera-mediafoundation/x64/Release/VirtualCamera_Installer.exe");
     if built.exists() {
         return built;
     }
@@ -479,6 +508,7 @@ fn evaluate_binary_identity(
 impl VirtualCamManager {
     pub fn new() -> Self {
         Self {
+            preview_endpoint: Mutex::new(None),
             child: Mutex::new(None),
             host_child: Mutex::new(None),
             host_operation: AtomicU64::new(0),
@@ -521,29 +551,44 @@ pub fn check_virtual_camera_backend() -> bool {
 
 #[tauri::command]
 pub async fn register_virtual_camera_backend() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(|| run_installer_command("--register")).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(|| run_installer_command("--register"))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn unregister_virtual_camera_backend() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(|| run_installer_command("--unregister")).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(|| run_installer_command("--unregister"))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn get_virtual_camera_backend_details() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(|| run_installer_command("--status")).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(|| run_installer_command("--status"))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn start_virtual_camera_host(app: AppHandle) -> Result<(), String> {
-    let operation = app.state::<VirtualCamManager>().host_operation.fetch_add(1, Ordering::AcqRel) + 1;
-    tauri::async_runtime::spawn_blocking(move || start_host_inner(&app.state::<VirtualCamManager>(), operation))
-        .await.map_err(|e| e.to_string())?
+    let operation = app
+        .state::<VirtualCamManager>()
+        .host_operation
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+    tauri::async_runtime::spawn_blocking(move || {
+        start_host_inner(&app.state::<VirtualCamManager>(), operation)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn start_host_inner(state: &VirtualCamManager, operation: u64) -> Result<(), String> {
     let mut host_guard = state.host_child.lock_recover();
-    if state.host_operation.load(Ordering::Acquire) != operation { return Err("Host start cancelled".into()); }
+    if state.host_operation.load(Ordering::Acquire) != operation {
+        return Err("Host start cancelled".into());
+    }
 
     // A stale handle to a dead host must not block a restart (this made the
     // Start button a silent no-op after the host crashed or failed to start).
@@ -670,15 +715,24 @@ fn start_host_inner(state: &VirtualCamManager, operation: u64) -> Result<(), Str
 
 #[tauri::command]
 pub async fn stop_virtual_camera_host(app: AppHandle) -> Result<(), String> {
-    let operation = app.state::<VirtualCamManager>().host_operation.fetch_add(1, Ordering::AcqRel) + 1;
-    tauri::async_runtime::spawn_blocking(move || stop_host_inner(&app.state::<VirtualCamManager>(), operation))
-        .await.map_err(|e| e.to_string())?
+    let operation = app
+        .state::<VirtualCamManager>()
+        .host_operation
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+    tauri::async_runtime::spawn_blocking(move || {
+        stop_host_inner(&app.state::<VirtualCamManager>(), operation)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn stop_host_inner(state: &VirtualCamManager, operation: u64) -> Result<(), String> {
     let mut host_guard = state.host_child.lock_recover();
     // A delayed Stop must never remove a child belonging to a newer Start.
-    if state.host_operation.load(Ordering::Acquire) != operation { return Ok(()); }
+    if state.host_operation.load(Ordering::Acquire) != operation {
+        return Ok(());
+    }
     state.host_activated.store(false, Ordering::Release);
     if let Some(mut child) = host_guard.take() {
         let _ = child.kill();
@@ -701,19 +755,47 @@ pub async fn start_virtual_camera_feeder(
     token: Option<String>,
     source: Option<String>,
 ) -> Result<(), String> {
-    let operation = app.state::<VirtualCamManager>().producer_instance.fetch_add(1, Ordering::AcqRel) + 1;
+    let operation = app
+        .state::<VirtualCamManager>()
+        .producer_instance
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<VirtualCamManager>();
-        start_feeder_inner(app.clone(), &state, operation, url, width, height, fps,
-            source_width, source_height, source_fps, profile, token, source)
-    }).await.map_err(|e| e.to_string())?
+        start_feeder_inner(
+            app.clone(),
+            &state,
+            operation,
+            url,
+            width,
+            height,
+            fps,
+            source_width,
+            source_height,
+            source_fps,
+            profile,
+            token,
+            source,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn start_feeder_inner(
-    app: AppHandle, state: &VirtualCamManager, operation: u64,
-    url: String, width: u32, height: u32, fps: f64,
-    source_width: u32, source_height: u32, source_fps: f64,
-    profile: Option<String>, token: Option<String>, source: Option<String>,
+    app: AppHandle,
+    state: &VirtualCamManager,
+    operation: u64,
+    url: String,
+    width: u32,
+    height: u32,
+    fps: f64,
+    source_width: u32,
+    source_height: u32,
+    source_fps: f64,
+    profile: Option<String>,
+    token: Option<String>,
+    source: Option<String>,
 ) -> Result<(), String> {
     let source = match source.as_deref() {
         None | Some("mjpeg") => "mjpeg",
@@ -730,7 +812,9 @@ fn start_feeder_inner(
         source, source_width, source_height, source_fps, width, height
     );
     let mut child_guard = state.child.lock_recover();
-    if state.producer_instance.load(Ordering::Acquire) != operation { return Err("Producer start cancelled".into()); }
+    if state.producer_instance.load(Ordering::Acquire) != operation {
+        return Err("Producer start cancelled".into());
+    }
     if let Some(mut child) = child_guard.take() {
         println!(
             ">>> [Tauri] Found existing producer (PID {}). Stopping it.",
@@ -743,6 +827,7 @@ fn start_feeder_inner(
     *state.metrics.lock_recover() = None;
     *state.last_metrics_time.lock_recover() = None;
     *state.producer_state.lock_recover() = "STARTING".to_string();
+    *state.preview_endpoint.lock_recover() = None;
 
     let repo_root = repository_root();
 
@@ -769,6 +854,21 @@ fn start_feeder_inner(
     // Note: the producer no longer accepts --latest-only (always on) or
     // --quality (JPEG quality is applied on the Android side).
     let mut cmd = Command::new(exe_path);
+    // Separate, per-process credential: the phone's LAN credential never
+    // crosses into a local preview request or a command-line/log message.
+    cmd.env_remove("OPENCAMBRIDGE_PREVIEW_TOKEN");
+    if source == "h264" {
+        use rand::RngCore;
+        let mut secret = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret);
+        let preview_token = hex::encode(secret);
+        cmd.env("OPENCAMBRIDGE_PREVIEW_TOKEN", &preview_token);
+        *state.preview_endpoint.lock_recover() = Some(LocalPreviewEndpoint {
+            url: String::new(),
+            token: preview_token,
+            producer_instance: operation,
+        });
+    }
     cmd.arg("--source")
         .arg(source)
         .arg("--url")
@@ -836,13 +936,33 @@ fn start_feeder_inner(
                 // Hold the ownership lock through publication. Checking the
                 // atomic alone allows an old callback to overwrite new metrics.
                 let child_guard = state_manager.child.lock_recover();
-                if state_manager.producer_instance.load(Ordering::Acquire) != operation || child_guard.is_none() { break; }
+                if state_manager.producer_instance.load(Ordering::Acquire) != operation
+                    || child_guard.is_none()
+                {
+                    break;
+                }
                 let value = serde_json::from_str::<serde_json::Value>(&line).ok();
                 match value
                     .as_ref()
                     .and_then(|v| v.get("type"))
                     .and_then(|v| v.as_str())
                 {
+                    Some("preview_endpoint") => {
+                        if let Some(port) = value
+                            .as_ref()
+                            .and_then(|v| v.get("port"))
+                            .and_then(|v| v.as_u64())
+                            .filter(|port| *port > 0 && *port <= u16::MAX as u64)
+                        {
+                            if let Some(endpoint) =
+                                state_manager.preview_endpoint.lock_recover().as_mut()
+                            {
+                                if endpoint.producer_instance == operation {
+                                    endpoint.url = format!("http://127.0.0.1:{port}/stream.ocb2");
+                                }
+                            }
+                        }
+                    }
                     Some("metrics") => {
                         if let Ok(mut metrics) =
                             serde_json::from_value::<VirtualCamMetrics>(value.unwrap())
@@ -914,7 +1034,9 @@ fn start_feeder_inner(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let mut guard = state.child.lock_recover();
-        if state.producer_instance.load(Ordering::Acquire) != operation { return Err("Producer start cancelled".into()); }
+        if state.producer_instance.load(Ordering::Acquire) != operation {
+            return Err("Producer start cancelled".into());
+        }
         if let Some(metrics) = state.metrics.lock_recover().as_ref() {
             if metrics.producer_state == "WRITING_RING" && metrics.ring_frames_committed >= 3 {
                 return Ok(());
@@ -946,14 +1068,24 @@ fn start_feeder_inner(
 
 #[tauri::command]
 pub async fn stop_virtual_camera_feeder(app: AppHandle) -> Result<(), String> {
-    let operation = app.state::<VirtualCamManager>().producer_instance.fetch_add(1, Ordering::AcqRel) + 1;
-    tauri::async_runtime::spawn_blocking(move || stop_feeder_inner(&app.state::<VirtualCamManager>(), operation))
-        .await.map_err(|e| e.to_string())?
+    let operation = app
+        .state::<VirtualCamManager>()
+        .producer_instance
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+    tauri::async_runtime::spawn_blocking(move || {
+        stop_feeder_inner(&app.state::<VirtualCamManager>(), operation)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn stop_feeder_inner(state: &VirtualCamManager, operation: u64) -> Result<(), String> {
     let mut child_guard = state.child.lock_recover();
-    if state.producer_instance.load(Ordering::Acquire) != operation { return Ok(()); }
+    if state.producer_instance.load(Ordering::Acquire) != operation {
+        return Ok(());
+    }
+    *state.preview_endpoint.lock_recover() = None;
     if let Some(mut child) = child_guard.take() {
         let _ = child.kill();
         let _ = child.wait();
@@ -969,10 +1101,42 @@ fn stop_feeder_inner(state: &VirtualCamManager, operation: u64) -> Result<(), St
     Ok(())
 }
 
+#[derive(Serialize, Clone)]
+pub struct LocalPreviewEndpoint {
+    url: String,
+    token: String,
+    producer_instance: u64,
+}
+
+#[tauri::command]
+pub fn get_h264_preview_endpoint(app: AppHandle) -> Option<LocalPreviewEndpoint> {
+    let state = app.state::<VirtualCamManager>();
+    let mut child = state.child.lock_recover();
+    if !child
+        .as_mut()
+        .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
+    {
+        return None;
+    }
+    let endpoint = state
+        .preview_endpoint
+        .lock_recover()
+        .as_ref()
+        .filter(|endpoint| {
+            !endpoint.url.is_empty()
+                && endpoint.producer_instance == state.producer_instance.load(Ordering::Acquire)
+        })
+        .cloned();
+    endpoint
+}
+
 #[tauri::command]
 pub async fn get_virtual_camera_status(app: AppHandle) -> Result<VirtualCamState, String> {
-    tauri::async_runtime::spawn_blocking(move || get_status_inner(&app.state::<VirtualCamManager>()))
-        .await.map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        get_status_inner(&app.state::<VirtualCamManager>())
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 fn get_status_inner(state: &VirtualCamManager) -> VirtualCamState {
@@ -1115,13 +1279,13 @@ fn get_status_inner(state: &VirtualCamManager) -> VirtualCamState {
 
 #[cfg(test)]
 mod tests {
-    use super::{start_host_inner, stop_feeder_inner, stop_host_inner, VirtualCamManager};
-    use crate::sync_state::RecoverMutex;
-    use std::sync::atomic::Ordering;
     use super::{
         binary_identity_mismatches, classify_producer_exit, complete_pipeline_ready,
         ProducerExitKind,
     };
+    use super::{start_host_inner, stop_feeder_inner, stop_host_inner, VirtualCamManager};
+    use crate::sync_state::RecoverMutex;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn producer_stop_execution_does_not_create_another_intent() {
@@ -1162,7 +1326,10 @@ mod tests {
     fn superseded_host_start_does_not_attempt_activation() {
         let state = VirtualCamManager::new();
         state.host_operation.store(8, Ordering::Release);
-        assert_eq!(start_host_inner(&state, 7).unwrap_err(), "Host start cancelled");
+        assert_eq!(
+            start_host_inner(&state, 7).unwrap_err(),
+            "Host start cancelled"
+        );
         assert!(state.host_child.lock_recover().is_none());
         assert!(state.last_error.lock_recover().is_none());
     }

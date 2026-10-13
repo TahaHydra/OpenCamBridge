@@ -1,5 +1,9 @@
 # Preview engine pass — September 2026
 
+Historical baseline. The October single-phone-stream fanout, shared latency
+profiles and native timing changes are documented in
+[streaming audit implementation](streaming-audit-implementation.md).
+
 Regression baseline: `22ce4ed55b5f2d9385057f72bedba1e77f480fa0`.
 
 ## Change

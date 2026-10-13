@@ -82,6 +82,18 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     val h264Bitrate: StateFlow<Int> = _h264Bitrate.asStateFlow()
     private val _h264BitrateMode = MutableStateFlow("auto")
     val h264BitrateMode: StateFlow<String> = _h264BitrateMode.asStateFlow()
+    private val _latencyProfile = MutableStateFlow("balanced")
+    val latencyProfile = _latencyProfile.asStateFlow()
+    private val _lowLightPriority = MutableStateFlow("stable")
+    val lowLightPriority = _lowLightPriority.asStateFlow()
+    private val _allowHighSpeed = MutableStateFlow(false)
+    val allowHighSpeed = _allowHighSpeed.asStateFlow()
+    private val _profile = MutableStateFlow("adaptive")
+    val profile = _profile.asStateFlow()
+    private val _thermalAdaptationReason = MutableStateFlow("")
+    val thermalAdaptationReason = _thermalAdaptationReason.asStateFlow()
+    private val _wifiLowLatencyLockReason = MutableStateFlow("inactive")
+    val wifiLowLatencyLockReason = _wifiLowLatencyLockReason.asStateFlow()
 
     private val _h264KeyframeInterval = MutableStateFlow(
         com.opencambridge.android.state.H264SettingsPolicy.DEFAULT_KEYFRAME_INTERVAL_SECONDS
@@ -215,8 +227,15 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         viewModelScope.launch {
+            var cameraListingHighSpeed: Boolean? = null
             while (true) {
                 val config = StreamState.currentConfig()
+                if (cameraListingHighSpeed != config.allowHighSpeed) {
+                    cameraListingHighSpeed = config.allowHighSpeed
+                    _cameras.value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        cameraRepo.listCameras(config.allowHighSpeed)
+                    }
+                }
                 val lifecycle = StreamState.lifecycleState.get()
                 _isStreaming.value = lifecycle == com.opencambridge.android.state.LifecycleState.STREAMING
                 _lifecycleState.value = lifecycle.name
@@ -250,6 +269,12 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 _actualFps.value = StreamState.actualFps.get()
                 _h264Bitrate.value = config.h264Bitrate
                 _h264BitrateMode.value = config.h264BitrateMode
+                _latencyProfile.value = config.latencyProfile
+                _lowLightPriority.value = config.lowLightPriority
+                _allowHighSpeed.value = config.allowHighSpeed
+                _profile.value = config.profile
+                _thermalAdaptationReason.value = StreamState.thermalAdaptationReason.get()
+                _wifiLowLatencyLockReason.value = StreamState.wifiLowLatencyLockReason.get()
                 _h264KeyframeInterval.value = config.h264KeyframeInterval
                 val active = StreamState.activeStreamMode.get()
                 _activeStreamMode.value = active
@@ -327,6 +352,10 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     fun updateStreamMode(mode: String) = controlPatch(UpdateSettingsRequest(streamMode = mode, clientType = "phone"))
     fun updateH264Bitrate(bitrate: Int) = controlPatch(UpdateSettingsRequest(h264Bitrate = bitrate, h264BitrateMode = "manual", clientType = "phone"))
     fun updateH264BitrateMode(mode: String) = controlPatch(UpdateSettingsRequest(h264BitrateMode = mode, clientType = "phone"))
+    fun updateLatencyProfile(mode: String) = controlPatch(UpdateSettingsRequest(latencyProfile = mode, clientType = "phone"))
+    fun updateLowLightPriority(mode: String) = controlPatch(UpdateSettingsRequest(lowLightPriority = mode, clientType = "phone"))
+    fun updateAllowHighSpeed(enabled: Boolean) = controlPatch(UpdateSettingsRequest(allowHighSpeed = enabled, clientType = "phone"))
+    fun updateProfile(mode: String) = controlPatch(UpdateSettingsRequest(profile = mode, clientType = "phone"))
     fun updateH264KeyframeInterval(seconds: Int) =
         controlPatch(UpdateSettingsRequest(h264KeyframeInterval = seconds, clientType = "phone"))
     fun updateAccessMode(mode: String) = controlPatch(UpdateSettingsRequest(accessMode = mode, clientType = "phone"))
@@ -399,6 +428,7 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 width = width,
                 height = height,
                 fps = fps,
+                profile = "manual",
                 clientType = "phone"
             )
         )

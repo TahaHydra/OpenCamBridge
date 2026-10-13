@@ -71,7 +71,14 @@ struct OpenCamBridgeRingHeader {
     volatile LONG64 playoutSchedulerResets;
     volatile LONG playoutClockPpm;
     volatile LONG playoutMaxOutputGapMs;
-    uint64_t reserved[1];
+    volatile LONG64 consumerRingAgeNs;
+    volatile LONG64 consumerDeliveryQpcNs;
+    volatile LONG64 consumerDeliveryCount;
+    volatile LONG64 consumerDeliveryRepeats;
+    volatile LONG64 consumerDeliveryProcessingUs;
+    volatile LONG64 resizeProcessingUs;
+    volatile LONG64 playoutSkippedFrames;
+    uint64_t reserved[2];
 };
 
 struct OpenCamBridgeSlotHeader {
@@ -105,6 +112,7 @@ struct OpenCamBridgeSlotHeader {
 
 #include "RingAbi.generated.h"
 #include "PlayoutScheduler.h"
+#include "FixedDelayPlayout.h"
 
 struct OpenCamBridgeFrameMetadata {
     uint64_t sequence = 0;
@@ -120,6 +128,7 @@ struct OpenCamBridgeFrameMetadata {
     // timestamps. Always strictly increasing.
     uint64_t sampleTimeNs = 0;
     uint64_t durationNs = 0;
+    uint64_t ringWriteTimestampNs = 0;
 };
 
 class SharedMemoryClient {
@@ -142,6 +151,8 @@ public:
     HRESULT SetConsumerAttached(bool attached);
     HRESULT MarkSampleRequest();
     HRESULT ReportSampleCopyFailure(HRESULT error);
+    HRESULT ReportSampleDelivery(const OpenCamBridgeFrameMetadata& metadata, uint64_t processingStartNs);
+    static uint64_t HostNowNs();
 
 private:
     HRESULT OpenHandles();
@@ -178,6 +189,11 @@ private:
     uint64_t m_playoutUnderruns = 0;
     uint64_t m_playoutResets = 0;
     uint64_t m_maxOutputGapNs = 0;
+    OcbFixedDelayPlayout m_fixedPlayout;
+    // Negotiation is per consumer. Global ring fields are diagnostics only:
+    // another application's 30 FPS request must not pace our 60 FPS stream.
+    DWORD m_consumerFpsNumerator = 30;
+    DWORD m_consumerFpsDenominator = 1;
     // Selection-cadence trace; see TraceSelection. Off unless OCB_VCAM_TRACE is set.
     LONG64 m_lastSelectQpc = 0;
     std::vector<BYTE> m_nv12Scratch;

@@ -38,7 +38,8 @@ data class H264EncoderSelection(
     val bitrateRange: Range<Int>,
     val captureEngine: H264CaptureEngine,
     val cameraFpsRange: Range<Int>,
-    val cameraCaptureFps: Int
+    val cameraCaptureFps: Int,
+    val performanceCovered: Boolean? = null
 )
 
 /**
@@ -48,15 +49,6 @@ data class H264EncoderSelection(
  * a constrained high-speed SurfaceTexture rendered into the encoder surface.
  */
 object H264Capabilities {
-    // The constrained high-speed session (direct 60 fps surface, or the 120->60
-    // GPU bridge) is the only way to reach 60 fps on OEM-locked devices like the
-    // OnePlus 9, but it crops the sensor FOV (reads as a "lens switch"), AE-limits
-    // in low light, and forces a SESSION_HIGH_SPEED teardown. Disable it: use only
-    // the regular Camera2 session and honor whatever fps it natively provides (30
-    // or, on capable phones, 60). Requests the regular session cannot meet fall
-    // back to its available rate instead of engaging high-speed.
-    private const val HIGH_SPEED_ENABLED = false
-
     val preferredModes = listOf(
         H264ModeDto(1920, 1080, 60),
         H264ModeDto(1280, 720, 60),
@@ -64,8 +56,34 @@ object H264Capabilities {
         H264ModeDto(1280, 720, 30)
     )
 
-    fun supportedModes(context: Context, cameraId: String): List<H264ModeDto> =
-        preferredModes.filter { selectionsForMode(context, cameraId, it).isNotEmpty() }
+    fun supportedModes(context: Context, cameraId: String, allowHighSpeed: Boolean = false): List<H264ModeDto> =
+        cameraModes(context, cameraId, allowHighSpeed)
+            .filter { selectionsForMode(context, cameraId, it, allowHighSpeed, "stable").isNotEmpty() }
+
+    /** Build actual camera/output tuples, then intersect with encoder capabilities.
+     * Cadence before area preserves the existing adaptive quality preference. */
+    private fun cameraModes(context: Context, cameraId: String, allowHighSpeed: Boolean): List<H264ModeDto> {
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val chars = try { manager.getCameraCharacteristics(cameraId) } catch (_: Exception) { return emptyList() }
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return emptyList()
+        val ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.map { RegularModePolicy.AeRange(it.lower, it.upper) }.orEmpty()
+        val outputs = try { map.getOutputSizes(MediaCodec::class.java)?.toList().orEmpty() } catch (_: Exception) { emptyList() }
+        val regular = RegularModePolicy.build(cameraId, "MEDIA_CODEC_SURFACE", outputs.map {
+            RegularModePolicy.Output(it.width, it.height,
+                try { map.getOutputMinFrameDuration(MediaCodec::class.java, it) } catch (_: Exception) { 0L })
+        }, ranges).map { H264ModeDto(it.width, it.height, it.fps) }
+        val highSpeed = if (allowHighSpeed) try {
+            map.highSpeedVideoSizes.toList().filter { RegularModePolicy.fitsRing(it.width, it.height) }.flatMap { size ->
+                val highRanges = map.getHighSpeedVideoFpsRangesFor(size).toList()
+                listOf(24, 25, 30, 50, 60).filter { fps ->
+                    chooseDirectHighSpeedRange(highRanges, fps) != null || chooseBridgeHighSpeedRange(highRanges, fps) != null
+                }.map { H264ModeDto(size.width, size.height, it) }
+            }
+        } catch (_: Exception) { emptyList() } else emptyList()
+        return (regular + highSpeed).distinct().sortedWith(
+            compareByDescending<H264ModeDto> { it.fps }.thenByDescending { it.width.toLong() * it.height })
+    }
 
     fun selectCandidates(
         context: Context,
@@ -73,12 +91,14 @@ object H264Capabilities {
         requestedWidth: Int,
         requestedHeight: Int,
         requestedFps: Int,
-        includeAdaptiveFallbacks: Boolean = false
+        includeAdaptiveFallbacks: Boolean = false,
+        allowHighSpeed: Boolean = false,
+        lowLightPriority: String = "stable"
     ): List<H264EncoderSelection> {
         val requested = H264ModeDto(requestedWidth, requestedHeight, requestedFps)
-        val modes = if (includeAdaptiveFallbacks) CapturePathPolicy.adaptiveModes(requested, preferredModes)
+        val modes = if (includeAdaptiveFallbacks) CapturePathPolicy.adaptiveModes(requested, supportedModes(context, cameraId, allowHighSpeed))
         else listOf(requested)
-        return selectCandidates(context, cameraId, modes)
+        return selectCandidates(context, cameraId, modes, allowHighSpeed, lowLightPriority)
     }
 
     /** Resolve an already policy-ordered mode list into concrete candidates
@@ -86,8 +106,10 @@ object H264Capabilities {
     fun selectCandidates(
         context: Context,
         cameraId: String,
-        modes: List<H264ModeDto>
-    ): List<H264EncoderSelection> = modes.flatMap { selectionsForMode(context, cameraId, it) }
+        modes: List<H264ModeDto>,
+        allowHighSpeed: Boolean = false,
+        lowLightPriority: String = "stable"
+    ): List<H264EncoderSelection> = modes.distinct().flatMap { selectionsForMode(context, cameraId, it, allowHighSpeed, lowLightPriority) }
 
     fun select(
         context: Context,
@@ -106,7 +128,9 @@ object H264Capabilities {
     fun inspectPathCapabilities(
         context: Context,
         cameraId: String,
-        mode: H264ModeDto
+        mode: H264ModeDto,
+        allowHighSpeed: Boolean = false,
+        lowLightPriority: String = "stable"
     ): List<H264PathCapability> {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val chars = try {
@@ -119,8 +143,8 @@ object H264Capabilities {
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?: return H264CaptureEngine.entries.map { H264PathCapability(it, false, "no stream configuration map") }
         val size = Size(mode.width, mode.height)
-        val encoder = findHardwareEncoder(mode)
-        val encoderFailure = if (encoder == null) "no hardware AVC surface encoder for ${mode.width}x${mode.height}@${mode.fps}" else null
+        val encoderFailure = if (!RegularModePolicy.fitsRing(mode.width, mode.height)) "dimensions exceed NV12 ring capacity"
+            else if (findHardwareEncoders(mode).isEmpty()) "no hardware AVC surface encoder for ${mode.width}x${mode.height}@${mode.fps}" else null
 
         val regularSizes = try {
             map.getOutputSizes(MediaCodec::class.java)?.toList().orEmpty()
@@ -132,6 +156,7 @@ object H264Capabilities {
         val regularRange = RegularModePolicy.selectRange(
             regularRanges.map { RegularModePolicy.AeRange(it.lower, it.upper) },
             mode.fps,
+            lowLightPriority,
         )?.let { Range(it.min, it.max) }
         val minDuration = if (regularSizes.contains(size)) {
             try { map.getOutputMinFrameDuration(MediaCodec::class.java, size) } catch (_: Exception) { 0L }
@@ -194,16 +219,16 @@ object H264Capabilities {
             ),
             H264PathCapability(
                 H264CaptureEngine.HIGH_SPEED_SURFACE,
-                HIGH_SPEED_ENABLED && directReason.startsWith("declared"),
-                if (HIGH_SPEED_ENABLED) directReason else "high-speed capture disabled; regular Camera2 session only",
+                allowHighSpeed && directReason.startsWith("declared"),
+                if (allowHighSpeed) directReason else "experimental high-speed opt-in disabled (may crop FOV and constrain exposure)",
                 directRange?.upper,
                 directRange?.lower,
                 directRange?.upper
             ),
             H264PathCapability(
                 H264CaptureEngine.HIGH_SPEED_GPU_BRIDGE,
-                HIGH_SPEED_ENABLED && bridgeReason.startsWith("declared"),
-                if (HIGH_SPEED_ENABLED) bridgeReason else "high-speed capture disabled; regular Camera2 session only",
+                allowHighSpeed && bridgeReason.startsWith("declared"),
+                if (allowHighSpeed) bridgeReason else "experimental high-speed opt-in disabled (may crop FOV and constrain exposure)",
                 bridgeRange?.upper,
                 bridgeRange?.lower,
                 bridgeRange?.upper
@@ -214,10 +239,13 @@ object H264Capabilities {
     private fun selectionsForMode(
         context: Context,
         cameraId: String,
-        mode: H264ModeDto
+        mode: H264ModeDto,
+        allowHighSpeed: Boolean,
+        lowLightPriority: String
     ): List<H264EncoderSelection> {
-        val encoder = findHardwareEncoder(mode) ?: return emptyList()
-        val capabilities = inspectPathCapabilities(context, cameraId, mode)
+        val encoders = findHardwareEncoders(mode)
+        if (encoders.isEmpty()) return emptyList()
+        val capabilities = inspectPathCapabilities(context, cameraId, mode, allowHighSpeed, lowLightPriority)
         return capabilities.asSequence()
             .filter { it.supported }
             // Avoid the bridge when the same constrained capture rate can feed
@@ -228,26 +256,31 @@ object H264Capabilities {
                     it.cameraFps == mode.fps &&
                     capabilities.any { direct -> direct.engine == H264CaptureEngine.HIGH_SPEED_SURFACE && direct.supported }
             }
-            .map {
+            .flatMap { path -> encoders.asSequence().map { encoder ->
                 H264EncoderSelection(
-                    encoder.first.name,
-                    true,
+                    encoder.info.name,
+                    encoder.info.isHardwareAccelerated,
                     mode,
-                    encoder.second,
-                    it.engine,
-                    Range(it.aeRangeLower ?: it.cameraFps ?: mode.fps, it.aeRangeUpper ?: it.cameraFps ?: mode.fps),
-                    it.cameraFps ?: mode.fps
+                    encoder.bitrateRange,
+                    path.engine,
+                    Range(path.aeRangeLower ?: path.cameraFps ?: mode.fps, path.aeRangeUpper ?: path.cameraFps ?: mode.fps),
+                    path.cameraFps ?: mode.fps,
+                    encoder.performanceCovered
                 )
-            }
+            } }
             .toList()
     }
 
-    private fun findHardwareEncoder(mode: H264ModeDto): Pair<MediaCodecInfo, Range<Int>>? {
+    private data class Encoder(val info: MediaCodecInfo, val bitrateRange: Range<Int>, val performanceCovered: Boolean?)
+
+    private fun findHardwareEncoders(mode: H264ModeDto): List<Encoder> {
+        if (!RegularModePolicy.fitsRing(mode.width, mode.height) || mode.fps !in 1..60) return emptyList()
         val infos = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
             .asSequence()
             .filter { it.isEncoder && !it.isSoftwareOnly }
             .filter { info -> info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, true) } }
-            .sortedBy { it.name }
+            .filterNot { it.isAlias }
+        val candidates = mutableListOf<Encoder>()
         for (info in infos) {
             val caps = try {
                 info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
@@ -261,9 +294,17 @@ object H264Capabilities {
             } catch (_: Exception) {
                 false
             }
-            if (supported) return info to video.bitrateRange
+            if (!supported) continue
+            val performance = try { video.supportedPerformancePoints?.let { points ->
+                val requested = MediaCodecInfo.VideoCapabilities.PerformancePoint(mode.width, mode.height, mode.fps)
+                points.any { it.covers(requested) }
+            } } catch (_: Exception) { null }
+            candidates += Encoder(info, video.bitrateRange, performance)
         }
-        return null
+        val ranking = H264EncoderPolicy.rank(candidates.map {
+            H264EncoderPolicy.Evidence(it.info.name, it.info.isHardwareAccelerated, it.info.isSoftwareOnly, true, true, it.performanceCovered)
+        })
+        return ranking.mapNotNull { ranked -> candidates.firstOrNull { it.info.name == ranked.name } }
     }
 
     private fun chooseDirectHighSpeedRange(ranges: List<Range<Int>>, fps: Int): Range<Int>? =

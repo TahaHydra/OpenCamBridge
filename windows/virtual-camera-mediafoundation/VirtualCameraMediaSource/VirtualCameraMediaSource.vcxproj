@@ -41,6 +41,7 @@
     <ClInclude Include="Nv12ResizeFallback.h" />
     <ClInclude Include="RingAbi.generated.h" />
     <ClInclude Include="PlayoutScheduler.h" />
+    <ClInclude Include="FixedDelayPlayout.h" />
     <None Include="packages.config" />
     <None Include="PropertySheet.props" />
     <None Include="VirtualCameraMediaSource.def" />

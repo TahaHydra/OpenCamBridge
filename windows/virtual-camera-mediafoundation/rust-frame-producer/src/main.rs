@@ -12,6 +12,7 @@ use std::thread::{sleep, spawn};
 use std::time::{Duration, Instant};
 mod mf_decoder;
 mod ocb2;
+mod preview_fanout;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Authorization::{
@@ -30,11 +31,12 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 const OCBR_MAGIC: u32 = 0x5242434F; // "OCBR"
-const RING_VERSION: u16 = 4;
+const RING_VERSION: u16 = 5;
 const FORMAT_NV12: u32 = 2;
 // matrix=BT.709, range=limited, primaries=BT.709, transfer=BT.709.
 const COLOR_BT709_LIMITED_SDR: u32 = 2 | (1 << 8) | (2 << 16) | (1 << 24);
-const MAX_NV12_SIZE: usize = 1920 * 1080 * 3 / 2;
+const MAX_NV12_SIZE: usize = RING_MAX_NV12_BYTES;
+const _: () = assert!(RING_MAX_PIXELS * 3 / 2 == MAX_NV12_SIZE);
 const SLOT_SIZE: usize = SLOT_HEADER_SIZE + MAX_NV12_SIZE;
 const MAX_SHM_SIZE: u32 = (RING_HEADER_SIZE + SLOT_COUNT * SLOT_SIZE) as u32;
 
@@ -99,7 +101,14 @@ struct OpenCamBridgeRingHeader {
     playout_scheduler_resets: std::sync::atomic::AtomicU64,
     playout_clock_ppm: std::sync::atomic::AtomicI32,
     playout_max_output_gap_ms: std::sync::atomic::AtomicU32,
-    reserved: [u64; 1],
+    consumer_ring_age_ns: std::sync::atomic::AtomicU64,
+    consumer_delivery_qpc_ns: std::sync::atomic::AtomicU64,
+    consumer_delivery_count: std::sync::atomic::AtomicU64,
+    consumer_delivery_repeats: std::sync::atomic::AtomicU64,
+    consumer_delivery_processing_us: std::sync::atomic::AtomicU64,
+    resize_processing_us: std::sync::atomic::AtomicU64,
+    playout_skipped_frames: std::sync::atomic::AtomicU64,
+    reserved: [u64; 2],
 }
 
 #[repr(C)]
@@ -445,8 +454,8 @@ impl SharedMemoryIpc {
                 && (*header).slot_size as usize == SLOT_SIZE
                 && (*header).ring_abi_hash == RING_ABI_HASH
             {
-                (*header).max_width = 1920;
-                (*header).max_height = 1920;
+                (*header).max_width = RING_MAX_DIMENSION as u32;
+                (*header).max_height = RING_MAX_DIMENSION as u32;
                 (*header).ring_abi_hash = RING_ABI_HASH;
                 (*header).producer_build_hash = self.producer_hash;
                 return;
@@ -457,8 +466,8 @@ impl SharedMemoryIpc {
             (*header).header_size = RING_HEADER_SIZE as u16;
             (*header).slot_count = SLOT_COUNT as u32;
             (*header).slot_size = SLOT_SIZE as u32;
-            (*header).max_width = 1920;
-            (*header).max_height = 1920;
+            (*header).max_width = RING_MAX_DIMENSION as u32;
+            (*header).max_height = RING_MAX_DIMENSION as u32;
             (*header).ring_abi_hash = RING_ABI_HASH;
             (*header).producer_build_hash = self.producer_hash;
             (*header)
@@ -744,6 +753,28 @@ impl SharedMemoryIpc {
                 playout_max_output_gap_ms: ring
                     .playout_max_output_gap_ms
                     .load(std::sync::atomic::Ordering::Acquire),
+                consumer_ring_age_ms: ring
+                    .consumer_ring_age_ns
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    / 1_000_000,
+                consumer_delivery_qpc_ns: ring
+                    .consumer_delivery_qpc_ns
+                    .load(std::sync::atomic::Ordering::Acquire),
+                consumer_delivery_count: ring
+                    .consumer_delivery_count
+                    .load(std::sync::atomic::Ordering::Acquire),
+                consumer_delivery_repeats: ring
+                    .consumer_delivery_repeats
+                    .load(std::sync::atomic::Ordering::Acquire),
+                consumer_delivery_processing_us: ring
+                    .consumer_delivery_processing_us
+                    .load(std::sync::atomic::Ordering::Acquire),
+                resize_processing_us: ring
+                    .resize_processing_us
+                    .load(std::sync::atomic::Ordering::Acquire),
+                playout_skipped_frames: ring
+                    .playout_skipped_frames
+                    .load(std::sync::atomic::Ordering::Acquire),
                 installed_dll_build_hash: hex_hash(&ring.installed_dll_build_hash),
                 producer_build_hash: self.producer_hash_hex.clone(),
                 ring_abi_hash: ring.ring_abi_hash,
@@ -811,6 +842,14 @@ struct RingDiagnostics {
     playout_scheduler_resets: u64,
     playout_clock_ppm: i32,
     playout_max_output_gap_ms: u32,
+    consumer_ring_age_ms: u64,
+    consumer_delivery_qpc_ns: u64,
+    consumer_delivery_count: u64,
+    consumer_delivery_repeats: u64,
+    consumer_delivery_processing_us: u64,
+    resize_processing_us: u64,
+    playout_skipped_frames: u64,
+
     installed_dll_build_hash: String,
     producer_build_hash: String,
     ring_abi_hash: u64,
@@ -925,8 +964,8 @@ fn validate_nv12_metadata(
 ) -> Option<usize> {
     if width == 0
         || height == 0
-        || width > 1920
-        || height > 1920
+        || width as usize > RING_MAX_DIMENSION
+        || height as usize > RING_MAX_DIMENSION
         || width % 2 != 0
         || height % 2 != 0
     {
@@ -1346,6 +1385,14 @@ mod ring_tests {
             playout_scheduler_resets: 1,
             playout_clock_ppm: 0,
             playout_max_output_gap_ms: 33,
+            consumer_ring_age_ms: 0,
+            consumer_delivery_qpc_ns: 0,
+            consumer_delivery_count: 0,
+            consumer_delivery_repeats: 0,
+            consumer_delivery_processing_us: 0,
+            resize_processing_us: 0,
+            playout_skipped_frames: 0,
+
             installed_dll_build_hash: "a".repeat(64),
             producer_build_hash: "b".repeat(64),
             ring_abi_hash: RING_ABI_HASH,
@@ -1486,9 +1533,21 @@ mod ring_tests {
     }
 
     #[test]
-    fn ring_v4_diagnostic_layout_is_stable() {
-        assert_eq!(RING_VERSION, 4);
-        assert_eq!(std::mem::size_of::<OpenCamBridgeRingHeader>(), 320);
+    fn ring_v5_diagnostic_layout_is_stable() {
+        assert_eq!(RING_VERSION, 5);
+        assert_eq!(std::mem::size_of::<OpenCamBridgeRingHeader>(), 384);
+        assert_eq!(
+            std::mem::offset_of!(OpenCamBridgeRingHeader, consumer_ring_age_ns),
+            312
+        );
+        assert_eq!(
+            std::mem::offset_of!(OpenCamBridgeRingHeader, consumer_delivery_count),
+            328
+        );
+        assert_eq!(
+            std::mem::offset_of!(OpenCamBridgeRingHeader, resize_processing_us),
+            352
+        );
         assert_eq!(
             std::mem::offset_of!(OpenCamBridgeRingHeader, consumer_attached),
             80
@@ -2721,12 +2780,7 @@ fn create_v2_decoder(
             config,
         ) {
             Ok(decoder) => return Ok(V2Decoder::MediaFoundation(decoder)),
-            Err(e) => emit_event(
-                "warning",
-                "HARDWARE_DECODER_UNAVAILABLE",
-                &e,
-                Some("FALLBACK"),
-            ),
+            Err(e) => emit_event("warning", "MF_DECODER_UNAVAILABLE", &e, Some("FALLBACK")),
         }
     }
     let mut decoder =
@@ -2740,26 +2794,104 @@ fn create_v2_decoder(
     })
 }
 
+#[cfg(test)]
+mod software_nv12_tests {
+    use super::*;
+    struct Planes {
+        width: usize,
+        height: usize,
+        strides: (usize, usize, usize),
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+    }
+    impl YUVSource for Planes {
+        fn dimensions(&self) -> (usize, usize) {
+            (self.width, self.height)
+        }
+        fn strides(&self) -> (usize, usize, usize) {
+            self.strides
+        }
+        fn y(&self) -> &[u8] {
+            &self.y
+        }
+        fn u(&self) -> &[u8] {
+            &self.u
+        }
+        fn v(&self) -> &[u8] {
+            &self.v
+        }
+    }
+    #[test]
+    fn portrait_full_hd_software_output_fits_ring_and_preserves_chroma() {
+        let p = Planes {
+            width: 1080,
+            height: 1920,
+            strides: (1088, 544, 544),
+            y: vec![16; 1088 * 1920],
+            u: vec![77; 544 * 960],
+            v: vec![155; 544 * 960],
+        };
+        let mut output = Vec::new();
+        assert_eq!(copy_i420_to_nv12(&p, &mut output).unwrap(), (1080, 1920));
+        assert_eq!(output.len(), MAX_NV12_SIZE);
+        assert_eq!(&output[1080 * 1920..1080 * 1920 + 4], &[77, 155, 77, 155]);
+    }
+    #[test]
+    fn invalid_software_strides_and_extreme_dimensions_return_errors_without_panics() {
+        for (width, height, strides) in [
+            (4, 4, (2, 1, 1)),
+            (usize::MAX - 1, 4, (4, 2, 2)),
+            (1920, 1920, (1920, 960, 960)),
+        ] {
+            let p = Planes {
+                width,
+                height,
+                strides,
+                y: vec![0; 16],
+                u: vec![0; 4],
+                v: vec![0; 4],
+            };
+            assert!(copy_i420_to_nv12(&p, &mut Vec::new()).is_err());
+        }
+    }
+}
+
 fn copy_i420_to_nv12(yuv: &impl YUVSource, scratch: &mut Vec<u8>) -> Result<(u32, u32), String> {
     let (width, height) = yuv.dimensions();
     if width == 0
         || height == 0
-        || width > 1920
-        || height > 1080
+        || width as usize > RING_MAX_DIMENSION
+        || height as usize > RING_MAX_DIMENSION
         || width % 2 != 0
         || height % 2 != 0
     {
         return Err(format!("invalid software decoder frame {width}x{height}"));
     }
-    let needed = width * height * 3 / 2;
-    scratch.resize(needed, 0);
+    let needed = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .map(|bytes| bytes / 2)
+        .filter(|bytes| *bytes <= MAX_NV12_SIZE)
+        .ok_or("software decoder frame exceeds ring capacity")?;
     let (sy, su, sv) = yuv.strides();
     let y = yuv.y();
     let u = yuv.u();
     let v = yuv.v();
-    if y.len() < sy * height || u.len() < su * (height / 2) || v.len() < sv * (height / 2) {
+    let plane_fits = |stride: usize, rows: usize, row_bytes: usize, available: usize| {
+        stride >= row_bytes
+            && stride <= 8192
+            && stride
+                .checked_mul(rows)
+                .is_some_and(|size| size <= available)
+    };
+    if !plane_fits(sy, height, width, y.len())
+        || !plane_fits(su, height / 2, width / 2, u.len())
+        || !plane_fits(sv, height / 2, width / 2, v.len())
+    {
         return Err("software decoder returned invalid plane bounds".to_string());
     }
+    scratch.resize(needed, 0);
     for row in 0..height {
         scratch[row * width..(row + 1) * width].copy_from_slice(&y[row * sy..row * sy + width]);
     }
@@ -3120,6 +3252,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
         Some("STARTING"),
     );
     let url = args.url.clone().ok_or("URL is required for OCB2 H.264")?;
+    let preview = preview_fanout::start_from_env()?;
     let mut stream_info: Option<ocb2::StreamInfo> = None;
     let mut codec_config = Vec::new();
     let mut decoder: Option<V2Decoder> = None;
@@ -3163,6 +3296,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
 
     loop {
         consumer_readiness.reset();
+        preview.reset();
         waiting_for_keyframe = true;
         phone_encoder_error = false;
         // Each connection restarts the phone's frame sequence, so retire every
@@ -3259,6 +3393,11 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                 let hardware_decode_json = hardware_decode
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "null".into());
+                let decoder_observations = match decoder.as_ref() {
+                    Some(V2Decoder::MediaFoundation(d)) => d.observations(),
+                    _ => serde_json::json!({ "acceleration_verified": false }),
+                };
+                let preview_observations = preview.metrics();
                 let info = stream_info.as_ref();
                 let (consumer_width, consumer_height, _) = ipc.consumer_format();
                 let (vcam_unique_total, vcam_repeated_total) = ipc.virtual_camera_counters();
@@ -3279,7 +3418,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                     serde_json::to_string(&readiness).unwrap_or_else(|_| "{}".into());
                 let virtual_camera_ready = readiness.ready;
                 println!(
-                    r#"{{"type":"metrics","producer_state":"WRITING_RING","ring_frames_committed":{},"source":"ocb2-h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":0,"replaced_frames":{},"jpeg_queue_len":0,"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":0,"write_ms_avg":{},"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"{}","d3d11_output":{},"hardware_decoder":{},"encoder_name":"{}","hardware_encoder":{},"camera_id":"{}","fallback_reason":"{}","resize_backend":"nv12-transform","rotation":{},"mirror":{},"sensor_orientation":{},"device_rotation":{},"last_error":{},"ring":{},"virtual_camera_readiness":{},"virtual_camera_ready":{}}}"#,
+                    r#"{{"type":"metrics","producer_state":"WRITING_RING","ring_frames_committed":{},"source":"ocb2-h264","profile":"{}","source_width":{},"source_height":{},"output_width":{},"output_height":{},"fps_target":{},"http_jpeg_fps":0,"decoded_fps":{},"written_fps":{},"transport_fps":{},"decoded_unique_fps":{},"virtual_camera_unique_fps":{},"repeated_samples":{},"dropped_jpegs":0,"replaced_frames":{},"jpeg_queue_len":0,"decode_ms_avg":{},"rotate_ms_avg":{},"resize_ms_avg":0,"write_ms_avg":{},"total_pipeline_ms":{},"latency_ms":{},"bytes_per_sec":{},"estimated_mbps":"{:.2}","pixel_format":"NV12","decode_backend":"{}","decoder_name":"{}","d3d11_output":{},"hardware_decoder":{},"decoder_observations":{},"preview_fanout":{},"encoder_name":"{}","hardware_encoder":{},"camera_id":"{}","fallback_reason":"{}","resize_backend":"nv12-transform","rotation":{},"mirror":{},"sensor_orientation":{},"device_rotation":{},"last_error":{},"ring":{},"virtual_camera_readiness":{},"virtual_camera_ready":{}}}"#,
                     ring_frames_committed,
                     json_escape(&args.profile),
                     info.map(|i| i.width).unwrap_or(0),
@@ -3303,13 +3442,19 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                     (window_bytes as f64 / seconds) as u64,
                     (window_bytes as f64 * 8.0 / seconds) / 1_000_000.0,
                     if media_foundation {
-                        "media-foundation-d3d11"
+                        if d3d11_output {
+                            "media-foundation-dxgi-output"
+                        } else {
+                            "media-foundation-cpu-output"
+                        }
                     } else {
                         "software-fallback"
                     },
                     json_escape(decoder_name),
                     d3d11_output,
                     hardware_decode_json,
+                    decoder_observations,
+                    preview_observations,
                     info.map(|i| json_escape(&i.encoder_name))
                         .unwrap_or_default(),
                     info.map(|i| i.hardware_encoder).unwrap_or(false),
@@ -3317,7 +3462,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                     if media_foundation {
                         ""
                     } else {
-                        "hardware decoder unavailable"
+                        "Media Foundation decoder unavailable"
                     },
                     info.map(|i| i.effective_rotation).unwrap_or(0),
                     info.map(|i| i.mirror).unwrap_or(false),
@@ -3371,6 +3516,7 @@ fn run_h264_v2(args: &Args, ipc: &SharedMemoryIpc) -> Result<(), String> {
                     break 'connection;
                 }
             };
+            preview.publish(&record);
             // Timestamp complete records before queueing so this estimate also
             // includes local reader/decoder queue wait.
             // The discontinuity flag is a property of the STREAM, not of one
@@ -3804,17 +3950,21 @@ fn main() {
     let mut fps = args.source_fps.or(args.fps).unwrap_or(defaults.2).max(1);
 
     // Every V2 slot is sized for one 1920x1080 NV12 frame.
-    let needed = (width as u64) * (height as u64) * 3 / 2;
+    let needed = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .map(|bytes| bytes / 2)
+        .unwrap_or(u64::MAX);
     if width == 0
         || height == 0
-        || width > 1920
-        || height > 1080
+        || width as usize > RING_MAX_DIMENSION
+        || height as usize > RING_MAX_DIMENSION
         || width % 2 != 0
         || height % 2 != 0
         || needed > MAX_NV12_SIZE as u64
     {
         eprintln!(
-            "Requested output {}x{} needs {} bytes but the shared framebuffer holds {} bytes (max 1920x1080).",
+            "Requested output {}x{} needs {} bytes but the shared framebuffer holds {} bytes (full-HD pixel capacity, landscape or portrait).",
             width, height, needed, MAX_NV12_SIZE
         );
         std::process::exit(2);

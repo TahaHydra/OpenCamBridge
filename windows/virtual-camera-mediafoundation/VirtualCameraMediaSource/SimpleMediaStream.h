@@ -89,6 +89,8 @@ namespace winrt::WindowsSample::implementation
                 // failure so a hiccup never becomes a visible flash.
                 std::vector<BYTE> m_lastGoodFrame;
                 DWORD m_lastGoodFrameLength = 0;
+                LONG m_lastGoodFramePitch = 0;
+                OpenCamBridgeFrameMetadata m_lastGoodMetadata;
 
         // FrameServer may issue RequestSample calls concurrently. One request
         // owns pacing, the ring copy, and sample publication as a transaction;

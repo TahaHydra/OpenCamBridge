@@ -102,13 +102,14 @@ private fun EncodingGroup(viewModel: StreamViewModel) {
     val hardwareEncoder by viewModel.hardwareEncoder.collectAsState()
     val encodedBitrate by viewModel.encodedBitrate.collectAsState()
     val rebinding by viewModel.rebindInProgress.collectAsState()
+    val accessMode by viewModel.accessMode.collectAsState()
     val enabled = !rebinding
 
     SettingsGroup(title = "Encoding") {
         if (streamMode == "h264") {
             // The rate Automatic targets for the selected mode (before the
             // encoder's own limits, which only the running encoder knows).
-            val automatic = H264BitratePolicy.resolve("auto", bitrate, width, height, fps, 1, Int.MAX_VALUE)
+            val automatic = H264BitratePolicy.resolve("auto", bitrate, width, height, fps, 1, Int.MAX_VALUE, accessMode)
             SegmentedRow(
                 title = "Bitrate",
                 options = listOf("auto" to "Automatic", "manual" to "Manual"),
@@ -121,7 +122,7 @@ private fun EncodingGroup(viewModel: StreamViewModel) {
                     else viewModel.updateH264BitrateMode("auto")
                 },
                 subtitle = if (bitrateMode == "manual") "Your fixed bitrate, applied live and kept after restarts."
-                else "Recommended. Picked from the resolution, frame rate and what the encoder supports."
+                else "Picked from resolution, frame rate, USB or LAN transport and encoder limits."
             )
             RowDivider()
             if (bitrateMode == "manual") {
@@ -241,6 +242,8 @@ fun DiagnosticsPage(viewModel: StreamViewModel, onBack: () -> Unit) {
     val encodedWidth by viewModel.encodedWidth.collectAsState()
     val encodedHeight by viewModel.encodedHeight.collectAsState()
     val mirror by viewModel.mirror.collectAsState()
+    val thermalReason by viewModel.thermalAdaptationReason.collectAsState()
+    val wifiLockReason by viewModel.wifiLowLatencyLockReason.collectAsState()
 
     SettingsScaffold(title = "Diagnostics", onBack = onBack) {
         if (lastError.isNotBlank()) Notice(lastError, Tone.Danger, title = "Last camera error", modifier = Modifier.fillMaxWidth())
@@ -262,6 +265,10 @@ fun DiagnosticsPage(viewModel: StreamViewModel, onBack: () -> Unit) {
             ValueRow("Encoder", if (encoderName.isBlank()) "—" else "${shortCodec(encoderName)} · ${if (hardwareEncoder) "hardware" else "software"}")
             RowDivider()
             ValueRow("Connected computers", "$clients")
+            RowDivider()
+            ValueRow("Thermal policy", thermalReason.ifBlank { "Inactive" })
+            RowDivider()
+            ValueRow("Wi-Fi latency lock", wifiLockReason)
         }
 
         // The rotation chain, spelled out: effective rotation is the sum of

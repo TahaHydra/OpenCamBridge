@@ -17,17 +17,26 @@ Android Camera2
 
 MJPEG remains a complete compatibility path when H.264 capture/encode/decode is unavailable or the user selects compatibility mode. The primary H.264 path does not pass camera frames through Kotlin YUV conversion, and the Windows virtual-camera path remains NV12 unless RGB32 compatibility is negotiated.
 
-The desktop preview independently streams compressed OCB2 into a WebCodecs worker
-and renders full-source-resolution video with OffscreenCanvas. Raw frames do not
+The producer owns one authenticated phone video connection and fans compressed OCB2
+out over an authenticated, bounded loopback endpoint into a WebCodecs worker,
+which renders full-source-resolution video with OffscreenCanvas. Raw frames do not
 cross Tauri IPC on this path. A small decoded-frame presentation queue absorbs
 arrival bursts; the existing reduced-resolution NV12 preview is retained for
 WebViews that cannot decode/render the stream. Preview failure does not stop the
-native virtual camera. See [preview implementation and validation](docs/preview-engine-2026-09.md).
+native virtual camera. See [current implementation and validation](docs/streaming-audit-implementation.md).
 
 Supported consumer formats include NV12 1920x1080, 1280x720 and 640x480 at 30 FPS,
-with 1080p/720p60 offered for a 60 FPS source, plus YUY2/RGB32 compatibility modes.
+with 1080p/720p60 offered for a 60 FPS source, plus YUY2/RGB32 compatibility modes
+at 60 FPS. Capture-derived 24/25/50 FPS and lower resolutions are available when
+the camera and encoder declare those exact combinations. NV12 remains preferred;
+conversion capacity and application compatibility require physical testing.
 The default follows a known source's dimensions/rate; a 30 FPS source does not
 advertise fake 60 FPS. Explicit camera profiles never silently adapt.
+
+Low latency, Balanced and Smooth profiles share time-based buffers across phone,
+preview and native output. Stable FPS and Low-light priority are separate exposure
+choices. Experimental high-speed capture is opt-in; automatic thermal adaptation
+never changes manual quality requests.
 
 H.264 bitrate has Automatic and Manual modes. Automatic selects a target from the
 actual resolution/FPS and encoder limits; Manual uses the same request at startup
