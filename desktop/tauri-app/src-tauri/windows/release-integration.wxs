@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="TARGETDIR"><Directory Id="SystemFolder" /></DirectoryRef>
+    <Property Id="OCBWINDOWSBUILD">
+      <RegistrySearch Id="Windows11Build" Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" Name="CurrentBuildNumber" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="OCBPROCESSORARCH">
+      <RegistrySearch Id="NativeProcessorArchitecture" Root="HKLM" Key="SYSTEM\CurrentControlSet\Control\Session Manager\Environment" Name="PROCESSOR_ARCHITECTURE" Type="raw" Win64="yes" />
+    </Property>
+    <Condition Message="OpenCamBridge requires Windows 11 on an Intel/AMD x64 PC (build 22000 or later). ARM64 is not supported by this camera DLL.">Installed OR (VersionNT64 AND OCBWINDOWSBUILD &gt;= 22000 AND OCBPROCESSORARCH="AMD64")</Condition>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="ReleaseIntegrationMarker" Guid="6B4FC6C4-4695-4BF9-A9B8-CED5D23211F1" Win64="yes">
+        <RegistryValue Root="HKLM" Key="Software\xHydra\OpenCamBridge" Name="InstallDirectory" Value="[INSTALLDIR]" Type="string" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+    <ComponentGroup Id="ReleaseIntegration"><ComponentRef Id="ReleaseIntegrationMarker" /></ComponentGroup>
+    <CustomAction Id="RegisterOcbCamera" Directory="INSTALLDIR" ExeCommand="&quot;[INSTALLDIR]windows\virtual-camera-mediafoundation\x64\Release\VirtualCamera_Installer.exe&quot; --register" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="RollbackOcbCamera" Directory="INSTALLDIR" ExeCommand="&quot;[INSTALLDIR]windows\virtual-camera-mediafoundation\x64\Release\VirtualCamera_Installer.exe&quot; --unregister" Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="RollbackOcbFirewall" Directory="SystemFolder" ExeCommand="&quot;[SystemFolder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;OpenCamBridge private pairing&quot;" Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="RemoveOcbCamera" Directory="INSTALLDIR" ExeCommand="&quot;[INSTALLDIR]windows\virtual-camera-mediafoundation\x64\Release\VirtualCamera_Installer.exe&quot; --unregister" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="RemoveOcbFirewall" Directory="SystemFolder" ExeCommand="&quot;[SystemFolder]netsh.exe&quot; advfirewall firewall delete rule name=&quot;OpenCamBridge private pairing&quot;" Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="AddOcbFirewall" Directory="SystemFolder" ExeCommand="&quot;[SystemFolder]netsh.exe&quot; advfirewall firewall add rule name=&quot;OpenCamBridge private pairing&quot; dir=in action=allow program=&quot;[INSTALLDIR]tauri-app.exe&quot; profile=private remoteip=localsubnet enable=yes" Execute="deferred" Impersonate="no" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="RemoveOcbCamera" Before="RemoveFiles">REMOVE="ALL"</Custom>
+      <Custom Action="RemoveOcbFirewall" Before="RemoveOcbCamera">REMOVE="ALL"</Custom>
+      <Custom Action="RegisterOcbCamera" After="InstallFiles">NOT REMOVE="ALL"</Custom>
+      <Custom Action="RollbackOcbCamera" Before="RegisterOcbCamera">NOT Installed AND NOT REMOVE="ALL"</Custom>
+      <Custom Action="RollbackOcbFirewall" Before="AddOcbFirewall">NOT Installed AND NOT REMOVE="ALL"</Custom>
+      <Custom Action="AddOcbFirewall" After="RegisterOcbCamera">NOT REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

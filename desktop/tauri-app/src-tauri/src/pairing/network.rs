@@ -34,7 +34,7 @@ fn headers(bytes: &[u8]) -> Result<(String, usize), String> {
         .collect();
     if first.len() != 3
         || first[0] != "POST"
-        || !matches!(first[1], "/pair/start" | "/pair/prove" | "/pair/finish")
+        || !matches!(first[1], "/pair/start" | "/pair/prove" | "/pair/compatibility" | "/pair/finish")
         || first[2] != "HTTP/1.1"
     {
         return Err("Invalid pairing endpoint".into());

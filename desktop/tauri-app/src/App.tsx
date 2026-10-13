@@ -1,7 +1,10 @@
 import { useEffect, useState } from 'react';
 import { AlertTriangle, Monitor } from 'lucide-react';
+import { getVersion } from '@tauri-apps/api/app';
 import ConnectScreen, { connectUsb } from './components/connect/ConnectScreen';
 import Studio from './components/shell/Studio';
+import UpdateNotice from './components/UpdateNotice';
+import { companionWarning } from './services/releasePolicy.js';
 import { apiFetch } from './services/api';
 import { desktopInvoke as invoke, isTauriRuntime } from './services/desktopBridge';
 import { startSession, logEvent } from './services/logging';
@@ -18,6 +21,7 @@ interface Session {
 function DesktopApp() {
   const [session, setSession] = useState<Session | null>(null);
   const [switchError, setSwitchError] = useState('');
+  const [compatibilityWarning, setCompatibilityWarning] = useState('');
 
   const connected = (baseUrl: string, token: string, connection: ConnectionInfo) => {
     rememberDevice({
@@ -29,6 +33,7 @@ function DesktopApp() {
       port: connection.port,
     });
     setSwitchError('');
+    setCompatibilityWarning('');
     setSession({ baseUrl, token, connection: connection.mode === 'lan' ? { ...connection, url: baseUrl } : connection });
   };
 
@@ -41,6 +46,8 @@ function DesktopApp() {
       await startSession({ transport: token ? 'LAN (token)' : 'USB', baseUrl });
       try {
         const info = await (await apiFetch(baseUrl, '/api/device/info', token)).json();
+        const currentVersion = await getVersion().catch(() => '0.1.0');
+        setCompatibilityWarning(companionWarning(info, currentVersion));
         logEvent('device', JSON.stringify(info));
         // The phone reports its real make and model; prefer that name.
         const name = `${info?.manufacturer || ''} ${info?.model || ''}`.trim();
@@ -123,6 +130,8 @@ function DesktopApp() {
   }
 
   return (
+    <>
+    {compatibilityWarning && <div className="app-banner" role="alert"><AlertTriangle size={14} /> {compatibilityWarning}</div>}
     <Studio
       // A different phone gets a fresh controller, never the previous one's state.
       key={`${session.baseUrl}|${session.connection.serial || ''}|${session.token ? 'lan' : 'usb'}`}
@@ -132,6 +141,7 @@ function DesktopApp() {
       onDisconnect={() => setSession(null)}
       onSwitchDevice={device => void switchDevice(device)}
     />
+    </>
   );
 }
 
@@ -160,6 +170,7 @@ export default function App() {
   }
   return (
     <ThemeRoot>
+      <UpdateNotice />
       <DesktopApp />
     </ThemeRoot>
   );

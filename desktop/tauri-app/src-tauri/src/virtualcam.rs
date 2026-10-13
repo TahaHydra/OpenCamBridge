@@ -277,11 +277,7 @@ fn classify_producer_exit(exit_code: Option<i32>) -> ProducerExitKind {
 }
 
 fn repository_root() -> PathBuf {
-    let mut root = std::env::current_dir().unwrap_or_default();
-    while !root.join("windows").exists() && root.parent().is_some() {
-        root = root.parent().unwrap().to_path_buf();
-    }
-    root
+    crate::runtime_paths::root()
 }
 
 fn virtual_camera_installer_path() -> PathBuf {
@@ -1084,10 +1080,7 @@ fn get_status_inner(state: &VirtualCamManager) -> VirtualCamState {
     let last_event = state.last_event.lock_recover().clone();
     let producer_instance = state.producer_instance.load(Ordering::Acquire);
 
-    let mut repo_root = std::env::current_dir().unwrap();
-    while !repo_root.join("windows").exists() && repo_root.parent().is_some() {
-        repo_root = repo_root.parent().unwrap().to_path_buf();
-    }
+    let repo_root = repository_root();
     let exe_path_release = repo_root.join("windows/virtual-camera-mediafoundation/rust-frame-producer/target/release/rust-frame-producer.exe");
     let producer_exists = exe_path_release.exists() || repo_root.join("windows/virtual-camera-mediafoundation/rust-frame-producer/target/debug/rust-frame-producer.exe").exists();
 

@@ -35,6 +35,7 @@ import kotlinx.coroutines.withContext
 @Composable
 fun PairingGroup(running: Boolean, port: Int, wifi: Boolean) {
     val context = LocalContext.current
+    val phoneVersion = remember { context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown" }
     val storage = remember { runCatching { PairingStore.get(context) } }
     val store = storage.getOrNull()
     if (store == null) {
@@ -73,7 +74,7 @@ fun PairingGroup(running: Boolean, port: Int, wifi: Boolean) {
                 for (host in invitation.hosts) {
                     try {
                         authenticated = withContext(Dispatchers.IO) {
-                            PairingClient.authenticate(PairingEndpoint(host, invitation.port, invitation.id, ""), invitation.secret, "qr")
+                            PairingClient.authenticate(PairingEndpoint(host, invitation.port, invitation.id, ""), invitation.secret, "qr", phoneVersion)
                         }
                         break
                     } catch (e: java.io.IOException) { /* Another advertised local interface may be reachable. */ }
@@ -140,7 +141,7 @@ fun PairingGroup(running: Boolean, port: Int, wifi: Boolean) {
             }
         },
         confirmButton = { TextButton(enabled = !busy && selected != null && code.replace(" ", "").length == 8, onClick = { runAction {
-            pending = withContext(Dispatchers.IO) { PairingClient.authenticate(selected!!, PairingInput.code(code), "code") }
+            pending = withContext(Dispatchers.IO) { PairingClient.authenticate(selected!!, PairingInput.code(code), "code", phoneVersion) }
             code = ""; manual = false
         } }) { Text(if (busy) "Working…" else "Verify PC") } },
         dismissButton = { TextButton(enabled = !busy, onClick = { manual = false; code = "" }) { Text("Cancel") } }
@@ -152,10 +153,13 @@ fun PairingGroup(running: Boolean, port: Int, wifi: Boolean) {
             text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("This PC authenticated with your pairing code or QR secret. Approve only if this is the computer you intended to pair.")
                 Text("PC ${session.pcId.take(8)}")
+                Text(session.companionVersion?.let { "Windows companion $it" }
+                    ?: "This companion does not report compatibility. Matching releases are recommended.")
+                session.compatibilityWarning?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 if (!wifi) Text("Wi-Fi mode is currently off. Pairing saves this PC; select Wi-Fi yourself before connecting over LAN.")
                 message?.let { Text(it) }
             } },
-            confirmButton = { TextButton(enabled = !busy, onClick = { runAction {
+            confirmButton = { TextButton(enabled = !busy && session.compatibilityWarning == null, onClick = { runAction {
                 session.approve(store, Build.MODEL.take(80).ifBlank { "Android phone" }, port)
                 pending = null
                 message = "Paired with ${session.name}. Start capture when you are ready to connect."

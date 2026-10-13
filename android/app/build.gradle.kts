@@ -6,19 +6,31 @@ plugins {
 
 android {
     namespace = "com.opencambridge.android"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.opencambridge.android"
         minSdk = 29
-        targetSdk = 35
+        targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
     }
 
+    val releaseStore = System.getenv("OCB_ANDROID_KEYSTORE")
+    signingConfigs {
+        if (!releaseStore.isNullOrBlank()) {
+            create("upload") {
+                storeFile = file(releaseStore)
+                storePassword = System.getenv("OCB_ANDROID_STORE_PASSWORD")
+                keyAlias = System.getenv("OCB_ANDROID_KEY_ALIAS") ?: "opencambridge-upload"
+                keyPassword = System.getenv("OCB_ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (!releaseStore.isNullOrBlank()) signingConfig = signingConfigs.getByName("upload")
         }
     }
 

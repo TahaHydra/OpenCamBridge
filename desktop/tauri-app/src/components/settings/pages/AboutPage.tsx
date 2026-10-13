@@ -2,17 +2,20 @@ import { BookOpen, Bug, ExternalLink, Scale } from 'lucide-react';
 import { LogoMark } from '../../brand/Logo';
 import { Button } from '../../primitives';
 import { SettingsSection } from '../SettingsPage';
+import { setPreferences, usePreferences } from '../../../state/preferences';
 import {
   ISSUES_URL,
   LICENSE_URL,
   REPOSITORY_URL,
   THIRD_PARTY_URL,
+  PRODUCT,
   openExternal,
   useAppInfo,
 } from '../../../state/appInfo';
 
 export default function AboutPage() {
   const app = useAppInfo();
+  const preferences = usePreferences();
   return (
     <div className="settings-page">
       <div className="about-hero">
@@ -27,9 +30,21 @@ export default function AboutPage() {
       <div className="settings-page__body">
         <SettingsSection title="Project">
           <div className="settings-actions settings-actions--wrap">
+            <Button onClick={() => void openExternal(PRODUCT.website)}>Website</Button>
+            <Button onClick={() => void openExternal(PRODUCT.documentation)}>Documentation</Button>
+            <Button onClick={() => void openExternal(`mailto:${PRODUCT.email}`)}>Contact support</Button>
+            <Button onClick={() => void openExternal(PRODUCT.privacy)}>Privacy policy</Button>
             <Button icon={<ExternalLink size={15} />} onClick={() => void openExternal(REPOSITORY_URL)}>GitHub repository</Button>
             <Button icon={<Bug size={15} />} onClick={() => void openExternal(ISSUES_URL)}>Report a problem</Button>
           </div>
+        </SettingsSection>
+
+        <SettingsSection title="Support development" description="All features are free. Contributions are optional and unlock no extra functionality.">
+          <div className="settings-actions settings-actions--wrap">
+            <Button onClick={() => void openExternal(PRODUCT.kofi)}>Support on Ko-fi</Button>
+            <Button onClick={() => void navigator.clipboard.writeText(PRODUCT.cryptoAddress)}>Copy BEP-20 address</Button>
+          </div>
+          <p className="settings-note">{PRODUCT.cryptoNetwork}<br /><code style={{ overflowWrap: 'anywhere' }}>{PRODUCT.cryptoAddress}</code></p>
         </SettingsSection>
 
         <SettingsSection title="Licences">
@@ -43,6 +58,12 @@ export default function AboutPage() {
             <Button icon={<BookOpen size={15} />} onClick={() => void openExternal(THIRD_PARTY_URL)}>Third-party notices</Button>
           </div>
         </SettingsSection>
+        {!preferences.reviewDismissed && <SettingsSection title="Enjoying OpenCamBridge?" description="An optional review helps other people find the Android app.">
+          <div className="settings-actions settings-actions--wrap">
+            <Button onClick={() => { setPreferences({ reviewDismissed: true }); void openExternal(PRODUCT.playStore); }}>Review us on Google Play</Button>
+            <Button onClick={() => setPreferences({ reviewDismissed: true })}>Don't show again</Button>
+          </div>
+        </SettingsSection>}
 
         <p className="about-copyright">Copyright © 2026 TahaHydra and contributors.</p>
       </div>

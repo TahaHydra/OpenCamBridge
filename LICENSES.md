@@ -1,5 +1,11 @@
 # OpenCamBridge Licensing
 
+Release packages also include generated dependency notices and an inventory
+under `THIRD-PARTY-NOTICES`. Regenerate with
+`python release-tools/collect-notices.py`. This is conservative build/dependency
+attribution, not a legal or patent-clearance opinion. Review inventory entries
+without packaged licence text and Android Maven attribution before publication.
+
 The OpenCamBridge project contains code under multiple licenses:
 
 ## OpenCamBridge Original Code

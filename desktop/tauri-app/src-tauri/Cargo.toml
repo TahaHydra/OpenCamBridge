@@ -35,7 +35,7 @@ subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
 if-addrs = "0.13"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 winreg = "0.56.0"
 windows = { version = "0.61.3", features = [
     "Win32_Foundation",

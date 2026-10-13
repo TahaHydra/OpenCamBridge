@@ -1,0 +1,12 @@
+{
+  "name": "OpenCamBridge",
+  "publisher": "xHydra",
+  "website": "https://xhydra.fr/products/opencambridge",
+  "documentation": "https://xhydra.fr/docs/opencambridge/getting-started",
+  "email": "opencambridge@xhydra.fr",
+  "privacy": "https://xhydra.fr/products/opencambridge/privacy",
+  "playStore": "https://play.google.com/store/apps/details?id=com.opencambridge.android&showAllReviews=true",
+  "kofi": "https://ko-fi.com/tahahydra",
+  "cryptoNetwork": "BNB Smart Chain (BEP-20)",
+  "cryptoAddress": "0x26AD6cA6252E946835FD85Eeb3F4253A1A1666cd"
+}

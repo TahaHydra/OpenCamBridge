@@ -1209,9 +1209,11 @@ class ControlServer(
     }
     private suspend fun serveDeviceInfo(call: RoutingCall) {
         val power = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-        call.respond(DeviceInfoDto(app = "OpenCamBridge", version = "2.0.0", platform = "android", serverPort = StreamState.port.get(),
+        val version = context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
+        call.respond(DeviceInfoDto(app = "OpenCamBridge", version = version, platform = "android", serverPort = StreamState.port.get(),
             manufacturer = android.os.Build.MANUFACTURER, model = android.os.Build.MODEL,
-            batteryOptimizationExempt = power.isIgnoringBatteryOptimizations(context.packageName)))
+            batteryOptimizationExempt = power.isIgnoringBatteryOptimizations(context.packageName),
+            controlProtocol = 1, streamProtocol = 2, minimumCompanionVersion = "0.1.0"))
     }
 
     private suspend fun serveCameraList(call: RoutingCall) {
@@ -1715,7 +1717,10 @@ private data class DeviceInfoDto(
     val serverPort: Int,
     val manufacturer: String,
     val model: String,
-    val batteryOptimizationExempt: Boolean
+    val batteryOptimizationExempt: Boolean,
+    val controlProtocol: Int,
+    val streamProtocol: Int,
+    val minimumCompanionVersion: String
 )
 
 @Serializable

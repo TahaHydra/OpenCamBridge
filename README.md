@@ -1,5 +1,18 @@
 # OpenCamBridge
 
+![OpenCamBridge](branding/generated/website-banner-1600x782.png)
+
+Website: https://xhydra.fr/products/opencambridge · Support: opencambridge@xhydra.fr
+
+Release preparation uses the proven `7844558` streaming implementation; the
+failed streaming experiment remains isolated. See the [installation guide](docs/release/user-guide.md),
+[privacy policy](docs/release/privacy-policy.md), [publisher checklist](docs/release/publishing-checklist.md)
+and [branding guide](branding/README.md). Public publication and clean-PC/device
+acceptance must be confirmed separately from local builds.
+
+All features are free. Optional support: [Ko-fi](https://ko-fi.com/tahahydra).
+BNB Smart Chain / BEP-20: `0x26AD6cA6252E946835FD85Eeb3F4253A1A1666cd`.
+
 OpenCamBridge is a privacy-first Android-to-Windows webcam: no cloud, account, telemetry, ads, or watermark. This branch contains the V2 low-latency streaming engine.
 
 ## V2 pipeline

@@ -3,6 +3,8 @@ mod logger;
 mod nv12_preview;
 mod output_framing;
 mod pairing;
+mod runtime_paths;
+mod updates;
 mod sync_state;
 mod virtualcam;
 mod winproc;
@@ -19,6 +21,7 @@ pub fn run() {
         .manage(output_framing::OutputFramingState::default())
         .manage(pairing::PairingManager::default())
         .invoke_handler(tauri::generate_handler![
+            updates::check_desktop_update,
             pairing::pairing_start,
             pairing::pairing_status,
             pairing::pairing_cancel,

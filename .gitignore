@@ -77,3 +77,16 @@ Thumbs.db
 # Android build outputs
 *.apk
 *.aab
+
+# Release keys, staging and generated private build records
+.release-secrets/
+release-output/
+desktop/tauri-app/src-tauri/release-runtime/
+*.p12
+*.jks
+*.keystore
+*.pfx
+android/.kotlin/
+!docs/release/
+!docs/release/**
+docs/release/third-party/

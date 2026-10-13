@@ -38,6 +38,8 @@ export interface CustomProfile {
 }
 
 export interface AppPreferences {
+  reviewDismissed: boolean;
+  checkForUpdatesOnStartup: boolean;
   /** Reveals engineering telemetry and expert controls throughout the UI. */
   advancedMode: boolean;
   theme: 'dark' | 'black';
@@ -71,6 +73,8 @@ export interface AppPreferences {
 const STORAGE_KEY = 'ocb.preferences.v1';
 
 export const DEFAULT_PREFERENCES: AppPreferences = {
+  reviewDismissed: false,
+  checkForUpdatesOnStartup: false,
   advancedMode: false,
   theme: 'dark',
   fitMode: 'fit',

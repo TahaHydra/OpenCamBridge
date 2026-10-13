@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { getTauriVersion, getVersion } from '@tauri-apps/api/app';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { isTauriRuntime } from '../services/desktopBridge';
+export { default as PRODUCT } from '../../../../branding/product.json';
 
 export const REPOSITORY_URL = 'https://github.com/TahaHydra/OpenCamBridge';
 export const RELEASES_URL = `${REPOSITORY_URL}/releases`;

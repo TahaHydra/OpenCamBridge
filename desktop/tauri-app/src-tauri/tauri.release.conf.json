@@ -1,0 +1,30 @@
+{
+  "bundle": {
+    "targets": ["msi"],
+    "publisher": "xHydra — Taha Laachari",
+    "copyright": "Copyright © 2026 Taha Laachari and contributors",
+    "homepage": "https://xhydra.fr/products/opencambridge",
+    "category": "Utility",
+    "shortDescription": "Your Android phone as a local Windows webcam",
+    "licenseFile": "../../../LICENSE",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"],
+    "resources": { "release-runtime/": "./" },
+    "windows": {
+      "certificateThumbprint": "F7CF5FB6237A244E81451045FD946452178F9485",
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://time.certum.pl",
+      "tsp": true,
+      "allowDowngrades": false,
+      "minimumWebview2Version": "120.0.0.0",
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "wix": {
+        "upgradeCode": "E3D55F76-6AF6-4ABC-BCC7-31782DCD39C4",
+        "language": "en-US",
+        "bannerPath": "../../../branding/generated/msi-banner.bmp",
+        "dialogImagePath": "../../../branding/generated/msi-dialog.bmp",
+        "fragmentPaths": ["windows/release-integration.wxs"],
+        "componentGroupRefs": ["ReleaseIntegration"]
+      }
+    }
+  }
+}

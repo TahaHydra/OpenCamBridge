@@ -21,6 +21,7 @@ import kotlinx.serialization.json.Json
 @Serializable private data class PhoneCredential(val phoneId: String, val name: String, val port: Int, val token: String, val credentialId: String)
 @Serializable private data class FinishRequest(val session: String, val nonce: String, val ciphertext: String)
 @Serializable private data class PairingAck(val ok: Boolean, val pcId: String)
+@Serializable private data class CompatibilityRequest(val session: String)
 
 /** Short-lived authenticated session. Tokens are created only by the explicit approve action. */
 class PendingPairing internal constructor(
@@ -29,7 +30,9 @@ class PendingPairing internal constructor(
     private val key: ByteArray,
     val pcId: String,
     val name: String,
-    private val deadlineNanos: Long
+    private val deadlineNanos: Long,
+    val compatibilityWarning: String? = null,
+    val companionVersion: String? = null
 ) : AutoCloseable {
     private var finishRequest: String? = null
     private var closed = false
@@ -81,7 +84,7 @@ object PairingClient {
             found.values.toList()
         }
     }
-    suspend fun authenticate(endpoint: PairingEndpoint, password: String, kind: String): PendingPairing {
+    suspend fun authenticate(endpoint: PairingEndpoint, password: String, kind: String, phoneVersion: String = "0.1.0"): PendingPairing {
         require(kind == "code" || kind == "qr")
         require(PairingInput.privateIpv4(endpoint.host) && endpoint.port in 1024..65535)
         val deadline = System.nanoTime() + 115_000_000_000L
@@ -94,7 +97,15 @@ object PairingClient {
         try {
             val pc = Json.decodeFromString<AuthenticatedPc>(PairingCipher.open(key, start.session, "pc", SealedPairing(response.nonce, response.ciphertext)))
             hexBytes(pc.pcId, 16); PairingInput.name(pc.name)
-            return PendingPairing(endpoint, start.session, key, pc.pcId, pc.name, deadline)
+            // Optional authenticated extension. Older companions reject the route;
+            // their unchanged pairing exchange still works, with compatibility unknown.
+            val compatibility = try {
+                val sealed = Json.decodeFromString<SealedPairing>(post(endpoint, "/pair/compatibility", Json.encodeToString(CompatibilityRequest(start.session))))
+                Json.decodeFromString<CompanionCompatibility>(PairingCipher.open(key, start.session, "compatibility", sealed))
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+              catch (_: Exception) { null }
+            return PendingPairing(endpoint, start.session, key, pc.pcId, pc.name, deadline,
+                compatibility?.warning(phoneVersion), compatibility?.version)
         } catch (e: Exception) { key.fill(0); throw e }
     }
     internal suspend fun post(endpoint: PairingEndpoint, path: String, payload: String): String = withContext(Dispatchers.IO) {

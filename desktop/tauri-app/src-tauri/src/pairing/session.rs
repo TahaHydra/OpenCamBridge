@@ -216,6 +216,22 @@ impl Invitation {
                     json!({"m2":hex::encode(exchange.proof.m2),"nonce":sealed.nonce,"ciphertext":sealed.ciphertext}),
                 )
             }
+            "/pair/compatibility" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct CompatibilityRequest { session: String }
+                let request: CompatibilityRequest = serde_json::from_value(request)
+                    .map_err(|_| "Invalid compatibility request")?;
+                let exchange = self.exchanges.get(&request.session).ok_or("Unknown pairing session")?;
+                if exchange.peer != peer || !exchange.verified {
+                    return Err("Authenticate this PC before checking compatibility".into());
+                }
+                let sealed = crypto::seal(&exchange.proof.key,
+                    &format!("ocb-pair-v1:{}:compatibility", request.session),
+                    json!({"version":env!("CARGO_PKG_VERSION"),"controlProtocol":1,"streamProtocol":2,"minimumPhoneVersion":"0.1.0"})
+                        .to_string().as_bytes())?;
+                Ok(json!({"nonce":sealed.nonce,"ciphertext":sealed.ciphertext}))
+            }
             "/pair/finish" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -349,6 +365,7 @@ mod tests {
         )
         .unwrap();
         let finish = json!({"session":session,"nonce":sealed.nonce,"ciphertext":sealed.ciphertext});
+        assert!(invitation.handle("/pair/compatibility", json!({"session":session}), peer, &mut store).is_err());
         assert!(invitation
             .handle("/pair/finish", finish.clone(), peer, &mut store)
             .is_err());
@@ -368,6 +385,14 @@ mod tests {
                 &mut store
             )
             .is_err());
+        assert!(invitation.handle("/pair/compatibility", json!({"session":session}), "192.168.1.3".parse().unwrap(), &mut store).is_err());
+        let compatibility = invitation.handle("/pair/compatibility", json!({"session":session}), peer, &mut store).unwrap();
+        let envelope = crypto::Envelope { nonce: compatibility["nonce"].as_str().unwrap().into(), ciphertext: compatibility["ciphertext"].as_str().unwrap().into() };
+        let decoded = crypto::open(&key, &format!("ocb-pair-v1:{session}:compatibility"), &envelope).unwrap();
+        let metadata: Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(metadata["controlProtocol"], 1);
+        assert_eq!(metadata["streamProtocol"], 2);
+        assert_eq!(metadata["version"], env!("CARGO_PKG_VERSION"));
         let ack = invitation
             .handle("/pair/finish", finish.clone(), peer, &mut store)
             .unwrap();

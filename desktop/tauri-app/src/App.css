@@ -23,3 +23,15 @@
 @import './styles/settings.css';
 @import './styles/connect.css';
 @import './styles/legacy.css';
+/* One quiet action; never covers the camera picture or opens itself. */
+.release-update-notice {
+  position: fixed; left: 18px; bottom: 18px; z-index: 140;
+  display: flex; align-items: center; gap: 8px;
+  border: 1px solid #60a5fa; border-radius: 10px; padding: 10px 14px;
+  background: #1458c0; color: white; font: inherit; font-size: 13px;
+  box-shadow: 0 4px 18px #0005; cursor: pointer;
+}
+.release-update-notice:hover { background: #1d65d5; }
+.release-update-notice:focus-visible { outline: 3px solid #93c5fd; outline-offset: 3px; }
+/* Clean feed is also used for window capture: keep update chrome out of it. */
+body:has(.clean-feed.is-active) .release-update-notice { display: none; }

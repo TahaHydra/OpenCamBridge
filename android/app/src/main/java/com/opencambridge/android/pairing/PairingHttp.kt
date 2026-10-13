@@ -9,9 +9,12 @@ import java.net.SocketTimeoutException
 /** The only socket HTTP client: fixed pairing routes, literal RFC1918 peers, SRP/AES payloads.
  * This intentionally does not change Android's app-wide cleartext traffic policy. */
 internal object PairingHttp {
+    internal fun requirePairingRoute(path: String) {
+        require(path in setOf("/pair/start", "/pair/prove", "/pair/finish", "/pair/compatibility"))
+    }
     fun post(endpoint: PairingEndpoint, path: String, payload: String): String {
         require(PairingInput.privateIpv4(endpoint.host) && endpoint.port in 1024..65535)
-        require(path in setOf("/pair/start", "/pair/prove", "/pair/finish"))
+        requirePairingRoute(path)
         val body = payload.toByteArray(Charsets.UTF_8)
         require(body.size <= 4096)
         return Socket().use { socket ->
